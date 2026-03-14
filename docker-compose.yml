@@ -1,0 +1,77 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: nextgen
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: >
+      uvicorn backend.app.main:app
+      --host 0.0.0.0 --port 8000
+      --reload --log-level info
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env.backend
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/nextgen
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - .:/app
+    working_dir: /app
+
+  admin_api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: >
+      uvicorn admin_api.app.main:app
+      --host 0.0.0.0 --port 8001
+      --reload --log-level info
+    ports:
+      - "8001:8001"
+    env_file:
+      - .env.admin
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/nextgen
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - .:/app
+    working_dir: /app
+
+volumes:
+  pgdata:
