@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     DEBUG: bool = False
     ENVIRONMENT: str = "development"  # development | staging | production
     API_V1_PREFIX: str = "/v1"
-    ALLOWED_ORIGINS: str = "http://localhost:3000,http://localhost:3001"
+    ALLOWED_ORIGINS: str = "https://nextgenintelligence.co.za,https://app.nextgenintelligence.co.za,https://staff.nextgenintelligence.co.za,https://admin.nextgenintelligence.co.za,http://localhost:3000,http://localhost:3001,http://localhost:5173,http://localhost:5174,http://localhost:5175"
 
     # ── Database ─────────────────────────────────────────────────────────
     DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/nextgen"

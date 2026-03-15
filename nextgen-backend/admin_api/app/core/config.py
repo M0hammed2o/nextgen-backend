@@ -21,7 +21,7 @@ class AdminSettings(BaseSettings):
     DEBUG: bool = False
     ENVIRONMENT: str = "development"
     API_V1_PREFIX: str = "/v1"
-    ALLOWED_ORIGINS: str = "http://localhost:3002"
+    ALLOWED_ORIGINS: str = "https://admin.nextgenintelligence.co.za,http://localhost:3000,http://localhost:3001,http://localhost:3002,http://localhost:5173,http://localhost:5174,http://localhost:5175"
 
     DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/nextgen"
     DATABASE_POOL_SIZE: int = 10
