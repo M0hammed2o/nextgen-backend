@@ -53,13 +53,19 @@ async def _send_via_meta_api(
         f"{settings.META_API_BASE_URL}/{settings.META_API_VERSION}"
         f"/{phone_number_id}/messages"
     )
+    token = settings.WHATSAPP_DEFAULT_ACCESS_TOKEN
     headers = {
-        "Authorization": f"Bearer {settings.WHATSAPP_DEFAULT_ACCESS_TOKEN}",
+        "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
 
     # Ensure required field
     payload.setdefault("messaging_product", "whatsapp")
+
+    logger.info(
+        "Meta API send: url=%s, phone_number_id=%s, token=%s",
+        url, phone_number_id, _masked_token(token),
+    )
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -81,6 +87,84 @@ async def _send_via_meta_api(
         logger.exception("Unexpected error sending WhatsApp message")
 
     return None
+
+
+async def _send_via_meta_api_with_detail(
+    phone_number_id: str,
+    recipient_wa_id: str,
+    payload: dict,
+) -> tuple[str | None, str | None]:
+    """
+    Like _send_via_meta_api but also returns an error string for diagnostics.
+
+    Returns: (wamid | None, error_detail | None)
+      - On success: (wamid, None)
+      - On failure: (None, human-readable error including Meta response body)
+    """
+    url = (
+        f"{settings.META_API_BASE_URL}/{settings.META_API_VERSION}"
+        f"/{phone_number_id}/messages"
+    )
+    token = settings.WHATSAPP_DEFAULT_ACCESS_TOKEN
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+    payload.setdefault("messaging_product", "whatsapp")
+
+    masked = _masked_token(token)
+    logger.info(
+        "Meta API test-send: url=%s, phone_number_id=%s, token=%s",
+        url, phone_number_id, masked,
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+
+            logger.info(
+                "Meta API response: status=%d, phone_number_id=%s, body=%s",
+                resp.status_code, phone_number_id, resp.text[:500],
+            )
+
+            if resp.status_code == 200:
+                data = resp.json()
+                messages = data.get("messages", [])
+                if messages:
+                    return messages[0].get("id"), None
+                return None, "Meta API returned 200 but no messages[] in response"
+            else:
+                try:
+                    err_body = resp.json()
+                    meta_error = err_body.get("error", {})
+                    detail = meta_error.get("message") or resp.text[:400]
+                    error_code = meta_error.get("code", "")
+                    error_subcode = meta_error.get("error_subcode", "")
+                    error_str = f"Meta API error {resp.status_code}"
+                    if error_code:
+                        error_str += f" (code={error_code}"
+                        if error_subcode:
+                            error_str += f", subcode={error_subcode}"
+                        error_str += ")"
+                    error_str += f": {detail}"
+                except Exception:
+                    error_str = f"Meta API error {resp.status_code}: {resp.text[:400]}"
+
+                logger.error(
+                    "Meta API error: status=%d, phone_number_id=%s, body=%s",
+                    resp.status_code, phone_number_id, resp.text[:500],
+                )
+                return None, error_str
+
+    except httpx.TimeoutException:
+        msg = f"Meta API timeout after 10s (phone_number_id={phone_number_id})"
+        logger.error(msg)
+        return None, msg
+    except Exception as exc:
+        msg = f"Unexpected error sending WhatsApp message: {exc!r}"
+        logger.exception(msg)
+        return None, msg
 
 
 # ── Text message (with outbox persistence) ───────────────────────────────────

@@ -391,7 +391,24 @@ async def send_whatsapp_test(
         )
 
     # Use the low-level sender (no DB persistence for test messages)
-    from backend.app.bot.whatsapp_sender import _send_via_meta_api
+    from backend.app.bot.whatsapp_sender import _send_via_meta_api_with_detail
+    from backend.app.core.config import get_settings as _get_backend_settings
+
+    _backend_settings = _get_backend_settings()
+    _masked = lambda t: f"{t[:6]}...{t[-4:]}" if len(t) > 12 else "***"  # noqa: E731
+
+    phone_number_id = biz.whatsapp_phone_number_id
+    token_source = "env:WHATSAPP_DEFAULT_ACCESS_TOKEN"
+    token = _backend_settings.WHATSAPP_DEFAULT_ACCESS_TOKEN
+
+    logger.info(
+        "WhatsApp test-send: business_id=%s, phone_number_id=%s, token_source=%s, token=%s, to=%s",
+        business_id,
+        phone_number_id,
+        token_source,
+        _masked(token),
+        body.to,
+    )
 
     payload = {
         "messaging_product": "whatsapp",
@@ -401,8 +418,8 @@ async def send_whatsapp_test(
         "text": {"body": body.text},
     }
 
-    wamid = await _send_via_meta_api(
-        phone_number_id=biz.whatsapp_phone_number_id,
+    wamid, error_detail = await _send_via_meta_api_with_detail(
+        phone_number_id=phone_number_id,
         recipient_wa_id=body.to,
         payload=payload,
     )
@@ -415,13 +432,17 @@ async def send_whatsapp_test(
         return WhatsAppTestSendResponse(
             success=True,
             wa_message_id=wamid,
-            phone_number_id=biz.whatsapp_phone_number_id,
+            phone_number_id=phone_number_id,
         )
     else:
+        logger.error(
+            "Test message failed: business=%s, phone_number_id=%s, error=%s",
+            business_id, phone_number_id, error_detail,
+        )
         return WhatsAppTestSendResponse(
             success=False,
-            error="Meta API call failed — check logs for details",
-            phone_number_id=biz.whatsapp_phone_number_id,
+            error=error_detail or "Meta API call failed — check logs for details",
+            phone_number_id=phone_number_id,
         )
 
 
