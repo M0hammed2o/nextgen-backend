@@ -70,8 +70,12 @@ async def process_inbound_message(
             msg_text, msg_type, raw_payload, contact_name,
         )
         await db.commit()
+        logger.info("PIPELINE_COMMITTED: wa_message_id=%s", wa_message_id)
     except Exception:
-        logger.exception("Pipeline error: wa_message_id=%s", wa_message_id)
+        logger.exception(
+            "PIPELINE_EXCEPTION: wa_message_id=%s, phone_number_id=%s — rolling back",
+            wa_message_id, phone_number_id,
+        )
         await db.rollback()
 
 
@@ -85,18 +89,32 @@ async def _process(
     raw_payload: dict,
     contact_name: str | None,
 ) -> None:
+    logger.info(
+        "PIPELINE_START: wa_message_id=%s, phone_number_id=%s, wa_id=%s, type=%s",
+        wa_message_id, phone_number_id, wa_id, msg_type,
+    )
+
     # ── 1. Resolve business ──────────────────────────────────────────────
     result = await db.execute(
         select(Business).where(Business.whatsapp_phone_number_id == phone_number_id)
     )
     business = result.scalar_one_or_none()
     if not business:
-        logger.warning("No business for phone_number_id=%s", phone_number_id)
+        logger.warning(
+            "PIPELINE_NO_BUSINESS: phone_number_id=%s — no business registered for this number. "
+            "Check that the business record has whatsapp_phone_number_id=%s set in the DB.",
+            phone_number_id, phone_number_id,
+        )
         return
+
+    logger.info(
+        "PIPELINE_BUSINESS_FOUND: business_id=%s, name=%s, active=%s",
+        business.id, business.name, business.is_active,
+    )
 
     # ── 2. Check active ──────────────────────────────────────────────────
     if not business.is_active:
-        logger.info("Business %s inactive, ignoring", business.id)
+        logger.info("PIPELINE_BUSINESS_INACTIVE: business_id=%s, skipping", business.id)
         return
 
     # ── 3. Get/create customer ───────────────────────────────────────────

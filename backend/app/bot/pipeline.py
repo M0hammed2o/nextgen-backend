@@ -70,8 +70,12 @@ async def process_inbound_message(
             msg_text, msg_type, raw_payload, contact_name,
         )
         await db.commit()
+        logger.info("PIPELINE_COMMITTED: wa_message_id=%s", wa_message_id)
     except Exception:
-        logger.exception("Pipeline error: wa_message_id=%s", wa_message_id)
+        logger.exception(
+            "PIPELINE_EXCEPTION: wa_message_id=%s, phone_number_id=%s — rolling back",
+            wa_message_id, phone_number_id,
+        )
         await db.rollback()
 
 
@@ -85,34 +89,53 @@ async def _process(
     raw_payload: dict,
     contact_name: str | None,
 ) -> None:
+    logger.info(
+        "PIPELINE_START: wa_message_id=%s, phone_number_id=%s, wa_id=%s, type=%s",
+        wa_message_id, phone_number_id, wa_id, msg_type,
+    )
+
     # ── 1. Resolve business ──────────────────────────────────────────────
     result = await db.execute(
         select(Business).where(Business.whatsapp_phone_number_id == phone_number_id)
     )
     business = result.scalar_one_or_none()
     if not business:
-        logger.warning("No business for phone_number_id=%s", phone_number_id)
+        logger.warning(
+            "PIPELINE_NO_BUSINESS: phone_number_id=%s — no business registered for this number. "
+            "Check that the business record has whatsapp_phone_number_id=%s set in the DB.",
+            phone_number_id, phone_number_id,
+        )
         return
+
+    logger.info(
+        "PIPELINE_BUSINESS_FOUND: business_id=%s, name=%s, active=%s, whatsapp_enabled=%s",
+        business.id, business.name, business.is_active,
+        getattr(business, "is_whatsapp_enabled", True),
+    )
 
     # ── 2. Check active ──────────────────────────────────────────────────
     if not business.is_active:
-        logger.info("Business %s inactive, ignoring", business.id)
+        logger.info("PIPELINE_BUSINESS_INACTIVE: business_id=%s, skipping", business.id)
         return
 
     # ── 3. Get/create customer ───────────────────────────────────────────
     customer = await _get_or_create_customer(db, business.id, wa_id, contact_name)
+    logger.info(
+        "PIPELINE_CUSTOMER: customer_id=%s, opted_out=%s, wa_id=%s",
+        customer.id, customer.opted_out, wa_id,
+    )
 
     # ── 4. Idempotency ───────────────────────────────────────────────────
     existing = await db.execute(
         select(Message.id).where(Message.wa_message_id == wa_message_id)
     )
     if existing.scalar_one_or_none():
-        logger.debug("Duplicate message: %s", wa_message_id)
+        logger.info("PIPELINE_DUPLICATE: wa_message_id=%s already processed, skipping", wa_message_id)
         return
 
     # ── 5. Check opt-out ─────────────────────────────────────────────────
     if customer.opted_out:
-        logger.info("Customer %s opted out, ignoring", customer.id)
+        logger.info("PIPELINE_OPTED_OUT: customer_id=%s, wa_id=%s, skipping", customer.id, wa_id)
         return
 
     # ── 6. Detect opt-out intent early ───────────────────────────────────
@@ -156,11 +179,20 @@ async def _process(
 
     # ── 12. Send response ────────────────────────────────────────────────
     if response_text:
+        logger.info(
+            "PIPELINE_SENDING_REPLY: business_id=%s, wa_id=%s, intent=%s, is_llm=%s, text_len=%d",
+            business.id, wa_id, intent.value if intent else "UNKNOWN", is_llm, len(response_text),
+        )
         await _send_response(
             db, business, customer, wa_id, response_text,
             is_llm=is_llm, llm_tokens=llm_tokens,
             llm_cost_cents=llm_cost, llm_provider=llm_provider,
             intent=intent.value if intent else "UNKNOWN",
+        )
+    else:
+        logger.info(
+            "PIPELINE_NO_REPLY: business_id=%s, wa_id=%s, intent=%s — no response_text generated",
+            business.id, wa_id, intent.value if intent else "UNKNOWN",
         )
 
     # ── 13. Update usage ─────────────────────────────────────────────────
