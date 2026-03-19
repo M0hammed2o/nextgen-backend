@@ -30,7 +30,15 @@ logger = logging.getLogger("nextgen")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Starting NextGen Backend v%s [%s]", settings.APP_VERSION, settings.ENVIRONMENT)
+    logger.warning(
+        "STARTUP: NextGen Backend v%s [env=%s] — "
+        "webhook public at %s/webhook/meta — "
+        "docs at /docs (debug=%s)",
+        settings.APP_VERSION,
+        settings.ENVIRONMENT,
+        settings.API_V1_PREFIX,
+        settings.DEBUG,
+    )
 
     # Start outbox worker as background task
     import asyncio
