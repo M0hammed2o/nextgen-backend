@@ -22,15 +22,23 @@ def to_business_tz(dt: datetime, tz_name: str) -> datetime:
 def is_business_open(business_hours: dict, tz_name: str) -> bool:
     """
     Check if a business is currently open based on business_hours config.
-    
+
+    If business_hours is empty or not configured, the business is treated
+    as always open (24/7). This prevents blocking all messages for new
+    businesses that haven't set their hours yet.
+
     business_hours format:
     {
         "mon": {"open": "08:00", "close": "22:00"},
         "tue": {"open": "08:00", "close": "22:00"},
         ...
-        "sun": null  // closed
+        "sun": null  // closed all day
     }
     """
+    # No hours configured → treat as always open
+    if not business_hours:
+        return True
+
     now_local = to_business_tz(utc_now(), tz_name)
     day_key = now_local.strftime("%a").lower()[:3]
 

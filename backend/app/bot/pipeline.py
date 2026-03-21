@@ -164,7 +164,10 @@ async def _process(
     session = await state_machine.get_or_create_session(db, business.id, customer.id)
 
     # ── 10. Check business hours ─────────────────────────────────────────
-    if not is_business_open(business.business_hours or {}, business.timezone):
+    # Only enforce hours if business_hours is actually configured.
+    # An empty/null business_hours means "always open" — do NOT block messages.
+    hours_configured = bool(business.business_hours)
+    if hours_configured and not is_business_open(business.business_hours, business.timezone):
         # Allow info requests even when closed
         if intent not in (MessageIntent.HOURS_REQUEST, MessageIntent.LOCATION_REQUEST):
             response_text = responses.closed_response(business)
