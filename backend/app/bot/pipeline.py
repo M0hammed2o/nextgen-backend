@@ -89,7 +89,7 @@ async def _process(
     raw_payload: dict,
     contact_name: str | None,
 ) -> None:
-    logger.info(
+    logger.warning(
         "PIPELINE_START: wa_message_id=%s, phone_number_id=%s, wa_id=%s, type=%s",
         wa_message_id, phone_number_id, wa_id, msg_type,
     )
@@ -167,24 +167,45 @@ async def _process(
     # Only enforce hours if business_hours is actually configured.
     # An empty/null business_hours means "always open" — do NOT block messages.
     hours_configured = bool(business.business_hours)
-    if hours_configured and not is_business_open(business.business_hours, business.timezone):
+    is_open = is_business_open(business.business_hours, business.timezone) if hours_configured else True
+    logger.warning(
+        "PIPELINE_HOURS_CHECK: business_id=%s, hours_configured=%s, is_open=%s, "
+        "intent=%s, timezone=%s",
+        business.id, hours_configured, is_open,
+        intent.value if intent else "None", business.timezone,
+    )
+    if hours_configured and not is_open:
         # Allow info requests even when closed
         if intent not in (MessageIntent.HOURS_REQUEST, MessageIntent.LOCATION_REQUEST):
+            logger.warning(
+                "PIPELINE_CLOSED_BRANCH: business_id=%s, intent=%s — business is closed, "
+                "sending closed_response (closed_text=%r)",
+                business.id, intent.value if intent else "None",
+                business.closed_text,
+            )
             response_text = responses.closed_response(business)
             await _send_response(db, business, customer, wa_id, response_text, intent="CLOSED")
             await usage_tracker.increment_usage(db, business.id, business.timezone, inbound_messages=1, outbound_messages=1)
             return
 
     # ── 11. Process based on intent + state ──────────────────────────────
+    logger.warning(
+        "PIPELINE_HANDLE_START: business_id=%s, wa_id=%s, intent=%s, "
+        "session_state=%s, msg_text=%r",
+        business.id, wa_id, intent.value if intent else "None",
+        session.state, msg_text[:80],
+    )
     response_text, is_llm, llm_tokens, llm_cost, llm_provider = await _handle_message(
         db, business, customer, session, msg_text, intent,
     )
 
     # ── 12. Send response ────────────────────────────────────────────────
     if response_text:
-        logger.info(
-            "PIPELINE_SENDING_REPLY: business_id=%s, wa_id=%s, intent=%s, is_llm=%s, text_len=%d",
-            business.id, wa_id, intent.value if intent else "UNKNOWN", is_llm, len(response_text),
+        logger.warning(
+            "PIPELINE_SENDING_REPLY: business_id=%s, wa_id=%s, intent=%s, "
+            "is_llm=%s, text_len=%d, text_preview=%r",
+            business.id, wa_id, intent.value if intent else "UNKNOWN",
+            is_llm, len(response_text), response_text[:60],
         )
         await _send_response(
             db, business, customer, wa_id, response_text,
@@ -193,7 +214,7 @@ async def _process(
             intent=intent.value if intent else "UNKNOWN",
         )
     else:
-        logger.info(
+        logger.warning(
             "PIPELINE_NO_REPLY: business_id=%s, wa_id=%s, intent=%s — no response_text generated",
             business.id, wa_id, intent.value if intent else "UNKNOWN",
         )
@@ -222,35 +243,45 @@ async def _handle_message(
     Returns (response_text, is_llm, llm_tokens, llm_cost_cents, llm_provider).
     """
     current_state = session.state
+    logger.warning(
+        "HANDLE_MSG: intent=%s, state=%s, msg=%r",
+        intent.value if intent else "None", current_state, msg_text[:80],
+    )
 
     # ── Template responses (no LLM needed) ───────────────────────────────
 
     if intent == MessageIntent.GREETING:
+        logger.warning("HANDLE_BRANCH: GREETING → greeting_response (greeting_text=%r)", business.greeting_text)
         state_machine.transition_state(session, ConversationState.GREETING.value)
         return responses.greeting_response(business), False, None, None, None
 
     if intent == MessageIntent.MENU_REQUEST:
+        logger.warning("HANDLE_BRANCH: MENU_REQUEST → menu_response")
         categories, items = await _load_menu(db, business.id)
         state_machine.transition_state(session, ConversationState.BROWSING_MENU.value)
         return responses.menu_response(categories, items, business.currency), False, None, None, None
 
     if intent == MessageIntent.SPECIALS_REQUEST:
+        logger.warning("HANDLE_BRANCH: SPECIALS_REQUEST → specials_response")
         specials = await _load_specials(db, business.id)
         return responses.specials_response(specials, business.currency), False, None, None, None
 
     if intent == MessageIntent.HOURS_REQUEST:
+        logger.warning("HANDLE_BRANCH: HOURS_REQUEST → hours_response")
         return responses.hours_response(business), False, None, None, None
 
     if intent == MessageIntent.LOCATION_REQUEST:
+        logger.warning("HANDLE_BRANCH: LOCATION_REQUEST → location_response")
         return responses.location_response(business), False, None, None, None
 
     if intent == MessageIntent.ORDER_CANCEL:
+        logger.warning("HANDLE_BRANCH: ORDER_CANCEL → clearing cart")
         state_machine.clear_cart(session)
         state_machine.transition_state(session, ConversationState.IDLE.value)
         return "Order cancelled. Your cart has been cleared. 🗑️\nAnything else I can help with?", False, None, None, None
 
     if intent == MessageIntent.ORDER_TRACK:
-        # Check last order for this customer
+        logger.warning("HANDLE_BRANCH: ORDER_TRACK → checking last order")
         last_order = await _get_last_order(db, business.id, customer.id)
         if last_order:
             from shared.utils.money import format_currency
@@ -264,26 +295,44 @@ async def _handle_message(
 
     # ── Order confirmation (in CONFIRMING_ORDER state) ───────────────────
     if current_state == ConversationState.CONFIRMING_ORDER.value:
-        if intent_router.is_confirmation(msg_text):
+        is_confirm = intent_router.is_confirmation(msg_text)
+        is_negate = intent_router.is_negation(msg_text)
+        logger.warning(
+            "HANDLE_BRANCH: CONFIRMING_ORDER state — is_confirm=%s, is_negate=%s",
+            is_confirm, is_negate,
+        )
+        if is_confirm:
             return await _handle_order_confirmation(db, business, customer, session)
-        elif intent_router.is_negation(msg_text):
+        elif is_negate:
             state_machine.transition_state(session, ConversationState.BUILDING_CART.value)
             return "No problem! What would you like to change?\n• Add more items\n• Remove something\n• Cancel the order", False, None, None, None
 
     # ── Collecting details state ─────────────────────────────────────────
     if current_state == ConversationState.COLLECTING_DETAILS.value:
+        logger.warning("HANDLE_BRANCH: COLLECTING_DETAILS state → collecting details")
         return await _handle_collecting_details(db, business, customer, session, msg_text)
 
     # ── LLM-required intents (ordering, ambiguous) ───────────────────────
-    if intent_router.needs_llm(intent, current_state):
+    needs_llm_call = intent_router.needs_llm(intent, current_state)
+    logger.warning(
+        "HANDLE_BRANCH: needs_llm=%s, intent=%s, state=%s",
+        needs_llm_call, intent.value if intent else "None", current_state,
+    )
+    if needs_llm_call:
         try:
             await usage_tracker.check_daily_limit(db, business, "llm_calls")
         except DailyLimitError:
+            logger.warning("HANDLE_BRANCH: LLM daily limit hit → fallback_response")
             return responses.fallback_response(business), False, None, None, None
 
+        logger.warning("HANDLE_BRANCH: → LLM call")
         return await _handle_with_llm(db, business, customer, session, msg_text)
 
     # ── Fallback ─────────────────────────────────────────────────────────
+    logger.warning(
+        "HANDLE_BRANCH: FALLBACK — intent=%s, state=%s, fallback_text=%r",
+        intent.value if intent else "None", current_state, business.fallback_text,
+    )
     return responses.fallback_response(business), False, None, None, None
 
 
