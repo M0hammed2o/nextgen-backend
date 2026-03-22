@@ -164,29 +164,43 @@ async def _process(
     session = await state_machine.get_or_create_session(db, business.id, customer.id)
 
     # ── 10. Check business hours ─────────────────────────────────────────
-    # Only enforce hours if business_hours is actually configured.
-    # An empty/null business_hours means "always open" — do NOT block messages.
+    # Rules:
+    #   A. No hours configured → always open, never send closed_text.
+    #   B. Hours configured + currently open → normal handler.
+    #   C. Hours configured + currently closed + closed_text set → send closed_text.
+    #   D. Hours configured + currently closed + closed_text empty → fall through
+    #      to normal handler (let AI respond rather than sending nothing or a
+    #      misleading canned close message).
     hours_configured = bool(business.business_hours)
     is_open = is_business_open(business.business_hours, business.timezone) if hours_configured else True
+    has_closed_text = bool(business.closed_text and business.closed_text.strip())
+
     logger.warning(
         "PIPELINE_HOURS_CHECK: business_id=%s, hours_configured=%s, is_open=%s, "
-        "intent=%s, timezone=%s",
-        business.id, hours_configured, is_open,
+        "has_closed_text=%s, intent=%s, timezone=%s",
+        business.id, hours_configured, is_open, has_closed_text,
         intent.value if intent else "None", business.timezone,
     )
-    if hours_configured and not is_open:
-        # Allow info requests even when closed
+
+    if hours_configured and not is_open and has_closed_text:
+        # Business is genuinely closed and has a configured closed message.
+        # Allow hours/location info requests through even when closed.
         if intent not in (MessageIntent.HOURS_REQUEST, MessageIntent.LOCATION_REQUEST):
             logger.warning(
-                "PIPELINE_CLOSED_BRANCH: business_id=%s, intent=%s — business is closed, "
-                "sending closed_response (closed_text=%r)",
-                business.id, intent.value if intent else "None",
-                business.closed_text,
+                "PIPELINE_CLOSED_BRANCH: business is closed + closed_text configured — "
+                "sending closed_response. business_id=%s, intent=%s, closed_text=%r",
+                business.id, intent.value if intent else "None", business.closed_text,
             )
             response_text = responses.closed_response(business)
             await _send_response(db, business, customer, wa_id, response_text, intent="CLOSED")
             await usage_tracker.increment_usage(db, business.id, business.timezone, inbound_messages=1, outbound_messages=1)
             return
+    elif hours_configured and not is_open and not has_closed_text:
+        logger.warning(
+            "PIPELINE_CLOSED_NO_TEXT: business is closed but closed_text is empty — "
+            "falling through to normal handler. business_id=%s, intent=%s",
+            business.id, intent.value if intent else "None",
+        )
 
     # ── 11. Process based on intent + state ──────────────────────────────
     logger.warning(
