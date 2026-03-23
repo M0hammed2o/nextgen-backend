@@ -12,7 +12,7 @@ Pipeline steps:
 6. Persist inbound message
 7. Check daily message limit
 8. Load/init conversation session
-9. Check business hours
+9. Log business-hours context (no hard closed gate)
 10. Run rules engine (keyword → intent)
 11. If needed: call LLM
 12. Process intent → update state → build response
@@ -62,19 +62,26 @@ async def process_inbound_message(
 ) -> None:
     """
     Full message processing pipeline.
-    Always commits at the end (or on error).
+    Always commits at the end (or rolls back on error).
     """
     try:
         await _process(
-            db, phone_number_id, wa_message_id, wa_id,
-            msg_text, msg_type, raw_payload, contact_name,
+            db=db,
+            phone_number_id=phone_number_id,
+            wa_message_id=wa_message_id,
+            wa_id=wa_id,
+            msg_text=msg_text,
+            msg_type=msg_type,
+            raw_payload=raw_payload,
+            contact_name=contact_name,
         )
         await db.commit()
         logger.info("PIPELINE_COMMITTED: wa_message_id=%s", wa_message_id)
     except Exception:
         logger.exception(
             "PIPELINE_EXCEPTION: wa_message_id=%s, phone_number_id=%s — rolling back",
-            wa_message_id, phone_number_id,
+            wa_message_id,
+            phone_number_id,
         )
         await db.rollback()
 
@@ -91,7 +98,10 @@ async def _process(
 ) -> None:
     logger.warning(
         "PIPELINE_START: wa_message_id=%s, phone_number_id=%s, wa_id=%s, type=%s",
-        wa_message_id, phone_number_id, wa_id, msg_type,
+        wa_message_id,
+        phone_number_id,
+        wa_id,
+        msg_type,
     )
 
     # ── 1. Resolve business ──────────────────────────────────────────────
@@ -101,15 +111,16 @@ async def _process(
     business = result.scalar_one_or_none()
     if not business:
         logger.warning(
-            "PIPELINE_NO_BUSINESS: phone_number_id=%s — no business registered for this number. "
-            "Check that the business record has whatsapp_phone_number_id=%s set in the DB.",
-            phone_number_id, phone_number_id,
+            "PIPELINE_NO_BUSINESS: phone_number_id=%s — no business registered",
+            phone_number_id,
         )
         return
 
     logger.info(
         "PIPELINE_BUSINESS_FOUND: business_id=%s, name=%s, active=%s, whatsapp_enabled=%s",
-        business.id, business.name, business.is_active,
+        business.id,
+        business.name,
+        business.is_active,
         getattr(business, "is_whatsapp_enabled", True),
     )
 
@@ -122,7 +133,9 @@ async def _process(
     customer = await _get_or_create_customer(db, business.id, wa_id, contact_name)
     logger.info(
         "PIPELINE_CUSTOMER: customer_id=%s, opted_out=%s, wa_id=%s",
-        customer.id, customer.opted_out, wa_id,
+        customer.id,
+        customer.opted_out,
+        wa_id,
     )
 
     # ── 4. Idempotency ───────────────────────────────────────────────────
@@ -130,88 +143,107 @@ async def _process(
         select(Message.id).where(Message.wa_message_id == wa_message_id)
     )
     if existing.scalar_one_or_none():
-        logger.info("PIPELINE_DUPLICATE: wa_message_id=%s already processed, skipping", wa_message_id)
+        logger.info(
+            "PIPELINE_DUPLICATE: wa_message_id=%s already processed, skipping",
+            wa_message_id,
+        )
         return
 
     # ── 5. Check opt-out ─────────────────────────────────────────────────
     if customer.opted_out:
-        logger.info("PIPELINE_OPTED_OUT: customer_id=%s, wa_id=%s, skipping", customer.id, wa_id)
+        logger.info(
+            "PIPELINE_OPTED_OUT: customer_id=%s, wa_id=%s, skipping",
+            customer.id,
+            wa_id,
+        )
         return
 
     # ── 6. Detect opt-out intent early ───────────────────────────────────
     intent = intent_router.match_intent(msg_text)
     if intent == MessageIntent.OPT_OUT:
         customer.opted_out = True
-        inbound = _persist_inbound(db, business.id, customer.id, wa_message_id, msg_text, raw_payload, "OPT_OUT")
-        await _send_response(db, business, customer, wa_id, responses.opted_out_response(), intent="OPT_OUT")
-        await usage_tracker.increment_usage(db, business.id, business.timezone, inbound_messages=1, outbound_messages=1)
+        _persist_inbound(
+            db=db,
+            business_id=business.id,
+            customer_id=customer.id,
+            wa_message_id=wa_message_id,
+            text=msg_text,
+            raw_payload=raw_payload,
+            intent="OPT_OUT",
+        )
+        await _send_response(
+            db=db,
+            business=business,
+            customer=customer,
+            wa_id=wa_id,
+            text=responses.opted_out_response(),
+            intent="OPT_OUT",
+        )
+        await usage_tracker.increment_usage(
+            db,
+            business.id,
+            business.timezone,
+            inbound_messages=1,
+            outbound_messages=1,
+        )
         return
 
     # ── 7. Persist inbound message ───────────────────────────────────────
-    inbound = _persist_inbound(
-        db, business.id, customer.id, wa_message_id, msg_text, raw_payload,
-        intent.value if intent else None,
+    _persist_inbound(
+        db=db,
+        business_id=business.id,
+        customer_id=customer.id,
+        wa_message_id=wa_message_id,
+        text=msg_text,
+        raw_payload=raw_payload,
+        intent=intent.value if intent else None,
     )
 
     # ── 8. Check daily message limit ─────────────────────────────────────
     try:
         await usage_tracker.check_daily_limit(db, business, "messages")
     except DailyLimitError:
-        logger.warning("Business %s hit daily message limit", business.id)
-        return  # Silently drop — don't tell customer about internal limits
+        logger.warning("PIPELINE_LIMIT_HIT: business_id=%s message limit hit", business.id)
+        return
 
     # ── 9. Load conversation session ─────────────────────────────────────
     session = await state_machine.get_or_create_session(db, business.id, customer.id)
 
-    # ── 10. Check business hours ─────────────────────────────────────────
-    # Only gate messages as "closed" when ALL THREE conditions are true:
-    #   1. business_hours is explicitly configured (not null/empty)
-    #   2. The current time is outside those hours
-    #   3. closed_text is explicitly set (not null/empty)
-    # If any condition is false → fall through to normal AI/intent handler.
-    # This ensures greetings, orders, and menu requests NEVER produce a
-    # CLOSED reply unless the business admin has explicitly configured it.
+    # ── 10. Business-hours context only (NO auto-closed gate) ───────────
     hours_configured = bool(business.business_hours)
-    is_open = is_business_open(business.business_hours, business.timezone) if hours_configured else True
-    has_closed_text = bool(business.closed_text and business.closed_text.strip())
-    is_truly_closed = hours_configured and not is_open and has_closed_text
+    is_open_now = (
+        is_business_open(business.business_hours, business.timezone)
+        if hours_configured
+        else True
+    )
 
     logger.warning(
         "PIPELINE_HOURS_CHECK: business_id=%s, hours_configured=%s, is_open=%s, "
-        "has_closed_text=%s, is_truly_closed=%s, intent=%s, timezone=%s",
-        business.id, hours_configured, is_open, has_closed_text, is_truly_closed,
-        intent.value if intent else "None", business.timezone,
+        "closed_text_present=%s, timezone=%s — no closed gate applied",
+        business.id,
+        hours_configured,
+        is_open_now,
+        bool(business.closed_text and str(business.closed_text).strip()),
+        business.timezone,
     )
-
-    if is_truly_closed:
-        # Hours/location info is always allowed even when closed.
-        if intent not in (MessageIntent.HOURS_REQUEST, MessageIntent.LOCATION_REQUEST):
-            logger.warning(
-                "PIPELINE_CLOSED_BRANCH: FIRING — hours_configured=%s, is_open=%s, "
-                "closed_text=%r, intent=%s — sending closed_response and returning",
-                hours_configured, is_open, business.closed_text,
-                intent.value if intent else "None",
-            )
-            response_text = responses.closed_response(business)
-            await _send_response(db, business, customer, wa_id, response_text, intent="CLOSED")
-            await usage_tracker.increment_usage(db, business.id, business.timezone, inbound_messages=1, outbound_messages=1)
-            return
-    else:
-        logger.warning(
-            "PIPELINE_HOURS_PASS: not gating — is_truly_closed=False "
-            "(hours_configured=%s, is_open=%s, has_closed_text=%s) → proceeding to handler",
-            hours_configured, is_open, has_closed_text,
-        )
 
     # ── 11. Process based on intent + state ──────────────────────────────
     logger.warning(
-        "PIPELINE_HANDLE_START: business_id=%s, wa_id=%s, intent=%s, "
-        "session_state=%s, msg_text=%r",
-        business.id, wa_id, intent.value if intent else "None",
-        session.state, msg_text[:80],
+        "PIPELINE_HANDLE_START: business_id=%s, wa_id=%s, intent=%s, session_state=%s, msg_text=%r",
+        business.id,
+        wa_id,
+        intent.value if intent else "None",
+        session.state,
+        msg_text[:80],
     )
+
     response_text, is_llm, llm_tokens, llm_cost, llm_provider = await _handle_message(
-        db, business, customer, session, msg_text, intent,
+        db=db,
+        business=business,
+        customer=customer,
+        session=session,
+        msg_text=msg_text,
+        intent=intent,
     )
 
     # ── 12. Send response ────────────────────────────────────────────────
@@ -219,24 +251,38 @@ async def _process(
         logger.warning(
             "PIPELINE_SENDING_REPLY: business_id=%s, wa_id=%s, intent=%s, "
             "is_llm=%s, text_len=%d, text_preview=%r",
-            business.id, wa_id, intent.value if intent else "UNKNOWN",
-            is_llm, len(response_text), response_text[:60],
+            business.id,
+            wa_id,
+            intent.value if intent else "UNKNOWN",
+            is_llm,
+            len(response_text),
+            response_text[:80],
         )
         await _send_response(
-            db, business, customer, wa_id, response_text,
-            is_llm=is_llm, llm_tokens=llm_tokens,
-            llm_cost_cents=llm_cost, llm_provider=llm_provider,
+            db=db,
+            business=business,
+            customer=customer,
+            wa_id=wa_id,
+            text=response_text,
+            is_llm=is_llm,
+            llm_tokens=llm_tokens,
+            llm_cost_cents=llm_cost,
+            llm_provider=llm_provider,
             intent=intent.value if intent else "UNKNOWN",
         )
     else:
         logger.warning(
-            "PIPELINE_NO_REPLY: business_id=%s, wa_id=%s, intent=%s — no response_text generated",
-            business.id, wa_id, intent.value if intent else "UNKNOWN",
+            "PIPELINE_NO_REPLY: business_id=%s, wa_id=%s, intent=%s",
+            business.id,
+            wa_id,
+            intent.value if intent else "UNKNOWN",
         )
 
     # ── 13. Update usage ─────────────────────────────────────────────────
     await usage_tracker.increment_usage(
-        db, business.id, business.timezone,
+        db=db,
+        business_id=business.id,
+        timezone_str=business.timezone,
         inbound_messages=1,
         outbound_messages=1 if response_text else 0,
         llm_calls=1 if is_llm else 0,
@@ -255,18 +301,24 @@ async def _handle_message(
 ) -> tuple[str, bool, int | None, int | None, str | None]:
     """
     Handle the message based on intent and conversation state.
-    Returns (response_text, is_llm, llm_tokens, llm_cost_cents, llm_provider).
+    Returns:
+      (response_text, is_llm, llm_tokens, llm_cost_cents, llm_provider)
     """
     current_state = session.state
     logger.warning(
         "HANDLE_MSG: intent=%s, state=%s, msg=%r",
-        intent.value if intent else "None", current_state, msg_text[:80],
+        intent.value if intent else "None",
+        current_state,
+        msg_text[:80],
     )
 
     # ── Template responses (no LLM needed) ───────────────────────────────
 
     if intent == MessageIntent.GREETING:
-        logger.warning("HANDLE_BRANCH: GREETING → greeting_response (greeting_text=%r)", business.greeting_text)
+        logger.warning(
+            "HANDLE_BRANCH: GREETING → greeting_response (greeting_text=%r)",
+            business.greeting_text,
+        )
         state_machine.transition_state(session, ConversationState.GREETING.value)
         return responses.greeting_response(business), False, None, None, None
 
@@ -293,19 +345,30 @@ async def _handle_message(
         logger.warning("HANDLE_BRANCH: ORDER_CANCEL → clearing cart")
         state_machine.clear_cart(session)
         state_machine.transition_state(session, ConversationState.IDLE.value)
-        return "Order cancelled. Your cart has been cleared. 🗑️\nAnything else I can help with?", False, None, None, None
+        return (
+            "Order cancelled. Your cart has been cleared. 🗑️\nAnything else I can help with?",
+            False,
+            None,
+            None,
+            None,
+        )
 
     if intent == MessageIntent.ORDER_TRACK:
         logger.warning("HANDLE_BRANCH: ORDER_TRACK → checking last order")
         last_order = await _get_last_order(db, business.id, customer.id)
         if last_order:
             from shared.utils.money import format_currency
+
             return (
                 f"📦 *Order {last_order.order_number}*\n"
                 f"Status: *{last_order.status}*\n"
                 f"Total: {format_currency(last_order.total_cents, business.currency)}\n"
-                f"Placed: {last_order.created_at.strftime('%H:%M')}"
-            ), False, None, None, None
+                f"Placed: {last_order.created_at.strftime('%H:%M')}",
+                False,
+                None,
+                None,
+                None,
+            )
         return "I couldn't find a recent order. Please check your order number.", False, None, None, None
 
     # ── Order confirmation (in CONFIRMING_ORDER state) ───────────────────
@@ -314,13 +377,20 @@ async def _handle_message(
         is_negate = intent_router.is_negation(msg_text)
         logger.warning(
             "HANDLE_BRANCH: CONFIRMING_ORDER state — is_confirm=%s, is_negate=%s",
-            is_confirm, is_negate,
+            is_confirm,
+            is_negate,
         )
         if is_confirm:
             return await _handle_order_confirmation(db, business, customer, session)
-        elif is_negate:
+        if is_negate:
             state_machine.transition_state(session, ConversationState.BUILDING_CART.value)
-            return "No problem! What would you like to change?\n• Add more items\n• Remove something\n• Cancel the order", False, None, None, None
+            return (
+                'No problem! What would you like to change?\n• Add more items\n• Remove something\n• Cancel the order',
+                False,
+                None,
+                None,
+                None,
+            )
 
     # ── Collecting details state ─────────────────────────────────────────
     if current_state == ConversationState.COLLECTING_DETAILS.value:
@@ -331,8 +401,11 @@ async def _handle_message(
     needs_llm_call = intent_router.needs_llm(intent, current_state)
     logger.warning(
         "HANDLE_BRANCH: needs_llm=%s, intent=%s, state=%s",
-        needs_llm_call, intent.value if intent else "None", current_state,
+        needs_llm_call,
+        intent.value if intent else "None",
+        current_state,
     )
+
     if needs_llm_call:
         try:
             await usage_tracker.check_daily_limit(db, business, "llm_calls")
@@ -346,7 +419,9 @@ async def _handle_message(
     # ── Fallback ─────────────────────────────────────────────────────────
     logger.warning(
         "HANDLE_BRANCH: FALLBACK — intent=%s, state=%s, fallback_text=%r",
-        intent.value if intent else "None", current_state, business.fallback_text,
+        intent.value if intent else "None",
+        current_state,
+        business.fallback_text,
     )
     return responses.fallback_response(business), False, None, None, None
 
@@ -363,26 +438,26 @@ async def _handle_with_llm(
     specials = await _load_specials(db, business.id)
     cart = state_machine.get_cart(session)
 
-    # Build prompt
     system_prompt = prompt_builder.build_system_prompt(
-        business, categories, items, specials,
-        session.state, cart,
+        business,
+        categories,
+        items,
+        specials,
+        session.state,
+        cart,
     )
 
-    # Call LLM
     from backend.app.llm.provider import get_llm_provider
+
     provider = get_llm_provider()
     llm_response = await provider.complete(system_prompt, msg_text)
 
-    # Parse response
     parsed = llm_parser.parse_llm_response(llm_response.text)
 
-    # Process action
     if parsed.action == "add_items" and parsed.items:
-        # Match items to menu and add to cart
         items_map = {i.name.lower(): i for i in items if i.is_active and not i.is_deleted}
-        added = []
-        unmatched = []
+        added: list[str] = []
+        unmatched: list[str] = []
 
         for pi in parsed.items:
             if not pi.name:
@@ -390,10 +465,8 @@ async def _handle_with_llm(
                     unmatched.append(pi.original_text)
                 continue
 
-            # Fuzzy match against menu
             matched_item = items_map.get(pi.name.lower())
             if not matched_item:
-                # Try partial match
                 for menu_name, menu_item in items_map.items():
                     if pi.name.lower() in menu_name or menu_name in pi.name.lower():
                         matched_item = menu_item
@@ -415,22 +488,30 @@ async def _handle_with_llm(
 
         state_machine.transition_state(session, ConversationState.BUILDING_CART.value)
 
-        # Build response
-        response_parts = []
+        response_parts: list[str] = []
         if added:
             response_parts.append("Added to your order: " + ", ".join(added) + " ✅")
         if unmatched:
-            response_parts.append(f"Sorry, I couldn't find: {', '.join(unmatched)}. Check our menu for available items.")
+            response_parts.append(
+                f"Sorry, I couldn't find: {', '.join(unmatched)}. Check our menu for available items."
+            )
 
         response_parts.append("\n" + state_machine.cart_summary_text(session, business.currency))
         response_parts.append('\nAnything else? Or say *"done"* to confirm your order.')
 
-        return "\n".join(response_parts), True, llm_response.total_tokens, llm_response.cost_cents, llm_response.provider
+        return (
+            "\n".join(response_parts),
+            True,
+            llm_response.total_tokens,
+            llm_response.cost_cents,
+            llm_response.provider,
+        )
 
-    elif parsed.action == "remove_item" and parsed.items:
+    if parsed.action == "remove_item" and parsed.items:
         for pi in parsed.items:
             if pi.name:
                 state_machine.remove_from_cart(session, pi.name)
+
         cart = state_machine.get_cart(session)
         if cart:
             msg = "Item removed.\n" + state_machine.cart_summary_text(session, business.currency)
@@ -438,39 +519,75 @@ async def _handle_with_llm(
         else:
             msg = "Your cart is now empty. What would you like to order?"
             state_machine.transition_state(session, ConversationState.IDLE.value)
-        return msg, True, llm_response.total_tokens, llm_response.cost_cents, llm_response.provider
 
-    elif parsed.action == "confirm_order":
-        # Move to confirmation state
+        return (
+            msg,
+            True,
+            llm_response.total_tokens,
+            llm_response.cost_cents,
+            llm_response.provider,
+        )
+
+    if parsed.action == "confirm_order":
         cart = state_machine.get_cart(session)
         if not cart:
-            return "Your cart is empty. What would you like to order?", True, llm_response.total_tokens, llm_response.cost_cents, llm_response.provider
+            return (
+                "Your cart is empty. What would you like to order?",
+                True,
+                llm_response.total_tokens,
+                llm_response.cost_cents,
+                llm_response.provider,
+            )
 
         state_machine.transition_state(session, ConversationState.CONFIRMING_ORDER.value)
         summary = state_machine.cart_summary_text(session, business.currency)
         total = state_machine.cart_total_cents(session)
-        return responses.ask_confirmation_response(
-            summary, total,
-            business.delivery_fee_cents if state_machine.get_context(session, "order_mode") == "DELIVERY" else 0,
-            state_machine.get_context(session, "order_mode", "PICKUP"),
-            business.currency,
-        ), True, llm_response.total_tokens, llm_response.cost_cents, llm_response.provider
 
-    elif parsed.action == "cancel_order":
+        return (
+            responses.ask_confirmation_response(
+                summary,
+                total,
+                business.delivery_fee_cents
+                if state_machine.get_context(session, "order_mode") == "DELIVERY"
+                else 0,
+                state_machine.get_context(session, "order_mode", "PICKUP"),
+                business.currency,
+            ),
+            True,
+            llm_response.total_tokens,
+            llm_response.cost_cents,
+            llm_response.provider,
+        )
+
+    if parsed.action == "cancel_order":
         state_machine.clear_cart(session)
         state_machine.transition_state(session, ConversationState.IDLE.value)
-        return "Order cancelled. 🗑️ Anything else?", True, llm_response.total_tokens, llm_response.cost_cents, llm_response.provider
+        return (
+            "Order cancelled. 🗑️ Anything else?",
+            True,
+            llm_response.total_tokens,
+            llm_response.cost_cents,
+            llm_response.provider,
+        )
 
-    elif parsed.action == "handoff":
+    if parsed.action == "handoff":
         state_machine.transition_state(session, ConversationState.HANDOFF.value)
         return (
             "Let me connect you with our team. 👋\n"
-            "A staff member will assist you shortly. Please hang tight!"
-        ), True, llm_response.total_tokens, llm_response.cost_cents, llm_response.provider
+            "A staff member will assist you shortly. Please hang tight!",
+            True,
+            llm_response.total_tokens,
+            llm_response.cost_cents,
+            llm_response.provider,
+        )
 
-    else:
-        # chitchat / ask_options — return LLM's message directly
-        return parsed.message, True, llm_response.total_tokens, llm_response.cost_cents, llm_response.provider
+    return (
+        parsed.message,
+        True,
+        llm_response.total_tokens,
+        llm_response.cost_cents,
+        llm_response.provider,
+    )
 
 
 async def _handle_order_confirmation(
@@ -480,7 +597,6 @@ async def _handle_order_confirmation(
     session,
 ) -> tuple[str, bool, int | None, int | None, str | None]:
     """Handle order confirmation — check details, create order."""
-    # Check if we need customer details
     already_have = {}
     if state_machine.get_context(session, "customer_name"):
         already_have["customer_name"] = True
@@ -495,35 +611,47 @@ async def _handle_order_confirmation(
     need_address = business.require_delivery_address and order_mode == "DELIVERY"
 
     details_prompt = responses.collecting_details_response(
-        need_name, need_phone, need_address, already_have
+        need_name,
+        need_phone,
+        need_address,
+        already_have,
     )
 
     if details_prompt:
         state_machine.transition_state(session, ConversationState.COLLECTING_DETAILS.value)
         return details_prompt, False, None, None, None
 
-    # All details collected — create order
     try:
         await usage_tracker.check_daily_limit(db, business, "orders")
     except DailyLimitError:
-        return "Sorry, we can't accept more orders right now. Please try again later.", False, None, None, None
+        return (
+            "Sorry, we can't accept more orders right now. Please try again later.",
+            False,
+            None,
+            None,
+            None,
+        )
 
     order = await order_creator.create_order_from_cart(db, business, customer, session)
 
-    # Build confirmation message
     summary = state_machine.cart_summary_text(session, business.currency)
     response_text = responses.order_confirmation_response(
-        order.order_number, summary, order.subtotal_cents,
-        order.delivery_fee_cents, order.order_mode, business.currency,
+        order.order_number,
+        summary,
+        order.subtotal_cents,
+        order.delivery_fee_cents,
+        order.order_mode,
+        business.currency,
     )
 
-    # Update usage
     await usage_tracker.increment_usage(
-        db, business.id, business.timezone,
-        orders_created=1, revenue_cents=order.total_cents,
+        db,
+        business.id,
+        business.timezone,
+        orders_created=1,
+        revenue_cents=order.total_cents,
     )
 
-    # Reset session
     state_machine.clear_cart(session)
     state_machine.transition_state(session, ConversationState.ORDER_PLACED.value)
 
@@ -541,21 +669,17 @@ async def _handle_collecting_details(
     ctx = session.context_json or {}
     text = msg_text.strip()
 
-    # Simple heuristic: check what we're still missing
     if business.require_customer_name and "customer_name" not in ctx:
         state_machine.set_context(session, "customer_name", text)
-        # Also update customer record
         customer.display_name = text
-        # Check if we need more
         still_missing = _check_missing_details(business, session)
         if still_missing:
             return still_missing, False, None, None, None
-        # Proceed to create order
         return await _handle_order_confirmation(db, business, customer, session)
 
     if business.require_phone_number and "phone_number" not in ctx:
-        # Basic phone validation
         import re
+
         phone = re.sub(r"[^\d+]", "", text)
         if len(phone) >= 9:
             state_machine.set_context(session, "phone_number", phone)
@@ -573,7 +697,6 @@ async def _handle_collecting_details(
             return still_missing, False, None, None, None
         return await _handle_order_confirmation(db, business, customer, session)
 
-    # Nothing missing — create order
     return await _handle_order_confirmation(db, business, customer, session)
 
 
@@ -581,6 +704,7 @@ def _check_missing_details(business: Business, session) -> str | None:
     """Check what details are still missing and return a prompt, or None."""
     ctx = session.context_json or {}
     order_mode = ctx.get("order_mode", "PICKUP")
+
     already = {}
     if ctx.get("customer_name"):
         already["customer_name"] = True
@@ -598,7 +722,7 @@ def _check_missing_details(business: Business, session) -> str | None:
     return prompt if prompt else None
 
 
-# ── Helper functions ─────────────────────────────────────────────────────────
+# ── Helper functions ─────────────────────────────────────────────────────
 
 async def _get_or_create_customer(
     db: AsyncSession,
@@ -667,10 +791,12 @@ async def _send_response(
     llm_provider: str | None = None,
     intent: str | None = None,
 ) -> None:
-    """Send a response via WhatsApp and persist it (Model 1: platform token from env)."""
+    """Send a response via WhatsApp and persist it."""
     if not business.whatsapp_phone_number_id:
-        logger.warning("Business %s missing phone_number_id, skipping send", business.id)
-        # Still persist the outbound message for records
+        logger.warning(
+            "SEND_SKIP: business %s missing phone_number_id, persisting outbound only",
+            business.id,
+        )
         outbound = Message(
             business_id=business.id,
             customer_id=customer.id,
@@ -686,7 +812,7 @@ async def _send_response(
         return
 
     if not getattr(business, "is_whatsapp_enabled", True):
-        logger.info("Business %s has WhatsApp disabled, skipping send", business.id)
+        logger.info("SEND_SKIP: business %s has WhatsApp disabled", business.id)
         return
 
     await whatsapp_sender.send_text_message(
@@ -705,21 +831,26 @@ async def _send_response(
 
 
 async def _load_menu(
-    db: AsyncSession, business_id: uuid.UUID
+    db: AsyncSession,
+    business_id: uuid.UUID,
 ) -> tuple[list[MenuCategory], list[MenuItem]]:
     """Load active menu categories and items for a business."""
     cats_result = await db.execute(
-        select(MenuCategory).where(
+        select(MenuCategory)
+        .where(
             MenuCategory.business_id == business_id,
-            MenuCategory.is_active == True,
-        ).order_by(MenuCategory.sort_order)
+            MenuCategory.is_active.is_(True),
+        )
+        .order_by(MenuCategory.sort_order)
     )
     items_result = await db.execute(
-        select(MenuItem).where(
+        select(MenuItem)
+        .where(
             MenuItem.business_id == business_id,
-            MenuItem.is_active == True,
-            MenuItem.is_deleted == False,
-        ).order_by(MenuItem.sort_order)
+            MenuItem.is_active.is_(True),
+            MenuItem.is_deleted.is_(False),
+        )
+        .order_by(MenuItem.sort_order)
     )
     return list(cats_result.scalars().all()), list(items_result.scalars().all())
 
@@ -727,21 +858,31 @@ async def _load_menu(
 async def _load_specials(db: AsyncSession, business_id: uuid.UUID) -> list[Special]:
     """Load active specials for a business."""
     result = await db.execute(
-        select(Special).where(
+        select(Special)
+        .where(
             Special.business_id == business_id,
-            Special.is_active == True,
-        ).order_by(Special.sort_order)
+            Special.is_active.is_(True),
+        )
+        .order_by(Special.sort_order)
     )
     return list(result.scalars().all())
 
 
-async def _get_last_order(db: AsyncSession, business_id: uuid.UUID, customer_id: uuid.UUID):
+async def _get_last_order(
+    db: AsyncSession,
+    business_id: uuid.UUID,
+    customer_id: uuid.UUID,
+):
     """Get the most recent order for a customer."""
     from shared.models.order import Order
+
     result = await db.execute(
-        select(Order).where(
+        select(Order)
+        .where(
             Order.business_id == business_id,
             Order.customer_id == customer_id,
-        ).order_by(Order.created_at.desc()).limit(1)
+        )
+        .order_by(Order.created_at.desc())
+        .limit(1)
     )
     return result.scalar_one_or_none()
