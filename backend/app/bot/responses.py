@@ -83,27 +83,34 @@ def menu_response(
     return "\n".join(lines)
 
 
-def specials_response(specials: list[Special], currency: str = "ZAR") -> str:
-    """Build specials response, filtering to today's active specials."""
-    if not specials:
-        return "We don't have any specials running right now. Check back soon! 🤞"
-
+def get_todays_active_specials(specials: list[Special]) -> list[Special]:
+    """Filter a list of specials to those active today."""
     today_name = date.today().strftime("%a").lower()[:3]
     active_today = []
-
+    now = utc_now()
     for s in specials:
         if not s.is_active:
             continue
-        # Check day-of-week filter
-        if s.days_of_week and today_name not in s.days_of_week:
-            continue
+        # Check day-of-week filter (supports both "mon" and "Monday" formats)
+        if s.days_of_week:
+            days_lower = [d.lower()[:3] for d in s.days_of_week]
+            if today_name not in days_lower:
+                continue
         # Check date range
-        now = utc_now()
         if s.start_at and now < s.start_at:
             continue
         if s.end_at and now > s.end_at:
             continue
         active_today.append(s)
+    return active_today
+
+
+def specials_response(specials: list[Special], currency: str = "ZAR") -> str:
+    """Build specials response, filtering to today's active specials."""
+    if not specials:
+        return "We don't have any specials running right now. Check back soon! 🤞"
+
+    active_today = get_todays_active_specials(specials)
 
     if not active_today:
         return "No specials today, but check back tomorrow! 🤞"

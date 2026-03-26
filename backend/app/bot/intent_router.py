@@ -81,6 +81,18 @@ _PATTERNS: list[tuple[re.Pattern, MessageIntent]] = [
     (re.compile(
         r"\b(add|also|and|plus|another|more|extra|with)\b", re.I
     ), MessageIntent.ORDER_ADD),
+
+    # View cart
+    (re.compile(
+        r"\b(cart|my order|what.*(did i|have i).*(order|add)|show.*order|view.*cart|"
+        r"current.*order|order.*so far|what.*(in|on).*my.*cart)\b", re.I
+    ), MessageIntent.VIEW_CART),
+
+    # Human handoff (high priority — customer wants a real person)
+    (re.compile(
+        r"\b(human|staff|agent|person|someone|call me|speak to|talk to|"
+        r"real person|manager|help.*person|connect me)\b", re.I
+    ), MessageIntent.HUMAN_HANDOFF),
 ]
 
 

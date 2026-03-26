@@ -279,6 +279,7 @@ async def _process(
         )
 
     # ── 13. Update usage ─────────────────────────────────────────────────
+<<<<<<< HEAD
     await usage_tracker.increment_usage(
         db=db,
         business_id=business.id,
@@ -289,6 +290,27 @@ async def _process(
         llm_tokens=llm_tokens or 0,
         llm_cost_cents=llm_cost or 0,
     )
+=======
+    # Wrapped in try/except: a usage-tracking failure must NEVER rollback
+    # a message that was already sent to the customer.
+    try:
+        await usage_tracker.increment_usage(
+            db=db,
+            business_id=business.id,
+            tz_name=business.timezone,
+            inbound_messages=1,
+            outbound_messages=1 if response_text else 0,
+            llm_calls=1 if is_llm else 0,
+            llm_tokens=llm_tokens or 0,
+            llm_cost_cents=llm_cost or 0,
+        )
+    except Exception:
+        logger.exception(
+            "PIPELINE_USAGE_ERROR: increment_usage failed — message was sent, "
+            "usage tracking skipped. business_id=%s",
+            business.id,
+        )
+>>>>>>> 92bdbf8 (Fix Messages and Make it Work)
 
 
 async def _handle_message(
@@ -320,17 +342,68 @@ async def _handle_message(
             business.greeting_text,
         )
         state_machine.transition_state(session, ConversationState.GREETING.value)
-        return responses.greeting_response(business), False, None, None, None
+        greeting = responses.greeting_response(business)
+        # Append today's specials preview if any are active
+        specials = await _load_specials(db, business.id)
+        todays_specials = responses.get_todays_active_specials(specials)
+        if todays_specials:
+            preview = "\n\n🔥 *Today's Specials:*\n" + "\n".join(
+                f"• {s.title}" for s in todays_specials[:3]
+            )
+            preview += '\n\nSay *"specials"* for more details!'
+            greeting = greeting + preview
+        return greeting, False, None, None, None
 
     if intent == MessageIntent.MENU_REQUEST:
-        logger.warning("HANDLE_BRANCH: MENU_REQUEST → menu_response")
+        menu_image_url = getattr(business, "menu_image_url", None)
+        logger.warning(
+            "HANDLE_BRANCH: MENU_REQUEST → menu_response (has_image=%s)",
+            bool(menu_image_url),
+        )
         categories, items = await _load_menu(db, business.id)
         state_machine.transition_state(session, ConversationState.BROWSING_MENU.value)
-        return responses.menu_response(categories, items, business.currency), False, None, None, None
+
+        if menu_image_url:
+            # Send image first (non-blocking — failure is logged, not raised)
+            try:
+                await whatsapp_sender.send_image_message(
+                    phone_number_id=business.whatsapp_phone_number_id,
+                    recipient_wa_id=customer.wa_id,
+                    image_url=menu_image_url,
+                    caption="Here's our menu 👇",
+                )
+            except Exception:
+                logger.exception(
+                    "PIPELINE_IMAGE_SEND_FAIL: failed to send menu image, "
+                    "falling back to text menu. business_id=%s",
+                    business.id,
+                )
+
+        # Always return text menu (with or without image)
+        text = responses.menu_response(categories, items, business.currency)
+        if menu_image_url:
+            text = "Let me know what you'd like to order! 😊\n\n" + text
+        return text, False, None, None, None
 
     if intent == MessageIntent.SPECIALS_REQUEST:
         logger.warning("HANDLE_BRANCH: SPECIALS_REQUEST → specials_response")
         specials = await _load_specials(db, business.id)
+        todays_specials = responses.get_todays_active_specials(specials)
+        # Send images for specials that have them (before the text summary)
+        for special in todays_specials:
+            if special.image_url:
+                try:
+                    await whatsapp_sender.send_image_message(
+                        phone_number_id=business.whatsapp_phone_number_id,
+                        recipient_wa_id=customer.wa_id,
+                        image_url=special.image_url,
+                        caption=special.title,
+                    )
+                except Exception:
+                    logger.exception(
+                        "PIPELINE_SPECIALS_IMAGE_FAIL: failed to send image for special_id=%s",
+                        special.id,
+                    )
         return responses.specials_response(specials, business.currency), False, None, None, None
 
     if intent == MessageIntent.HOURS_REQUEST:
@@ -370,6 +443,27 @@ async def _handle_message(
                 None,
             )
         return "I couldn't find a recent order. Please check your order number.", False, None, None, None
+
+    if intent == MessageIntent.VIEW_CART:
+        logger.warning("HANDLE_BRANCH: VIEW_CART → cart summary")
+        cart = state_machine.get_cart(session)
+        if cart:
+            summary = state_machine.cart_summary_text(session, business.currency)
+            return (
+                f"Got it! Here's what you have so far 🛒\n\n{summary}\n\n"
+                'To confirm, say *"done"*. To add more, just tell me what you\'d like.',
+                False, None, None, None,
+            )
+        return "Your cart is empty. Say *\"menu\"* to see what we have! 😊", False, None, None, None
+
+    if intent == MessageIntent.HUMAN_HANDOFF:
+        logger.warning("HANDLE_BRANCH: HUMAN_HANDOFF → transitioning to HANDOFF state")
+        state_machine.transition_state(session, ConversationState.HANDOFF.value)
+        return (
+            "No problem! 👋 Let me connect you with our team.\n"
+            "A staff member will assist you shortly. Please hang tight!",
+            False, None, None, None,
+        )
 
     # ── Order confirmation (in CONFIRMING_ORDER state) ───────────────────
     if current_state == ConversationState.CONFIRMING_ORDER.value:

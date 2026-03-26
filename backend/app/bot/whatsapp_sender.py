@@ -247,6 +247,40 @@ async def send_text_message(
     return wa_message_id
 
 
+# ── Image message ────────────────────────────────────────────────────────────
+
+async def send_image_message(
+    phone_number_id: str,
+    recipient_wa_id: str,
+    image_url: str,
+    caption: str | None = None,
+) -> str | None:
+    """
+    Send an image message via Meta WhatsApp Cloud API.
+    image_url must be a publicly accessible HTTPS URL.
+    Returns the wamid on success, None on failure.
+    """
+    payload: dict = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": recipient_wa_id,
+        "type": "image",
+        "image": {"link": image_url},
+    }
+    if caption:
+        payload["image"]["caption"] = caption
+
+    logger.info(
+        "Sending image: phone_number_id=%s, to=%s, url=%s",
+        phone_number_id, recipient_wa_id, image_url[:60],
+    )
+    return await _send_via_meta_api(
+        phone_number_id=phone_number_id,
+        recipient_wa_id=recipient_wa_id,
+        payload=payload,
+    )
+
+
 # ── Template message ─────────────────────────────────────────────────────────
 
 async def send_template_message(

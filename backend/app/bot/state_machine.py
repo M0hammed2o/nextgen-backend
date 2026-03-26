@@ -22,6 +22,7 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 
 from shared.enums import ConversationState
 from shared.models.customer import ConversationSession
@@ -84,10 +85,12 @@ def get_cart(session: ConversationSession) -> list[dict]:
 
 
 def set_cart(session: ConversationSession, cart: list[dict]) -> None:
-    """Set the cart in session context."""
-    ctx = session.context_json or {}
+    """Set the cart in session context. Uses a new dict + flag_modified so
+    SQLAlchemy always detects the JSONB change regardless of object identity."""
+    ctx = dict(session.context_json or {})
     ctx["cart"] = cart
     session.context_json = ctx
+    flag_modified(session, "context_json")
 
 
 def add_to_cart(
@@ -184,10 +187,12 @@ def cart_summary_text(session: ConversationSession, currency: str = "ZAR") -> st
 
 
 def set_context(session: ConversationSession, key: str, value) -> None:
-    """Set a value in session context."""
-    ctx = session.context_json or {}
+    """Set a value in session context. Uses a new dict + flag_modified so
+    SQLAlchemy always detects the JSONB change."""
+    ctx = dict(session.context_json or {})
     ctx[key] = value
     session.context_json = ctx
+    flag_modified(session, "context_json")
 
 
 def get_context(session: ConversationSession, key: str, default=None):

@@ -101,6 +101,10 @@ class Business(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     logo_asset_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True
     )
+    menu_image_url: Mapped[str | None] = mapped_column(
+        Text, nullable=True,
+        comment="Public URL of menu image to send via WhatsApp when customer requests menu"
+    )
     address: Mapped[str | None] = mapped_column(Text, nullable=True)
     phone: Mapped[str | None] = mapped_column(String(32), nullable=True)
 

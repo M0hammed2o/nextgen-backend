@@ -27,6 +27,7 @@ class SpecialCreate(BaseModel):
     rule_json: dict | None = None
     sort_order: int = 0
     image_asset_id: uuid.UUID | None = None
+    image_url: str | None = None
 
 
 class SpecialUpdate(BaseModel):
@@ -39,6 +40,7 @@ class SpecialUpdate(BaseModel):
     is_active: bool | None = None
     sort_order: int | None = None
     image_asset_id: uuid.UUID | None = None
+    image_url: str | None = None
 
 
 class SpecialResponse(BaseModel):
