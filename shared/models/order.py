@@ -35,6 +35,10 @@ class Order(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     status: Mapped[str] = mapped_column(
         String(32), default="NEW", nullable=False, index=True
     )
+    payment_status: Mapped[str] = mapped_column(
+        String(32), default="PENDING", nullable=False,
+        comment="PENDING / PAID / CASH_ON_COLLECTION"
+    )
 
     # ── Order Details ────────────────────────────────────────────────────
     order_mode: Mapped[str] = mapped_column(

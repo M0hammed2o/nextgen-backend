@@ -128,8 +128,8 @@ def needs_llm(intent: MessageIntent | None, conversation_state: str) -> bool:
         return True
 
     # These always need LLM to understand what the customer wants to order
-    if intent in (MessageIntent.ORDER_START, MessageIntent.ORDER_ADD):
-        return True  # LLM parses the specific items/quantities
+    if intent in (MessageIntent.ORDER_START, MessageIntent.ORDER_ADD, MessageIntent.ORDER_REMOVE):
+        return True  # LLM parses the specific items/quantities/removals
 
     # If in cart-building state, most messages need LLM for item parsing
     if conversation_state in ("BUILDING_CART", "CHOOSING_OPTIONS"):

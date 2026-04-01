@@ -40,6 +40,7 @@ class OrderResponse(BaseModel):
     id: uuid.UUID
     order_number: str
     status: str
+    payment_status: str
     order_mode: str
     source: str
     subtotal_cents: int
@@ -363,4 +364,35 @@ async def update_order_status(
         import logging
         logging.getLogger("nextgen").warning("Failed to publish SSE event for order %s", order.id)
 
+    return OrderResponse.model_validate(order)
+
+
+class PaymentUpdateRequest(BaseModel):
+    payment_status: str = Field(pattern=r"^(PENDING|PAID|CASH_ON_COLLECTION)$")
+
+
+@router.patch("/{order_id}/payment", response_model=OrderResponse)
+async def update_payment_status(
+    order_id: uuid.UUID,
+    body: PaymentUpdateRequest,
+    user: AuthUser = Depends(require_staff_or_above),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Update payment status on an order.
+    Staff / Manager / Owner can mark PENDING → PAID or CASH_ON_COLLECTION.
+    """
+    result = await db.execute(
+        select(Order).where(
+            Order.id == order_id,
+            Order.business_id == user.business_id,
+        )
+    )
+    order = result.scalar_one_or_none()
+    if not order:
+        raise NotFoundError("Order", str(order_id))
+
+    order.payment_status = body.payment_status
+    await db.commit()
+    await db.refresh(order)
     return OrderResponse.model_validate(order)

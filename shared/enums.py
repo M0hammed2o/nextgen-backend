@@ -70,6 +70,12 @@ class OrderSource(str, enum.Enum):
     ADMIN = "ADMIN"
 
 
+class PaymentStatus(str, enum.Enum):
+    PENDING = "PENDING"
+    PAID = "PAID"
+    CASH_ON_COLLECTION = "CASH_ON_COLLECTION"
+
+
 # ── Messages ─────────────────────────────────────────────────────────────────
 
 class MessageDirection(str, enum.Enum):

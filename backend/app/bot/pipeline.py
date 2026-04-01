@@ -279,18 +279,6 @@ async def _process(
         )
 
     # ── 13. Update usage ─────────────────────────────────────────────────
-<<<<<<< HEAD
-    await usage_tracker.increment_usage(
-        db=db,
-        business_id=business.id,
-        timezone_str=business.timezone,
-        inbound_messages=1,
-        outbound_messages=1 if response_text else 0,
-        llm_calls=1 if is_llm else 0,
-        llm_tokens=llm_tokens or 0,
-        llm_cost_cents=llm_cost or 0,
-    )
-=======
     # Wrapped in try/except: a usage-tracking failure must NEVER rollback
     # a message that was already sent to the customer.
     try:
@@ -310,7 +298,6 @@ async def _process(
             "usage tracking skipped. business_id=%s",
             business.id,
         )
->>>>>>> 92bdbf8 (Fix Messages and Make it Work)
 
 
 async def _handle_message(
@@ -456,6 +443,28 @@ async def _handle_message(
             )
         return "Your cart is empty. Say *\"menu\"* to see what we have! 😊", False, None, None, None
 
+    # Only intercept ORDER_CONFIRM when NOT already in the confirming state.
+    # If already in CONFIRMING_ORDER, fall through to the state handler below
+    # so that "yes" / "done" actually places the order instead of looping.
+    if intent == MessageIntent.ORDER_CONFIRM and current_state != ConversationState.CONFIRMING_ORDER.value:
+        logger.warning("HANDLE_BRANCH: ORDER_CONFIRM → cart confirmation gate (state=%s)", current_state)
+        cart = state_machine.get_cart(session)
+        if not cart:
+            return (
+                "Your cart is empty. 🛒\nSay *\"menu\"* to see what we have!",
+                False, None, None, None,
+            )
+        # Move to CONFIRMING_ORDER state and show summary
+        state_machine.transition_state(session, ConversationState.CONFIRMING_ORDER.value)
+        summary = state_machine.cart_summary_text(session, business.currency)
+        total = state_machine.cart_total_cents(session)
+        order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
+        delivery_fee = business.delivery_fee_cents if order_mode == "DELIVERY" else 0
+        return (
+            responses.ask_confirmation_response(summary, total, delivery_fee, order_mode, business.currency),
+            False, None, None, None,
+        )
+
     if intent == MessageIntent.HUMAN_HANDOFF:
         logger.warning("HANDLE_BRANCH: HUMAN_HANDOFF → transitioning to HANDOFF state")
         state_machine.transition_state(session, ConversationState.HANDOFF.value)
@@ -527,7 +536,7 @@ async def _handle_with_llm(
     session,
     msg_text: str,
 ) -> tuple[str, bool, int | None, int | None, str | None]:
-    """Call LLM, parse response, update cart/state accordingly."""
+    """Call LLM with conversation history, parse response, update cart/state."""
     categories, items = await _load_menu(db, business.id)
     specials = await _load_specials(db, business.id)
     cart = state_machine.get_cart(session)
@@ -544,7 +553,15 @@ async def _handle_with_llm(
     from backend.app.llm.provider import get_llm_provider
 
     provider = get_llm_provider()
-    llm_response = await provider.complete(system_prompt, msg_text)
+
+    # Load conversation history so LLM has context across multiple messages
+    history = await _load_conversation_history(db, business.id, customer.id, limit=8)
+    # The current inbound message is already flushed to DB (step 7+9 flush).
+    # If it's the last entry in history, use history as-is; otherwise append it.
+    if not history or not (history[-1]["role"] == "user" and history[-1]["content"] == msg_text):
+        history.append({"role": "user", "content": msg_text})
+
+    llm_response = await provider.complete_with_history(system_prompt, history)
 
     parsed = llm_parser.parse_llm_response(llm_response.text)
 
@@ -960,6 +977,37 @@ async def _load_specials(db: AsyncSession, business_id: uuid.UUID) -> list[Speci
         .order_by(Special.sort_order)
     )
     return list(result.scalars().all())
+
+
+async def _load_conversation_history(
+    db: AsyncSession,
+    business_id: uuid.UUID,
+    customer_id: uuid.UUID,
+    limit: int = 8,
+) -> list[dict]:
+    """
+    Load the last N messages for this customer as LLM conversation history.
+    Returns messages in chronological order, formatted as role/content dicts.
+    """
+    result = await db.execute(
+        select(Message.direction, Message.text)
+        .where(
+            Message.business_id == business_id,
+            Message.customer_id == customer_id,
+            Message.text.is_not(None),
+        )
+        .order_by(Message.created_at.desc())
+        .limit(limit)
+    )
+    rows = list(reversed(result.all()))
+    return [
+        {
+            "role": "user" if row.direction == "INBOUND" else "assistant",
+            "content": row.text,
+        }
+        for row in rows
+        if row.text
+    ]
 
 
 async def _get_last_order(
