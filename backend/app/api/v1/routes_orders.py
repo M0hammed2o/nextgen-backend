@@ -364,7 +364,72 @@ async def update_order_status(
         import logging
         logging.getLogger("nextgen").warning("Failed to publish SSE event for order %s", order.id)
 
+    # ── Notify customer via WhatsApp (fire and forget) ────────────────────
+    try:
+        if order.customer_id:
+            from shared.models.customer import Customer
+            from backend.app.bot.whatsapp_sender import send_notification_message
+
+            cust_row = await db.execute(
+                select(Customer.wa_id).where(Customer.id == order.customer_id)
+            )
+            wa_id = cust_row.scalar_one_or_none()
+
+            biz_row = await db.execute(
+                select(Business.whatsapp_phone_number_id).where(
+                    Business.id == order.business_id
+                )
+            )
+            phone_number_id = biz_row.scalar_one_or_none()
+
+            if wa_id and phone_number_id:
+                msg = _customer_status_message(
+                    status=requested.value,
+                    order_number=order.order_number,
+                    estimated_ready_minutes=body.estimated_ready_minutes,
+                    reason=body.reason,
+                )
+                if msg:
+                    await send_notification_message(
+                        phone_number_id=phone_number_id,
+                        recipient_wa_id=wa_id,
+                        text=msg,
+                    )
+    except Exception:
+        import logging
+        logging.getLogger("nextgen").warning(
+            "Failed to send customer WhatsApp notification for order %s", order.id
+        )
+
     return OrderResponse.model_validate(order)
+
+
+def _customer_status_message(
+    status: str,
+    order_number: str,
+    estimated_ready_minutes: int | None,
+    reason: str | None,
+) -> str | None:
+    """Return a customer-facing WhatsApp notification text, or None to skip."""
+    if status == "ACCEPTED":
+        msg = f"✅ Your order *{order_number}* has been accepted!"
+        if estimated_ready_minutes:
+            msg += f" Estimated ready time: *{estimated_ready_minutes} minutes*."
+        return msg
+    if status == "IN_PROGRESS":
+        return f"👨‍🍳 Your order *{order_number}* is being prepared."
+    if status == "READY":
+        return f"🎉 Your order *{order_number}* is ready for collection!"
+    if status == "DELIVERED":
+        return f"🛵 Your order *{order_number}* has been delivered. Enjoy! 🙏"
+    if status == "COLLECTED":
+        return f"Thank you! Your order *{order_number}* has been collected. Enjoy! 🙏"
+    if status == "CANCELLED":
+        msg = f"❌ Sorry, your order *{order_number}* has been cancelled."
+        if reason:
+            msg += f"\nReason: {reason}"
+        return msg
+    return None
 
 
 class PaymentUpdateRequest(BaseModel):

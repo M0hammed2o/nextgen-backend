@@ -21,6 +21,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -38,42 +39,44 @@ async def get_or_create_session(
     """
     Get the active conversation session for this customer+business,
     or create a new one. Auto-expires stale sessions.
+
+    Race-safe: uses INSERT … ON CONFLICT DO NOTHING so that concurrent
+    webhook deliveries cannot create duplicate session rows (relies on
+    the uq_conversation_sessions_business_customer DB constraint).
     """
+    now = datetime.now(timezone.utc)
+
+    # Ensure exactly one row exists — no-op if row already present
+    await db.execute(
+        pg_insert(ConversationSession)
+        .values(
+            business_id=business_id,
+            customer_id=customer_id,
+            state=ConversationState.IDLE.value,
+            context_json={},
+            last_activity_at=now,
+            expires_at=now + timedelta(minutes=SESSION_TIMEOUT_MINUTES),
+        )
+        .on_conflict_do_nothing(
+            constraint="uq_conversation_sessions_business_customer"
+        )
+    )
+
     result = await db.execute(
         select(ConversationSession).where(
             ConversationSession.business_id == business_id,
             ConversationSession.customer_id == customer_id,
-        ).order_by(ConversationSession.last_activity_at.desc())
+        )
     )
-    session = result.scalar_one_or_none()
+    session = result.scalar_one()
 
-    now = datetime.now(timezone.utc)
+    # Reset expired session
+    if session.expires_at and session.expires_at < now:
+        session.state = ConversationState.IDLE.value
+        session.context_json = {}
 
-    # If session exists but expired, reset it
-    if session:
-        if session.expires_at and session.expires_at < now:
-            session.state = ConversationState.IDLE.value
-            session.context_json = {}
-            session.last_activity_at = now
-            session.expires_at = now + timedelta(minutes=SESSION_TIMEOUT_MINUTES)
-            await db.flush()
-            return session
-        # Touch activity
-        session.last_activity_at = now
-        session.expires_at = now + timedelta(minutes=SESSION_TIMEOUT_MINUTES)
-        await db.flush()
-        return session
-
-    # Create new session
-    session = ConversationSession(
-        business_id=business_id,
-        customer_id=customer_id,
-        state=ConversationState.IDLE.value,
-        context_json={},
-        last_activity_at=now,
-        expires_at=now + timedelta(minutes=SESSION_TIMEOUT_MINUTES),
-    )
-    db.add(session)
+    session.last_activity_at = now
+    session.expires_at = now + timedelta(minutes=SESSION_TIMEOUT_MINUTES)
     await db.flush()
     return session
 

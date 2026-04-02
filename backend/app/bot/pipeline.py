@@ -769,6 +769,35 @@ async def _handle_order_confirmation(
     return response_text, False, None, None, None
 
 
+def _parse_name_and_phone(text: str) -> tuple[str | None, str | None]:
+    """
+    Split a free-text message into (name, phone).  Handles multi-line input:
+      "Mohammed Moosa\\n0837866021" → ("Mohammed Moosa", "0837866021")
+      "0837866021\\nMohammed Moosa" → ("Mohammed Moosa", "0837866021")
+      "Mohammed Moosa"             → ("Mohammed Moosa", None)
+      "0837866021"                 → (None, "0837866021")
+    A line is treated as a phone if, after stripping non-digit/+ chars, it is
+    9–15 characters long.
+    """
+    import re as _re
+    lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
+    if not lines:
+        return None, None
+
+    phone: str | None = None
+    name_parts: list[str] = []
+
+    for line in lines:
+        cleaned = _re.sub(r"[^\d+]", "", line)
+        if 9 <= len(cleaned) <= 15 and phone is None:
+            phone = cleaned
+        else:
+            name_parts.append(line)
+
+    name = " ".join(name_parts).strip() or None
+    return name, phone
+
+
 async def _handle_collecting_details(
     db: AsyncSession,
     business: Business,
@@ -777,20 +806,41 @@ async def _handle_collecting_details(
     msg_text: str,
 ) -> tuple[str, bool, int | None, int | None, str | None]:
     """Parse customer details from free-text message during COLLECTING_DETAILS state."""
+    import re
+
     ctx = session.context_json or {}
     text = msg_text.strip()
 
+    # ── Collect name ─────────────────────────────────────────────────────────
     if business.require_customer_name and "customer_name" not in ctx:
-        state_machine.set_context(session, "customer_name", text)
-        customer.display_name = text
+        parsed_name, parsed_phone = _parse_name_and_phone(text)
+
+        if not parsed_name:
+            # Only digits were sent when we expected a name — re-prompt
+            return (
+                "Please send your name (e.g. *Mohammed Moosa*).",
+                False, None, None, None,
+            )
+
+        state_machine.set_context(session, "customer_name", parsed_name)
+        customer.display_name = parsed_name
+
+        # Opportunistically capture phone if sent on the same message
+        if (
+            parsed_phone
+            and business.require_phone_number
+            and "phone_number" not in (session.context_json or {})
+        ):
+            state_machine.set_context(session, "phone_number", parsed_phone)
+            customer.phone_number = parsed_phone
+
         still_missing = _check_missing_details(business, session)
         if still_missing:
             return still_missing, False, None, None, None
         return await _handle_order_confirmation(db, business, customer, session)
 
+    # ── Collect phone ─────────────────────────────────────────────────────────
     if business.require_phone_number and "phone_number" not in ctx:
-        import re
-
         phone = re.sub(r"[^\d+]", "", text)
         if len(phone) >= 9:
             state_machine.set_context(session, "phone_number", phone)
@@ -801,6 +851,7 @@ async def _handle_collecting_details(
             return await _handle_order_confirmation(db, business, customer, session)
         return "Please send a valid phone number (e.g., 0812345678).", False, None, None, None
 
+    # ── Collect delivery address ──────────────────────────────────────────────
     if business.require_delivery_address and "delivery_address" not in ctx:
         state_machine.set_context(session, "delivery_address", text)
         still_missing = _check_missing_details(business, session)

@@ -247,6 +247,29 @@ async def send_text_message(
     return wa_message_id
 
 
+# ── Notification message (no DB persistence) ────────────────────────────────
+
+async def send_notification_message(
+    phone_number_id: str,
+    recipient_wa_id: str,
+    text: str,
+) -> str | None:
+    """
+    Send a short notification to a customer — e.g. order status updates.
+    Unlike send_text_message, this does NOT persist to the messages table or outbox.
+    Call fire-and-forget inside a try/except.
+    Returns wamid on success, None on failure.
+    """
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": recipient_wa_id,
+        "type": "text",
+        "text": {"body": text},
+    }
+    return await _send_via_meta_api(phone_number_id, recipient_wa_id, payload)
+
+
 # ── Image message ────────────────────────────────────────────────────────────
 
 async def send_image_message(
