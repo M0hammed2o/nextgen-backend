@@ -140,11 +140,25 @@ def needs_llm(intent: MessageIntent | None, conversation_state: str) -> bool:
 
 
 def is_confirmation(text: str) -> bool:
-    """Check if a message is a clear yes/confirmation."""
+    """
+    Check if a message is a clear yes/confirmation.
+
+    Allows common trailing polite words so "yes please", "yes, go ahead!",
+    "yep thanks", "sure thing", "confirm please" all match correctly.
+    Does NOT match messages that add new content, e.g. "yes but change the chips".
+    """
+    _CONFIRM_CORE = (
+        r"yes|yep|yeah|yah|yebo|ja|jah|sure|sharp|confirm|confirmed|"
+        r"that.?s\s+(it|all|correct|right)|looks\s+good|perfect|lekker|"
+        r"100|right|cool|ok|okay|done|place\s+it|send\s+it|"
+        r"go\s+ahead|let.?s\s+go|do\s+it|sounds\s+good|all\s+good|proceed"
+    )
+    _CONFIRM_TRAILING = (
+        r"(\s+(please|thanks|thank\s+you|bru|man|mate|now|"
+        r"sure\s+thing|that.?s\s+right|great|awesome|for\s+sure))*"
+    )
     confirmations = re.compile(
-        r"^(yes|yep|yeah|yah|sure|confirm|that.?s (it|all|correct|right)|"
-        r"looks good|perfect|sharp|100|lekker|right|cool|ok|okay|done|"
-        r"place it|send it|go ahead)\s*[.!]*$", re.I
+        rf"^({_CONFIRM_CORE}){_CONFIRM_TRAILING}\s*[,!.]*$", re.I
     )
     return bool(confirmations.match(text.strip()))
 
@@ -152,6 +166,7 @@ def is_confirmation(text: str) -> bool:
 def is_negation(text: str) -> bool:
     """Check if a message is a clear no/negation."""
     negations = re.compile(
-        r"^(no|nah|nope|not yet|wait|hold on|actually)\s*[.!]*$", re.I
+        r"^(no|nah|nope|not\s+yet|not\s+now|wait|hold\s+on|actually|"
+        r"cancel\s+that|scratch\s+that|never\s+mind|nevermind)\s*[,!.]*$", re.I
     )
     return bool(negations.match(text.strip()))

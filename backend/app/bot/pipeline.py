@@ -578,10 +578,22 @@ async def _handle_with_llm(
 
             matched_item = items_map.get(pi.name.lower())
             if not matched_item:
+                # Fuzzy fallback: prefer the LONGEST menu name that is a substring of
+                # the LLM name (e.g. "Double Smash Burger" is preferred over "Smash Burger"
+                # when the LLM says "double smash burger").
+                # We only match in one direction (menu_name ⊆ llm_name) to avoid
+                # "Smash Burger" matching when customer orders "Cheese Burger".
+                candidates: list[tuple[int, MenuItem]] = []
+                llm_name_lower = pi.name.lower()
                 for menu_name, menu_item in items_map.items():
-                    if pi.name.lower() in menu_name or menu_name in pi.name.lower():
-                        matched_item = menu_item
-                        break
+                    if menu_name in llm_name_lower:
+                        # Require at least 60 % character overlap to avoid weak matches
+                        ratio = len(menu_name) / max(len(llm_name_lower), 1)
+                        if ratio >= 0.5:
+                            candidates.append((len(menu_name), menu_item))
+                if candidates:
+                    # Pick the longest (most specific) matching menu name
+                    matched_item = sorted(candidates, reverse=True)[0][1]
 
             if matched_item:
                 state_machine.add_to_cart(
@@ -644,6 +656,20 @@ async def _handle_with_llm(
         if not cart:
             return (
                 "Your cart is empty. What would you like to order?",
+                True,
+                llm_response.total_tokens,
+                llm_response.cost_cents,
+                llm_response.provider,
+            )
+
+        # If already in CONFIRMING_ORDER the customer is saying "yes" (or similar).
+        # Actually place the order instead of showing the summary a second time.
+        if session.state == ConversationState.CONFIRMING_ORDER.value:
+            response_text, _, _, _, _ = await _handle_order_confirmation(
+                db, business, customer, session
+            )
+            return (
+                response_text,
                 True,
                 llm_response.total_tokens,
                 llm_response.cost_cents,

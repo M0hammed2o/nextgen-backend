@@ -44,6 +44,7 @@ class BusinessSettingsResponse(BaseModel):
     daily_order_limit: int
     address: str | None
     phone: str | None
+    menu_image_url: str | None
 
     model_config = {"from_attributes": True}
 
@@ -63,6 +64,7 @@ class BusinessSettingsUpdate(BaseModel):
     require_delivery_address: bool | None = None
     address: str | None = None
     phone: str | None = None
+    menu_image_url: str | None = None
 
 
 # ── Routes ───────────────────────────────────────────────────────────────────

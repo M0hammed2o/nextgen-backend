@@ -1,13 +1,14 @@
 """
 Menu routes — CRUD for categories and items.
 OWNER / MANAGER can manage. Items support soft delete.
+Category delete is blocked when active items are still linked.
 """
 
 import uuid
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.errors import NotFoundError
@@ -130,6 +131,52 @@ async def update_category(
     await db.commit()
     await db.refresh(cat)
     return CategoryResponse.model_validate(cat)
+
+
+@router.delete("/categories/{category_id}", status_code=204)
+async def delete_category(
+    category_id: uuid.UUID,
+    user: AuthUser = Depends(require_owner_or_manager),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Delete a category.
+
+    Blocked if the category still has active (non-deleted) menu items.
+    Remove or reassign the items first, then retry.
+    """
+    result = await db.execute(
+        select(MenuCategory).where(
+            MenuCategory.id == category_id,
+            MenuCategory.business_id == user.business_id,
+        )
+    )
+    cat = result.scalar_one_or_none()
+    if not cat:
+        raise NotFoundError("Category", str(category_id))
+
+    # Count active items still linked to this category
+    item_count_result = await db.execute(
+        select(func.count(MenuItem.id)).where(
+            MenuItem.category_id == category_id,
+            MenuItem.business_id == user.business_id,
+            MenuItem.is_deleted == False,
+        )
+    )
+    active_item_count = item_count_result.scalar_one()
+
+    if active_item_count > 0:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Cannot delete category '{cat.name}': it still has "
+                f"{active_item_count} active item{'s' if active_item_count != 1 else ''}. "
+                "Remove or reassign the items first."
+            ),
+        )
+
+    await db.delete(cat)
+    await db.commit()
 
 
 # ── Item Routes ──────────────────────────────────────────────────────────────

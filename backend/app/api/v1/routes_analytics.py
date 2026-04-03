@@ -232,13 +232,20 @@ async def get_daily_breakdown(
     )
     msg_rows = {row.day: row for row in msg_daily.scalars().all()}
 
-    all_days = sorted(set(order_rows.keys()) | set(msg_rows.keys()))
+    # Always emit every day in the requested range — even days with zero activity —
+    # so the chart always shows a full timeline rather than appearing blank.
+    from datetime import timedelta as _td
+    today_local = today_date_for_business(tz_name)
+    all_days: list[date] = []
+    cursor = start_date
+    while cursor <= today_local:
+        all_days.append(cursor)
+        cursor += _td(days=1)
 
     result = []
     for d in all_days:
         odata = order_rows.get(d)
         mdata = msg_rows.get(d)
-
         result.append(
             DailyBreakdown(
                 day=d,
