@@ -344,14 +344,23 @@ async def _handle_message(
     if intent == MessageIntent.MENU_REQUEST:
         menu_image_url = getattr(business, "menu_image_url", None)
         logger.warning(
-            "HANDLE_BRANCH: MENU_REQUEST → menu_response (has_image=%s)",
+            "HANDLE_BRANCH: MENU_REQUEST → menu_response (has_image=%s, state=%s)",
             bool(menu_image_url),
+            current_state,
         )
         categories, items = await _load_menu(db, business.id)
-        state_machine.transition_state(session, ConversationState.BROWSING_MENU.value)
+
+        # Do NOT transition away from BUILDING_CART or CONFIRMING_ORDER.
+        # Customer is browsing while mid-order — keep their order context intact.
+        _order_active_states = {
+            ConversationState.BUILDING_CART.value,
+            ConversationState.CONFIRMING_ORDER.value,
+            ConversationState.COLLECTING_DETAILS.value,
+        }
+        if current_state not in _order_active_states:
+            state_machine.transition_state(session, ConversationState.BROWSING_MENU.value)
 
         if menu_image_url:
-            # Send image first (non-blocking — failure is logged, not raised)
             try:
                 await whatsapp_sender.send_image_message(
                     phone_number_id=business.whatsapp_phone_number_id,
@@ -366,9 +375,16 @@ async def _handle_message(
                     business.id,
                 )
 
-        # Always return text menu (with or without image)
         text = responses.menu_response(categories, items, business.currency)
-        if menu_image_url:
+        cart = state_machine.get_cart(session)
+        if current_state in _order_active_states and cart:
+            # Remind the customer their order is still intact
+            text = (
+                "Here's the full menu! Your current order is still saved 🛒\n\n"
+                + text
+                + '\n\nJust tell me what you\'d like to add, or say *"done"* to confirm your order.'
+            )
+        elif menu_image_url:
             text = "Let me know what you'd like to order! 😊\n\n" + text
         return text, False, None, None, None
 
@@ -454,7 +470,14 @@ async def _handle_message(
                 "Your cart is empty. 🛒\nSay *\"menu\"* to see what we have!",
                 False, None, None, None,
             )
-        # Move to CONFIRMING_ORDER state and show summary
+        # ── CART LOCK ─────────────────────────────────────────────────────
+        # Freeze a snapshot of the cart into confirmed_cart the moment the
+        # customer says "done". All subsequent order creation uses ONLY this
+        # snapshot, so no race condition or concurrent message can alter what
+        # the customer agreed to pay.
+        import copy
+        state_machine.set_context(session, "confirmed_cart", copy.deepcopy(cart))
+        # ──────────────────────────────────────────────────────────────────
         state_machine.transition_state(session, ConversationState.CONFIRMING_ORDER.value)
         summary = state_machine.cart_summary_text(session, business.currency)
         total = state_machine.cart_total_cents(session)
@@ -645,6 +668,78 @@ async def _handle_with_llm(
 
         return (
             msg,
+            True,
+            llm_response.total_tokens,
+            llm_response.cost_cents,
+            llm_response.provider,
+        )
+
+    if parsed.action == "replace_item" and parsed.items:
+        # Atomically remove the old item and add the new one.
+        # The LLM sends: {"remove": "Old Item Name", "add": "New Item Name", "quantity": 1}
+        items_map = {i.name.lower(): i for i in items if i.is_active and not i.is_deleted}
+        replaced: list[str] = []
+        replace_errors: list[str] = []
+
+        for pi in parsed.items:
+            remove_name = pi.remove or pi.name  # fallback for LLM that uses "name" for remove
+            add_name = pi.add
+
+            if not remove_name or not add_name:
+                replace_errors.append("couldn't parse replacement")
+                continue
+
+            # Remove old item
+            _, was_removed = state_machine.remove_from_cart(session, remove_name)
+
+            # Find new item in menu
+            new_item = items_map.get(add_name.lower())
+            if not new_item:
+                # Fuzzy fallback — longest specific match
+                candidates = [
+                    (len(mn), mi) for mn, mi in items_map.items()
+                    if mn in add_name.lower() and len(mn) / max(len(add_name), 1) >= 0.5
+                ]
+                if candidates:
+                    new_item = sorted(candidates, reverse=True)[0][1]
+
+            if new_item:
+                state_machine.add_to_cart(
+                    session,
+                    menu_item_id=str(new_item.id),
+                    name=new_item.name,
+                    price_cents=new_item.price_cents,
+                    quantity=pi.quantity,
+                    options=pi.options if pi.options else None,
+                    special_instructions=pi.special_instructions,
+                )
+                replaced.append(f"{remove_name} → {new_item.name}")
+            else:
+                # Couldn't find replacement — restore original if it was removed
+                if was_removed and remove_name:
+                    orig = items_map.get(remove_name.lower())
+                    if orig:
+                        state_machine.add_to_cart(
+                            session, str(orig.id), orig.name, orig.price_cents, pi.quantity
+                        )
+                replace_errors.append(f"couldn't find '{add_name}' on the menu")
+
+        state_machine.transition_state(session, ConversationState.BUILDING_CART.value)
+        cart = state_machine.get_cart(session)
+
+        parts = []
+        if replaced:
+            parts.append("Updated: " + ", ".join(replaced) + " ✅")
+        if replace_errors:
+            parts.append("Sorry: " + "; ".join(replace_errors) + ". Please check the menu.")
+        if cart:
+            parts.append("\n" + state_machine.cart_summary_text(session, business.currency))
+            parts.append('\nAnything else? Or say *"done"* to confirm.')
+        else:
+            parts.append("Your cart is now empty. What would you like to order?")
+
+        return (
+            "\n".join(parts),
             True,
             llm_response.total_tokens,
             llm_response.cost_cents,

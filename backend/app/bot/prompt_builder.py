@@ -72,7 +72,8 @@ Your response MUST end with a JSON block on a new line in this exact format:
 
 ACTION must be one of:
 - "add_items" — customer wants to add items. items = [{{"name": "exact menu item name", "quantity": 1, "options": {{}}, "special_instructions": ""}}]
-- "remove_item" — customer wants to remove. items = [{{"name": "item to remove"}}]
+- "remove_item" — customer wants to remove an item. items = [{{"name": "item to remove"}}]
+- "replace_item" — customer wants to swap one item for another (e.g. "change my Coke 500ml to Coke 330ml", "replace chips with cheesy chips"). items = [{{"remove": "exact name of item to remove", "add": "exact name of new item", "quantity": 1, "options": {{}}, "special_instructions": ""}}]
 - "confirm_order" — customer confirmed the order
 - "cancel_order" — customer wants to cancel
 - "ask_options" — need to clarify size/options before adding
@@ -80,6 +81,8 @@ ACTION must be one of:
 - "handoff" — customer needs human help
 
 IMPORTANT: The "name" field in items MUST exactly match a menu item name from the menu above.
+For "replace_item", both "remove" and "add" must exactly match menu item names.
+Use "replace_item" whenever the customer says: change X to Y, swap X for Y, instead of X I want Y, upgrade X to Y.
 """
 
 

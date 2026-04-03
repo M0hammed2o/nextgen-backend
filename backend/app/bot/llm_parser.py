@@ -20,11 +20,14 @@ class ParsedItem:
     options: dict = field(default_factory=dict)
     special_instructions: str | None = None
     original_text: str | None = None  # For unmatched items
+    # replace_item fields (only used when action == "replace_item")
+    remove: str | None = None   # item name to remove from cart
+    add: str | None = None      # item name to add to cart
 
 
 @dataclass
 class ParsedLLMResponse:
-    action: str  # add_items, remove_item, confirm_order, cancel_order, ask_options, chitchat, handoff
+    action: str  # add_items, remove_item, replace_item, confirm_order, cancel_order, ask_options, chitchat, handoff
     items: list[ParsedItem]
     message: str
     raw_json: dict | None = None
@@ -53,6 +56,8 @@ def parse_llm_response(raw_text: str) -> ParsedLLMResponse:
                         options=item_data.get("options", {}),
                         special_instructions=item_data.get("special_instructions"),
                         original_text=item_data.get("original_text"),
+                        remove=item_data.get("remove"),
+                        add=item_data.get("add"),
                     ))
 
             # If message is empty, use the text before the JSON block

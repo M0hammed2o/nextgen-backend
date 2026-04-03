@@ -35,10 +35,11 @@ _PATTERNS: list[tuple[re.Pattern, MessageIntent]] = [
         r"today.?s.*special|weekly.*special)\b", re.I
     ), MessageIntent.SPECIALS_REQUEST),
 
-    # Hours
+    # Hours — matches "trading hours", "what time do you open", "are you open", etc.
     (re.compile(
-        r"\b(hours|open|close|closing|opening|when.*open|what time|"
-        r"are you open|still open|operating)\b", re.I
+        r"\b(hours|trading|open|close|closing|opening|when.*open|what time|"
+        r"are you open|still open|operating|business hours|opening times|"
+        r"open till|until what time|what time.*close|when.*close)\b", re.I
     ), MessageIntent.HOURS_REQUEST),
 
     # Location

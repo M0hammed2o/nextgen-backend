@@ -37,7 +37,11 @@ async def create_order_from_cart(
     Raises ValueError if cart is empty.
     """
     ctx = session.context_json or {}
-    cart = ctx.get("cart", [])
+
+    # Prefer the locked snapshot (set at "done" time) over the live cart.
+    # This guarantees the order matches exactly what the customer approved,
+    # even if a concurrent message somehow mutated the live cart afterwards.
+    cart = ctx.get("confirmed_cart") or ctx.get("cart", [])
 
     if not cart:
         raise ValueError("Cannot create order: cart is empty")

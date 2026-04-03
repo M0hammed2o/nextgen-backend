@@ -21,7 +21,6 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -40,43 +39,48 @@ async def get_or_create_session(
     Get the active conversation session for this customer+business,
     or create a new one. Auto-expires stale sessions.
 
-    Race-safe: uses INSERT … ON CONFLICT DO NOTHING so that concurrent
-    webhook deliveries cannot create duplicate session rows (relies on
-    the uq_conversation_sessions_business_customer DB constraint).
+    Uses SELECT-first, INSERT-if-missing. Safe regardless of whether
+    the uq_conversation_sessions_business_customer unique constraint
+    exists (migration 0005). Does NOT use pg_insert so no constraint
+    dependency that could silently roll back on missing migration.
+
+    .limit(1) ORDER BY last_activity_at DESC is retained to handle any
+    legacy duplicate rows that may exist before migration 0005 runs.
     """
     now = datetime.now(timezone.utc)
 
-    # Ensure exactly one row exists — no-op if row already present
-    await db.execute(
-        pg_insert(ConversationSession)
-        .values(
-            business_id=business_id,
-            customer_id=customer_id,
-            state=ConversationState.IDLE.value,
-            context_json={},
-            last_activity_at=now,
-            expires_at=now + timedelta(minutes=SESSION_TIMEOUT_MINUTES),
-        )
-        .on_conflict_do_nothing(
-            constraint="uq_conversation_sessions_business_customer"
-        )
-    )
-
     result = await db.execute(
-        select(ConversationSession).where(
+        select(ConversationSession)
+        .where(
             ConversationSession.business_id == business_id,
             ConversationSession.customer_id == customer_id,
         )
+        .order_by(ConversationSession.last_activity_at.desc())
+        .limit(1)
     )
-    session = result.scalar_one()
+    session = result.scalar_one_or_none()
 
-    # Reset expired session
-    if session.expires_at and session.expires_at < now:
-        session.state = ConversationState.IDLE.value
-        session.context_json = {}
+    if session is not None:
+        # Reset if expired
+        if session.expires_at and session.expires_at < now:
+            session.state = ConversationState.IDLE.value
+            session.context_json = {}
+            flag_modified(session, "context_json")
+        session.last_activity_at = now
+        session.expires_at = now + timedelta(minutes=SESSION_TIMEOUT_MINUTES)
+        await db.flush()
+        return session
 
-    session.last_activity_at = now
-    session.expires_at = now + timedelta(minutes=SESSION_TIMEOUT_MINUTES)
+    # No session found — create a fresh one
+    session = ConversationSession(
+        business_id=business_id,
+        customer_id=customer_id,
+        state=ConversationState.IDLE.value,
+        context_json={},
+        last_activity_at=now,
+        expires_at=now + timedelta(minutes=SESSION_TIMEOUT_MINUTES),
+    )
+    db.add(session)
     await db.flush()
     return session
 
@@ -148,8 +152,12 @@ def remove_from_cart(session: ConversationSession, item_name: str) -> tuple[list
 
 
 def clear_cart(session: ConversationSession) -> None:
-    """Clear all items from the cart."""
-    set_cart(session, [])
+    """Clear cart and the confirmed_cart snapshot."""
+    ctx = dict(session.context_json or {})
+    ctx["cart"] = []
+    ctx.pop("confirmed_cart", None)  # Remove snapshot so it doesn't ghost into next order
+    session.context_json = ctx
+    flag_modified(session, "context_json")
 
 
 def cart_total_cents(session: ConversationSession) -> int:
