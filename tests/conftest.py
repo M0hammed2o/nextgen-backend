@@ -3,6 +3,9 @@ Shared fixtures for all tests.
 
 Patches SQLAlchemy's flag_modified so state_machine functions work
 without a live database session.
+
+Also sets required env vars before any imports so pydantic-settings
+doesn't fail without a .env.backend file.
 """
 import sys
 import os
@@ -15,6 +18,15 @@ import pytest
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
+
+# ── Provide minimal env vars so pydantic-settings doesn't need .env.backend ──
+# All of these have defaults already, but setting them explicitly avoids any
+# validation surprise from a missing file.
+os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost/nextgen")
+os.environ.setdefault("REDIS_URL", "redis://localhost:6379/0")
+os.environ.setdefault("JWT_SECRET_KEY", "test-secret-key-for-unit-tests")
+os.environ.setdefault("META_VERIFY_TOKEN", "test-verify-token")
+os.environ.setdefault("WHATSAPP_DEFAULT_ACCESS_TOKEN", "test-token")
 
 
 # ── Silence flag_modified globally so unit tests don't need a real SA session ─
