@@ -63,19 +63,19 @@ async def get_or_create_session(
                 (id, business_id, customer_id, state, context_json,
                  last_activity_at, expires_at, created_at)
             VALUES
-                (gen_random_uuid(), :biz_id::uuid, :cust_id::uuid,
-                 'IDLE', '{}'::jsonb, :now, :expires, :now)
+                (gen_random_uuid(), CAST(:biz_id AS uuid), CAST(:cust_id AS uuid),
+                 'IDLE', '{}'::jsonb, :now_ts, :expires_ts, :now_ts)
             ON CONFLICT (business_id, customer_id)
             DO UPDATE SET
-                last_activity_at = :now,
-                expires_at       = :expires,
+                last_activity_at = :now_ts,
+                expires_at       = :expires_ts,
                 state        = CASE
-                                 WHEN conversation_sessions.expires_at < :now
+                                 WHEN conversation_sessions.expires_at < :now_ts
                                  THEN 'IDLE'
                                  ELSE conversation_sessions.state
                                END,
                 context_json = CASE
-                                 WHEN conversation_sessions.expires_at < :now
+                                 WHEN conversation_sessions.expires_at < :now_ts
                                  THEN '{}'::jsonb
                                  ELSE conversation_sessions.context_json
                                END
@@ -83,8 +83,8 @@ async def get_or_create_session(
         {
             "biz_id": str(business_id),
             "cust_id": str(customer_id),
-            "now": now,
-            "expires": expires,
+            "now_ts": now,
+            "expires_ts": expires,
         },
     )
     await db.flush()
