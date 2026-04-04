@@ -20,7 +20,7 @@ context_json stores:
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -28,6 +28,9 @@ from shared.enums import ConversationState
 from shared.models.customer import ConversationSession
 
 SESSION_TIMEOUT_MINUTES = 30
+
+import logging
+_sm_logger = logging.getLogger("nextgen.bot.state_machine")
 
 
 async def get_or_create_session(
@@ -39,49 +42,75 @@ async def get_or_create_session(
     Get the active conversation session for this customer+business,
     or create a new one. Auto-expires stale sessions.
 
-    Uses SELECT-first, INSERT-if-missing. Safe regardless of whether
-    the uq_conversation_sessions_business_customer unique constraint
-    exists (migration 0005). Does NOT use pg_insert so no constraint
-    dependency that could silently roll back on missing migration.
+    Uses INSERT ... ON CONFLICT DO UPDATE so concurrent webhook deliveries
+    can NEVER create two session rows — the upsert is atomic at the DB level.
+    Requires migration 0005 (UNIQUE constraint on business_id+customer_id).
 
-    .limit(1) ORDER BY last_activity_at DESC is retained to handle any
-    legacy duplicate rows that may exist before migration 0005 runs.
+    Expiry reset is handled inside the SQL CASE expression:
+      - If existing row's expires_at < now  → reset state='IDLE', context_json='{}'
+      - Otherwise                           → preserve state + context_json (cart intact)
+
+    This is the only guarantee that:
+        cart shown to customer == cart used for confirmation == cart saved in order
     """
     now = datetime.now(timezone.utc)
+    expires = now + timedelta(minutes=SESSION_TIMEOUT_MINUTES)
 
+    # ── Atomic upsert with inline expiry reset ───────────────────────────
+    await db.execute(
+        text("""
+            INSERT INTO conversation_sessions
+                (id, business_id, customer_id, state, context_json,
+                 last_activity_at, expires_at, created_at)
+            VALUES
+                (gen_random_uuid(), :biz_id::uuid, :cust_id::uuid,
+                 'IDLE', '{}'::jsonb, :now, :expires, :now)
+            ON CONFLICT (business_id, customer_id)
+            DO UPDATE SET
+                last_activity_at = :now,
+                expires_at       = :expires,
+                state        = CASE
+                                 WHEN conversation_sessions.expires_at < :now
+                                 THEN 'IDLE'
+                                 ELSE conversation_sessions.state
+                               END,
+                context_json = CASE
+                                 WHEN conversation_sessions.expires_at < :now
+                                 THEN '{}'::jsonb
+                                 ELSE conversation_sessions.context_json
+                               END
+        """),
+        {
+            "biz_id": str(business_id),
+            "cust_id": str(customer_id),
+            "now": now,
+            "expires": expires,
+        },
+    )
+    await db.flush()
+
+    # ── Load the single guaranteed-unique row ────────────────────────────
     result = await db.execute(
         select(ConversationSession)
         .where(
             ConversationSession.business_id == business_id,
             ConversationSession.customer_id == customer_id,
         )
-        .order_by(ConversationSession.last_activity_at.desc())
-        .limit(1)
     )
-    session = result.scalar_one_or_none()
+    session = result.scalar_one()
 
-    if session is not None:
-        # Reset if expired
-        if session.expires_at and session.expires_at < now:
-            session.state = ConversationState.IDLE.value
-            session.context_json = {}
-            flag_modified(session, "context_json")
-        session.last_activity_at = now
-        session.expires_at = now + timedelta(minutes=SESSION_TIMEOUT_MINUTES)
-        await db.flush()
-        return session
-
-    # No session found — create a fresh one
-    session = ConversationSession(
-        business_id=business_id,
-        customer_id=customer_id,
-        state=ConversationState.IDLE.value,
-        context_json={},
-        last_activity_at=now,
-        expires_at=now + timedelta(minutes=SESSION_TIMEOUT_MINUTES),
+    ctx = session.context_json or {}
+    _sm_logger.warning(
+        "SESSION_LOAD: session_id=%s, business_id=%s, customer_id=%s, "
+        "state=%s, cart_items=%d, confirmed_cart_items=%d",
+        session.id,
+        business_id,
+        customer_id,
+        session.state,
+        len(ctx.get("cart", [])),
+        len(ctx.get("confirmed_cart", [])),
     )
-    db.add(session)
-    await db.flush()
+
     return session
 
 

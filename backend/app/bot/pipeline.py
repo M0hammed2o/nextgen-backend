@@ -471,12 +471,19 @@ async def _handle_message(
                 False, None, None, None,
             )
         # ── CART LOCK ─────────────────────────────────────────────────────
-        # Freeze a snapshot of the cart into confirmed_cart the moment the
-        # customer says "done". All subsequent order creation uses ONLY this
-        # snapshot, so no race condition or concurrent message can alter what
-        # the customer agreed to pay.
+        # Deep-copy the live cart into confirmed_cart the moment the customer
+        # says "done". Order creation ALWAYS reads confirmed_cart, never the
+        # live cart, so no subsequent message can alter what was agreed.
         import copy
-        state_machine.set_context(session, "confirmed_cart", copy.deepcopy(cart))
+        locked = copy.deepcopy(cart)
+        state_machine.set_context(session, "confirmed_cart", locked)
+        logger.warning(
+            "CART_LOCKED: session_id=%s, items=%d, total_cents=%d, snapshot=%s",
+            session.id,
+            len(locked),
+            sum(i["line_total_cents"] for i in locked),
+            [(i["name"], i["quantity"], i["line_total_cents"]) for i in locked],
+        )
         # ──────────────────────────────────────────────────────────────────
         state_machine.transition_state(session, ConversationState.CONFIRMING_ORDER.value)
         summary = state_machine.cart_summary_text(session, business.currency)
@@ -517,6 +524,25 @@ async def _handle_message(
                 None,
                 None,
             )
+
+    # ── CONFIRMING_ORDER catch-all: block any LLM dispatch while cart is locked ──
+    # If neither is_confirmation() nor is_negation() matched above, we must
+    # NOT fall through to _handle_with_llm. That would allow add_items /
+    # remove_item / replace_item to mutate the live cart while confirmed_cart
+    # is already locked — producing an inconsistent order summary.
+    if current_state == ConversationState.CONFIRMING_ORDER.value:
+        logger.warning(
+            "HANDLE_BRANCH: CONFIRMING_ORDER catch-all — ambiguous message, re-prompting"
+        )
+        summary = state_machine.cart_summary_text(session, business.currency)
+        total = state_machine.cart_total_cents(session)
+        order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
+        delivery_fee = business.delivery_fee_cents if order_mode == "DELIVERY" else 0
+        return (
+            "Please reply *yes* to confirm your order or *no* to make changes.\n\n"
+            + responses.ask_confirmation_response(summary, total, delivery_fee, order_mode, business.currency),
+            False, None, None, None,
+        )
 
     # ── Collecting details state ─────────────────────────────────────────
     if current_state == ConversationState.COLLECTING_DETAILS.value:
@@ -619,16 +645,18 @@ async def _handle_with_llm(
                     matched_item = sorted(candidates, reverse=True)[0][1]
 
             if matched_item:
+                # Clamp quantity: LLM output is untrusted. 1-20 is the allowed range.
+                safe_qty = max(1, min(int(pi.quantity or 1), 20))
                 state_machine.add_to_cart(
                     session,
                     menu_item_id=str(matched_item.id),
                     name=matched_item.name,
                     price_cents=matched_item.price_cents,
-                    quantity=pi.quantity,
+                    quantity=safe_qty,
                     options=pi.options if pi.options else None,
                     special_instructions=pi.special_instructions,
                 )
-                added.append(f"{pi.quantity}x {matched_item.name}")
+                added.append(f"{safe_qty}x {matched_item.name}")
             else:
                 unmatched.append(pi.name)
 
@@ -704,12 +732,13 @@ async def _handle_with_llm(
                     new_item = sorted(candidates, reverse=True)[0][1]
 
             if new_item:
+                safe_qty = max(1, min(int(pi.quantity or 1), 20))
                 state_machine.add_to_cart(
                     session,
                     menu_item_id=str(new_item.id),
                     name=new_item.name,
                     price_cents=new_item.price_cents,
-                    quantity=pi.quantity,
+                    quantity=safe_qty,
                     options=pi.options if pi.options else None,
                     special_instructions=pi.special_instructions,
                 )
@@ -719,8 +748,9 @@ async def _handle_with_llm(
                 if was_removed and remove_name:
                     orig = items_map.get(remove_name.lower())
                     if orig:
+                        safe_qty = max(1, min(int(pi.quantity or 1), 20))
                         state_machine.add_to_cart(
-                            session, str(orig.id), orig.name, orig.price_cents, pi.quantity
+                            session, str(orig.id), orig.name, orig.price_cents, safe_qty
                         )
                 replace_errors.append(f"couldn't find '{add_name}' on the menu")
 
@@ -757,34 +787,27 @@ async def _handle_with_llm(
                 llm_response.provider,
             )
 
-        # If already in CONFIRMING_ORDER the customer is saying "yes" (or similar).
-        # Actually place the order instead of showing the summary a second time.
-        if session.state == ConversationState.CONFIRMING_ORDER.value:
-            response_text, _, _, _, _ = await _handle_order_confirmation(
-                db, business, customer, session
-            )
-            return (
-                response_text,
-                True,
-                llm_response.total_tokens,
-                llm_response.cost_cents,
-                llm_response.provider,
-            )
-
+        # ── HARD RULE: LLM output can NEVER trigger order creation. ──────
+        # Only deterministic is_confirmation() may place an order.
+        # Regardless of what action the LLM returns, if we're in
+        # CONFIRMING_ORDER state we re-show the summary and ask again.
+        # The customer must send a plain "yes"/"done"/etc. that passes
+        # the is_confirmation() check in _handle_message — not the LLM.
+        logger.warning(
+            "LLM_CONFIRM_BLOCKED: LLM returned confirm_order but order "
+            "creation is reserved for deterministic is_confirmation() path. "
+            "Re-prompting. session_id=%s, state=%s",
+            session.id,
+            session.state,
+        )
         state_machine.transition_state(session, ConversationState.CONFIRMING_ORDER.value)
         summary = state_machine.cart_summary_text(session, business.currency)
         total = state_machine.cart_total_cents(session)
+        order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
+        delivery_fee = business.delivery_fee_cents if order_mode == "DELIVERY" else 0
 
         return (
-            responses.ask_confirmation_response(
-                summary,
-                total,
-                business.delivery_fee_cents
-                if state_machine.get_context(session, "order_mode") == "DELIVERY"
-                else 0,
-                state_machine.get_context(session, "order_mode", "PICKUP"),
-                business.currency,
-            ),
+            responses.ask_confirmation_response(summary, total, delivery_fee, order_mode, business.currency),
             True,
             llm_response.total_tokens,
             llm_response.cost_cents,

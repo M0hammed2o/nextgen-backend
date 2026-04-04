@@ -41,7 +41,19 @@ async def create_order_from_cart(
     # Prefer the locked snapshot (set at "done" time) over the live cart.
     # This guarantees the order matches exactly what the customer approved,
     # even if a concurrent message somehow mutated the live cart afterwards.
-    cart = ctx.get("confirmed_cart") or ctx.get("cart", [])
+    confirmed_cart = ctx.get("confirmed_cart")
+    live_cart = ctx.get("cart", [])
+    cart = confirmed_cart or live_cart
+
+    logger.warning(
+        "ORDER_CREATE: session_id=%s, using_confirmed_cart=%s, "
+        "confirmed_items=%d, live_items=%d, total_cents=%d",
+        session.id,
+        confirmed_cart is not None,
+        len(confirmed_cart) if confirmed_cart else 0,
+        len(live_cart),
+        sum(i["line_total_cents"] for i in cart),
+    )
 
     if not cart:
         raise ValueError("Cannot create order: cart is empty")
