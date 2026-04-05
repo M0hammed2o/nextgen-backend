@@ -23,10 +23,13 @@ _PATTERNS: list[tuple[re.Pattern, MessageIntent]] = [
         r"sawubona|molo|hola|ola|gday)\b", re.I
     ), MessageIntent.GREETING),
 
-    # Menu requests
+    # Menu requests — "what do you recommend/suggest/think" must NOT match here
+    # (those go to LLM for a proper recommendation response).
+    # Only "what do you have/sell/serve" and "what's available" are menu dumps.
     (re.compile(
-        r"\b(menu|food|eat|what.*(do you|have|sell|serve)|price list|"
-        r"what.*available|show me|items|catalog|catalogue)\b", re.I
+        r"\b(menu|food|eat|"
+        r"what\s+(do\s+you\s+(have|sell|serve)|.*(have|sell|serve))|"
+        r"what.*available|price list|show me|items|catalog|catalogue)\b", re.I
     ), MessageIntent.MENU_REQUEST),
 
     # Specials

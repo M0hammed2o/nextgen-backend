@@ -360,7 +360,16 @@ async def _handle_message(
         if current_state not in _order_active_states:
             state_machine.transition_state(session, ConversationState.BROWSING_MENU.value)
 
-        if menu_image_url:
+        # Only send as image media if the URL is a direct image file (not a page/album URL).
+        # Meta requires a public URL ending in a recognised image extension.
+        _direct_image = bool(
+            menu_image_url
+            and any(
+                menu_image_url.lower().split("?")[0].endswith(ext)
+                for ext in (".jpg", ".jpeg", ".png", ".webp", ".gif")
+            )
+        )
+        if menu_image_url and _direct_image:
             try:
                 await whatsapp_sender.send_image_message(
                     phone_number_id=business.whatsapp_phone_number_id,
@@ -374,6 +383,14 @@ async def _handle_message(
                     "falling back to text menu. business_id=%s",
                     business.id,
                 )
+        elif menu_image_url:
+            logger.warning(
+                "PIPELINE_IMAGE_SKIP: menu_image_url is not a direct image file URL "
+                "(no .jpg/.png extension) — will include as clickable link instead. "
+                "url=%s, business_id=%s",
+                menu_image_url,
+                business.id,
+            )
 
         text = responses.menu_response(categories, items, business.currency)
         cart = state_machine.get_cart(session)
@@ -384,8 +401,12 @@ async def _handle_message(
                 + text
                 + '\n\nJust tell me what you\'d like to add, or say *"done"* to confirm your order.'
             )
-        elif menu_image_url:
-            text = "Let me know what you'd like to order! 😊\n\n" + text
+        else:
+            header = "Here's our menu 😊"
+            if menu_image_url and not _direct_image:
+                # Album/page URL — show as a clickable link in text
+                header += f"\n📷 View menu image: {menu_image_url}"
+            text = header + "\n\n" + text + "\n\nLet me know what you'd like to order! 😊"
         return text, False, None, None, None
 
     if intent == MessageIntent.SPECIALS_REQUEST:
