@@ -24,6 +24,7 @@ async def create_order_from_cart(
     business: Business,
     customer: Customer,
     session: ConversationSession,
+    initial_status: str = "NEW",
 ) -> Order:
     """
     Create an order from the cart in the conversation session.
@@ -71,7 +72,10 @@ async def create_order_from_cart(
     # ── 2. Calculate totals ──────────────────────────────────────────────
     subtotal = sum(item["line_total_cents"] for item in cart)
     order_mode = ctx.get("order_mode", "PICKUP")
-    delivery_fee = business.delivery_fee_cents if order_mode == "DELIVERY" else 0
+    # Delivery fee is set by staff after reviewing the delivery location.
+    # Never auto-apply the business default here — use only the value staff
+    # explicitly stored in session context (0 until staff sets it).
+    delivery_fee = ctx.get("delivery_fee_cents", 0)
     total = subtotal + delivery_fee
 
     # ── 3. Create order ──────────────────────────────────────────────────
@@ -79,7 +83,7 @@ async def create_order_from_cart(
         business_id=business.id,
         customer_id=customer.id,
         order_number=order_number,
-        status="NEW",
+        status=initial_status,
         order_mode=order_mode,
         source="WHATSAPP",
         subtotal_cents=subtotal,
@@ -114,8 +118,8 @@ async def create_order_from_cart(
         order_id=order.id,
         business_id=business.id,
         old_status=None,
-        new_status="NEW",
-        reason="Order placed via WhatsApp",
+        new_status=initial_status,
+        reason="Order placed via WhatsApp" if initial_status == "NEW" else "Awaiting delivery fee approval",
     )
     db.add(event)
 

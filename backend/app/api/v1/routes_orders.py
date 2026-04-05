@@ -100,6 +100,7 @@ class OrderCreate(BaseModel):
 # ── Routes ───────────────────────────────────────────────────────────────────
 
 LIVE_STATUSES = [
+    OrderStatus.PENDING_DELIVERY_FEE.value,
     OrderStatus.NEW.value,
     OrderStatus.ACCEPTED.value,
     OrderStatus.IN_PROGRESS.value,
@@ -430,6 +431,136 @@ def _customer_status_message(
             msg += f"\nReason: {reason}"
         return msg
     return None
+
+
+class DeliveryFeeRequest(BaseModel):
+    delivery_fee_cents: int = Field(ge=0, description="Delivery fee in cents")
+
+
+@router.post("/{order_id}/delivery-fee", response_model=OrderResponse)
+async def set_delivery_fee(
+    order_id: uuid.UUID,
+    body: DeliveryFeeRequest,
+    user: AuthUser = Depends(require_staff_or_above),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Staff sets the delivery fee on a PENDING_DELIVERY_FEE order.
+    Stores the fee in the order AND sends a WhatsApp message to the customer
+    asking them to approve it. Order status moves to FEE_SENT.
+    """
+    result = await db.execute(
+        select(Order).where(
+            Order.id == order_id,
+            Order.business_id == user.business_id,
+        )
+    )
+    order = result.scalar_one_or_none()
+    if not order:
+        raise NotFoundError("Order", str(order_id))
+
+    if order.status != OrderStatus.PENDING_DELIVERY_FEE.value:
+        from backend.app.core.errors import InvalidTransitionError
+        raise InvalidTransitionError(order.status, "FEE_SENT")
+
+    fee = body.delivery_fee_cents
+    order.delivery_fee_cents = fee
+    order.total_cents = order.subtotal_cents + fee
+    order.status = "FEE_SENT"
+
+    event = OrderEvent(
+        order_id=order.id,
+        business_id=user.business_id,
+        old_status=OrderStatus.PENDING_DELIVERY_FEE.value,
+        new_status="FEE_SENT",
+        changed_by_user_id=user.user_id,
+        reason=f"Delivery fee set: {fee} cents",
+    )
+    db.add(event)
+    await db.flush()
+
+    # Send WhatsApp message to customer asking them to approve the fee
+    try:
+        if order.customer_id:
+            from shared.models.customer import Customer
+            from shared.models.business import Business
+            from backend.app.bot.whatsapp_sender import send_notification_message
+            from shared.utils.money import format_currency
+
+            cust_row = await db.execute(
+                select(Customer.wa_id).where(Customer.id == order.customer_id)
+            )
+            wa_id = cust_row.scalar_one_or_none()
+
+            biz_row = await db.execute(
+                select(Business.whatsapp_phone_number_id, Business.currency).where(
+                    Business.id == order.business_id
+                )
+            )
+            biz = biz_row.one_or_none()
+
+            if wa_id and biz and biz.whatsapp_phone_number_id:
+                fee_str = format_currency(fee, biz.currency)
+                msg = (
+                    f"🚗 *Delivery Fee for Order {order.order_number}*\n\n"
+                    f"Your delivery fee is *{fee_str}*.\n\n"
+                    f"Reply *yes* to confirm and place your order, or *no* to cancel."
+                )
+                await send_notification_message(
+                    phone_number_id=biz.whatsapp_phone_number_id,
+                    recipient_wa_id=wa_id,
+                    text=msg,
+                )
+
+            # Store fee in customer's conversation session so pipeline can finalise
+            from shared.models.customer import ConversationSession
+            from sqlalchemy.orm.attributes import flag_modified
+            sess_row = await db.execute(
+                select(ConversationSession).where(
+                    ConversationSession.business_id == order.business_id,
+                    ConversationSession.customer_id == order.customer_id,
+                )
+            )
+            conv = sess_row.scalar_one_or_none()
+            if conv:
+                ctx = dict(conv.context_json or {})
+                ctx["delivery_fee_cents"] = fee
+                ctx["delivery_fee_status"] = "FEE_SENT"
+                ctx["pending_order_id"] = str(order.id)
+                conv.context_json = ctx
+                flag_modified(conv, "context_json")
+                from shared.enums import ConversationState
+                conv.state = ConversationState.WAITING_DELIVERY_FEE_APPROVAL.value
+    except Exception:
+        import logging as _log
+        _log.getLogger("nextgen").warning(
+            "Failed to send delivery fee WhatsApp message for order %s", order.id
+        )
+
+    await db.commit()
+    await db.refresh(order)
+
+    # Publish SSE so dashboard refreshes
+    try:
+        from backend.app.db.session import get_redis
+        import json
+        redis = await get_redis()
+        await redis.publish(
+            f"orders:{user.business_id}",
+            json.dumps({
+                "type": "order_status_changed",
+                "order_id": str(order.id),
+                "order_number": order.order_number,
+                "old_status": OrderStatus.PENDING_DELIVERY_FEE.value,
+                "new_status": "FEE_SENT",
+                "total_cents": order.total_cents,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }),
+        )
+    except Exception:
+        pass
+
+    return OrderResponse.model_validate(order)
 
 
 class PaymentUpdateRequest(BaseModel):

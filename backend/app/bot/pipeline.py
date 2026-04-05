@@ -25,7 +25,7 @@ import logging
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import select, update as _sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.bot import (
@@ -44,10 +44,21 @@ from shared.models.business import Business
 from shared.models.customer import Customer
 from shared.models.menu import MenuCategory, MenuItem
 from shared.models.message import Message
+from shared.models.order import Order as _Order, OrderEvent as _OrderEvent
 from shared.models.specials import Special
 from shared.utils.time import is_business_open
 
 logger = logging.getLogger("nextgen.bot.pipeline")
+
+
+def _parse_uuid(val) -> uuid.UUID | None:
+    """Safely parse a UUID string; return None on failure."""
+    if not val:
+        return None
+    try:
+        return uuid.UUID(str(val))
+    except (ValueError, TypeError):
+        return None
 
 
 async def process_inbound_message(
@@ -497,11 +508,10 @@ async def _handle_message(
         summary = state_machine.cart_summary_text(session, business.currency)
         total = state_machine.cart_total_cents(session)
         order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
-        delivery_fee = business.delivery_fee_cents if order_mode == "DELIVERY" else 0
-        return (
-            responses.ask_confirmation_response(summary, total, delivery_fee, order_mode, business.currency),
-            False, None, None, None,
-        )
+        confirm_msg = responses.ask_confirmation_response(summary, total, 0, order_mode, business.currency)
+        if order_mode == "DELIVERY":
+            confirm_msg += "\n_Delivery fee will be confirmed by our team._"
+        return (confirm_msg, False, None, None, None)
 
     if intent == MessageIntent.HUMAN_HANDOFF:
         logger.warning("HANDLE_BRANCH: HUMAN_HANDOFF → transitioning to HANDOFF state")
@@ -532,6 +542,21 @@ async def _handle_message(
                 None,
                 None,
             )
+
+    # ── Choosing options state (e.g. "what size?") ──────────────────────
+    if current_state == ConversationState.CHOOSING_OPTIONS.value:
+        logger.warning("HANDLE_BRANCH: CHOOSING_OPTIONS → LLM resolves pending item options")
+        return await _handle_with_llm(db, business, customer, session, msg_text)
+
+    # ── Choosing order mode (pickup vs delivery) ─────────────────────────
+    if current_state == ConversationState.CHOOSING_ORDER_MODE.value:
+        logger.warning("HANDLE_BRANCH: CHOOSING_ORDER_MODE → parsing pickup/delivery choice")
+        return await _handle_choosing_order_mode(db, business, customer, session, msg_text)
+
+    # ── Waiting for delivery fee approval from customer ──────────────────
+    if current_state == ConversationState.WAITING_DELIVERY_FEE_APPROVAL.value:
+        logger.warning("HANDLE_BRANCH: WAITING_DELIVERY_FEE_APPROVAL → checking fee + answer")
+        return await _handle_waiting_delivery_fee(db, business, customer, session, msg_text)
 
     # ── Collecting details state ─────────────────────────────────────────
     if current_state == ConversationState.COLLECTING_DETAILS.value:
@@ -567,6 +592,57 @@ async def _handle_message(
     return responses.fallback_response(business), False, None, None, None
 
 
+# ── Size-variant helpers ─────────────────────────────────────────────────────
+# Words that indicate a size choice inside an item name.
+_SIZE_KEYWORDS: frozenset[str] = frozenset({
+    "small", "medium", "large", "regular", "xl", "xxl", "mini",
+    "sm", "md", "lg", "half", "full", "single", "double",
+})
+
+
+def _find_size_variants(msg_text: str, menu_items: list) -> tuple[str | None, list]:
+    """
+    Pre-LLM check: detect if the message refers to a menu item that has
+    multiple size variants (e.g. Small Pizza / Medium Pizza / Large Pizza).
+
+    Groups active items by their 'base name' (item name with size keywords stripped).
+    Returns (base_name, [MenuItem, ...]) when:
+      - The base name matches the message text, AND
+      - At least 2 variants exist, AND
+      - The message does NOT already contain a size keyword (so we only ask once).
+    Otherwise returns (None, []).
+    """
+    active = [i for i in menu_items if i.is_active and not i.is_deleted]
+    msg_lower = msg_text.lower()
+    msg_words = set(msg_lower.split())
+
+    # If the customer already stated a size, skip — no need to ask
+    if msg_words & _SIZE_KEYWORDS:
+        return None, []
+
+    groups: dict[str, list] = {}
+    for item in active:
+        name_parts = item.name.lower().split()
+        base_parts = [w for w in name_parts if w not in _SIZE_KEYWORDS]
+        if not base_parts:
+            continue
+        base = " ".join(base_parts)
+        groups.setdefault(base, []).append(item)
+
+    for base, variants in groups.items():
+        if len(variants) < 2:
+            continue
+        significant = [w for w in base.split() if len(w) > 3]
+        if not significant:
+            continue
+        # Require ≥80% of the significant base words to appear in the message
+        match_ratio = sum(1 for w in significant if w in msg_words) / len(significant)
+        if match_ratio >= 0.8:
+            return base, variants
+
+    return None, []
+
+
 async def _handle_with_llm(
     db: AsyncSession,
     business: Business,
@@ -579,6 +655,25 @@ async def _handle_with_llm(
     specials = await _load_specials(db, business.id)
     cart = state_machine.get_cart(session)
 
+    # ── Deterministic size-ambiguity check (no LLM for the question) ────────
+    # Skip when already in CHOOSING_OPTIONS — customer is answering the question.
+    if session.state != ConversationState.CHOOSING_OPTIONS.value:
+        base_name, variants = _find_size_variants(msg_text, items)
+        if base_name and variants:
+            pending = [{"name": base_name, "quantity": 1, "options": None, "special_instructions": None}]
+            state_machine.set_context(session, "pending_options", pending)
+            state_machine.transition_state(session, ConversationState.CHOOSING_OPTIONS.value)
+            size_options = "\n".join(f"  • {v.name}" for v in variants)
+            logger.warning(
+                "SIZE_AMBIGUITY: base=%r, variants=%d, session_id=%s",
+                base_name, len(variants), session.id,
+            )
+            return (
+                f"Which *{base_name.title()}* would you like?\n{size_options}",
+                False, None, None, None,
+            )
+
+    pending_options = state_machine.get_context(session, "pending_options")
     system_prompt = prompt_builder.build_system_prompt(
         business,
         categories,
@@ -586,6 +681,7 @@ async def _handle_with_llm(
         specials,
         session.state,
         cart,
+        pending_options=pending_options,
     )
 
     from backend.app.llm.provider import get_llm_provider
@@ -648,6 +744,11 @@ async def _handle_with_llm(
                 f"Sorry, I couldn't find: {', '.join(unmatched)}. Check our menu for available items."
             )
 
+        # If items were added while resolving a pending options question, clear it.
+        if session.state == ConversationState.CHOOSING_OPTIONS.value:
+            state_machine.set_context(session, "pending_options", None)
+            logger.warning("PENDING_OPTIONS_RESOLVED: cleared pending_options. session_id=%s", session.id)
+
         # Lock cart + go to CONFIRMING_ORDER so one "yes" places the order.
         # If already in CONFIRMING_ORDER, relock with updated cart.
         import copy as _copy
@@ -659,12 +760,12 @@ async def _handle_with_llm(
             len(updated_cart), sum(i["line_total_cents"] for i in updated_cart),
         )
         order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
-        delivery_fee = business.delivery_fee_cents if order_mode == "DELIVERY" else 0
         total = state_machine.cart_total_cents(session)
         summary = state_machine.cart_summary_text(session, business.currency)
-        response_parts.append(
-            "\n" + responses.ask_confirmation_response(summary, total, delivery_fee, order_mode, business.currency)
-        )
+        confirm_msg = responses.ask_confirmation_response(summary, total, 0, order_mode, business.currency)
+        if order_mode == "DELIVERY":
+            confirm_msg += "\n_Delivery fee will be confirmed by our team._"
+        response_parts.append("\n" + confirm_msg)
 
         return (
             "\n".join(response_parts),
@@ -685,12 +786,12 @@ async def _handle_with_llm(
                 import copy as _copy
                 state_machine.set_context(session, "confirmed_cart", _copy.deepcopy(cart))
                 order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
-                delivery_fee = business.delivery_fee_cents if order_mode == "DELIVERY" else 0
                 total = state_machine.cart_total_cents(session)
                 summary = state_machine.cart_summary_text(session, business.currency)
-                msg = "Item removed. ✅\n" + responses.ask_confirmation_response(
-                    summary, total, delivery_fee, order_mode, business.currency
-                )
+                confirm_msg = responses.ask_confirmation_response(summary, total, 0, order_mode, business.currency)
+                if order_mode == "DELIVERY":
+                    confirm_msg += "\n_Delivery fee will be confirmed by our team._"
+                msg = "Item removed. ✅\n" + confirm_msg
             else:
                 msg = "Item removed. ✅\n" + state_machine.cart_summary_text(session, business.currency)
                 msg += '\nAnything else? Or say *"done"* to confirm.'
@@ -753,15 +854,44 @@ async def _handle_with_llm(
             state_machine.set_context(session, "confirmed_cart", _copy.deepcopy(cart))
             state_machine.transition_state(session, ConversationState.CONFIRMING_ORDER.value)
             order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
-            delivery_fee = business.delivery_fee_cents if order_mode == "DELIVERY" else 0
             total = state_machine.cart_total_cents(session)
             summary = state_machine.cart_summary_text(session, business.currency)
-            parts.append("\n" + responses.ask_confirmation_response(summary, total, delivery_fee, order_mode, business.currency))
+            confirm_msg = responses.ask_confirmation_response(summary, total, 0, order_mode, business.currency)
+            if order_mode == "DELIVERY":
+                confirm_msg += "\n_Delivery fee will be confirmed by our team._"
+            parts.append("\n" + confirm_msg)
         else:
             state_machine.transition_state(session, ConversationState.IDLE.value)
             parts.append("Your cart is now empty. What would you like to order?")
 
         return ("\n".join(parts), True, llm_response.total_tokens, llm_response.cost_cents, llm_response.provider)
+
+    if parsed.action == "ask_options":
+        # LLM needs clarification (e.g. size) before adding an item.
+        # Save the pending item(s) so the CHOOSING_OPTIONS handler can resolve them.
+        pending = []
+        for pi in (parsed.items or []):
+            if pi.name:
+                pending.append({
+                    "name": pi.name,
+                    "quantity": pi.quantity or 1,
+                    "options": pi.options,
+                    "special_instructions": pi.special_instructions,
+                })
+        if pending:
+            state_machine.set_context(session, "pending_options", pending)
+            logger.warning(
+                "ASK_OPTIONS: saved %d pending item(s), transitioning to CHOOSING_OPTIONS. session_id=%s",
+                len(pending), session.id,
+            )
+        state_machine.transition_state(session, ConversationState.CHOOSING_OPTIONS.value)
+        return (
+            parsed.message,
+            True,
+            llm_response.total_tokens,
+            llm_response.cost_cents,
+            llm_response.provider,
+        )
 
     if parsed.action == "confirm_order":
         cart = state_machine.get_cart(session)
@@ -781,10 +911,12 @@ async def _handle_with_llm(
         summary = state_machine.cart_summary_text(session, business.currency)
         total = state_machine.cart_total_cents(session)
         order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
-        delivery_fee = business.delivery_fee_cents if order_mode == "DELIVERY" else 0
+        confirm_msg = responses.ask_confirmation_response(summary, total, 0, order_mode, business.currency)
+        if order_mode == "DELIVERY":
+            confirm_msg += "\n_Delivery fee will be confirmed by our team._"
 
         return (
-            responses.ask_confirmation_response(summary, total, delivery_fee, order_mode, business.currency),
+            confirm_msg,
             True,
             llm_response.total_tokens,
             llm_response.cost_cents,
@@ -829,6 +961,22 @@ async def _handle_order_confirmation(
     session,
 ) -> tuple[str, bool, int | None, int | None, str | None]:
     """Handle order confirmation — check details, create order."""
+
+    # ── Ask pickup vs delivery if not yet chosen ─────────────────────────
+    order_mode = state_machine.get_context(session, "order_mode", None)
+    if order_mode is None:
+        if getattr(business, "delivery_enabled", False) and not getattr(business, "order_in_only", False):
+            state_machine.transition_state(session, ConversationState.CHOOSING_ORDER_MODE.value)
+            logger.warning("ORDER_MODE_GATE: asking customer, session_id=%s", session.id)
+            return (
+                "Is this order for *pickup* 🏃 or *delivery* 🚗?",
+                False, None, None, None,
+            )
+        # Business only supports pickup/dine-in — set it automatically
+        order_mode = "DINE_IN" if getattr(business, "order_in_only", False) else "PICKUP"
+        state_machine.set_context(session, "order_mode", order_mode)
+        logger.warning("ORDER_MODE_AUTO: set to %s, session_id=%s", order_mode, session.id)
+
     already_have = {}
     if state_machine.get_context(session, "customer_name"):
         already_have["customer_name"] = True
@@ -836,11 +984,10 @@ async def _handle_order_confirmation(
         already_have["phone_number"] = True
     if state_machine.get_context(session, "delivery_address"):
         already_have["delivery_address"] = True
-
-    order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
     need_name = business.require_customer_name
     need_phone = business.require_phone_number
-    need_address = business.require_delivery_address and order_mode == "DELIVERY"
+    # Delivery address always required for delivery orders
+    need_address = order_mode == "DELIVERY" and not already_have.get("delivery_address")
 
     details_prompt = responses.collecting_details_response(
         need_name,
@@ -852,6 +999,40 @@ async def _handle_order_confirmation(
     if details_prompt:
         state_machine.transition_state(session, ConversationState.COLLECTING_DETAILS.value)
         return details_prompt, False, None, None, None
+
+    # ── Delivery flow: park the order waiting for staff to set the fee ───
+    if order_mode == "DELIVERY":
+        delivery_address = state_machine.get_context(session, "delivery_address")
+        if not delivery_address:
+            # Should have been caught above, but guard again
+            state_machine.transition_state(session, ConversationState.COLLECTING_DETAILS.value)
+            return "Please provide your delivery address.", False, None, None, None
+
+        # Check if a fee has already been set and approved
+        fee_status = state_machine.get_context(session, "delivery_fee_status")
+        if fee_status != "APPROVED":
+            # Create the order in PENDING_DELIVERY_FEE status so staff can see it
+            try:
+                await usage_tracker.check_daily_limit(db, business, "orders")
+            except DailyLimitError:
+                return "Sorry, we can't accept more orders right now. Please try again later.", False, None, None, None
+
+            order = await order_creator.create_order_from_cart(
+                db, business, customer, session,
+                initial_status="PENDING_DELIVERY_FEE",
+            )
+            state_machine.set_context(session, "pending_order_id", str(order.id))
+            state_machine.transition_state(session, ConversationState.WAITING_DELIVERY_FEE_APPROVAL.value)
+            logger.warning(
+                "DELIVERY_FEE_PENDING: order_id=%s, address=%r, session_id=%s",
+                order.id, delivery_address, session.id,
+            )
+            return (
+                "Got it! 📍 Your delivery address has been noted.\n\n"
+                "Our team will review your location and send you the delivery fee shortly. "
+                "You'll receive a WhatsApp message to confirm before we process your order. 🚗",
+                False, None, None, None,
+            )
 
     try:
         await usage_tracker.check_daily_limit(db, business, "orders")
@@ -888,6 +1069,158 @@ async def _handle_order_confirmation(
     state_machine.transition_state(session, ConversationState.ORDER_PLACED.value)
 
     return response_text, False, None, None, None
+
+
+async def _handle_choosing_order_mode(
+    db: AsyncSession,
+    business: Business,
+    customer: Customer,
+    session,
+    msg_text: str,
+) -> tuple[str, bool, int | None, int | None, str | None]:
+    """Parse customer's pickup/delivery choice and proceed to confirmation."""
+    text_lower = msg_text.lower().strip()
+
+    if any(w in text_lower for w in ["pickup", "pick up", "pick-up", "collect", "collection", "takeaway", "take away", "take-away"]):
+        state_machine.set_context(session, "order_mode", "PICKUP")
+        state_machine.transition_state(session, ConversationState.CONFIRMING_ORDER.value)
+        logger.warning("ORDER_MODE_SET: PICKUP, session_id=%s", session.id)
+        return await _handle_order_confirmation(db, business, customer, session)
+
+    if any(w in text_lower for w in ["delivery", "deliver", "bring", "drop", "drop off"]):
+        state_machine.set_context(session, "order_mode", "DELIVERY")
+        state_machine.transition_state(session, ConversationState.CONFIRMING_ORDER.value)
+        logger.warning("ORDER_MODE_SET: DELIVERY, session_id=%s", session.id)
+        return await _handle_order_confirmation(db, business, customer, session)
+
+    return (
+        "Please choose: *pickup* 🏃 (collect from us) or *delivery* 🚗 (we bring it to you)?",
+        False, None, None, None,
+    )
+
+
+async def _handle_waiting_delivery_fee(
+    db: AsyncSession,
+    business: Business,
+    customer: Customer,
+    session,
+    msg_text: str,
+) -> tuple[str, bool, int | None, int | None, str | None]:
+    """
+    Customer is replying to a delivery fee proposal sent by staff.
+    YES → mark fee approved, finalize order.
+    NO  → cancel order, offer alternatives.
+    Anything else → re-prompt.
+    """
+    fee_cents = state_machine.get_context(session, "delivery_fee_cents", 0)
+    pending_order_id = state_machine.get_context(session, "pending_order_id")
+
+    if intent_router.is_confirmation(msg_text):
+        # Mark fee approved and finalise the order
+        state_machine.set_context(session, "delivery_fee_status", "APPROVED")
+        state_machine.transition_state(session, ConversationState.ORDER_PLACED.value)
+
+        # Update the pending order: set fee + total, change status to NEW
+        if pending_order_id:
+            try:
+                result = await db.execute(
+                    _sa_update(_Order)
+                    .where(
+                        _Order.id == _parse_uuid(pending_order_id),
+                        _Order.business_id == business.id,
+                    )
+                    .values(
+                        delivery_fee_cents=fee_cents,
+                        total_cents=_Order.subtotal_cents + fee_cents,
+                        status="NEW",
+                    )
+                    .returning(_Order.order_number, _Order.subtotal_cents)
+                )
+                row = result.one_or_none()
+                order_number = row.order_number if row else "—"
+                subtotal = row.subtotal_cents if row else 0
+
+                db.add(_OrderEvent(
+                    order_id=_parse_uuid(pending_order_id),
+                    business_id=business.id,
+                    old_status="PENDING_DELIVERY_FEE",
+                    new_status="NEW",
+                    reason="Customer approved delivery fee",
+                ))
+                await db.flush()
+
+                # Publish SSE so staff dashboard refreshes
+                try:
+                    from backend.app.db.session import get_redis
+                    import json as _json
+                    redis = await get_redis()
+                    await redis.publish(
+                        f"orders:{business.id}",
+                        _json.dumps({
+                            "type": "order_created",
+                            "order_id": pending_order_id,
+                            "order_number": order_number,
+                            "status": "NEW",
+                            "total_cents": subtotal + fee_cents,
+                            "created_at": datetime.now(timezone.utc).isoformat(),
+                        }),
+                    )
+                except Exception:
+                    pass
+
+                from shared.utils.money import format_currency
+                state_machine.clear_cart(session)
+                await usage_tracker.increment_usage(db, business.id, business.timezone, orders_created=1, revenue_cents=subtotal + fee_cents)
+                return (
+                    f"✅ *Order Confirmed!*\n\nOrder Number: *{order_number}*\n"
+                    f"Delivery fee: {format_currency(fee_cents, business.currency)}\n"
+                    f"💰 *Total: {format_currency(subtotal + fee_cents, business.currency)}*\n\n"
+                    f"🚗 We'll be on our way once your order is ready!",
+                    False, None, None, None,
+                )
+            except Exception:
+                logger.exception("Failed to finalise delivery order. pending_order_id=%s", pending_order_id)
+                return "Something went wrong confirming your order. Please contact us directly.", False, None, None, None
+        return "✅ Delivery fee accepted! Your order is being prepared.", False, None, None, None
+
+    if intent_router.is_negation(msg_text):
+        # Cancel the pending order
+        if pending_order_id:
+            try:
+                await db.execute(
+                    _sa_update(_Order)
+                    .where(
+                        _Order.id == _parse_uuid(pending_order_id),
+                        _Order.business_id == business.id,
+                    )
+                    .values(status="CANCELLED", cancelled_reason="Customer rejected delivery fee")
+                )
+                db.add(_OrderEvent(
+                    order_id=_parse_uuid(pending_order_id),
+                    business_id=business.id,
+                    old_status="PENDING_DELIVERY_FEE",
+                    new_status="CANCELLED",
+                    reason="Customer rejected delivery fee",
+                ))
+                await db.flush()
+            except Exception:
+                logger.exception("Failed to cancel delivery order. pending_order_id=%s", pending_order_id)
+        state_machine.clear_cart(session)
+        state_machine.transition_state(session, ConversationState.IDLE.value)
+        return (
+            "No problem! Your order has been cancelled. 🗑️\n\n"
+            "You can:\n• Place a pickup order instead\n• Message us to arrange delivery manually",
+            False, None, None, None,
+        )
+
+    # No clear yes/no — re-prompt with the fee so they can decide
+    from shared.utils.money import format_currency
+    fee_str = format_currency(fee_cents, business.currency) if fee_cents else "not yet confirmed"
+    return (
+        f"Your delivery fee is *{fee_str}*. Do you accept?\n"
+        f"Reply *yes* to confirm or *no* to cancel.",
+        False, None, None, None,
+    )
 
 
 def _parse_name_and_phone(text: str) -> tuple[str | None, str | None]:

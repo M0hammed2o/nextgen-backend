@@ -23,6 +23,7 @@ def build_system_prompt(
     specials: list[Special],
     conversation_state: str,
     cart: list[dict],
+    pending_options: list[dict] | None = None,
 ) -> str:
     """
     Build a constrained system prompt for the LLM.
@@ -31,6 +32,7 @@ def build_system_prompt(
     menu_text = _format_menu_for_prompt(categories, menu_items, business.currency)
     specials_text = _format_specials_for_prompt(specials)
     cart_text = _format_cart_for_prompt(cart, business.currency)
+    pending_text = _format_pending_options_for_prompt(pending_options)
 
     return f"""You are the WhatsApp ordering assistant for {business.name}.
 You help customers browse the menu, build orders, and answer questions.
@@ -61,6 +63,7 @@ Order mode: {"Dine-in/Pickup only" if business.order_in_only else "Pickup" + (" 
 ═══ CURRENT CONVERSATION STATE ═══
 State: {conversation_state}
 {f"Current cart:{chr(10)}{cart_text}" if cart else "Cart: empty"}
+{f"═══ PENDING ITEM (awaiting option choice) ═══{chr(10)}{pending_text}{chr(10)}The customer's next message answers the option question above. Resolve it and return add_items with the chosen option filled in." if pending_text else ""}
 
 ═══ YOUR TASK ═══
 Based on the customer's message, respond naturally AND output a JSON action block.
@@ -193,6 +196,19 @@ def _format_cart_for_prompt(cart: list[dict], currency: str) -> str:
         lines.append(f"  {item['quantity']}x {item['name']} = {price}")
     total = sum(i["line_total_cents"] for i in cart)
     lines.append(f"  Subtotal: {format_currency(total, currency)}")
+    return "\n".join(lines)
+
+
+def _format_pending_options_for_prompt(pending_options: list[dict] | None) -> str:
+    """Format pending items waiting for option clarification."""
+    if not pending_options:
+        return ""
+    lines = []
+    for p in pending_options:
+        line = f"- {p['name']} (qty: {p.get('quantity', 1)})"
+        if p.get("special_instructions"):
+            line += f" — note: {p['special_instructions']}"
+        lines.append(line)
     return "\n".join(lines)
 
 
