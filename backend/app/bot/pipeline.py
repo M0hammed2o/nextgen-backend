@@ -409,6 +409,11 @@ async def _handle_message(
             text = header + "\n\n" + text + "\n\nLet me know what you'd like to order! 😊"
         return text, False, None, None, None
 
+    if intent == MessageIntent.RECOMMENDATION:
+        logger.warning("HANDLE_BRANCH: RECOMMENDATION → deterministic popular items")
+        _, menu_items = await _load_menu(db, business.id)
+        return _handle_recommendation(menu_items, business.currency), False, None, None, None
+
     if intent == MessageIntent.SPECIALS_REQUEST:
         logger.warning("HANDLE_BRANCH: SPECIALS_REQUEST → specials_response")
         specials = await _load_specials(db, business.id)
@@ -693,9 +698,26 @@ async def _handle_with_llm(
             )
             # State stays CONFIRMING_ORDER — no transition needed
         else:
-            state_machine.transition_state(session, ConversationState.BUILDING_CART.value)
-            response_parts.append("\n" + state_machine.cart_summary_text(session, business.currency))
-            response_parts.append('\nAnything else? Or say *"done"* to confirm your order.')
+            # Lock the cart immediately after items are added — this means the
+            # customer only needs ONE "yes" to place the order. If they want to
+            # edit further, the CONFIRMING_ORDER path handles it correctly.
+            import copy as _copy
+            new_cart = state_machine.get_cart(session)
+            state_machine.set_context(session, "confirmed_cart", _copy.deepcopy(new_cart))
+            state_machine.transition_state(session, ConversationState.CONFIRMING_ORDER.value)
+            logger.warning(
+                "CART_LOCKED_ON_ADD: session_id=%s, items=%d, total_cents=%d",
+                session.id,
+                len(new_cart),
+                sum(i["line_total_cents"] for i in new_cart),
+            )
+            order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
+            delivery_fee = business.delivery_fee_cents if order_mode == "DELIVERY" else 0
+            total = state_machine.cart_total_cents(session)
+            summary = state_machine.cart_summary_text(session, business.currency)
+            response_parts.append(
+                "\n" + responses.ask_confirmation_response(summary, total, delivery_fee, order_mode, business.currency)
+            )
 
         return (
             "\n".join(response_parts),
@@ -712,8 +734,19 @@ async def _handle_with_llm(
 
         cart = state_machine.get_cart(session)
         if cart:
-            msg = "Item removed.\n" + state_machine.cart_summary_text(session, business.currency)
-            msg += '\nAnything else? Or say *"done"* to confirm.'
+            if session.state == ConversationState.CONFIRMING_ORDER.value:
+                import copy as _copy
+                state_machine.set_context(session, "confirmed_cart", _copy.deepcopy(cart))
+                order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
+                delivery_fee = business.delivery_fee_cents if order_mode == "DELIVERY" else 0
+                total = state_machine.cart_total_cents(session)
+                summary = state_machine.cart_summary_text(session, business.currency)
+                msg = "Item removed. ✅\n" + responses.ask_confirmation_response(
+                    summary, total, delivery_fee, order_mode, business.currency
+                )
+            else:
+                msg = "Item removed. ✅\n" + state_machine.cart_summary_text(session, business.currency)
+                msg += '\nAnything else? Or say *"done"* to confirm.'
         else:
             msg = "Your cart is now empty. What would you like to order?"
             state_machine.transition_state(session, ConversationState.IDLE.value)
@@ -778,7 +811,6 @@ async def _handle_with_llm(
                         )
                 replace_errors.append(f"couldn't find '{add_name}' on the menu")
 
-        state_machine.transition_state(session, ConversationState.BUILDING_CART.value)
         cart = state_machine.get_cart(session)
 
         parts = []
@@ -787,9 +819,23 @@ async def _handle_with_llm(
         if replace_errors:
             parts.append("Sorry: " + "; ".join(replace_errors) + ". Please check the menu.")
         if cart:
-            parts.append("\n" + state_machine.cart_summary_text(session, business.currency))
-            parts.append('\nAnything else? Or say *"done"* to confirm.')
+            if session.state == ConversationState.CONFIRMING_ORDER.value:
+                import copy as _copy
+                state_machine.set_context(session, "confirmed_cart", _copy.deepcopy(cart))
+                order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
+                delivery_fee = business.delivery_fee_cents if order_mode == "DELIVERY" else 0
+                total = state_machine.cart_total_cents(session)
+                summary = state_machine.cart_summary_text(session, business.currency)
+                parts.append("\n" + responses.ask_confirmation_response(
+                    summary, total, delivery_fee, order_mode, business.currency
+                ))
+                # Stay in CONFIRMING_ORDER — no transition
+            else:
+                state_machine.transition_state(session, ConversationState.BUILDING_CART.value)
+                parts.append("\n" + state_machine.cart_summary_text(session, business.currency))
+                parts.append('\nAnything else? Or say *"done"* to confirm.')
         else:
+            state_machine.transition_state(session, ConversationState.IDLE.value)
             parts.append("Your cart is now empty. What would you like to order?")
 
         return (
@@ -1028,6 +1074,63 @@ async def _handle_collecting_details(
         return await _handle_order_confirmation(db, business, customer, session)
 
     return await _handle_order_confirmation(db, business, customer, session)
+
+
+def _handle_recommendation(menu_items: list, currency: str) -> str:
+    """
+    Deterministic popular-items response. Picks up to 5 active items,
+    trying to mix categories (max 2 per category). No LLM involved.
+    """
+    from shared.utils.money import format_currency
+
+    active = [i for i in menu_items if i.is_active and not i.is_deleted]
+    if not active:
+        return (
+            "Our menu is being updated right now. "
+            "Reply *menu* to see what's available! 😊"
+        )
+
+    # Collect up to 2 items per category, then up to 5 total.
+    # Items with a description are preferred (more informative).
+    by_cat: dict = {}
+    for item in active:
+        key = str(item.category_id) if item.category_id else "__none__"
+        by_cat.setdefault(key, []).append(item)
+
+    picked: list = []
+    # Round-robin across categories to ensure variety
+    cat_iters = {k: iter(v) for k, v in by_cat.items()}
+    slots_per_cat: dict = {}
+    while len(picked) < 5:
+        advanced = False
+        for key, it in list(cat_iters.items()):
+            if slots_per_cat.get(key, 0) >= 2:
+                continue
+            item = next(it, None)
+            if item is None:
+                cat_iters.pop(key)
+                continue
+            picked.append(item)
+            slots_per_cat[key] = slots_per_cat.get(key, 0) + 1
+            advanced = True
+            if len(picked) >= 5:
+                break
+        if not advanced:
+            break
+
+    # Build the response
+    _ICONS = ["🍔", "🍕", "🍗", "🥤", "🌯", "🍟", "🥗", "🍱"]
+    lines = ["Here are some of our most popular items 😊\n"]
+    for idx, item in enumerate(picked):
+        icon = _ICONS[idx % len(_ICONS)]
+        price = format_currency(item.price_cents, currency)
+        line = f"{icon} *{item.name}* — {price}"
+        if item.description:
+            line += f"\n_{item.description}_"
+        lines.append(line)
+
+    lines.append("\nWould you like to order any of these? 😊")
+    return "\n".join(lines)
 
 
 def _check_missing_details(business: Business, session) -> str | None:

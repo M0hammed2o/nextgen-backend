@@ -23,9 +23,16 @@ _PATTERNS: list[tuple[re.Pattern, MessageIntent]] = [
         r"sawubona|molo|hola|ola|gday)\b", re.I
     ), MessageIntent.GREETING),
 
-    # Menu requests — "what do you recommend/suggest/think" must NOT match here
-    # (those go to LLM for a proper recommendation response).
-    # Only "what do you have/sell/serve" and "what's available" are menu dumps.
+    # Recommendations — must come BEFORE MENU_REQUEST to prevent misrouting
+    (re.compile(
+        r"\b(recommend|recommendation|popular|best.?sell|best.?seller|"
+        r"what.?s good|what is good|what.?s nice|what.?s great|"
+        r"what.?s your best|what do you suggest|suggest|suggestion|"
+        r"most ordered|fan.?fav|fan favourite|fan favorite|must.?try|"
+        r"what should i (get|order|try|have)|what.?s worth|worth trying)\b", re.I
+    ), MessageIntent.RECOMMENDATION),
+
+    # Menu requests — recommendation phrases excluded above
     (re.compile(
         r"\b(menu|food|eat|"
         r"what\s+(do\s+you\s+(have|sell|serve)|.*(have|sell|serve))|"
@@ -159,7 +166,8 @@ def is_confirmation(text: str) -> bool:
     )
     _CONFIRM_TRAILING = (
         r"(\s+(please|thanks|thank\s+you|bru|man|mate|now|"
-        r"sure\s+thing|that.?s\s+right|great|awesome|for\s+sure))*"
+        r"sure\s+thing|that.?s\s+right|great|awesome|for\s+sure|"
+        r"confirm|confirmed|proceed|place|order|my\s+order|the\s+order|it))*"
     )
     confirmations = re.compile(
         rf"^({_CONFIRM_CORE}){_CONFIRM_TRAILING}\s*[,!.]*$", re.I
