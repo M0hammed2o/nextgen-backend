@@ -525,25 +525,6 @@ async def _handle_message(
                 None,
             )
 
-    # ── CONFIRMING_ORDER catch-all: block any LLM dispatch while cart is locked ──
-    # If neither is_confirmation() nor is_negation() matched above, we must
-    # NOT fall through to _handle_with_llm. That would allow add_items /
-    # remove_item / replace_item to mutate the live cart while confirmed_cart
-    # is already locked — producing an inconsistent order summary.
-    if current_state == ConversationState.CONFIRMING_ORDER.value:
-        logger.warning(
-            "HANDLE_BRANCH: CONFIRMING_ORDER catch-all — ambiguous message, re-prompting"
-        )
-        summary = state_machine.cart_summary_text(session, business.currency)
-        total = state_machine.cart_total_cents(session)
-        order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
-        delivery_fee = business.delivery_fee_cents if order_mode == "DELIVERY" else 0
-        return (
-            "Please reply *yes* to confirm your order or *no* to make changes.\n\n"
-            + responses.ask_confirmation_response(summary, total, delivery_fee, order_mode, business.currency),
-            False, None, None, None,
-        )
-
     # ── Collecting details state ─────────────────────────────────────────
     if current_state == ConversationState.COLLECTING_DETAILS.value:
         logger.warning("HANDLE_BRANCH: COLLECTING_DETAILS state → collecting details")
@@ -660,8 +641,6 @@ async def _handle_with_llm(
             else:
                 unmatched.append(pi.name)
 
-        state_machine.transition_state(session, ConversationState.BUILDING_CART.value)
-
         response_parts: list[str] = []
         if added:
             response_parts.append("Added to your order: " + ", ".join(added) + " ✅")
@@ -670,8 +649,32 @@ async def _handle_with_llm(
                 f"Sorry, I couldn't find: {', '.join(unmatched)}. Check our menu for available items."
             )
 
-        response_parts.append("\n" + state_machine.cart_summary_text(session, business.currency))
-        response_parts.append('\nAnything else? Or say *"done"* to confirm your order.')
+        # ── State-aware transition after add_items ───────────────────────
+        # If the customer was already in CONFIRMING_ORDER (adding items mid-confirm),
+        # re-lock confirmed_cart with the updated cart and stay in CONFIRMING_ORDER
+        # so the NEXT "yes" immediately places the order without a double-confirm loop.
+        if session.state == ConversationState.CONFIRMING_ORDER.value:
+            import copy
+            updated_cart = state_machine.get_cart(session)
+            state_machine.set_context(session, "confirmed_cart", copy.deepcopy(updated_cart))
+            logger.warning(
+                "CART_RELOCKED: added items while in CONFIRMING_ORDER — "
+                "re-locked confirmed_cart with %d items, total_cents=%d",
+                len(updated_cart),
+                sum(i["line_total_cents"] for i in updated_cart),
+            )
+            order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
+            delivery_fee = business.delivery_fee_cents if order_mode == "DELIVERY" else 0
+            total = state_machine.cart_total_cents(session)
+            summary = state_machine.cart_summary_text(session, business.currency)
+            response_parts.append(
+                "\n" + responses.ask_confirmation_response(summary, total, delivery_fee, order_mode, business.currency)
+            )
+            # State stays CONFIRMING_ORDER — no transition needed
+        else:
+            state_machine.transition_state(session, ConversationState.BUILDING_CART.value)
+            response_parts.append("\n" + state_machine.cart_summary_text(session, business.currency))
+            response_parts.append('\nAnything else? Or say *"done"* to confirm your order.')
 
         return (
             "\n".join(response_parts),
