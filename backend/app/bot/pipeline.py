@@ -409,11 +409,6 @@ async def _handle_message(
             text = header + "\n\n" + text + "\n\nLet me know what you'd like to order! 😊"
         return text, False, None, None, None
 
-    if intent == MessageIntent.RECOMMENDATION:
-        logger.warning("HANDLE_BRANCH: RECOMMENDATION → deterministic popular items")
-        _, menu_items = await _load_menu(db, business.id)
-        return _handle_recommendation(menu_items, business.currency), False, None, None, None
-
     if intent == MessageIntent.SPECIALS_REQUEST:
         logger.warning("HANDLE_BRANCH: SPECIALS_REQUEST → specials_response")
         specials = await _load_specials(db, business.id)
@@ -1074,63 +1069,6 @@ async def _handle_collecting_details(
         return await _handle_order_confirmation(db, business, customer, session)
 
     return await _handle_order_confirmation(db, business, customer, session)
-
-
-def _handle_recommendation(menu_items: list, currency: str) -> str:
-    """
-    Deterministic popular-items response. Picks up to 5 active items,
-    trying to mix categories (max 2 per category). No LLM involved.
-    """
-    from shared.utils.money import format_currency
-
-    active = [i for i in menu_items if i.is_active and not i.is_deleted]
-    if not active:
-        return (
-            "Our menu is being updated right now. "
-            "Reply *menu* to see what's available! 😊"
-        )
-
-    # Collect up to 2 items per category, then up to 5 total.
-    # Items with a description are preferred (more informative).
-    by_cat: dict = {}
-    for item in active:
-        key = str(item.category_id) if item.category_id else "__none__"
-        by_cat.setdefault(key, []).append(item)
-
-    picked: list = []
-    # Round-robin across categories to ensure variety
-    cat_iters = {k: iter(v) for k, v in by_cat.items()}
-    slots_per_cat: dict = {}
-    while len(picked) < 5:
-        advanced = False
-        for key, it in list(cat_iters.items()):
-            if slots_per_cat.get(key, 0) >= 2:
-                continue
-            item = next(it, None)
-            if item is None:
-                cat_iters.pop(key)
-                continue
-            picked.append(item)
-            slots_per_cat[key] = slots_per_cat.get(key, 0) + 1
-            advanced = True
-            if len(picked) >= 5:
-                break
-        if not advanced:
-            break
-
-    # Build the response
-    _ICONS = ["🍔", "🍕", "🍗", "🥤", "🌯", "🍟", "🥗", "🍱"]
-    lines = ["Here are some of our most popular items 😊\n"]
-    for idx, item in enumerate(picked):
-        icon = _ICONS[idx % len(_ICONS)]
-        price = format_currency(item.price_cents, currency)
-        line = f"{icon} *{item.name}* — {price}"
-        if item.description:
-            line += f"\n_{item.description}_"
-        lines.append(line)
-
-    lines.append("\nWould you like to order any of these? 😊")
-    return "\n".join(lines)
 
 
 def _check_missing_details(business: Business, session) -> str | None:

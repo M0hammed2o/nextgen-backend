@@ -142,6 +142,12 @@ def needs_llm(intent: MessageIntent | None, conversation_state: str) -> bool:
     if intent in (MessageIntent.ORDER_START, MessageIntent.ORDER_ADD, MessageIntent.ORDER_REMOVE):
         return True  # LLM parses the specific items/quantities/removals
 
+    # Recommendation queries go to LLM so it can respond naturally using the
+    # full menu context in the system prompt. The RECOMMENDATION pattern only
+    # exists to prevent misrouting to MENU_REQUEST (which dumps the full menu).
+    if intent == MessageIntent.RECOMMENDATION:
+        return True
+
     # If in cart-building state, most messages need LLM for item parsing
     if conversation_state in ("BUILDING_CART", "CHOOSING_OPTIONS"):
         if intent == MessageIntent.UNKNOWN:
