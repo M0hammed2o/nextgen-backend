@@ -20,7 +20,8 @@ context_json stores:
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select, text
+from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -42,75 +43,53 @@ async def get_or_create_session(
     Get the active conversation session for this customer+business,
     or create a new one. Auto-expires stale sessions.
 
-    Uses INSERT ... ON CONFLICT DO UPDATE so concurrent webhook deliveries
-    can NEVER create two session rows — the upsert is atomic at the DB level.
-    Requires migration 0005 (UNIQUE constraint on business_id+customer_id).
-
-    Expiry reset is handled inside the SQL CASE expression:
-      - If existing row's expires_at < now  → reset state='IDLE', context_json='{}'
-      - Otherwise                           → preserve state + context_json (cart intact)
-
-    This is the only guarantee that:
-        cart shown to customer == cart used for confirmation == cart saved in order
+    Race-safe: uses INSERT … ON CONFLICT DO NOTHING so that concurrent
+    webhook deliveries cannot create duplicate session rows (relies on
+    the uq_conversation_sessions_business_customer DB constraint).
     """
     now = datetime.now(timezone.utc)
-    expires = now + timedelta(minutes=SESSION_TIMEOUT_MINUTES)
 
-    # ── Atomic upsert with inline expiry reset ───────────────────────────
+    # Ensure exactly one row exists — no-op if row already present
     await db.execute(
-        text("""
-            INSERT INTO conversation_sessions
-                (id, business_id, customer_id, state, context_json,
-                 last_activity_at, expires_at, created_at)
-            VALUES
-                (gen_random_uuid(), CAST(:biz_id AS uuid), CAST(:cust_id AS uuid),
-                 'IDLE', '{}'::jsonb, :now_ts, :expires_ts, :now_ts)
-            ON CONFLICT (business_id, customer_id)
-            DO UPDATE SET
-                last_activity_at = :now_ts,
-                expires_at       = :expires_ts,
-                state        = CASE
-                                 WHEN conversation_sessions.expires_at < :now_ts
-                                 THEN 'IDLE'
-                                 ELSE conversation_sessions.state
-                               END,
-                context_json = CASE
-                                 WHEN conversation_sessions.expires_at < :now_ts
-                                 THEN '{}'::jsonb
-                                 ELSE conversation_sessions.context_json
-                               END
-        """),
-        {
-            "biz_id": str(business_id),
-            "cust_id": str(customer_id),
-            "now_ts": now,
-            "expires_ts": expires,
-        },
+        pg_insert(ConversationSession)
+        .values(
+            business_id=business_id,
+            customer_id=customer_id,
+            state=ConversationState.IDLE.value,
+            context_json={},
+            last_activity_at=now,
+            expires_at=now + timedelta(minutes=SESSION_TIMEOUT_MINUTES),
+        )
+        .on_conflict_do_nothing(
+            constraint="uq_conversation_sessions_business_customer"
+        )
     )
-    await db.flush()
 
-    # ── Load the single guaranteed-unique row ────────────────────────────
     result = await db.execute(
-        select(ConversationSession)
-        .where(
+        select(ConversationSession).where(
             ConversationSession.business_id == business_id,
             ConversationSession.customer_id == customer_id,
         )
     )
     session = result.scalar_one()
 
+    # Reset expired session
+    if session.expires_at and session.expires_at < now:
+        session.state = ConversationState.IDLE.value
+        session.context_json = {}
+
+    session.last_activity_at = now
+    session.expires_at = now + timedelta(minutes=SESSION_TIMEOUT_MINUTES)
+    await db.flush()
+
     ctx = session.context_json or {}
     _sm_logger.warning(
-        "SESSION_LOAD: session_id=%s, business_id=%s, customer_id=%s, "
-        "state=%s, cart_items=%d, confirmed_cart_items=%d",
+        "SESSION_LOAD: session_id=%s, state=%s, cart_items=%d, confirmed_cart_items=%d",
         session.id,
-        business_id,
-        customer_id,
         session.state,
         len(ctx.get("cart", [])),
         len(ctx.get("confirmed_cart", [])),
     )
-
     return session
 
 
@@ -181,10 +160,10 @@ def remove_from_cart(session: ConversationSession, item_name: str) -> tuple[list
 
 
 def clear_cart(session: ConversationSession) -> None:
-    """Clear cart and the confirmed_cart snapshot."""
+    """Clear cart and confirmed_cart snapshot so it can't ghost into the next order."""
     ctx = dict(session.context_json or {})
     ctx["cart"] = []
-    ctx.pop("confirmed_cart", None)  # Remove snapshot so it doesn't ghost into next order
+    ctx.pop("confirmed_cart", None)
     session.context_json = ctx
     flag_modified(session, "context_json")
 

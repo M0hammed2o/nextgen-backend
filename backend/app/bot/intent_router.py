@@ -23,16 +23,17 @@ _PATTERNS: list[tuple[re.Pattern, MessageIntent]] = [
         r"sawubona|molo|hola|ola|gday)\b", re.I
     ), MessageIntent.GREETING),
 
-    # Recommendations — must come BEFORE MENU_REQUEST to prevent misrouting
+    # Recommendations — intercept BEFORE menu so "what do you recommend" never
+    # hits the menu dump. These route to the LLM for a natural response.
     (re.compile(
         r"\b(recommend|recommendation|popular|best.?sell|best.?seller|"
         r"what.?s good|what is good|what.?s nice|what.?s great|"
-        r"what.?s your best|what do you suggest|suggest|suggestion|"
+        r"what.?s your best|what do you suggest|suggest|"
         r"most ordered|fan.?fav|fan favourite|fan favorite|must.?try|"
-        r"what should i (get|order|try|have)|what.?s worth|worth trying)\b", re.I
+        r"what should i (get|order|try|have)|worth trying)\b", re.I
     ), MessageIntent.RECOMMENDATION),
 
-    # Menu requests — recommendation phrases excluded above
+    # Menu requests — recommendation phrases handled above
     (re.compile(
         r"\b(menu|food|eat|"
         r"what\s+(do\s+you\s+(have|sell|serve)|.*(have|sell|serve))|"
@@ -45,11 +46,10 @@ _PATTERNS: list[tuple[re.Pattern, MessageIntent]] = [
         r"today.?s.*special|weekly.*special)\b", re.I
     ), MessageIntent.SPECIALS_REQUEST),
 
-    # Hours — matches "trading hours", "what time do you open", "are you open", etc.
+    # Hours
     (re.compile(
-        r"\b(hours|trading|open|close|closing|opening|when.*open|what time|"
-        r"are you open|still open|operating|business hours|opening times|"
-        r"open till|until what time|what time.*close|when.*close)\b", re.I
+        r"\b(hours|open|close|closing|opening|when.*open|what time|"
+        r"are you open|still open|operating)\b", re.I
     ), MessageIntent.HOURS_REQUEST),
 
     # Location
@@ -142,9 +142,7 @@ def needs_llm(intent: MessageIntent | None, conversation_state: str) -> bool:
     if intent in (MessageIntent.ORDER_START, MessageIntent.ORDER_ADD, MessageIntent.ORDER_REMOVE):
         return True  # LLM parses the specific items/quantities/removals
 
-    # Recommendation queries go to LLM so it can respond naturally using the
-    # full menu context in the system prompt. The RECOMMENDATION pattern only
-    # exists to prevent misrouting to MENU_REQUEST (which dumps the full menu).
+    # Recommendations go to LLM for a natural conversational response
     if intent == MessageIntent.RECOMMENDATION:
         return True
 
@@ -159,25 +157,21 @@ def needs_llm(intent: MessageIntent | None, conversation_state: str) -> bool:
 def is_confirmation(text: str) -> bool:
     """
     Check if a message is a clear yes/confirmation.
-
-    Allows common trailing polite words so "yes please", "yes, go ahead!",
-    "yep thanks", "sure thing", "confirm please" all match correctly.
-    Does NOT match messages that add new content, e.g. "yes but change the chips".
+    Allows trailing polite words: "yes please", "yes please confirm order", "sure thanks".
+    Does NOT match messages that add new content: "yes but change the chips".
     """
-    _CONFIRM_CORE = (
+    _CORE = (
         r"yes|yep|yeah|yah|yebo|ja|jah|sure|sharp|confirm|confirmed|"
         r"that.?s\s+(it|all|correct|right)|looks\s+good|perfect|lekker|"
         r"100|right|cool|ok|okay|done|place\s+it|send\s+it|"
         r"go\s+ahead|let.?s\s+go|do\s+it|sounds\s+good|all\s+good|proceed"
     )
-    _CONFIRM_TRAILING = (
+    _TRAILING = (
         r"(\s+(please|thanks|thank\s+you|bru|man|mate|now|"
-        r"sure\s+thing|that.?s\s+right|great|awesome|for\s+sure|"
+        r"sure\s+thing|great|awesome|for\s+sure|"
         r"confirm|confirmed|proceed|place|order|my\s+order|the\s+order|it))*"
     )
-    confirmations = re.compile(
-        rf"^({_CONFIRM_CORE}){_CONFIRM_TRAILING}\s*[,!.]*$", re.I
-    )
+    confirmations = re.compile(rf"^({_CORE}){_TRAILING}\s*[,!.]*$", re.I)
     return bool(confirmations.match(text.strip()))
 
 

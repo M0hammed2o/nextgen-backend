@@ -350,8 +350,8 @@ async def _handle_message(
         )
         categories, items = await _load_menu(db, business.id)
 
-        # Do NOT transition away from BUILDING_CART or CONFIRMING_ORDER.
-        # Customer is browsing while mid-order — keep their order context intact.
+        # Don't transition away from BUILDING_CART or CONFIRMING_ORDER —
+        # customer is browsing mid-order. Keep their order context intact.
         _order_active_states = {
             ConversationState.BUILDING_CART.value,
             ConversationState.CONFIRMING_ORDER.value,
@@ -360,8 +360,7 @@ async def _handle_message(
         if current_state not in _order_active_states:
             state_machine.transition_state(session, ConversationState.BROWSING_MENU.value)
 
-        # Only send as image media if the URL is a direct image file (not a page/album URL).
-        # Meta requires a public URL ending in a recognised image extension.
+        # Only send image if URL is a direct image file (not a page/album URL)
         _direct_image = bool(
             menu_image_url
             and any(
@@ -385,17 +384,13 @@ async def _handle_message(
                 )
         elif menu_image_url:
             logger.warning(
-                "PIPELINE_IMAGE_SKIP: menu_image_url is not a direct image file URL "
-                "(no .jpg/.png extension) — will include as clickable link instead. "
-                "url=%s, business_id=%s",
+                "PIPELINE_IMAGE_SKIP: not a direct image URL, including as link. url=%s",
                 menu_image_url,
-                business.id,
             )
 
         text = responses.menu_response(categories, items, business.currency)
         cart = state_machine.get_cart(session)
         if current_state in _order_active_states and cart:
-            # Remind the customer their order is still intact
             text = (
                 "Here's the full menu! Your current order is still saved 🛒\n\n"
                 + text
@@ -404,7 +399,6 @@ async def _handle_message(
         else:
             header = "Here's our menu 😊"
             if menu_image_url and not _direct_image:
-                # Album/page URL — show as a clickable link in text
                 header += f"\n📷 View menu image: {menu_image_url}"
             text = header + "\n\n" + text + "\n\nLet me know what you'd like to order! 😊"
         return text, False, None, None, None
@@ -491,21 +485,14 @@ async def _handle_message(
                 "Your cart is empty. 🛒\nSay *\"menu\"* to see what we have!",
                 False, None, None, None,
             )
-        # ── CART LOCK ─────────────────────────────────────────────────────
-        # Deep-copy the live cart into confirmed_cart the moment the customer
-        # says "done". Order creation ALWAYS reads confirmed_cart, never the
-        # live cart, so no subsequent message can alter what was agreed.
+        # Lock cart snapshot — order creation always reads confirmed_cart, never live cart
         import copy
         locked = copy.deepcopy(cart)
         state_machine.set_context(session, "confirmed_cart", locked)
         logger.warning(
-            "CART_LOCKED: session_id=%s, items=%d, total_cents=%d, snapshot=%s",
-            session.id,
-            len(locked),
-            sum(i["line_total_cents"] for i in locked),
-            [(i["name"], i["quantity"], i["line_total_cents"]) for i in locked],
+            "CART_LOCKED: session_id=%s, items=%d, total_cents=%d",
+            session.id, len(locked), sum(i["line_total_cents"] for i in locked),
         )
-        # ──────────────────────────────────────────────────────────────────
         state_machine.transition_state(session, ConversationState.CONFIRMING_ORDER.value)
         summary = state_machine.cart_summary_text(session, business.currency)
         total = state_machine.cart_total_cents(session)
@@ -629,25 +616,16 @@ async def _handle_with_llm(
 
             matched_item = items_map.get(pi.name.lower())
             if not matched_item:
-                # Fuzzy fallback: prefer the LONGEST menu name that is a substring of
-                # the LLM name (e.g. "Double Smash Burger" is preferred over "Smash Burger"
-                # when the LLM says "double smash burger").
-                # We only match in one direction (menu_name ⊆ llm_name) to avoid
-                # "Smash Burger" matching when customer orders "Cheese Burger".
-                candidates: list[tuple[int, MenuItem]] = []
+                # Fuzzy: longest menu name that is a substring of the LLM name
                 llm_name_lower = pi.name.lower()
-                for menu_name, menu_item in items_map.items():
-                    if menu_name in llm_name_lower:
-                        # Require at least 60 % character overlap to avoid weak matches
-                        ratio = len(menu_name) / max(len(llm_name_lower), 1)
-                        if ratio >= 0.5:
-                            candidates.append((len(menu_name), menu_item))
+                candidates = [
+                    (len(mn), mi) for mn, mi in items_map.items()
+                    if mn in llm_name_lower and len(mn) / max(len(llm_name_lower), 1) >= 0.5
+                ]
                 if candidates:
-                    # Pick the longest (most specific) matching menu name
                     matched_item = sorted(candidates, reverse=True)[0][1]
 
             if matched_item:
-                # Clamp quantity: LLM output is untrusted. 1-20 is the allowed range.
                 safe_qty = max(1, min(int(pi.quantity or 1), 20))
                 state_machine.add_to_cart(
                     session,
@@ -670,49 +648,23 @@ async def _handle_with_llm(
                 f"Sorry, I couldn't find: {', '.join(unmatched)}. Check our menu for available items."
             )
 
-        # ── State-aware transition after add_items ───────────────────────
-        # If the customer was already in CONFIRMING_ORDER (adding items mid-confirm),
-        # re-lock confirmed_cart with the updated cart and stay in CONFIRMING_ORDER
-        # so the NEXT "yes" immediately places the order without a double-confirm loop.
-        if session.state == ConversationState.CONFIRMING_ORDER.value:
-            import copy
-            updated_cart = state_machine.get_cart(session)
-            state_machine.set_context(session, "confirmed_cart", copy.deepcopy(updated_cart))
-            logger.warning(
-                "CART_RELOCKED: added items while in CONFIRMING_ORDER — "
-                "re-locked confirmed_cart with %d items, total_cents=%d",
-                len(updated_cart),
-                sum(i["line_total_cents"] for i in updated_cart),
-            )
-            order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
-            delivery_fee = business.delivery_fee_cents if order_mode == "DELIVERY" else 0
-            total = state_machine.cart_total_cents(session)
-            summary = state_machine.cart_summary_text(session, business.currency)
-            response_parts.append(
-                "\n" + responses.ask_confirmation_response(summary, total, delivery_fee, order_mode, business.currency)
-            )
-            # State stays CONFIRMING_ORDER — no transition needed
-        else:
-            # Lock the cart immediately after items are added — this means the
-            # customer only needs ONE "yes" to place the order. If they want to
-            # edit further, the CONFIRMING_ORDER path handles it correctly.
-            import copy as _copy
-            new_cart = state_machine.get_cart(session)
-            state_machine.set_context(session, "confirmed_cart", _copy.deepcopy(new_cart))
-            state_machine.transition_state(session, ConversationState.CONFIRMING_ORDER.value)
-            logger.warning(
-                "CART_LOCKED_ON_ADD: session_id=%s, items=%d, total_cents=%d",
-                session.id,
-                len(new_cart),
-                sum(i["line_total_cents"] for i in new_cart),
-            )
-            order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
-            delivery_fee = business.delivery_fee_cents if order_mode == "DELIVERY" else 0
-            total = state_machine.cart_total_cents(session)
-            summary = state_machine.cart_summary_text(session, business.currency)
-            response_parts.append(
-                "\n" + responses.ask_confirmation_response(summary, total, delivery_fee, order_mode, business.currency)
-            )
+        # Lock cart + go to CONFIRMING_ORDER so one "yes" places the order.
+        # If already in CONFIRMING_ORDER, relock with updated cart.
+        import copy as _copy
+        updated_cart = state_machine.get_cart(session)
+        state_machine.set_context(session, "confirmed_cart", _copy.deepcopy(updated_cart))
+        state_machine.transition_state(session, ConversationState.CONFIRMING_ORDER.value)
+        logger.warning(
+            "CART_LOCKED_ON_ADD: items=%d, total_cents=%d",
+            len(updated_cart), sum(i["line_total_cents"] for i in updated_cart),
+        )
+        order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
+        delivery_fee = business.delivery_fee_cents if order_mode == "DELIVERY" else 0
+        total = state_machine.cart_total_cents(session)
+        summary = state_machine.cart_summary_text(session, business.currency)
+        response_parts.append(
+            "\n" + responses.ask_confirmation_response(summary, total, delivery_fee, order_mode, business.currency)
+        )
 
         return (
             "\n".join(response_parts),
@@ -755,91 +707,61 @@ async def _handle_with_llm(
         )
 
     if parsed.action == "replace_item" and parsed.items:
-        # Atomically remove the old item and add the new one.
-        # The LLM sends: {"remove": "Old Item Name", "add": "New Item Name", "quantity": 1}
         items_map = {i.name.lower(): i for i in items if i.is_active and not i.is_deleted}
         replaced: list[str] = []
         replace_errors: list[str] = []
 
         for pi in parsed.items:
-            remove_name = pi.remove or pi.name  # fallback for LLM that uses "name" for remove
+            remove_name = pi.remove or pi.name
             add_name = pi.add
-
             if not remove_name or not add_name:
                 replace_errors.append("couldn't parse replacement")
                 continue
-
-            # Remove old item
             _, was_removed = state_machine.remove_from_cart(session, remove_name)
-
-            # Find new item in menu
             new_item = items_map.get(add_name.lower())
             if not new_item:
-                # Fuzzy fallback — longest specific match
                 candidates = [
                     (len(mn), mi) for mn, mi in items_map.items()
                     if mn in add_name.lower() and len(mn) / max(len(add_name), 1) >= 0.5
                 ]
                 if candidates:
                     new_item = sorted(candidates, reverse=True)[0][1]
-
             if new_item:
                 safe_qty = max(1, min(int(pi.quantity or 1), 20))
                 state_machine.add_to_cart(
-                    session,
-                    menu_item_id=str(new_item.id),
-                    name=new_item.name,
-                    price_cents=new_item.price_cents,
-                    quantity=safe_qty,
+                    session, str(new_item.id), new_item.name,
+                    new_item.price_cents, safe_qty,
                     options=pi.options if pi.options else None,
                     special_instructions=pi.special_instructions,
                 )
                 replaced.append(f"{remove_name} → {new_item.name}")
             else:
-                # Couldn't find replacement — restore original if it was removed
                 if was_removed and remove_name:
                     orig = items_map.get(remove_name.lower())
                     if orig:
-                        safe_qty = max(1, min(int(pi.quantity or 1), 20))
-                        state_machine.add_to_cart(
-                            session, str(orig.id), orig.name, orig.price_cents, safe_qty
-                        )
+                        state_machine.add_to_cart(session, str(orig.id), orig.name, orig.price_cents, 1)
                 replace_errors.append(f"couldn't find '{add_name}' on the menu")
 
         cart = state_machine.get_cart(session)
-
         parts = []
         if replaced:
             parts.append("Updated: " + ", ".join(replaced) + " ✅")
         if replace_errors:
             parts.append("Sorry: " + "; ".join(replace_errors) + ". Please check the menu.")
         if cart:
-            if session.state == ConversationState.CONFIRMING_ORDER.value:
-                import copy as _copy
-                state_machine.set_context(session, "confirmed_cart", _copy.deepcopy(cart))
-                order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
-                delivery_fee = business.delivery_fee_cents if order_mode == "DELIVERY" else 0
-                total = state_machine.cart_total_cents(session)
-                summary = state_machine.cart_summary_text(session, business.currency)
-                parts.append("\n" + responses.ask_confirmation_response(
-                    summary, total, delivery_fee, order_mode, business.currency
-                ))
-                # Stay in CONFIRMING_ORDER — no transition
-            else:
-                state_machine.transition_state(session, ConversationState.BUILDING_CART.value)
-                parts.append("\n" + state_machine.cart_summary_text(session, business.currency))
-                parts.append('\nAnything else? Or say *"done"* to confirm.')
+            import copy as _copy
+            state_machine.set_context(session, "confirmed_cart", _copy.deepcopy(cart))
+            state_machine.transition_state(session, ConversationState.CONFIRMING_ORDER.value)
+            order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
+            delivery_fee = business.delivery_fee_cents if order_mode == "DELIVERY" else 0
+            total = state_machine.cart_total_cents(session)
+            summary = state_machine.cart_summary_text(session, business.currency)
+            parts.append("\n" + responses.ask_confirmation_response(summary, total, delivery_fee, order_mode, business.currency))
         else:
             state_machine.transition_state(session, ConversationState.IDLE.value)
             parts.append("Your cart is now empty. What would you like to order?")
 
-        return (
-            "\n".join(parts),
-            True,
-            llm_response.total_tokens,
-            llm_response.cost_cents,
-            llm_response.provider,
-        )
+        return ("\n".join(parts), True, llm_response.total_tokens, llm_response.cost_cents, llm_response.provider)
 
     if parsed.action == "confirm_order":
         cart = state_machine.get_cart(session)
@@ -852,19 +774,9 @@ async def _handle_with_llm(
                 llm_response.provider,
             )
 
-        # ── HARD RULE: LLM output can NEVER trigger order creation. ──────
-        # Only deterministic is_confirmation() may place an order.
-        # Regardless of what action the LLM returns, if we're in
-        # CONFIRMING_ORDER state we re-show the summary and ask again.
-        # The customer must send a plain "yes"/"done"/etc. that passes
-        # the is_confirmation() check in _handle_message — not the LLM.
-        logger.warning(
-            "LLM_CONFIRM_BLOCKED: LLM returned confirm_order but order "
-            "creation is reserved for deterministic is_confirmation() path. "
-            "Re-prompting. session_id=%s, state=%s",
-            session.id,
-            session.state,
-        )
+        # LLM-returned confirm_order never creates an order directly.
+        # Only deterministic is_confirmation() in _handle_message may do that.
+        logger.warning("LLM_CONFIRM_BLOCKED: re-prompting. session_id=%s", session.id)
         state_machine.transition_state(session, ConversationState.CONFIRMING_ORDER.value)
         summary = state_machine.cart_summary_text(session, business.currency)
         total = state_machine.cart_total_cents(session)
