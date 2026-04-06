@@ -563,6 +563,18 @@ async def _handle_message(
         logger.warning("HANDLE_BRANCH: COLLECTING_DETAILS state → collecting details")
         return await _handle_collecting_details(db, business, customer, session, msg_text)
 
+    # ── Recommendation acceptance ─────────────────────────────────────────
+    # Must come BEFORE the LLM gate: when the customer says "I'll take those"
+    # after a recommendation, we convert stored items to real cart entries
+    # without an LLM call (deterministic, no hallucination possible).
+    _recommended = state_machine.get_context(session, "recommended_items")
+    if _recommended and intent_router.is_recommendation_acceptance(msg_text):
+        logger.warning(
+            "REC_ACCEPT: acceptance detected, %d stored item(s), session_id=%s, msg=%r",
+            len(_recommended), session.id, msg_text[:60],
+        )
+        return await _handle_recommendation_acceptance(db, business, customer, session, _recommended)
+
     # ── LLM-required intents (ordering, ambiguous) ───────────────────────
     needs_llm_call = intent_router.needs_llm(intent, current_state)
     logger.warning(
@@ -674,6 +686,7 @@ async def _handle_with_llm(
             )
 
     pending_options = state_machine.get_context(session, "pending_options")
+    recommended_items = state_machine.get_context(session, "recommended_items")
     system_prompt = prompt_builder.build_system_prompt(
         business,
         categories,
@@ -682,6 +695,7 @@ async def _handle_with_llm(
         session.state,
         cart,
         pending_options=pending_options,
+        recommended_items=recommended_items,
     )
 
     from backend.app.llm.provider import get_llm_provider
@@ -866,6 +880,33 @@ async def _handle_with_llm(
 
         return ("\n".join(parts), True, llm_response.total_tokens, llm_response.cost_cents, llm_response.provider)
 
+    if parsed.action == "recommend_items" and parsed.items:
+        # Store recommended items in session so customer can accept without re-asking LLM
+        rec_items = []
+        for pi in parsed.items:
+            if pi.name:
+                rec_items.append({
+                    "name": pi.name,
+                    "quantity": pi.quantity or 1,
+                    "options": pi.options if pi.options else None,
+                    "special_instructions": pi.special_instructions,
+                })
+        if rec_items:
+            state_machine.set_context(session, "recommended_items", rec_items)
+            logger.warning(
+                "REC_STORED: stored %d recommended item(s) in session: %r, session_id=%s",
+                len(rec_items), [r["name"] for r in rec_items], session.id,
+            )
+        # Do NOT add to cart — customer must accept first
+        state_machine.transition_state(session, ConversationState.BROWSING_MENU.value)
+        return (
+            parsed.message,
+            True,
+            llm_response.total_tokens,
+            llm_response.cost_cents,
+            llm_response.provider,
+        )
+
     if parsed.action == "ask_options":
         # LLM needs clarification (e.g. size) before adding an item.
         # Save the pending item(s) so the CHOOSING_OPTIONS handler can resolve them.
@@ -945,6 +986,22 @@ async def _handle_with_llm(
             llm_response.provider,
         )
 
+    # ── Catch-all: chitchat or unknown action ────────────────────────────
+    # Safety guard: warn loudly when the LLM sends conversational text while
+    # the session has an active cart. This is the "fake order summary" bug path.
+    # We do NOT suppress the message — it could be a legitimate clarification —
+    # but the log entry provides proof of what happened.
+    active_cart = state_machine.get_cart(session)
+    if active_cart:
+        logger.warning(
+            "CHITCHAT_WITH_ACTIVE_CART: action=%r, cart_items=%d, state=%s, session_id=%s — "
+            "LLM returned no cart mutation. Cart unchanged. msg_preview=%r",
+            parsed.action,
+            len(active_cart),
+            session.state,
+            session.id,
+            parsed.message[:80],
+        )
     return (
         parsed.message,
         True,
@@ -1069,6 +1126,93 @@ async def _handle_order_confirmation(
     state_machine.transition_state(session, ConversationState.ORDER_PLACED.value)
 
     return response_text, False, None, None, None
+
+
+async def _handle_recommendation_acceptance(
+    db: AsyncSession,
+    business: Business,
+    customer: Customer,
+    session,
+    recommended_items: list[dict],
+) -> tuple[str, bool, int | None, int | None, str | None]:
+    """
+    Customer accepted the bot's recommendation.
+    Convert stored recommended_items into real cart entries using add_to_cart,
+    then lock the cart and go to CONFIRMING_ORDER.
+    """
+    _, items = await _load_menu(db, business.id)
+    items_map = {i.name.lower(): i for i in items if i.is_active and not i.is_deleted}
+
+    added: list[str] = []
+    unmatched: list[str] = []
+
+    for rec in recommended_items:
+        name = rec.get("name", "")
+        matched = items_map.get(name.lower())
+        if not matched:
+            # Fuzzy fallback
+            candidates = [
+                (len(mn), mi) for mn, mi in items_map.items()
+                if mn in name.lower() and len(mn) / max(len(name), 1) >= 0.5
+            ]
+            if candidates:
+                matched = sorted(candidates, reverse=True)[0][1]
+
+        if matched:
+            safe_qty = max(1, min(int(rec.get("quantity") or 1), 20))
+            state_machine.add_to_cart(
+                session,
+                menu_item_id=str(matched.id),
+                name=matched.name,
+                price_cents=matched.price_cents,
+                quantity=safe_qty,
+                options=rec.get("options"),
+                special_instructions=rec.get("special_instructions"),
+            )
+            added.append(f"{safe_qty}x {matched.name}")
+            logger.warning(
+                "REC_ACCEPT_ADDED: %dx %s (price_cents=%d), session_id=%s",
+                safe_qty, matched.name, matched.price_cents, session.id,
+            )
+        else:
+            unmatched.append(name)
+            logger.warning(
+                "REC_ACCEPT_UNMATCHED: %r not found in menu, session_id=%s",
+                name, session.id,
+            )
+
+    # Clear the stored recommendation regardless of outcome
+    state_machine.set_context(session, "recommended_items", None)
+
+    if not added:
+        return (
+            "Sorry, I couldn't find those items on the menu. Say *\"menu\"* to browse what's available.",
+            False, None, None, None,
+        )
+
+    # Lock cart and move to CONFIRMING_ORDER
+    import copy as _copy
+    updated_cart = state_machine.get_cart(session)
+    state_machine.set_context(session, "confirmed_cart", _copy.deepcopy(updated_cart))
+    state_machine.transition_state(session, ConversationState.CONFIRMING_ORDER.value)
+    logger.warning(
+        "REC_ACCEPT_CART_LOCKED: items=%d, total_cents=%d, session_id=%s",
+        len(updated_cart), sum(i["line_total_cents"] for i in updated_cart), session.id,
+    )
+
+    order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
+    total = state_machine.cart_total_cents(session)
+    summary = state_machine.cart_summary_text(session, business.currency)
+    confirm_msg = responses.ask_confirmation_response(summary, total, 0, order_mode, business.currency)
+    if order_mode == "DELIVERY":
+        confirm_msg += "\n_Delivery fee will be confirmed by our team._"
+
+    parts = ["Added to your order: " + ", ".join(added) + " ✅"]
+    if unmatched:
+        parts.append(f"Sorry, I couldn't find: {', '.join(unmatched)}.")
+    parts.append("\n" + confirm_msg)
+
+    return ("\n".join(parts), False, None, None, None)
 
 
 async def _handle_choosing_order_mode(

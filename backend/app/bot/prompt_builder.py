@@ -24,6 +24,7 @@ def build_system_prompt(
     conversation_state: str,
     cart: list[dict],
     pending_options: list[dict] | None = None,
+    recommended_items: list[dict] | None = None,
 ) -> str:
     """
     Build a constrained system prompt for the LLM.
@@ -33,6 +34,7 @@ def build_system_prompt(
     specials_text = _format_specials_for_prompt(specials)
     cart_text = _format_cart_for_prompt(cart, business.currency)
     pending_text = _format_pending_options_for_prompt(pending_options)
+    recommended_text = _format_recommended_items_for_prompt(recommended_items)
 
     return f"""You are the WhatsApp ordering assistant for {business.name}.
 You help customers browse the menu, build orders, and answer questions.
@@ -64,6 +66,7 @@ Order mode: {"Dine-in/Pickup only" if business.order_in_only else "Pickup" + (" 
 State: {conversation_state}
 {f"Current cart:{chr(10)}{cart_text}" if cart else "Cart: empty"}
 {f"═══ PENDING ITEM (awaiting option choice) ═══{chr(10)}{pending_text}{chr(10)}The customer's next message answers the option question above. Resolve it and return add_items with the chosen option filled in." if pending_text else ""}
+{f"═══ PREVIOUSLY RECOMMENDED ITEMS ═══{chr(10)}{recommended_text}{chr(10)}These items were recommended to the customer. If the customer now accepts (says yes/take those/I'll have that), use add_items for all of them. If they add more items too, include both recommended AND new items in add_items." if recommended_text else ""}
 
 ═══ YOUR TASK ═══
 Based on the customer's message, respond naturally AND output a JSON action block.
@@ -77,15 +80,18 @@ ACTION must be one of:
 - "add_items" — customer wants to add items. items = [{{"name": "exact menu item name", "quantity": 1, "options": {{}}, "special_instructions": ""}}]
 - "remove_item" — customer wants to remove an item. items = [{{"name": "item to remove"}}]
 - "replace_item" — customer wants to swap one item for another (e.g. "change my Coke to a Sprite", "replace chips with cheesy chips"). items = [{{"remove": "exact name to remove", "add": "exact name to add", "quantity": 1, "options": {{}}, "special_instructions": ""}}]
+- "recommend_items" — you are recommending items the customer should try. items = [{{"name": "exact menu item name", "quantity": 1, "options": {{}}, "special_instructions": ""}}]. Items are NOT added to cart yet — customer must confirm. ALWAYS use this action when making recommendations, never chitchat.
 - "confirm_order" — customer confirmed the order
 - "cancel_order" — customer wants to cancel
 - "ask_options" — need to clarify size/options before adding
-- "chitchat" — just responding to a question/greeting, no cart changes
+- "chitchat" — just responding to a question/greeting with NO ordering intent and NO item recommendations. NEVER use chitchat if you are recommending menu items.
 - "handoff" — customer needs human help
 
 IMPORTANT: The "name" field in items MUST exactly match a menu item name from the menu above.
 For "replace_item", both "remove" and "add" must exactly match menu item names.
 Use "replace_item" whenever the customer says: change X to Y, swap X for Y, instead of X give me Y.
+Use "recommend_items" (never "chitchat") whenever you suggest specific menu items to a customer.
+NEVER summarize or echo back cart contents in a chitchat message — the system builds all order summaries from the real cart.
 """
 
 
@@ -196,6 +202,17 @@ def _format_cart_for_prompt(cart: list[dict], currency: str) -> str:
         lines.append(f"  {item['quantity']}x {item['name']} = {price}")
     total = sum(i["line_total_cents"] for i in cart)
     lines.append(f"  Subtotal: {format_currency(total, currency)}")
+    return "\n".join(lines)
+
+
+def _format_recommended_items_for_prompt(recommended_items: list[dict] | None) -> str:
+    """Format previously recommended items for system prompt context."""
+    if not recommended_items:
+        return ""
+    lines = []
+    for r in recommended_items:
+        line = f"- {r['name']} (qty: {r.get('quantity', 1)})"
+        lines.append(line)
     return "\n".join(lines)
 
 

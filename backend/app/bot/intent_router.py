@@ -182,3 +182,34 @@ def is_negation(text: str) -> bool:
         r"cancel\s+that|scratch\s+that|never\s+mind|nevermind)\s*[,!.]*$", re.I
     )
     return bool(negations.match(text.strip()))
+
+
+def is_recommendation_acceptance(text: str) -> bool:
+    """
+    Check if a message is accepting a prior recommendation from the bot.
+    Only matches messages that are clearly about the recommendation, not
+    generic confirmations (those are handled by is_confirmation in CONFIRMING_ORDER).
+
+    Examples that match:
+      "I'll take what you recommend"    "ok I'll have that"
+      "take the recommendation"         "I'll take those"
+      "give me what you recommended"    "I'll go with that"
+      "sounds good I'll take those"     "that works for me"
+    """
+    pattern = re.compile(
+        r"^("
+        # explicit "take/have/get what you recommend/suggest/said"
+        r"i.?ll?\s+(take|have|get|go\s+with)\s+(what\s+you\s+(recommend\w*|suggest\w*|said)|"
+        r"those?|that|your\s+recommendation\w*|the\s+recommendation\w*)"
+        r"|take\s+(the\s+)?(recommendation\w*|those?|that|what\s+you\s+(recommend\w*|suggest\w*))"
+        r"|give\s+me\s+(what\s+you\s+(recommend\w*|suggest\w*)|those?|that)"
+        r"|i.?ll?\s+have\s+(what\s+you.{0,15}(recommend\w*|suggest\w*)|those?|that)"
+        r"|i.?ll?\s+go\s+with\s+(those?|that|your\s+\w+|the\s+\w+)"
+        r"|go\s+with\s+(those?|that|your\s+recommendation\w*|the\s+recommendation\w*)"
+        # short acceptance with explicit reference to "those"
+        r"|(ok|okay|sure|yes|yeah|yep)\s*[,.]?\s*i.?ll?\s+(take|have|get)\s+(those?|that|them)"
+        r"|(ok|okay|sure)\s*[,.]?\s*(give\s+me\s+(those?|that)|i.?ll?\s+go\s+with\s+(those?|that))"
+        r")\s*[.!]*$",
+        re.I
+    )
+    return bool(pattern.match(text.strip()))
