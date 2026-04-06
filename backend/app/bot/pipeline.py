@@ -655,6 +655,79 @@ def _find_size_variants(msg_text: str, menu_items: list) -> tuple[str | None, li
     return None, []
 
 
+def _parse_quantity_before(msg_lower: str, item_start: int) -> int:
+    """Return the quantity token immediately before the item match, defaulting to 1."""
+    prefix = msg_lower[:item_start].rstrip()
+    if not prefix:
+        return 1
+    tokens = prefix.split()
+    if not tokens:
+        return 1
+    last = tokens[-1].rstrip(".,")
+    if last.isdigit():
+        return max(1, min(int(last), 20))
+    _WORD_NUMS = {
+        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+        "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    }
+    if last in _WORD_NUMS:
+        return _WORD_NUMS[last]
+    return 1
+
+
+def _extract_items_from_message(
+    msg_text: str,
+    menu_items: list,
+) -> list[tuple]:
+    """
+    Deterministic pre-LLM item extraction.
+
+    Scans the customer message for exact menu item names (case-insensitive,
+    word-boundary-safe). Returns a list of (MenuItem, quantity) tuples.
+    Longest item names are tested first so "Cheesy Chips" wins over "Chips".
+    Each item is matched at most once per message.
+    Returns [] when no confident match is found — caller falls back to LLM.
+    """
+    active = [i for i in menu_items if i.is_active and not i.is_deleted]
+    if not active:
+        return []
+
+    msg_lower = msg_text.lower()
+    # Longest names first — prevents "Chips" shadowing "Cheesy Chips"
+    active_sorted = sorted(active, key=lambda i: len(i.name), reverse=True)
+
+    matched: list[tuple] = []
+    consumed: set[int] = set()
+
+    for item in active_sorted:
+        name_lower = item.name.lower()
+        if len(name_lower) < 2:
+            continue  # skip pathologically short item names
+        start = 0
+        while True:
+            idx = msg_lower.find(name_lower, start)
+            if idx == -1:
+                break
+            end = idx + len(name_lower)
+            span = set(range(idx, end))
+            if span & consumed:
+                start = idx + 1
+                continue
+            # Word-boundary guard: character immediately before/after must not be alpha
+            # prevents "Tea" matching inside "Steak"
+            before_ok = idx == 0 or not msg_lower[idx - 1].isalpha()
+            after_ok = end == len(msg_lower) or not msg_lower[end].isalpha()
+            if not (before_ok and after_ok):
+                start = idx + 1
+                continue
+            qty = _parse_quantity_before(msg_lower, idx)
+            matched.append((item, qty))
+            consumed |= span
+            break  # each item matched at most once per message
+
+    return matched
+
+
 async def _handle_with_llm(
     db: AsyncSession,
     business: Business,
@@ -685,6 +758,50 @@ async def _handle_with_llm(
                 f"Which *{base_name.title()}* would you like?\n{size_options}",
                 False, None, None, None,
             )
+
+    # ── Deterministic item extraction (pre-LLM, ORDER_START / ORDER_ADD only) ──
+    # If one or more active menu items are confidently found in the message,
+    # add them directly to cart and skip the LLM entirely.
+    # CHOOSING_OPTIONS is excluded — the LLM must resolve the pending option.
+    if (
+        intent in (MessageIntent.ORDER_START, MessageIntent.ORDER_ADD)
+        and session.state != ConversationState.CHOOSING_OPTIONS.value
+    ):
+        det_matches = _extract_items_from_message(msg_text, items)
+        if det_matches:
+            det_added: list[str] = []
+            for det_item, det_qty in det_matches:
+                state_machine.add_to_cart(
+                    session,
+                    menu_item_id=str(det_item.id),
+                    name=det_item.name,
+                    price_cents=det_item.price_cents,
+                    quantity=det_qty,
+                    options=None,
+                    special_instructions=None,
+                )
+                det_added.append(f"{det_qty}x {det_item.name}")
+            logger.warning(
+                "DET_MATCH: added %d item(s) deterministically: %r, session_id=%s",
+                len(det_added), det_added, session.id,
+            )
+            import copy as _copy
+            updated_cart = state_machine.get_cart(session)
+            state_machine.set_context(session, "confirmed_cart", _copy.deepcopy(updated_cart))
+            state_machine.transition_state(session, ConversationState.CONFIRMING_ORDER.value)
+            logger.warning(
+                "CART_LOCKED_DET: items=%d, total_cents=%d, session_id=%s",
+                len(updated_cart), sum(i["line_total_cents"] for i in updated_cart), session.id,
+            )
+            order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
+            total = state_machine.cart_total_cents(session)
+            summary = state_machine.cart_summary_text(session, business.currency)
+            confirm_msg = responses.ask_confirmation_response(summary, total, 0, order_mode, business.currency)
+            if order_mode == "DELIVERY":
+                confirm_msg += "\n_Delivery fee will be confirmed by our team._"
+            parts = ["Added to your order: " + ", ".join(det_added) + " ✅"]
+            parts.append("\n" + confirm_msg)
+            return ("\n".join(parts), False, None, None, None)
 
     pending_options = state_machine.get_context(session, "pending_options")
     recommended_items = state_machine.get_context(session, "recommended_items")
