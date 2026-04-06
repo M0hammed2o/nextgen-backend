@@ -546,7 +546,7 @@ async def _handle_message(
     # ── Choosing options state (e.g. "what size?") ──────────────────────
     if current_state == ConversationState.CHOOSING_OPTIONS.value:
         logger.warning("HANDLE_BRANCH: CHOOSING_OPTIONS → LLM resolves pending item options")
-        return await _handle_with_llm(db, business, customer, session, msg_text)
+        return await _handle_with_llm(db, business, customer, session, msg_text, intent=intent)
 
     # ── Choosing order mode (pickup vs delivery) ─────────────────────────
     if current_state == ConversationState.CHOOSING_ORDER_MODE.value:
@@ -592,7 +592,7 @@ async def _handle_message(
             return responses.fallback_response(business), False, None, None, None
 
         logger.warning("HANDLE_BRANCH: → LLM call")
-        return await _handle_with_llm(db, business, customer, session, msg_text)
+        return await _handle_with_llm(db, business, customer, session, msg_text, intent=intent)
 
     # ── Fallback ─────────────────────────────────────────────────────────
     logger.warning(
@@ -661,6 +661,7 @@ async def _handle_with_llm(
     customer: Customer,
     session,
     msg_text: str,
+    intent: MessageIntent | None = None,
 ) -> tuple[str, bool, int | None, int | None, str | None]:
     """Call LLM with conversation history, parse response, update cart/state."""
     categories, items = await _load_menu(db, business.id)
@@ -980,6 +981,29 @@ async def _handle_with_llm(
         return (
             "Let me connect you with our team. 👋\n"
             "A staff member will assist you shortly. Please hang tight!",
+            True,
+            llm_response.total_tokens,
+            llm_response.cost_cents,
+            llm_response.provider,
+        )
+
+    # ── Order-mutation guard ─────────────────────────────────────────────
+    # If the intent was clearly an ordering message (ORDER_START / ORDER_ADD)
+    # but the LLM returned an action that doesn't mutate the cart, we must NOT
+    # show the LLM's message — it is almost certainly a fake order summary.
+    # Return a controlled retry prompt instead.
+    _ORDER_MUTATION_ACTIONS = {"add_items", "remove_item", "replace_item", "ask_options"}
+    _ORDER_INTENTS = {MessageIntent.ORDER_START, MessageIntent.ORDER_ADD}
+    if intent in _ORDER_INTENTS and parsed.action not in _ORDER_MUTATION_ACTIONS:
+        logger.warning(
+            "ORDER_MUTATION_MISSED: intent=%s parsed_action=%s state=%s msg=%r",
+            intent.value if intent else "None",
+            parsed.action,
+            session.state,
+            msg_text[:80],
+        )
+        return (
+            "Sorry, I didn't catch the items properly. Please tell me exactly what you'd like to add 😊",
             True,
             llm_response.total_tokens,
             llm_response.cost_cents,
