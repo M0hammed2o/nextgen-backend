@@ -852,9 +852,15 @@ async def _handle_with_llm(
     # If one or more active menu items are confidently found in the message,
     # add them directly to cart and skip the LLM entirely.
     # CHOOSING_OPTIONS is excluded — the LLM must resolve the pending option.
+    # CONFIRMING_ORDER is excluded — compound mutations (add + remove in one
+    # message) must be handled atomically by the LLM; the det extractor would
+    # process only the add half and return early, silently dropping the remove.
     if (
         intent in (MessageIntent.ORDER_START, MessageIntent.ORDER_ADD)
-        and session.state != ConversationState.CHOOSING_OPTIONS.value
+        and session.state not in (
+            ConversationState.CHOOSING_OPTIONS.value,
+            ConversationState.CONFIRMING_ORDER.value,
+        )
     ):
         det_matches = _extract_items_from_message(msg_text, items)
         if det_matches:
@@ -1240,6 +1246,74 @@ async def _handle_with_llm(
     )
 
 
+async def _cancel_prior_live_orders(
+    db: AsyncSession,
+    business: Business,
+    customer: Customer,
+    exclude_order_id,
+) -> None:
+    """
+    After a new order is created, cancel any prior orders from the same
+    customer that are still in the live queue (not yet in progress / done).
+    This handles the common case where the customer re-orders without the
+    session being in ORDER_PLACED state, so superseded_order_id was never set.
+    Fire-and-forget; never raises.
+    """
+    _CANCELLABLE_STATUSES = [
+        "PENDING_DELIVERY_FEE", "FEE_SENT", "NEW", "ACCEPTED",
+    ]
+    try:
+        result = await db.execute(
+            select(_Order).where(
+                _Order.business_id == business.id,
+                _Order.customer_id == customer.id,
+                _Order.id != exclude_order_id,
+                _Order.status.in_(_CANCELLABLE_STATUSES),
+            )
+        )
+        old_orders = result.scalars().all()
+        if not old_orders:
+            return
+
+        try:
+            from backend.app.db.session import get_redis
+            import json as _json
+            redis = await get_redis()
+        except Exception:
+            redis = None
+
+        for old_order in old_orders:
+            old_order.status = "CANCELLED"
+            db.add(_OrderEvent(
+                order_id=old_order.id,
+                business_id=business.id,
+                old_status=None,
+                new_status="CANCELLED",
+                reason="Superseded by new customer order",
+            ))
+            logger.warning(
+                "PRIOR_ORDER_CANCELLED: order_id=%s, old_status=%s",
+                old_order.id, old_order.status,
+            )
+            if redis:
+                try:
+                    await redis.publish(
+                        f"orders:{business.id}",
+                        _json.dumps({
+                            "type": "order_status_changed",
+                            "order_id": str(old_order.id),
+                            "old_status": "unknown",
+                            "new_status": "CANCELLED",
+                            "updated_at": datetime.now(timezone.utc).isoformat(),
+                        }),
+                    )
+                except Exception:
+                    pass
+        await db.flush()
+    except Exception:
+        logger.exception("Failed to cancel prior live orders for customer %s", customer.id)
+
+
 async def _cancel_superseded_order(
     db: AsyncSession,
     business: Business,
@@ -1368,6 +1442,7 @@ async def _handle_order_confirmation(
                 db, business, customer, session,
                 initial_status="PENDING_DELIVERY_FEE",
             )
+            await _cancel_prior_live_orders(db, business, customer, exclude_order_id=order.id)
             state_machine.set_context(session, "pending_order_id", str(order.id))
             state_machine.transition_state(session, ConversationState.WAITING_DELIVERY_FEE_APPROVAL.value)
             logger.warning(
@@ -1396,6 +1471,7 @@ async def _handle_order_confirmation(
     await _cancel_superseded_order(db, business, session)
 
     order = await order_creator.create_order_from_cart(db, business, customer, session)
+    await _cancel_prior_live_orders(db, business, customer, exclude_order_id=order.id)
 
     summary = state_machine.cart_summary_text(session, business.currency)
     response_text = responses.order_confirmation_response(

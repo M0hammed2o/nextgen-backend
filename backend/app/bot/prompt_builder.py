@@ -54,7 +54,7 @@ Name: {business.name}
 {f"Address: {business.address}" if business.address else ""}
 {f"Phone: {business.phone}" if business.phone else ""}
 Currency: {business.currency}
-Delivery: {"Available (R{:.2f} delivery fee)".format(business.delivery_fee_cents / 100) if business.delivery_enabled else "Not available"}
+Delivery: {"Available (fee confirmed by staff per order)" if business.delivery_enabled else "Not available"}
 Order mode: {"Dine-in/Pickup only" if business.order_in_only else "Pickup" + (" & Delivery" if business.delivery_enabled else "")}
 
 ═══ MENU ═══
