@@ -38,6 +38,7 @@ class PlanTier(str, enum.Enum):
 
 class OrderStatus(str, enum.Enum):
     PENDING_DELIVERY_FEE = "PENDING_DELIVERY_FEE"  # delivery order waiting for staff to set fee
+    FEE_SENT = "FEE_SENT"                          # staff set fee, waiting for customer approval
     NEW = "NEW"
     ACCEPTED = "ACCEPTED"
     IN_PROGRESS = "IN_PROGRESS"
@@ -49,7 +50,8 @@ class OrderStatus(str, enum.Enum):
 
 # Valid status transitions: {current_status: [allowed_next_statuses]}
 ORDER_STATUS_TRANSITIONS: dict[OrderStatus, list[OrderStatus]] = {
-    OrderStatus.PENDING_DELIVERY_FEE: [OrderStatus.NEW, OrderStatus.CANCELLED],
+    OrderStatus.PENDING_DELIVERY_FEE: [OrderStatus.FEE_SENT, OrderStatus.CANCELLED],
+    OrderStatus.FEE_SENT: [OrderStatus.NEW, OrderStatus.CANCELLED],
     OrderStatus.NEW: [OrderStatus.ACCEPTED, OrderStatus.CANCELLED],
     OrderStatus.ACCEPTED: [OrderStatus.IN_PROGRESS, OrderStatus.CANCELLED],
     OrderStatus.IN_PROGRESS: [OrderStatus.READY, OrderStatus.CANCELLED],
@@ -116,6 +118,7 @@ class ConversationState(str, enum.Enum):
     CONFIRMING_ORDER = "CONFIRMING_ORDER"
     COLLECTING_DETAILS = "COLLECTING_DETAILS"        # name/phone/address
     WAITING_DELIVERY_FEE_APPROVAL = "WAITING_DELIVERY_FEE_APPROVAL"  # delivery: waiting for staff to set fee
+    COLLECTING_PAYMENT = "COLLECTING_PAYMENT"                        # waiting for cash/card choice
     ORDER_PLACED = "ORDER_PLACED"
     HANDOFF = "HANDOFF"
 

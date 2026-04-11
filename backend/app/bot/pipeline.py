@@ -558,6 +558,11 @@ async def _handle_message(
         logger.warning("HANDLE_BRANCH: WAITING_DELIVERY_FEE_APPROVAL → checking fee + answer")
         return await _handle_waiting_delivery_fee(db, business, customer, session, msg_text)
 
+    # ── Collecting payment method (cash / card) ───────────────────────────
+    if current_state == ConversationState.COLLECTING_PAYMENT.value:
+        logger.warning("HANDLE_BRANCH: COLLECTING_PAYMENT → parsing payment choice")
+        return await _handle_collecting_payment(db, business, customer, session, msg_text)
+
     # ── Collecting details state ─────────────────────────────────────────
     if current_state == ConversationState.COLLECTING_DETAILS.value:
         logger.warning("HANDLE_BRANCH: COLLECTING_DETAILS state → collecting details")
@@ -610,6 +615,14 @@ _SIZE_KEYWORDS: frozenset[str] = frozenset({
     "small", "medium", "large", "regular", "xl", "xxl", "mini",
     "sm", "md", "lg", "half", "full", "single", "double",
 })
+
+# Customer shorthand → substring that must appear in a menu item name.
+# All keys and values lowercase. Add new entries here for each deployment.
+_ITEM_ALIASES: dict[str, str] = {
+    "coke":  "coca-cola",
+    "cola":  "coca-cola",
+    "wings": "wings",   # matches "Wings (6 pcs)", "Wings (12 pcs)", etc.
+}
 
 
 def _find_size_variants(msg_text: str, menu_items: list) -> tuple[str | None, list]:
@@ -687,6 +700,9 @@ def _extract_items_from_message(
     Longest item names are tested first so "Cheesy Chips" wins over "Chips".
     Each item is matched at most once per message.
     Returns [] when no confident match is found — caller falls back to LLM.
+
+    Alias pass: before normal matching, _ITEM_ALIASES is used to expand
+    customer shorthand ("coke" → look for menu items containing "coca-cola").
     """
     active = [i for i in menu_items if i.is_active and not i.is_deleted]
     if not active:
@@ -699,6 +715,32 @@ def _extract_items_from_message(
     matched: list[tuple] = []
     consumed: set[int] = set()
 
+    # ── Alias pass ────────────────────────────────────────────────────────
+    # Expand each alias that appears in the message to a menu item BEFORE
+    # running the normal substring scan, so "coke" correctly resolves to
+    # "Coca-Cola (330ml)" even though "coke" is not a substring of that name.
+    for alias, target_substr in _ITEM_ALIASES.items():
+        import re as _re
+        # Word-boundary match for the alias in the message
+        for m in _re.finditer(rf"\b{_re.escape(alias)}\b", msg_lower):
+            a_start, a_end = m.start(), m.end()
+            span = set(range(a_start, a_end))
+            if span & consumed:
+                continue
+            # Find the longest menu item whose name contains target_substr
+            candidates = [
+                item for item in active_sorted
+                if target_substr in item.name.lower()
+            ]
+            if not candidates:
+                continue
+            best = candidates[0]  # already sorted longest-first
+            qty = _parse_quantity_before(msg_lower, a_start)
+            matched.append((best, qty))
+            consumed |= span
+            break  # one alias occurrence per alias key
+
+    # ── Normal substring pass ─────────────────────────────────────────────
     for item in active_sorted:
         name_lower = item.name.lower()
         if len(name_lower) < 2:
@@ -1401,72 +1443,14 @@ async def _handle_waiting_delivery_fee(
     pending_order_id = state_machine.get_context(session, "pending_order_id")
 
     if intent_router.is_confirmation(msg_text):
-        # Mark fee approved and finalise the order
+        # Fee approved — now ask how they'll pay before finalising.
         state_machine.set_context(session, "delivery_fee_status", "APPROVED")
-        state_machine.transition_state(session, ConversationState.ORDER_PLACED.value)
-
-        # Update the pending order: set fee + total, change status to NEW
-        if pending_order_id:
-            try:
-                result = await db.execute(
-                    _sa_update(_Order)
-                    .where(
-                        _Order.id == _parse_uuid(pending_order_id),
-                        _Order.business_id == business.id,
-                    )
-                    .values(
-                        delivery_fee_cents=fee_cents,
-                        total_cents=_Order.subtotal_cents + fee_cents,
-                        status="NEW",
-                    )
-                    .returning(_Order.order_number, _Order.subtotal_cents)
-                )
-                row = result.one_or_none()
-                order_number = row.order_number if row else "—"
-                subtotal = row.subtotal_cents if row else 0
-
-                db.add(_OrderEvent(
-                    order_id=_parse_uuid(pending_order_id),
-                    business_id=business.id,
-                    old_status="PENDING_DELIVERY_FEE",
-                    new_status="NEW",
-                    reason="Customer approved delivery fee",
-                ))
-                await db.flush()
-
-                # Publish SSE so staff dashboard refreshes
-                try:
-                    from backend.app.db.session import get_redis
-                    import json as _json
-                    redis = await get_redis()
-                    await redis.publish(
-                        f"orders:{business.id}",
-                        _json.dumps({
-                            "type": "order_created",
-                            "order_id": pending_order_id,
-                            "order_number": order_number,
-                            "status": "NEW",
-                            "total_cents": subtotal + fee_cents,
-                            "created_at": datetime.now(timezone.utc).isoformat(),
-                        }),
-                    )
-                except Exception:
-                    pass
-
-                from shared.utils.money import format_currency
-                state_machine.clear_cart(session)
-                await usage_tracker.increment_usage(db, business.id, business.timezone, orders_created=1, revenue_cents=subtotal + fee_cents)
-                return (
-                    f"✅ *Order Confirmed!*\n\nOrder Number: *{order_number}*\n"
-                    f"Delivery fee: {format_currency(fee_cents, business.currency)}\n"
-                    f"💰 *Total: {format_currency(subtotal + fee_cents, business.currency)}*\n\n"
-                    f"🚗 We'll be on our way once your order is ready!",
-                    False, None, None, None,
-                )
-            except Exception:
-                logger.exception("Failed to finalise delivery order. pending_order_id=%s", pending_order_id)
-                return "Something went wrong confirming your order. Please contact us directly.", False, None, None, None
-        return "✅ Delivery fee accepted! Your order is being prepared.", False, None, None, None
+        state_machine.transition_state(session, ConversationState.COLLECTING_PAYMENT.value)
+        logger.warning("DELIVERY_FEE_APPROVED: moving to COLLECTING_PAYMENT, session_id=%s", session.id)
+        return (
+            "Great! Will you be paying *cash* 💵 or *card* 💳?",
+            False, None, None, None,
+        )
 
     if intent_router.is_negation(msg_text):
         # Cancel the pending order
@@ -1506,6 +1490,142 @@ async def _handle_waiting_delivery_fee(
         f"Reply *yes* to confirm or *no* to cancel.",
         False, None, None, None,
     )
+
+
+async def _handle_collecting_payment(
+    db: AsyncSession,
+    business: Business,
+    customer: Customer,
+    session,
+    msg_text: str,
+) -> tuple[str, bool, int | None, int | None, str | None]:
+    """
+    Customer is providing their payment method (cash / card).
+    Parse → store → then check if we still need name/phone → finalise order.
+    """
+    text_lower = msg_text.lower().strip()
+    if any(w in text_lower for w in ["cash", "notes", "money"]):
+        payment_method = "CASH_ON_COLLECTION"
+    elif any(w in text_lower for w in ["card", "eft", "tap", "swipe", "visa", "mastercard", "credit", "debit"]):
+        payment_method = "CARD"
+    else:
+        return (
+            "Please reply *cash* 💵 or *card* 💳 so we can prepare for your arrival.",
+            False, None, None, None,
+        )
+
+    state_machine.set_context(session, "payment_method", payment_method)
+    logger.warning(
+        "PAYMENT_METHOD_SET: %s, session_id=%s",
+        payment_method, session.id,
+    )
+
+    # Check if we still need name/phone (may already be set)
+    ctx = session.context_json or {}
+    already_have = {}
+    if ctx.get("customer_name") or customer.display_name:
+        already_have["customer_name"] = True
+    if ctx.get("phone_number") or customer.phone_number:
+        already_have["phone_number"] = True
+
+    details_prompt = responses.collecting_details_response(
+        business.require_customer_name,
+        business.require_phone_number,
+        False,  # delivery address already collected earlier
+        already_have,
+    )
+    if details_prompt:
+        state_machine.transition_state(session, ConversationState.COLLECTING_DETAILS.value)
+        return details_prompt, False, None, None, None
+
+    return await _finalize_pending_delivery_order(db, business, customer, session)
+
+
+async def _finalize_pending_delivery_order(
+    db: AsyncSession,
+    business: Business,
+    customer: Customer,
+    session,
+) -> tuple[str, bool, int | None, int | None, str | None]:
+    """
+    Finalise a PENDING_DELIVERY_FEE or FEE_SENT order after the customer has
+    approved the fee and provided their payment method.
+    Updates the order: sets fee, total, payment_status, status → NEW.
+    """
+    from shared.utils.money import format_currency
+
+    fee_cents = state_machine.get_context(session, "delivery_fee_cents", 0)
+    pending_order_id = state_machine.get_context(session, "pending_order_id")
+    payment_method = state_machine.get_context(session, "payment_method", "CASH_ON_COLLECTION")
+    payment_status = "CASH_ON_COLLECTION" if payment_method == "CASH_ON_COLLECTION" else "PENDING"
+
+    if pending_order_id:
+        try:
+            result = await db.execute(
+                _sa_update(_Order)
+                .where(
+                    _Order.id == _parse_uuid(pending_order_id),
+                    _Order.business_id == business.id,
+                )
+                .values(
+                    delivery_fee_cents=fee_cents,
+                    total_cents=_Order.subtotal_cents + fee_cents,
+                    status="NEW",
+                    payment_status=payment_status,
+                )
+                .returning(_Order.order_number, _Order.subtotal_cents)
+            )
+            row = result.one_or_none()
+            order_number = row.order_number if row else "—"
+            subtotal = row.subtotal_cents if row else 0
+
+            db.add(_OrderEvent(
+                order_id=_parse_uuid(pending_order_id),
+                business_id=business.id,
+                old_status="FEE_SENT",
+                new_status="NEW",
+                reason="Customer approved delivery fee and provided payment method",
+            ))
+            await db.flush()
+
+            # Publish SSE so staff dashboard refreshes
+            try:
+                from backend.app.db.session import get_redis
+                import json as _json
+                redis = await get_redis()
+                await redis.publish(
+                    f"orders:{business.id}",
+                    _json.dumps({
+                        "type": "order_created",
+                        "order_id": pending_order_id,
+                        "order_number": order_number,
+                        "status": "NEW",
+                        "total_cents": subtotal + fee_cents,
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                    }),
+                )
+            except Exception:
+                pass
+
+            state_machine.clear_cart(session)
+            state_machine.transition_state(session, ConversationState.ORDER_PLACED.value)
+            await usage_tracker.increment_usage(
+                db, business.id, business.timezone,
+                orders_created=1, revenue_cents=subtotal + fee_cents,
+            )
+            return (
+                f"✅ *Order Confirmed!*\n\nOrder Number: *{order_number}*\n"
+                f"Delivery fee: {format_currency(fee_cents, business.currency)}\n"
+                f"💰 *Total: {format_currency(subtotal + fee_cents, business.currency)}*\n"
+                f"Payment: *{'Cash on delivery' if payment_method == 'CASH_ON_COLLECTION' else 'Card'}*\n\n"
+                f"🚗 We'll be on our way once your order is ready!",
+                False, None, None, None,
+            )
+        except Exception:
+            logger.exception("Failed to finalise delivery order. pending_order_id=%s", pending_order_id)
+            return "Something went wrong confirming your order. Please contact us directly.", False, None, None, None
+
+    return "✅ Delivery confirmed! Your order is being prepared.", False, None, None, None
 
 
 def _parse_name_and_phone(text: str) -> tuple[str | None, str | None]:
@@ -1576,7 +1696,7 @@ async def _handle_collecting_details(
         still_missing = _check_missing_details(business, session)
         if still_missing:
             return still_missing, False, None, None, None
-        return await _handle_order_confirmation(db, business, customer, session)
+        return await _next_after_details(db, business, customer, session)
 
     # ── Collect phone ─────────────────────────────────────────────────────────
     if business.require_phone_number and "phone_number" not in ctx:
@@ -1587,7 +1707,7 @@ async def _handle_collecting_details(
             still_missing = _check_missing_details(business, session)
             if still_missing:
                 return still_missing, False, None, None, None
-            return await _handle_order_confirmation(db, business, customer, session)
+            return await _next_after_details(db, business, customer, session)
         return "Please send a valid phone number (e.g., 0812345678).", False, None, None, None
 
     # ── Collect delivery address ──────────────────────────────────────────────
@@ -1596,8 +1716,24 @@ async def _handle_collecting_details(
         still_missing = _check_missing_details(business, session)
         if still_missing:
             return still_missing, False, None, None, None
-        return await _handle_order_confirmation(db, business, customer, session)
+        return await _next_after_details(db, business, customer, session)
 
+    return await _next_after_details(db, business, customer, session)
+
+
+async def _next_after_details(
+    db: AsyncSession,
+    business: Business,
+    customer: Customer,
+    session,
+) -> tuple[str, bool, int | None, int | None, str | None]:
+    """
+    After all required details are collected, decide what to do next:
+    - If a pending delivery order exists (fee already approved), finalise it.
+    - Otherwise, continue normal order confirmation flow.
+    """
+    if state_machine.get_context(session, "pending_order_id"):
+        return await _finalize_pending_delivery_order(db, business, customer, session)
     return await _handle_order_confirmation(db, business, customer, session)
 
 
