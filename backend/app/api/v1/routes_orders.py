@@ -101,6 +101,7 @@ class OrderCreate(BaseModel):
 
 LIVE_STATUSES = [
     OrderStatus.PENDING_DELIVERY_FEE.value,
+    OrderStatus.FEE_SENT.value,
     OrderStatus.NEW.value,
     OrderStatus.ACCEPTED.value,
     OrderStatus.IN_PROGRESS.value,

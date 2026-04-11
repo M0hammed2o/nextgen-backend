@@ -168,7 +168,7 @@ def clear_cart(session: ConversationSession) -> None:
     for key in (
         "confirmed_cart", "order_mode", "pending_order_id",
         "delivery_fee_cents", "delivery_fee_status", "payment_method",
-        "pending_options", "recommended_items",
+        "pending_options", "recommended_items", "superseded_order_id",
     ):
         ctx.pop(key, None)
     session.context_json = ctx

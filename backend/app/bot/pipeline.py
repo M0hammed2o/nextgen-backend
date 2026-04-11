@@ -473,10 +473,12 @@ async def _handle_message(
                 "Your order is already being prepared. Please contact the store if you need to make changes. 🙏",
                 False, None, None, None,
             )
-        # Order is still modifiable — reset to BUILDING_CART and fall through
+        # Order is still modifiable — save its ID so the next confirmed order
+        # can cancel it, preventing it from lingering in the live queue.
         if last_order and last_order.status in _MODIFIABLE_STATUSES:
+            state_machine.set_context(session, "superseded_order_id", str(last_order.id))
             logger.warning(
-                "ORDER_PLACED_GUARD: order=%s status=%s, allowing modification",
+                "ORDER_PLACED_GUARD: order=%s status=%s, allowing modification — superseded_order_id saved",
                 last_order.order_number, last_order.status,
             )
         state_machine.transition_state(session, ConversationState.BUILDING_CART.value)
@@ -1001,19 +1003,18 @@ async def _handle_with_llm(
 
         cart = state_machine.get_cart(session)
         if cart:
-            if session.state == ConversationState.CONFIRMING_ORDER.value:
-                import copy as _copy
-                state_machine.set_context(session, "confirmed_cart", _copy.deepcopy(cart))
-                order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
-                total = state_machine.cart_total_cents(session)
-                summary = state_machine.cart_summary_text(session, business.currency)
-                confirm_msg = responses.ask_confirmation_response(summary, total, 0, order_mode, business.currency)
-                if order_mode == "DELIVERY":
-                    confirm_msg += "\n_Delivery fee will be confirmed by our team._"
-                msg = "Item removed. ✅\n" + confirm_msg
-            else:
-                msg = "Item removed. ✅\n" + state_machine.cart_summary_text(session, business.currency)
-                msg += '\nAnything else? Or say *"done"* to confirm.'
+            # Always resync confirmed_cart to the current cart after any removal,
+            # regardless of prior state — ensures the order snapshot is never stale.
+            import copy as _copy
+            state_machine.set_context(session, "confirmed_cart", _copy.deepcopy(cart))
+            state_machine.transition_state(session, ConversationState.CONFIRMING_ORDER.value)
+            order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
+            total = state_machine.cart_total_cents(session)
+            summary = state_machine.cart_summary_text(session, business.currency)
+            confirm_msg = responses.ask_confirmation_response(summary, total, 0, order_mode, business.currency)
+            if order_mode == "DELIVERY":
+                confirm_msg += "\n_Delivery fee will be confirmed by our team._"
+            msg = "Item removed. ✅\n" + confirm_msg
         else:
             msg = "Your cart is now empty. What would you like to order?"
             state_machine.transition_state(session, ConversationState.IDLE.value)
@@ -1239,6 +1240,59 @@ async def _handle_with_llm(
     )
 
 
+async def _cancel_superseded_order(
+    db: AsyncSession,
+    business: Business,
+    session,
+) -> None:
+    """
+    If the customer modified a previously placed order, cancel the old one
+    so it disappears from the live staff queue. Fire-and-forget; never raises.
+    """
+    superseded_id = state_machine.get_context(session, "superseded_order_id")
+    if not superseded_id:
+        return
+    try:
+        await db.execute(
+            _sa_update(_Order)
+            .where(
+                _Order.id == _parse_uuid(superseded_id),
+                _Order.business_id == business.id,
+                _Order.status.not_in(["CANCELLED", "COLLECTED", "DELIVERED"]),
+            )
+            .values(status="CANCELLED", cancelled_reason="Superseded by customer modification")
+        )
+        db.add(_OrderEvent(
+            order_id=_parse_uuid(superseded_id),
+            business_id=business.id,
+            old_status=None,
+            new_status="CANCELLED",
+            reason="Superseded by customer modification",
+        ))
+        await db.flush()
+        # Publish SSE so staff dashboard removes the old card immediately
+        try:
+            from backend.app.db.session import get_redis
+            import json as _json
+            redis = await get_redis()
+            await redis.publish(
+                f"orders:{business.id}",
+                _json.dumps({
+                    "type": "order_status_changed",
+                    "order_id": superseded_id,
+                    "old_status": "unknown",
+                    "new_status": "CANCELLED",
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }),
+            )
+        except Exception:
+            pass
+        state_machine.set_context(session, "superseded_order_id", None)
+        logger.warning("SUPERSEDED_ORDER_CANCELLED: order_id=%s, session_id=%s", superseded_id, session.id)
+    except Exception:
+        logger.exception("Failed to cancel superseded order %s", superseded_id)
+
+
 async def _handle_order_confirmation(
     db: AsyncSession,
     business: Business,
@@ -1249,8 +1303,14 @@ async def _handle_order_confirmation(
 
     # ── Ask pickup vs delivery if not yet chosen ─────────────────────────
     order_mode = state_machine.get_context(session, "order_mode", None)
+    _delivery_enabled = bool(getattr(business, "delivery_enabled", False))
+    _order_in_only = bool(getattr(business, "order_in_only", False))
+    logger.warning(
+        "ORDER_MODE_CHECK: order_mode=%s, delivery_enabled=%s, order_in_only=%s, session_id=%s",
+        order_mode, _delivery_enabled, _order_in_only, session.id,
+    )
     if order_mode is None:
-        if getattr(business, "delivery_enabled", False) and not getattr(business, "order_in_only", False):
+        if _delivery_enabled and not _order_in_only:
             state_machine.transition_state(session, ConversationState.CHOOSING_ORDER_MODE.value)
             logger.warning("ORDER_MODE_GATE: asking customer, session_id=%s", session.id)
             return (
@@ -1258,7 +1318,7 @@ async def _handle_order_confirmation(
                 False, None, None, None,
             )
         # Business only supports pickup/dine-in — set it automatically
-        order_mode = "DINE_IN" if getattr(business, "order_in_only", False) else "PICKUP"
+        order_mode = "DINE_IN" if _order_in_only else "PICKUP"
         state_machine.set_context(session, "order_mode", order_mode)
         logger.warning("ORDER_MODE_AUTO: set to %s, session_id=%s", order_mode, session.id)
 
@@ -1302,6 +1362,8 @@ async def _handle_order_confirmation(
             except DailyLimitError:
                 return "Sorry, we can't accept more orders right now. Please try again later.", False, None, None, None
 
+            await _cancel_superseded_order(db, business, session)
+
             order = await order_creator.create_order_from_cart(
                 db, business, customer, session,
                 initial_status="PENDING_DELIVERY_FEE",
@@ -1329,6 +1391,9 @@ async def _handle_order_confirmation(
             None,
             None,
         )
+
+    # ── Cancel the superseded order (customer replaced a prior order) ────
+    await _cancel_superseded_order(db, business, session)
 
     order = await order_creator.create_order_from_cart(db, business, customer, session)
 
