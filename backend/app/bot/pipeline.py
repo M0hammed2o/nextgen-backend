@@ -849,18 +849,13 @@ async def _handle_with_llm(
             )
 
     # ── Deterministic item extraction (pre-LLM, ORDER_START / ORDER_ADD only) ──
-    # If one or more active menu items are confidently found in the message,
-    # add them directly to cart and skip the LLM entirely.
-    # CHOOSING_OPTIONS is excluded — the LLM must resolve the pending option.
-    # CONFIRMING_ORDER is excluded — compound mutations (add + remove in one
-    # message) must be handled atomically by the LLM; the det extractor would
-    # process only the add half and return early, silently dropping the remove.
+    # Only runs in BUILDING_CART — fast, reliable extraction with no side effects.
+    # All other states (CONFIRMING_ORDER, CHOOSING_OPTIONS, COLLECTING_DETAILS, etc.)
+    # are handled by the LLM so that compound mutations, option resolution, and
+    # natural modifications ("add wings, remove cheese") work correctly.
     if (
         intent in (MessageIntent.ORDER_START, MessageIntent.ORDER_ADD)
-        and session.state not in (
-            ConversationState.CHOOSING_OPTIONS.value,
-            ConversationState.CONFIRMING_ORDER.value,
-        )
+        and session.state == ConversationState.BUILDING_CART.value
     ):
         det_matches = _extract_items_from_message(msg_text, items)
         if det_matches:
