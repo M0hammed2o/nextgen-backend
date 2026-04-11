@@ -28,7 +28,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from shared.enums import ConversationState
 from shared.models.customer import ConversationSession
 
-SESSION_TIMEOUT_MINUTES = 30
+SESSION_TIMEOUT_MINUTES = 60
 
 import logging
 _sm_logger = logging.getLogger("nextgen.bot.state_machine")
@@ -160,10 +160,17 @@ def remove_from_cart(session: ConversationSession, item_name: str) -> tuple[list
 
 
 def clear_cart(session: ConversationSession) -> None:
-    """Clear cart and confirmed_cart snapshot so it can't ghost into the next order."""
+    """Clear cart, confirmed_cart, and all order-specific context so the next
+    order starts completely fresh. Customer name/phone are kept to avoid
+    re-collecting them on repeat orders."""
     ctx = dict(session.context_json or {})
     ctx["cart"] = []
-    ctx.pop("confirmed_cart", None)
+    for key in (
+        "confirmed_cart", "order_mode", "pending_order_id",
+        "delivery_fee_cents", "delivery_fee_status", "payment_method",
+        "pending_options", "recommended_items",
+    ):
+        ctx.pop(key, None)
     session.context_json = ctx
     flag_modified(session, "context_json")
 

@@ -455,6 +455,32 @@ async def _handle_message(
             None,
         )
 
+    # ── ORDER_PLACED guard: block add/modify if order already in progress ────
+    # Statuses that still allow modification: PENDING_DELIVERY_FEE, FEE_SENT, NEW, ACCEPTED
+    _MODIFIABLE_STATUSES = {"PENDING_DELIVERY_FEE", "FEE_SENT", "NEW", "ACCEPTED"}
+    _IN_PROGRESS_STATUSES = {"IN_PROGRESS", "READY", "COLLECTED", "DELIVERED"}
+    if (
+        current_state == ConversationState.ORDER_PLACED.value
+        and intent in (MessageIntent.ORDER_START, MessageIntent.ORDER_ADD, MessageIntent.ORDER_REMOVE)
+    ):
+        last_order = await _get_last_order(db, business.id, customer.id)
+        if last_order and last_order.status in _IN_PROGRESS_STATUSES:
+            logger.warning(
+                "ORDER_PLACED_GUARD: order=%s status=%s, blocking modification",
+                last_order.order_number, last_order.status,
+            )
+            return (
+                "Your order is already being prepared. Please contact the store if you need to make changes. 🙏",
+                False, None, None, None,
+            )
+        # Order is still modifiable — reset to BUILDING_CART and fall through
+        if last_order and last_order.status in _MODIFIABLE_STATUSES:
+            logger.warning(
+                "ORDER_PLACED_GUARD: order=%s status=%s, allowing modification",
+                last_order.order_number, last_order.status,
+            )
+        state_machine.transition_state(session, ConversationState.BUILDING_CART.value)
+
     if intent == MessageIntent.ORDER_TRACK:
         logger.warning("HANDLE_BRANCH: ORDER_TRACK → checking last order")
         last_order = await _get_last_order(db, business.id, customer.id)
@@ -688,6 +714,77 @@ def _parse_quantity_before(msg_lower: str, item_start: int) -> int:
     return 1
 
 
+def _extract_items_from_chunk(
+    chunk: str,
+    active_sorted: list,
+    global_consumed_names: set[str],
+) -> list[tuple]:
+    """
+    Run alias + substring extraction against a single message chunk.
+    `global_consumed_names` prevents the same menu item being returned twice
+    across all chunks (e.g., "burger and burger" → 1 match, not 2 — quantity
+    accumulation is handled by add_to_cart).
+    """
+    import re as _re
+    chunk_lower = chunk.strip().lower()
+    if not chunk_lower:
+        return []
+
+    matched: list[tuple] = []
+    consumed_positions: set[int] = set()
+
+    # ── Alias pass ────────────────────────────────────────────────────────
+    for alias, target_substr in _ITEM_ALIASES.items():
+        for m in _re.finditer(rf"\b{_re.escape(alias)}\b", chunk_lower):
+            a_start, a_end = m.start(), m.end()
+            span = set(range(a_start, a_end))
+            if span & consumed_positions:
+                continue
+            candidates = [
+                item for item in active_sorted
+                if target_substr in item.name.lower()
+                and item.name.lower() not in global_consumed_names
+            ]
+            if not candidates:
+                continue
+            best = candidates[0]
+            qty = _parse_quantity_before(chunk_lower, a_start)
+            matched.append((best, qty))
+            consumed_positions |= span
+            global_consumed_names.add(best.name.lower())
+            break
+
+    # ── Normal substring pass ─────────────────────────────────────────────
+    for item in active_sorted:
+        name_lower = item.name.lower()
+        if len(name_lower) < 2:
+            continue
+        if name_lower in global_consumed_names:
+            continue
+        start = 0
+        while True:
+            idx = chunk_lower.find(name_lower, start)
+            if idx == -1:
+                break
+            end = idx + len(name_lower)
+            span = set(range(idx, end))
+            if span & consumed_positions:
+                start = idx + 1
+                continue
+            before_ok = idx == 0 or not chunk_lower[idx - 1].isalpha()
+            after_ok = end == len(chunk_lower) or not chunk_lower[end].isalpha()
+            if not (before_ok and after_ok):
+                start = idx + 1
+                continue
+            qty = _parse_quantity_before(chunk_lower, idx)
+            matched.append((item, qty))
+            consumed_positions |= span
+            global_consumed_names.add(name_lower)
+            break
+
+    return matched
+
+
 def _extract_items_from_message(
     msg_text: str,
     menu_items: list,
@@ -695,79 +792,27 @@ def _extract_items_from_message(
     """
     Deterministic pre-LLM item extraction.
 
-    Scans the customer message for exact menu item names (case-insensitive,
-    word-boundary-safe). Returns a list of (MenuItem, quantity) tuples.
-    Longest item names are tested first so "Cheesy Chips" wins over "Chips".
-    Each item is matched at most once per message.
-    Returns [] when no confident match is found — caller falls back to LLM.
-
-    Alias pass: before normal matching, _ITEM_ALIASES is used to expand
-    customer shorthand ("coke" → look for menu items containing "coca-cola").
+    Splits the message on "and", "also", and "," then runs alias + substring
+    extraction per chunk. Longest menu names tested first so "Cheesy Chips"
+    wins over "Chips". Returns [] if nothing matched — caller falls back to LLM.
     """
+    import re as _re
     active = [i for i in menu_items if i.is_active and not i.is_deleted]
     if not active:
         return []
 
-    msg_lower = msg_text.lower()
-    # Longest names first — prevents "Chips" shadowing "Cheesy Chips"
+    # Longest names first
     active_sorted = sorted(active, key=lambda i: len(i.name), reverse=True)
 
-    matched: list[tuple] = []
-    consumed: set[int] = set()
+    # Split on natural item separators
+    chunks = _re.split(r"\band\b|\balso\b|,", msg_text, flags=_re.I)
 
-    # ── Alias pass ────────────────────────────────────────────────────────
-    # Expand each alias that appears in the message to a menu item BEFORE
-    # running the normal substring scan, so "coke" correctly resolves to
-    # "Coca-Cola (330ml)" even though "coke" is not a substring of that name.
-    for alias, target_substr in _ITEM_ALIASES.items():
-        import re as _re
-        # Word-boundary match for the alias in the message
-        for m in _re.finditer(rf"\b{_re.escape(alias)}\b", msg_lower):
-            a_start, a_end = m.start(), m.end()
-            span = set(range(a_start, a_end))
-            if span & consumed:
-                continue
-            # Find the longest menu item whose name contains target_substr
-            candidates = [
-                item for item in active_sorted
-                if target_substr in item.name.lower()
-            ]
-            if not candidates:
-                continue
-            best = candidates[0]  # already sorted longest-first
-            qty = _parse_quantity_before(msg_lower, a_start)
-            matched.append((best, qty))
-            consumed |= span
-            break  # one alias occurrence per alias key
+    all_matched: list[tuple] = []
+    consumed_names: set[str] = set()
+    for chunk in chunks:
+        all_matched.extend(_extract_items_from_chunk(chunk, active_sorted, consumed_names))
 
-    # ── Normal substring pass ─────────────────────────────────────────────
-    for item in active_sorted:
-        name_lower = item.name.lower()
-        if len(name_lower) < 2:
-            continue  # skip pathologically short item names
-        start = 0
-        while True:
-            idx = msg_lower.find(name_lower, start)
-            if idx == -1:
-                break
-            end = idx + len(name_lower)
-            span = set(range(idx, end))
-            if span & consumed:
-                start = idx + 1
-                continue
-            # Word-boundary guard: character immediately before/after must not be alpha
-            # prevents "Tea" matching inside "Steak"
-            before_ok = idx == 0 or not msg_lower[idx - 1].isalpha()
-            after_ok = end == len(msg_lower) or not msg_lower[end].isalpha()
-            if not (before_ok and after_ok):
-                start = idx + 1
-                continue
-            qty = _parse_quantity_before(msg_lower, idx)
-            matched.append((item, qty))
-            consumed |= span
-            break  # each item matched at most once per message
-
-    return matched
+    return all_matched
 
 
 async def _handle_with_llm(
