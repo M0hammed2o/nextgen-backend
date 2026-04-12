@@ -482,6 +482,15 @@ async def _handle_message(
                 last_order.order_number, last_order.status,
             )
         state_machine.transition_state(session, ConversationState.BUILDING_CART.value)
+        # Return a clear framing message so the customer knows they're starting a
+        # fresh replacement order. Without this the bot falls through with an empty
+        # cart and misprocesses the original ORDER_REMOVE / ORDER_ADD intent.
+        order_ref = f" (replacing {last_order.order_number})" if last_order else ""
+        return (
+            f"Got it{order_ref}! I've started a new order for you. "
+            f"Please tell me what you'd like — just send your full order again and I'll build it from scratch. 🛒",
+            False, None, None, None,
+        )
 
     if intent == MessageIntent.ORDER_TRACK:
         logger.warning("HANDLE_BRANCH: ORDER_TRACK → checking last order")
@@ -895,6 +904,19 @@ async def _handle_with_llm(
 
     pending_options = state_machine.get_context(session, "pending_options")
     recommended_items = state_machine.get_context(session, "recommended_items")
+
+    # When the customer is actively ordering (not accepting a recommendation),
+    # clear stored recommended_items so the LLM doesn't re-add them alongside
+    # the new items — that causes duplicate cart entries.
+    if intent in (MessageIntent.ORDER_START, MessageIntent.ORDER_ADD, MessageIntent.ORDER_REMOVE):
+        if recommended_items:
+            state_machine.set_context(session, "recommended_items", None)
+            recommended_items = None
+            logger.warning(
+                "REC_CLEARED: cleared recommended_items before LLM (ordering intent). session_id=%s",
+                session.id,
+            )
+
     system_prompt = prompt_builder.build_system_prompt(
         business,
         categories,
@@ -1194,12 +1216,12 @@ async def _handle_with_llm(
         )
 
     # ── Order-mutation guard ─────────────────────────────────────────────
-    # If the intent was clearly an ordering message (ORDER_START / ORDER_ADD)
-    # but the LLM returned an action that doesn't mutate the cart, we must NOT
-    # show the LLM's message — it is almost certainly a fake order summary.
-    # Return a controlled retry prompt instead.
+    # If the intent was an ordering/removal message but the LLM returned an
+    # action that doesn't mutate the cart, we must NOT show the LLM's message —
+    # it is almost certainly a fake/hallucinated order summary.
+    # Covers ORDER_START, ORDER_ADD, and ORDER_REMOVE.
     _ORDER_MUTATION_ACTIONS = {"add_items", "remove_item", "replace_item", "ask_options"}
-    _ORDER_INTENTS = {MessageIntent.ORDER_START, MessageIntent.ORDER_ADD}
+    _ORDER_INTENTS = {MessageIntent.ORDER_START, MessageIntent.ORDER_ADD, MessageIntent.ORDER_REMOVE}
     if intent in _ORDER_INTENTS and parsed.action not in _ORDER_MUTATION_ACTIONS:
         logger.warning(
             "ORDER_MUTATION_MISSED: intent=%s parsed_action=%s state=%s msg=%r",
@@ -1208,8 +1230,12 @@ async def _handle_with_llm(
             session.state,
             msg_text[:80],
         )
+        if intent == MessageIntent.ORDER_REMOVE:
+            retry_msg = "Sorry, I didn't catch which item to remove. Could you tell me the name of the item you'd like taken off? 😊"
+        else:
+            retry_msg = "Sorry, I didn't catch the items properly. Please tell me exactly what you'd like to add 😊"
         return (
-            "Sorry, I didn't catch the items properly. Please tell me exactly what you'd like to add 😊",
+            retry_msg,
             True,
             llm_response.total_tokens,
             llm_response.cost_cents,
