@@ -617,6 +617,15 @@ async def _handle_message(
         )
         return await _handle_recommendation_acceptance(db, business, customer, session, _recommended)
 
+    # Customer did NOT accept the recommendation (gate above returned early if they had).
+    # Clear it now so the LLM doesn't re-add recommended items alongside new ones.
+    if _recommended:
+        state_machine.set_context(session, "recommended_items", None)
+        logger.warning(
+            "REC_CLEARED: customer moved on, cleared recommended_items. session_id=%s",
+            session.id,
+        )
+
     # ── LLM-required intents (ordering, ambiguous) ───────────────────────
     needs_llm_call = intent_router.needs_llm(intent, current_state)
     logger.warning(
@@ -903,19 +912,10 @@ async def _handle_with_llm(
             return ("\n".join(parts), False, None, None, None)
 
     pending_options = state_machine.get_context(session, "pending_options")
+    # recommended_items is cleared in _handle_message as soon as the customer
+    # does anything other than accept the recommendation, so this will be None
+    # in all normal ordering flows.
     recommended_items = state_machine.get_context(session, "recommended_items")
-
-    # When the customer is actively ordering (not accepting a recommendation),
-    # clear stored recommended_items so the LLM doesn't re-add them alongside
-    # the new items — that causes duplicate cart entries.
-    if intent in (MessageIntent.ORDER_START, MessageIntent.ORDER_ADD, MessageIntent.ORDER_REMOVE):
-        if recommended_items:
-            state_machine.set_context(session, "recommended_items", None)
-            recommended_items = None
-            logger.warning(
-                "REC_CLEARED: cleared recommended_items before LLM (ordering intent). session_id=%s",
-                session.id,
-            )
 
     system_prompt = prompt_builder.build_system_prompt(
         business,

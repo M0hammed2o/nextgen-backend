@@ -35,6 +35,7 @@ def build_system_prompt(
     cart_text = _format_cart_for_prompt(cart, business.currency)
     pending_text = _format_pending_options_for_prompt(pending_options)
     recommended_text = _format_recommended_items_for_prompt(recommended_items)
+    state_rules_text = _format_state_rules(conversation_state)
 
     return f"""You are the WhatsApp ordering assistant for {business.name}.
 You help customers browse the menu, build orders, and answer questions.
@@ -68,7 +69,7 @@ State: {conversation_state}
 {f"═══ PENDING ITEM (awaiting option choice) ═══{chr(10)}{pending_text}{chr(10)}The customer's next message answers the option question above. Resolve it and return add_items with the chosen option filled in." if pending_text else ""}
 {f"═══ PREVIOUSLY RECOMMENDED ITEMS ═══{chr(10)}{recommended_text}{chr(10)}These items were recommended to the customer. If the customer now accepts (says yes/take those/I'll have that), use add_items for all of them. If they add more items too, include both recommended AND new items in add_items." if recommended_text else ""}
 
-═══ YOUR TASK ═══
+{f"═══ STATE-SPECIFIC RULES ═══{chr(10)}{state_rules_text}{chr(10)}" if state_rules_text else ""}═══ YOUR TASK ═══
 Based on the customer's message, respond naturally AND output a JSON action block.
 
 Your response MUST end with a JSON block on a new line in this exact format:
@@ -227,6 +228,20 @@ def _format_pending_options_for_prompt(pending_options: list[dict] | None) -> st
             line += f" — note: {p['special_instructions']}"
         lines.append(line)
     return "\n".join(lines)
+
+
+def _format_state_rules(conversation_state: str) -> str:
+    """Return extra state-specific instructions injected into the system prompt."""
+    if conversation_state == "CONFIRMING_ORDER":
+        return (
+            "The customer is currently reviewing their order (CONFIRMING_ORDER).\n"
+            "- If they say YES / confirm → use \"confirm_order\"\n"
+            "- If they want to ADD more items → you MUST use \"add_items\". NEVER use \"chitchat\" for an add request.\n"
+            "- If they want to REMOVE an item → you MUST use \"remove_item\". NEVER use \"chitchat\" for a remove request.\n"
+            "- If they want to SWAP an item → you MUST use \"replace_item\".\n"
+            "- Never summarise the cart in a chitchat message — always use the correct action."
+        )
+    return ""
 
 
 def _format_hours_for_prompt(business: Business) -> str:

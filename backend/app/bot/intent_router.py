@@ -89,8 +89,12 @@ _PATTERNS: list[tuple[re.Pattern, MessageIntent]] = [
     ), MessageIntent.ORDER_REMOVE),
 
     # Add more to cart
+    # NOTE: "also", "and", "with" are intentionally excluded here — they are too
+    # common and cause false positives on questions ("Also how is ur wings?").
+    # Those words only signal ordering intent when combined with an explicit
+    # item reference, which the LLM handles naturally via the None → LLM path.
     (re.compile(
-        r"\b(add|also|and|plus|another|more|extra|with)\b", re.I
+        r"\b(add|plus|another|extra)\b", re.I
     ), MessageIntent.ORDER_ADD),
 
     # View cart
