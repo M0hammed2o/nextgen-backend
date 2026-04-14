@@ -173,7 +173,8 @@ def is_confirmation(text: str) -> bool:
     _TRAILING = (
         r"(\s+(please|thanks|thank\s+you|bru|man|mate|now|"
         r"sure\s+thing|great|awesome|for\s+sure|"
-        r"confirm|confirmed|proceed|place|order|my\s+order|the\s+order|it))*"
+        r"confirm|confirmed|proceed|place|order|my\s+order|the\s+order|it|"
+        r"delivery|for\s+delivery|pickup|for\s+pickup|collection|for\s+collection))*"
     )
     confirmations = re.compile(rf"^({_CORE}){_TRAILING}\s*[,!.]*$", re.I)
     return bool(confirmations.match(text.strip()))

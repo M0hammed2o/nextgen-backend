@@ -458,7 +458,7 @@ async def _handle_message(
     # ── ORDER_PLACED guard: block add/modify if order already in progress ────
     # Statuses that still allow modification: PENDING_DELIVERY_FEE, FEE_SENT, NEW, ACCEPTED
     _MODIFIABLE_STATUSES = {"PENDING_DELIVERY_FEE", "FEE_SENT", "NEW", "ACCEPTED"}
-    _IN_PROGRESS_STATUSES = {"IN_PROGRESS", "READY", "COLLECTED", "DELIVERED"}
+    _IN_PROGRESS_STATUSES = {"IN_PROGRESS", "READY"}  # COLLECTED/DELIVERED are terminal — new orders allowed
     if (
         current_state == ConversationState.ORDER_PLACED.value
         and intent in (MessageIntent.ORDER_START, MessageIntent.ORDER_ADD, MessageIntent.ORDER_REMOVE)
@@ -569,6 +569,15 @@ async def _handle_message(
             is_negate,
         )
         if is_confirm:
+            # If the confirmation message mentions delivery/pickup, apply it now
+            # before entering order confirmation (e.g. "yes for delivery").
+            import re as _re2
+            if _re2.search(r"\b(delivery|deliver)\b", msg_text, _re2.I):
+                state_machine.set_context(session, "order_mode", "DELIVERY")
+                logger.warning("CONFIRM_MODE_SET: DELIVERY from confirmation msg. session_id=%s", session.id)
+            elif _re2.search(r"\b(pickup|pick\s+up|collection|collect)\b", msg_text, _re2.I):
+                state_machine.set_context(session, "order_mode", "PICKUP")
+                logger.warning("CONFIRM_MODE_SET: PICKUP from confirmation msg. session_id=%s", session.id)
             return await _handle_order_confirmation(db, business, customer, session)
         if is_negate:
             state_machine.transition_state(session, ConversationState.BUILDING_CART.value)
@@ -580,14 +589,13 @@ async def _handle_message(
                 None,
             )
         # Cart correction: customer is restating the full order with corrected quantities.
-        # Clear the cart and re-extract from scratch via LLM so quantities reset to exactly
-        # what the customer said (not stacked on top of the existing cart).
-        # State stays CONFIRMING_ORDER so deterministic extraction is skipped and LLM handles
-        # special instructions like "without tomato" correctly.
+        # Clear the cart, transition to BUILDING_CART, then call LLM with ORDER_START so that
+        # real add_to_cart() logic executes and confirmed_cart is correctly locked afterward.
         if intent_router.is_cart_correction(msg_text):
             state_machine.clear_cart(session)
+            state_machine.transition_state(session, ConversationState.BUILDING_CART.value)
             logger.warning(
-                "CART_CORRECTION: cleared cart, rebuilding via LLM. session_id=%s, msg=%r",
+                "CART_CORRECTION: cleared cart, transitioning to BUILDING_CART, rebuilding via LLM. session_id=%s, msg=%r",
                 session.id, msg_text[:80],
             )
             return await _handle_with_llm(db, business, customer, session, msg_text, intent=MessageIntent.ORDER_START)
@@ -862,7 +870,13 @@ async def _handle_with_llm(
 
     # ── Deterministic size-ambiguity check (no LLM for the question) ────────
     # Skip when already in CHOOSING_OPTIONS — customer is answering the question.
-    if session.state != ConversationState.CHOOSING_OPTIONS.value:
+    # Skip when the message already contains a size word — no ambiguity exists.
+    import re as _re
+    _SIZE_WORDS = _re.compile(r"\b(small|medium|large)\b", _re.I)
+    if (
+        session.state != ConversationState.CHOOSING_OPTIONS.value
+        and not _SIZE_WORDS.search(msg_text)
+    ):
         base_name, variants = _find_size_variants(msg_text, items)
         if base_name and variants:
             pending = [{"name": base_name, "quantity": 1, "options": None, "special_instructions": None}]
@@ -878,15 +892,22 @@ async def _handle_with_llm(
                 False, None, None, None,
             )
 
-    # ── Deterministic item extraction (pre-LLM, ORDER_START / ORDER_ADD only) ──
-    # Only runs in BUILDING_CART — fast, reliable extraction with no side effects.
-    # All other states (CONFIRMING_ORDER, CHOOSING_OPTIONS, COLLECTING_DETAILS, etc.)
-    # are handled by the LLM so that compound mutations, option resolution, and
-    # natural modifications ("add wings, remove cheese") work correctly.
-    if (
-        intent in (MessageIntent.ORDER_START, MessageIntent.ORDER_ADD)
-        and session.state == ConversationState.BUILDING_CART.value
-    ):
+    # ── Deterministic item extraction (pre-LLM, ORDER_START / ORDER_ADD) ───────
+    # For ORDER_START: runs in any non-CHOOSING_OPTIONS state so that "Can I get
+    # one Double Smash Burger" is always resolved deterministically regardless of
+    # current state (IDLE, BROWSING_MENU, BUILDING_CART, CONFIRMING_ORDER).
+    # For ORDER_ADD: BUILDING_CART only (add-ons in CONFIRMING_ORDER are handled
+    # by the separate DET_ADD_CONFIRMING block below which checks for mutation signals).
+    # CHOOSING_OPTIONS is always excluded — customer is answering a size/option question.
+    _det_states_for_add = {ConversationState.BUILDING_CART.value}
+    _det_eligible = (
+        intent == MessageIntent.ORDER_START
+        and session.state != ConversationState.CHOOSING_OPTIONS.value
+    ) or (
+        intent == MessageIntent.ORDER_ADD
+        and session.state in _det_states_for_add
+    )
+    if _det_eligible:
         det_matches = _extract_items_from_message(msg_text, items)
         if det_matches:
             det_added: list[str] = []
