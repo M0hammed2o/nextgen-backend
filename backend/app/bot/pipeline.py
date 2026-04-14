@@ -579,6 +579,18 @@ async def _handle_message(
                 None,
                 None,
             )
+        # Cart correction: customer is restating the full order with corrected quantities.
+        # Clear the cart and re-extract from scratch via LLM so quantities reset to exactly
+        # what the customer said (not stacked on top of the existing cart).
+        # State stays CONFIRMING_ORDER so deterministic extraction is skipped and LLM handles
+        # special instructions like "without tomato" correctly.
+        if intent_router.is_cart_correction(msg_text):
+            state_machine.clear_cart(session)
+            logger.warning(
+                "CART_CORRECTION: cleared cart, rebuilding via LLM. session_id=%s, msg=%r",
+                session.id, msg_text[:80],
+            )
+            return await _handle_with_llm(db, business, customer, session, msg_text, intent=MessageIntent.ORDER_START)
 
     # ── Choosing options state (e.g. "what size?") ──────────────────────
     if current_state == ConversationState.CHOOSING_OPTIONS.value:
@@ -911,6 +923,50 @@ async def _handle_with_llm(
             parts.append("\n" + confirm_msg)
             return ("\n".join(parts), False, None, None, None)
 
+    # ── Deterministic add-on in CONFIRMING_ORDER (simple add-only messages) ──
+    # Handles "Add the ice coffee", "Add wings" while reviewing cart.
+    # Only fires when the message has no remove/replace/special-instruction signals.
+    # Complex mutations (remove, swap, without) still go to LLM as before.
+    import re as _re
+    _CONFIRMING_MUTATION_SIGNALS = _re.compile(
+        r"\b(remove|take\s+off|delete|instead\s+of|replace|swap|without)\b", _re.I
+    )
+    if (
+        intent in (MessageIntent.ORDER_START, MessageIntent.ORDER_ADD)
+        and session.state == ConversationState.CONFIRMING_ORDER.value
+        and not _CONFIRMING_MUTATION_SIGNALS.search(msg_text)
+    ):
+        det_matches = _extract_items_from_message(msg_text, items)
+        if det_matches:
+            det_added: list[str] = []
+            for det_item, det_qty in det_matches:
+                state_machine.add_to_cart(
+                    session,
+                    menu_item_id=str(det_item.id),
+                    name=det_item.name,
+                    price_cents=det_item.price_cents,
+                    quantity=det_qty,
+                    options=None,
+                    special_instructions=None,
+                )
+                det_added.append(f"{det_qty}x {det_item.name}")
+            import copy as _copy
+            updated_cart = state_machine.get_cart(session)
+            state_machine.set_context(session, "confirmed_cart", _copy.deepcopy(updated_cart))
+            logger.warning(
+                "DET_ADD_CONFIRMING: added %d item(s): %r, session_id=%s",
+                len(det_added), det_added, session.id,
+            )
+            order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
+            total = state_machine.cart_total_cents(session)
+            summary = state_machine.cart_summary_text(session, business.currency)
+            confirm_msg = responses.ask_confirmation_response(summary, total, 0, order_mode, business.currency)
+            if order_mode == "DELIVERY":
+                confirm_msg += "\n_Delivery fee will be confirmed by our team._"
+            parts = ["Added: " + ", ".join(det_added) + " ✅"]
+            parts.append("\n" + confirm_msg)
+            return ("\n".join(parts), False, None, None, None)
+
     pending_options = state_machine.get_context(session, "pending_options")
     # recommended_items is cleared in _handle_message as soon as the customer
     # does anything other than accept the recommendation, so this will be None
@@ -1223,24 +1279,38 @@ async def _handle_with_llm(
     _ORDER_MUTATION_ACTIONS = {"add_items", "remove_item", "replace_item", "ask_options"}
     _ORDER_INTENTS = {MessageIntent.ORDER_START, MessageIntent.ORDER_ADD, MessageIntent.ORDER_REMOVE}
     if intent in _ORDER_INTENTS and parsed.action not in _ORDER_MUTATION_ACTIONS:
-        logger.warning(
-            "ORDER_MUTATION_MISSED: intent=%s parsed_action=%s state=%s msg=%r",
-            intent.value if intent else "None",
-            parsed.action,
-            session.state,
-            msg_text[:80],
-        )
-        if intent == MessageIntent.ORDER_REMOVE:
-            retry_msg = "Sorry, I didn't catch which item to remove. Could you tell me the name of the item you'd like taken off? 😊"
+        # Before firing the guard, check if the message actually contains menu items.
+        # An empty cart + no item names in the message = customer is asking about ordering
+        # (e.g. "Can I place an order for delivery?"), not a failed item extraction.
+        # In that case let the LLM's chitchat response through — it's correct.
+        _cart_is_empty = not state_machine.get_cart(session)
+        _has_menu_items = bool(_extract_items_from_message(msg_text, items))
+        if _cart_is_empty and not _has_menu_items:
+            logger.warning(
+                "ORDER_MUTATION_GUARD_SKIPPED: empty cart + no items in msg, letting LLM response through. "
+                "intent=%s action=%s msg=%r",
+                intent.value if intent else "None", parsed.action, msg_text[:80],
+            )
+            # Fall through to catch-all below — LLM's chitchat response is returned
         else:
-            retry_msg = "Sorry, I didn't catch the items properly. Please tell me exactly what you'd like to add 😊"
-        return (
-            retry_msg,
-            True,
-            llm_response.total_tokens,
-            llm_response.cost_cents,
-            llm_response.provider,
-        )
+            logger.warning(
+                "ORDER_MUTATION_MISSED: intent=%s parsed_action=%s state=%s msg=%r",
+                intent.value if intent else "None",
+                parsed.action,
+                session.state,
+                msg_text[:80],
+            )
+            if intent == MessageIntent.ORDER_REMOVE:
+                retry_msg = "Sorry, I didn't catch which item to remove. Could you tell me the name of the item you'd like taken off? 😊"
+            else:
+                retry_msg = "Sorry, I didn't catch the items properly. Please tell me exactly what you'd like to add 😊"
+            return (
+                retry_msg,
+                True,
+                llm_response.total_tokens,
+                llm_response.cost_cents,
+                llm_response.provider,
+            )
 
     # ── Catch-all: chitchat or unknown action ────────────────────────────
     # Safety guard: warn loudly when the LLM sends conversational text while

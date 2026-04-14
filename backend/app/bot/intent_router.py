@@ -203,17 +203,54 @@ def is_recommendation_acceptance(text: str) -> bool:
     pattern = re.compile(
         r"^("
         # explicit "take/have/get what you recommend/suggest/said"
-        r"i.?ll?\s+(take|have|get|go\s+with)\s+(what\s+you\s+(recommend\w*|suggest\w*|said)|"
+        r"i.?ll?\s+(take|have|get|go\s+with)\s+(what\s+(you|u)\s+(recommend\w*|suggest\w*|said)|"
         r"those?|that|your\s+recommendation\w*|the\s+recommendation\w*)"
-        r"|take\s+(the\s+)?(recommendation\w*|those?|that|what\s+you\s+(recommend\w*|suggest\w*))"
-        r"|give\s+me\s+(what\s+you\s+(recommend\w*|suggest\w*)|those?|that)"
-        r"|i.?ll?\s+have\s+(what\s+you.{0,15}(recommend\w*|suggest\w*)|those?|that)"
+        r"|take\s+(the\s+)?(recommendation\w*|those?|that|what\s+(you|u)\s+(recommend\w*|suggest\w*))"
+        r"|give\s+me\s+(what\s+(you|u)\s+(recommend\w*|suggest\w*)|those?|that)"
+        r"|i.?ll?\s+have\s+(what\s+(you|u).{0,15}(recommend\w*|suggest\w*)|those?|that)"
         r"|i.?ll?\s+go\s+with\s+(those?|that|your\s+\w+|the\s+\w+)"
         r"|go\s+with\s+(those?|that|your\s+recommendation\w*|the\s+recommendation\w*)"
         # short acceptance with explicit reference to "those"
         r"|(ok|okay|sure|yes|yeah|yep)\s*[,.]?\s*i.?ll?\s+(take|have|get)\s+(those?|that|them)"
         r"|(ok|okay|sure)\s*[,.]?\s*(give\s+me\s+(those?|that)|i.?ll?\s+go\s+with\s+(those?|that))"
+        # "add what you recommend" / "yes please add what u recommend" / "add those recommendations"
+        r"|(yes\s+please\s+|please\s+)?(add|give\s+me)\s+(what\s+(you|u)\s+(recommend\w*|suggest\w*)|those?\s+recommendation\w*|the\s+recommendation\w*)"
+        r"|(yes|yeah|ok|okay|sure)\s*[,.]?\s*(please\s+)?(add|give\s+me)\s+(those?|that|them|all|what\s+(you|u)\s+(recommend\w*|suggest\w*))"
         r")\s*[.!]*$",
         re.I
     )
     return bool(pattern.match(text.strip()))
+
+
+def is_cart_correction(text: str) -> bool:
+    """
+    Check if a message in CONFIRMING_ORDER is the customer restating their
+    full desired order (correcting quantities), not adding new items on top.
+
+    These should clear the cart and rebuild from scratch:
+      "No one of each item I want"
+      "I only want one of each"
+      "No, just one of each"
+      "Actually I want only one of each"
+      "Make it just one of each"
+
+    These should NOT match (simple add-ons or removals):
+      "Add an ice coffee"
+      "Remove the tomato"
+      "I want to add wings"
+    """
+    pattern = re.compile(
+        r"("
+        # "only want one/a of each/every"
+        r"(i\s+)?(only\s+want|just\s+want|want\s+only)\s+(one|1|a\s+single)\s+of\s+(each|every)"
+        # "one of each" as a standalone correction
+        r"|(no[,.]?\s+)?(just\s+)?(one|1)\s+of\s+(each|every)"
+        # "no one of each" / "no, one of each"
+        r"|(no[,.]?\s+)(one|1)\s+of\s+(each|every)"
+        # "actually/no I want only" / "make it just"
+        r"|(actually|no)[,!]?\s+(i\s+)?(only\s+want|want\s+only|just\s+want)"
+        r"|make\s+it\s+just"
+        r")",
+        re.I,
+    )
+    return bool(pattern.search(text.strip()))
