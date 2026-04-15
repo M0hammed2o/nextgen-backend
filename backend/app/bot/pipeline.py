@@ -440,8 +440,16 @@ async def _handle_message(
         return responses.hours_response(business), False, None, None, None
 
     if intent == MessageIntent.LOCATION_REQUEST:
-        logger.warning("HANDLE_BRANCH: LOCATION_REQUEST → location_response")
-        return responses.location_response(business), False, None, None, None
+        # Don't intercept when collecting details — "Address is 22 Kings Ave"
+        # means the customer is providing their delivery address, not asking
+        # for ours. Let COLLECTING_DETAILS handle it normally.
+        if current_state != ConversationState.COLLECTING_DETAILS.value:
+            logger.warning("HANDLE_BRANCH: LOCATION_REQUEST → location_response")
+            return responses.location_response(business), False, None, None, None
+        logger.warning(
+            "HANDLE_BRANCH: LOCATION_REQUEST skipped — state=COLLECTING_DETAILS, "
+            "treating as detail input. session_id=%s", session.id
+        )
 
     if intent == MessageIntent.ORDER_CANCEL:
         logger.warning("HANDLE_BRANCH: ORDER_CANCEL → clearing cart")
@@ -1608,6 +1616,23 @@ async def _handle_order_confirmation(
 
     # ── Cancel the superseded order (customer replaced a prior order) ────
     await _cancel_superseded_order(db, business, session)
+
+    # Re-lock confirmed_cart from the current live cart right before creating
+    # the order. This handles the case where replace_item updated the live cart
+    # (e.g., swapped Wings 12 pcs → 6 pcs) but the DB-persisted confirmed_cart
+    # may still reflect the older snapshot from a prior "yes" lock.
+    import copy as _copy_pu
+    _live_cart_pu = state_machine.get_cart(session)
+    if _live_cart_pu:
+        state_machine.set_context(
+            session, "confirmed_cart", _copy_pu.deepcopy(_live_cart_pu)
+        )
+        logger.warning(
+            "PICKUP_CART_RELOCK: %d item(s), total_cents=%d, session_id=%s",
+            len(_live_cart_pu),
+            sum(i["line_total_cents"] for i in _live_cart_pu),
+            session.id,
+        )
 
     order = await order_creator.create_order_from_cart(db, business, customer, session)
     await _cancel_prior_live_orders(db, business, customer, exclude_order_id=order.id)

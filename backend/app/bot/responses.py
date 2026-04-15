@@ -263,8 +263,7 @@ def collecting_details_response(
     if not missing:
         return ""  # Nothing needed
 
-    if len(missing) == 1:
-        return f"Almost there! Please send me {missing[0]}."
-    else:
-        items = ", ".join(missing[:-1]) + f" and {missing[-1]}"
-        return f"Almost there! I need {items} to complete your order."
+    # Ask for one field at a time — avoids the customer trying to send
+    # everything in one message, which breaks address/phone parsing and
+    # can trigger unintended intent handlers (e.g. LOCATION_REQUEST).
+    return f"Almost there! Please send me {missing[0]}."
