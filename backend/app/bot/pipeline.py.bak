@@ -452,11 +452,11 @@ async def _handle_message(
         )
 
     if intent == MessageIntent.ORDER_CANCEL:
-        logger.warning("HANDLE_BRANCH: ORDER_CANCEL → redirecting to phone")
+        logger.warning("HANDLE_BRANCH: ORDER_CANCEL → clearing cart")
         state_machine.clear_cart(session)
         state_machine.transition_state(session, ConversationState.IDLE.value)
         return (
-            "To cancel your order, please call the store directly and we'll sort it out for you right away! 📞",
+            "Order cancelled. Your cart has been cleared. 🗑️\nAnything else I can help with?",
             False,
             None,
             None,
