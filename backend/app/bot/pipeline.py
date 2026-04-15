@@ -1556,6 +1556,23 @@ async def _handle_order_confirmation(
 
             await _cancel_superseded_order(db, business, session)
 
+            # Re-lock confirmed_cart from the current live cart right before
+            # creating the order. Delivery orders are created several messages
+            # after the customer last said "yes" (address collection, etc.), so
+            # confirmed_cart in context can lag behind a replace_item update.
+            import copy as _copy_dlv
+            _live_cart_dlv = state_machine.get_cart(session)
+            if _live_cart_dlv:
+                state_machine.set_context(
+                    session, "confirmed_cart", _copy_dlv.deepcopy(_live_cart_dlv)
+                )
+                logger.warning(
+                    "DELIVERY_CART_RELOCK: %d item(s), total_cents=%d, session_id=%s",
+                    len(_live_cart_dlv),
+                    sum(i["line_total_cents"] for i in _live_cart_dlv),
+                    session.id,
+                )
+
             order = await order_creator.create_order_from_cart(
                 db, business, customer, session,
                 initial_status="PENDING_DELIVERY_FEE",

@@ -231,7 +231,12 @@ async def list_orders(
     if live:
         query = query.where(Order.status.in_(LIVE_STATUSES))
     elif status:
-        query = query.where(Order.status == status)
+        # Support comma-separated values e.g. ?status=COLLECTED,DELIVERED
+        statuses = [s.strip() for s in status.split(",") if s.strip()]
+        if len(statuses) == 1:
+            query = query.where(Order.status == statuses[0])
+        else:
+            query = query.where(Order.status.in_(statuses))
 
     if cursor:
         from backend.app.core.pagination import decode_cursor
