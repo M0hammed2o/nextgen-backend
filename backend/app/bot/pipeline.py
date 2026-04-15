@@ -452,10 +452,7 @@ async def _handle_message(
         )
 
     if intent == MessageIntent.ORDER_CANCEL:
-        logger.warning("HANDLE_BRANCH: ORDER_CANCEL → cancelling live orders + clearing cart")
-        # Cancel any live DB orders for this customer so the staff dashboard
-        # reflects the cancellation immediately. Fire-and-forget — never raises.
-        await _cancel_prior_live_orders(db, business, customer, exclude_order_id=None)
+        logger.warning("HANDLE_BRANCH: ORDER_CANCEL → clearing cart")
         state_machine.clear_cart(session)
         state_machine.transition_state(session, ConversationState.IDLE.value)
         return (
