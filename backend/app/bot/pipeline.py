@@ -522,10 +522,16 @@ async def _handle_message(
             )
         return "Your cart is empty. Say *\"menu\"* to see what we have! 😊", False, None, None, None
 
-    # Only intercept ORDER_CONFIRM when NOT already in the confirming state.
-    # If already in CONFIRMING_ORDER, fall through to the state handler below
-    # so that "yes" / "done" actually places the order instead of looping.
-    if intent == MessageIntent.ORDER_CONFIRM and current_state != ConversationState.CONFIRMING_ORDER.value:
+    # Only intercept ORDER_CONFIRM when NOT already in a state that manages
+    # confirmation itself. Falls through in CONFIRMING_ORDER (so "yes" places
+    # the order), WAITING_DELIVERY_FEE_APPROVAL (so "yes" approves the fee),
+    # and COLLECTING_PAYMENT (so "cash"/"card" is handled by that state).
+    _SKIP_CONFIRM_GATE_STATES = {
+        ConversationState.CONFIRMING_ORDER.value,
+        ConversationState.WAITING_DELIVERY_FEE_APPROVAL.value,
+        ConversationState.COLLECTING_PAYMENT.value,
+    }
+    if intent == MessageIntent.ORDER_CONFIRM and current_state not in _SKIP_CONFIRM_GATE_STATES:
         logger.warning("HANDLE_BRANCH: ORDER_CONFIRM → cart confirmation gate (state=%s)", current_state)
         cart = state_machine.get_cart(session)
         if not cart:
@@ -1555,6 +1561,10 @@ async def _handle_order_confirmation(
                 initial_status="PENDING_DELIVERY_FEE",
             )
             await _cancel_prior_live_orders(db, business, customer, exclude_order_id=order.id)
+            # Clear cart now — items are persisted in the order's items_json.
+            # An empty cart prevents the ORDER_CONFIRM gate from hijacking any
+            # subsequent "Yes" reply (which must go to WAITING_DELIVERY_FEE_APPROVAL).
+            state_machine.clear_cart(session)
             state_machine.set_context(session, "pending_order_id", str(order.id))
             state_machine.transition_state(session, ConversationState.WAITING_DELIVERY_FEE_APPROVAL.value)
             logger.warning(
