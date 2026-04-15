@@ -39,20 +39,22 @@ async def create_order_from_cart(
     """
     ctx = session.context_json or {}
 
-    # Prefer the locked snapshot (set at "done" time) over the live cart.
-    # This guarantees the order matches exactly what the customer approved,
-    # even if a concurrent message somehow mutated the live cart afterwards.
-    confirmed_cart = ctx.get("confirmed_cart")
+    # Always prefer the live cart — it is updated by every add/remove/replace
+    # operation and is the authoritative, most-recent state of what the customer
+    # wants.  The confirmed_cart snapshot can be stale after a replace_item swap
+    # followed by detail-collection messages, so we only fall back to it when
+    # the live cart is genuinely empty (edge-case guard).
     live_cart = ctx.get("cart", [])
-    cart = confirmed_cart or live_cart
+    confirmed_cart = ctx.get("confirmed_cart")
+    cart = live_cart or confirmed_cart
 
     logger.warning(
-        "ORDER_CREATE: session_id=%s, using_confirmed_cart=%s, "
-        "confirmed_items=%d, live_items=%d, total_cents=%d",
+        "ORDER_CREATE: session_id=%s, using_live_cart=%s, "
+        "live_items=%d, confirmed_items=%d, total_cents=%d",
         session.id,
-        confirmed_cart is not None,
-        len(confirmed_cart) if confirmed_cart else 0,
+        bool(live_cart),
         len(live_cart),
+        len(confirmed_cart) if confirmed_cart else 0,
         sum(i["line_total_cents"] for i in cart),
     )
 
