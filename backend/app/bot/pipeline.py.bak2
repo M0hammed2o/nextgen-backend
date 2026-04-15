@@ -230,49 +230,13 @@ async def _process(
 
     logger.warning(
         "PIPELINE_HOURS_CHECK: business_id=%s, hours_configured=%s, is_open=%s, "
-        "closed_text_present=%s, timezone=%s",
+        "closed_text_present=%s, timezone=%s — no closed gate applied",
         business.id,
         hours_configured,
         is_open_now,
         bool(business.closed_text and str(business.closed_text).strip()),
         business.timezone,
     )
-
-    # ── 10b. Closed gate — block all processing after hours ──────────────
-    # If the business is closed, send the closed message ONCE per customer
-    # per day, then stay completely silent for the rest of the night.
-    # This saves every LLM call and every outbound WhatsApp message.
-    if hours_configured and not is_open_now:
-        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        closed_sent_date = state_machine.get_context(session, "closed_msg_sent_date")
-        if closed_sent_date == today_str:
-            # Already notified this customer today — stay silent (zero cost)
-            logger.info(
-                "PIPELINE_CLOSED_SILENT: already notified today, skipping. session_id=%s",
-                session.id,
-            )
-            await usage_tracker.increment_usage(
-                db, business.id, business.timezone, inbound_messages=1
-            )
-            return
-        # First message after hours today — send closed message, save the date
-        state_machine.set_context(session, "closed_msg_sent_date", today_str)
-        await _send_response(
-            db=db,
-            business=business,
-            customer=customer,
-            wa_id=wa_id,
-            text=responses.closed_response(business),
-            intent="CLOSED",
-        )
-        await usage_tracker.increment_usage(
-            db, business.id, business.timezone, inbound_messages=1, outbound_messages=1
-        )
-        logger.warning(
-            "PIPELINE_CLOSED_GATE: sent closed message to customer_id=%s, session_id=%s",
-            customer.id, session.id,
-        )
-        return
 
     # ── 11. Process based on intent + state ──────────────────────────────
     logger.warning(
