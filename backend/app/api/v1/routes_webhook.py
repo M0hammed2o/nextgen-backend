@@ -16,13 +16,11 @@ AUTH: This router has NO authentication dependencies.
 import json
 import logging
 
-from fastapi import APIRouter, Depends, Header, Query, Request, Response, status
+from fastapi import APIRouter, Header, Query, Request, Response, status
 from fastapi.responses import JSONResponse
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.config import get_settings
 from backend.app.core.security import verify_meta_signature
-from backend.app.db.session import get_db
 
 logger = logging.getLogger("nextgen.webhook")
 
@@ -98,7 +96,6 @@ async def verify_webhook(
 @router.post("/meta", status_code=200)
 async def receive_webhook(
     request: Request,
-    db: AsyncSession = Depends(get_db),
     x_hub_signature_256: str | None = Header(None),
 ):
     """
@@ -108,9 +105,10 @@ async def receive_webhook(
     1. Log entry (WARNING level — always visible)
     2. Verify HMAC SHA256 signature (X-Hub-Signature-256)
     3. Parse payload → extract phone_number_id for business routing
-    4. Route each message to the full bot pipeline
+    4. Enqueue each message as an ARQ job — returns 200 immediately
 
     Always returns 200 to Meta (even on internal errors) to prevent retries.
+    Processing happens asynchronously in the ARQ worker process.
     """
     # ── ENTRY — WARNING level so it appears at any Render log setting ─────
     logger.warning(
@@ -202,9 +200,7 @@ async def receive_webhook(
         )
         return {"status": "ignored"}
 
-    # ── Step 3: Process each message through the bot pipeline ────────────
-    from backend.app.bot.pipeline import process_inbound_message
-
+    # ── Step 3: Enqueue each message as an ARQ job ───────────────────────
     entries = payload.get("entry", [])
     total_messages = 0
     total_statuses = 0
@@ -286,29 +282,30 @@ async def receive_webhook(
 
                 total_messages += 1
                 logger.warning(
-                    "WEBHOOK_POST_PIPELINE_START: wa_message_id=%s, "
+                    "WEBHOOK_POST_ENQUEUE: wa_message_id=%s, "
                     "wa_id=%s, phone_number_id=%s",
                     wa_message_id, wa_id, phone_number_id,
                 )
 
                 try:
-                    await process_inbound_message(
-                        db=db,
-                        phone_number_id=phone_number_id,
-                        wa_message_id=wa_message_id,
-                        wa_id=wa_id,
-                        msg_text=msg_text,
-                        msg_type=msg_type,
-                        raw_payload=message,
-                        contact_name=contact_name,
+                    await request.app.state.arq_pool.enqueue_job(
+                        "process_whatsapp_message",
+                        phone_number_id,
+                        wa_message_id,
+                        wa_id,
+                        msg_text,
+                        msg_type,
+                        message,
+                        contact_name,
                     )
                     logger.warning(
-                        "WEBHOOK_POST_PIPELINE_DONE: wa_message_id=%s, wa_id=%s",
+                        "WEBHOOK_POST_ENQUEUED: wa_message_id=%s, wa_id=%s",
                         wa_message_id, wa_id,
                     )
                 except Exception:
                     logger.exception(
-                        "WEBHOOK_POST_PIPELINE_ERROR: wa_message_id=%s, wa_id=%s",
+                        "WEBHOOK_POST_ENQUEUE_ERROR: wa_message_id=%s, wa_id=%s — "
+                        "message was NOT queued; check ARQ pool health.",
                         wa_message_id, wa_id,
                     )
 
@@ -317,10 +314,10 @@ async def receive_webhook(
                 _handle_status_update(wa_status)
 
     logger.warning(
-        "WEBHOOK_POST_COMPLETE: total_messages=%d, total_statuses=%d",
+        "WEBHOOK_POST_COMPLETE: total_messages=%d enqueued, total_statuses=%d",
         total_messages, total_statuses,
     )
-    return {"status": "processed"}
+    return {"status": "ok"}
 
 
 def _handle_status_update(status_data: dict) -> None:

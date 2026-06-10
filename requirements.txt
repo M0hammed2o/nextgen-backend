@@ -13,6 +13,9 @@ greenlet==3.1.1
 # ── Redis ────────────────────────────────────────────────────────────────────
 redis[hiredis]==5.2.1
 
+# ── ARQ (async Redis job queue — webhook processing + background jobs) ────────
+arq==0.26.1
+
 # ── Auth & Security ──────────────────────────────────────────────────────────
 bcrypt==4.2.1
 PyJWT==2.10.1

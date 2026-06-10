@@ -40,25 +40,19 @@ async def lifespan(app: FastAPI):
         settings.DEBUG,
     )
 
-    # Start outbox worker as background task
-    import asyncio
-    outbox_task = None
-    try:
-        from backend.app.bot.outbox_worker import run_outbox_worker
-        outbox_task = asyncio.create_task(run_outbox_worker())
-        logger.info("Outbox worker started as background task")
-    except Exception:
-        logger.warning("Failed to start outbox worker (non-fatal)")
+    # Create ARQ pool — webhook handler enqueues jobs here.
+    # Background processing (outbox, delivery fee timeout) runs in the
+    # dedicated ARQ worker process: arq backend.app.worker.WorkerSettings
+    from arq import create_pool
+    from arq.connections import RedisSettings
+    arq_pool = await create_pool(RedisSettings.from_dsn(settings.REDIS_URL))
+    app.state.arq_pool = arq_pool
+    logger.info("ARQ pool ready — webhook jobs will be enqueued asynchronously.")
 
     yield
 
     logger.info("Shutting down NextGen Backend...")
-    if outbox_task:
-        outbox_task.cancel()
-        try:
-            await outbox_task
-        except asyncio.CancelledError:
-            pass
+    await arq_pool.aclose()
     await close_redis()
     await close_db()
 

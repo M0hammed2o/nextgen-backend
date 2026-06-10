@@ -165,7 +165,7 @@ def is_confirmation(text: str) -> bool:
     Does NOT match messages that add new content: "yes but change the chips".
     """
     _CORE = (
-        r"yes|yep|yeah|yah|yebo|ja|jah|sure|sharp|confirm|confirmed|"
+        r"yes|yep|yeah|yah|yebo|ja|jah|sure\s+thing|sure|sharp|confirm|confirmed|"
         r"that.?s\s+(it|all|correct|right)|looks\s+good|perfect|lekker|"
         r"100|right|cool|ok|okay|done|place\s+it|send\s+it|"
         r"go\s+ahead|let.?s\s+go|do\s+it|sounds\s+good|all\s+good|proceed"
