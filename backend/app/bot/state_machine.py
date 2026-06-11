@@ -117,13 +117,22 @@ def add_to_cart(
     options: dict | None = None,
     special_instructions: str | None = None,
 ) -> list[dict]:
-    """Add an item to the cart. Returns updated cart."""
+    """Add an item to the cart. Returns updated cart.
+
+    Modifier-aware: items with different special_instructions are treated as
+    separate line items. When special_instructions is None (the common case),
+    behaviour is identical to before — same item + same options accumulates qty.
+    """
     cart = get_cart(session)
 
-    # Check if same item (with same options) already in cart
+    # Match on menu_item_id + options + special_instructions so that e.g.
+    # "Burger (no tomato)" and "Burger (extra cheese)" are distinct line items.
     for item in cart:
-        if (item["menu_item_id"] == menu_item_id
-                and item.get("options") == options):
+        if (
+            item["menu_item_id"] == menu_item_id
+            and item.get("options") == options
+            and item.get("special_instructions") == special_instructions
+        ):
             item["quantity"] += quantity
             item["line_total_cents"] = item["price_cents"] * item["quantity"]
             set_cart(session, cart)
@@ -142,17 +151,58 @@ def add_to_cart(
     return cart
 
 
-def remove_from_cart(session: ConversationSession, item_name: str) -> tuple[list[dict], bool]:
+def remove_from_cart(
+    session: ConversationSession,
+    item_name: str,
+    quantity: int | None = None,
+) -> tuple[list[dict], bool]:
     """
-    Remove an item from cart by name (fuzzy match).
-    Returns (updated_cart, was_removed).
+    Remove or reduce an item from cart by name (fuzzy match).
+
+    If `quantity` is given and the item has more units than that, the quantity
+    is reduced by `quantity` instead of removing the entry entirely.
+    Returns (updated_cart, was_found).
     """
     cart = get_cart(session)
     name_lower = item_name.lower().strip()
 
     for i, item in enumerate(cart):
         if name_lower in item["name"].lower():
+            if quantity is not None and item["quantity"] > quantity:
+                item["quantity"] -= quantity
+                item["line_total_cents"] = item["price_cents"] * item["quantity"]
+                set_cart(session, cart)
+                return cart, True
             cart.pop(i)
+            set_cart(session, cart)
+            return cart, True
+
+    return cart, False
+
+
+def update_cart_item_instructions(
+    session: ConversationSession,
+    item_name: str,
+    special_instructions: str,
+) -> tuple[list[dict], bool]:
+    """
+    Merge new special_instructions into an existing cart item (fuzzy name match).
+
+    Appends to any existing instructions with ", " so that successive modifier
+    messages ("no tomato" then "extra cheese") accumulate correctly.
+    Returns (updated_cart, was_found).
+    """
+    cart = get_cart(session)
+    name_lower = item_name.lower().strip()
+
+    for item in cart:
+        item_name_lower = item["name"].lower()
+        if name_lower in item_name_lower or item_name_lower in name_lower:
+            existing = item.get("special_instructions") or ""
+            if existing:
+                item["special_instructions"] = existing + ", " + special_instructions
+            else:
+                item["special_instructions"] = special_instructions
             set_cart(session, cart)
             return cart, True
 

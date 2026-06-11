@@ -96,3 +96,63 @@ async def admin_login(
         refresh_token=refresh_raw,
         expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
     )
+
+
+class AdminRefreshRequest(BaseModel):
+    refresh_token: str
+
+
+@router.post("/refresh", response_model=AdminTokenResponse)
+async def admin_refresh(
+    body: AdminRefreshRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Rotate an admin refresh token and issue a new access + refresh pair."""
+    from datetime import datetime, timezone
+    from backend.app.core.security import hash_refresh_token, create_admin_access_token
+    from shared.utils import generate_refresh_token
+    from sqlalchemy import select
+
+    token_hash = hash_refresh_token(body.refresh_token)
+    result = await db.execute(
+        select(AdminRefreshToken).where(AdminRefreshToken.token_hash == token_hash)
+    )
+    stored = result.scalar_one_or_none()
+
+    now = datetime.now(timezone.utc)
+    if not stored or stored.revoked_at or stored.expires_at < now:
+        from backend.app.core.errors import AppError
+        raise AppError("INVALID_REFRESH_TOKEN", "Refresh token is invalid or expired", 401)
+
+    # Revoke old token
+    stored.revoked_at = now
+
+    # Load admin user for role
+    from shared.models.admin import AdminUser
+    admin_result = await db.execute(
+        select(AdminUser).where(AdminUser.id == stored.user_id)
+    )
+    admin = admin_result.scalar_one_or_none()
+    if not admin or not admin.is_active:
+        from backend.app.core.errors import AppError
+        raise AppError("ACCOUNT_DISABLED", "Admin account is disabled", 403)
+
+    # Issue new pair
+    new_access = create_admin_access_token(admin.id, admin.role)
+    new_refresh_raw = generate_refresh_token()
+
+    new_rt = AdminRefreshToken(
+        user_id=admin.id,
+        token_hash=hash_refresh_token(new_refresh_raw),
+        expires_at=now + __import__("datetime").timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS),
+        ip_address=request.client.host if request.client else None,
+    )
+    db.add(new_rt)
+    await db.commit()
+
+    return AdminTokenResponse(
+        access_token=new_access,
+        refresh_token=new_refresh_raw,
+        expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+    )

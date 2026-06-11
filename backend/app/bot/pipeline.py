@@ -790,6 +790,93 @@ def _find_size_variants(msg_text: str, menu_items: list) -> tuple[str | None, li
     return None, []
 
 
+def _extract_modifier_from_suffix(suffix: str) -> str | None:
+    """
+    Scan text immediately following an item-name match for modifier tokens.
+
+    Handles the most common South African fast-food ordering patterns:
+      "with no tomato"   → "no tomato"
+      "without onion"    → "no onion"
+      "extra cheese"     → "extra cheese"
+      "with extra sauce" → "extra sauce"
+
+    Multiple modifiers separated by "and" or "," are collected:
+      "no tomato and extra cheese" → "no tomato, extra cheese"
+
+    Returns None when no modifier tokens are found.
+    """
+    import re as _re
+    if not suffix:
+        return None
+    s = suffix.strip().lower()
+
+    parts: list[str] = []
+
+    # "no X" / "with no X"
+    for m in _re.finditer(r"(?:with\s+)?no\s+([\w]+(?:\s+[\w]+){0,2})", s):
+        parts.append(f"no {m.group(1).strip()}")
+
+    # "without X"
+    for m in _re.finditer(r"without\s+([\w]+(?:\s+[\w]+){0,2})", s):
+        parts.append(f"no {m.group(1).strip()}")
+
+    # "extra X" / "with extra X" (must not be double-counted with "no" above)
+    for m in _re.finditer(r"(?:with\s+)?extra\s+([\w]+(?:\s+[\w]+){0,2})", s):
+        parts.append(f"extra {m.group(1).strip()}")
+
+    return ", ".join(parts) if parts else None
+
+
+def _detect_modifier_update(
+    msg_text: str,
+    cart: list[dict],
+) -> tuple[str, dict] | None:
+    """
+    Detect if msg_text is a modifier-only update aimed at an existing cart item.
+
+    Returns (modifier_text, cart_item_dict) when:
+      - The message matches "add/put <modifier> to/on <item_ref>" patterns, AND
+      - At least one cart item fuzzy-matches the item_ref.
+
+    Examples that match:
+      "Add extra cheese to the burger"  → ("extra cheese", {burger cart entry})
+      "Put no tomato on my pizza"       → ("no tomato", {pizza cart entry})
+
+    Returns None when the pattern doesn't match or no cart item matches.
+    """
+    import re as _re
+    if not cart:
+        return None
+
+    pattern = _re.compile(
+        r"^(?:(?:add|put|can\s+you\s+add|please\s+add)\s+)?"
+        # modifier group: no/extra/more/less/without/with no/with extra + ingredient
+        r"((?:no|extra|more|less|without|with\s+no|with\s+extra)\s+[\w]+(?:\s+[\w]+){0,3})"
+        r"\s+(?:to|on|for|in)\s+(?:the\s+|my\s+)?"
+        # item reference (rest of message)
+        r"([\w][\w\s]*)$",
+        _re.I,
+    )
+    m = pattern.match(msg_text.strip())
+    if not m:
+        return None
+
+    raw_modifier = m.group(1).strip().lower()
+    item_ref = m.group(2).strip().lower()
+
+    # Normalise "with no X" → "no X", "with extra X" → "extra X"
+    raw_modifier = _re.sub(r"^with\s+", "", raw_modifier)
+
+    # Fuzzy cart-item lookup: any word in item_ref (>3 chars) present in item name
+    ref_words = [w for w in item_ref.split() if len(w) > 3]
+    for cart_item in cart:
+        name_lower = cart_item["name"].lower()
+        if item_ref in name_lower or any(w in name_lower for w in ref_words):
+            return raw_modifier, cart_item
+
+    return None
+
+
 def _parse_quantity_before(msg_lower: str, item_start: int) -> int:
     """Return the quantity token immediately before the item match, defaulting to 1."""
     prefix = msg_lower[:item_start].rstrip()
@@ -820,6 +907,10 @@ def _extract_items_from_chunk(
     `global_consumed_names` prevents the same menu item being returned twice
     across all chunks (e.g., "burger and burger" → 1 match, not 2 — quantity
     accumulation is handled by add_to_cart).
+
+    Returns list of (MenuItem, quantity, special_instructions | None).
+    The modifier (special_instructions) is extracted from the suffix of the
+    chunk after the item name: "with no tomato" → "no tomato".
     """
     import re as _re
     chunk_lower = chunk.strip().lower()
@@ -845,7 +936,9 @@ def _extract_items_from_chunk(
                 continue
             best = candidates[0]
             qty = _parse_quantity_before(chunk_lower, a_start)
-            matched.append((best, qty))
+            suffix = chunk_lower[a_end:]
+            modifier = _extract_modifier_from_suffix(suffix)
+            matched.append((best, qty, modifier))
             consumed_positions |= span
             global_consumed_names.add(best.name.lower())
             break
@@ -873,7 +966,9 @@ def _extract_items_from_chunk(
                 start = idx + 1
                 continue
             qty = _parse_quantity_before(chunk_lower, idx)
-            matched.append((item, qty))
+            suffix = chunk_lower[end:]
+            modifier = _extract_modifier_from_suffix(suffix)
+            matched.append((item, qty, modifier))
             consumed_positions |= span
             global_consumed_names.add(name_lower)
             break
@@ -891,6 +986,8 @@ def _extract_items_from_message(
     Splits the message on "and", "also", and "," then runs alias + substring
     extraction per chunk. Longest menu names tested first so "Cheesy Chips"
     wins over "Chips". Returns [] if nothing matched — caller falls back to LLM.
+
+    Each element is (MenuItem, quantity, special_instructions | None).
     """
     import re as _re
     active = [i for i in menu_items if i.is_active and not i.is_deleted]
@@ -967,7 +1064,7 @@ async def _handle_with_llm(
         det_matches = _extract_items_from_message(msg_text, items)
         if det_matches:
             det_added: list[str] = []
-            for det_item, det_qty in det_matches:
+            for det_item, det_qty, det_modifier in det_matches:
                 state_machine.add_to_cart(
                     session,
                     menu_item_id=str(det_item.id),
@@ -975,9 +1072,12 @@ async def _handle_with_llm(
                     price_cents=det_item.price_cents,
                     quantity=det_qty,
                     options=None,
-                    special_instructions=None,
+                    special_instructions=det_modifier,
                 )
-                det_added.append(f"{det_qty}x {det_item.name}")
+                label = f"{det_qty}x {det_item.name}"
+                if det_modifier:
+                    label += f" ({det_modifier})"
+                det_added.append(label)
             logger.warning(
                 "DET_MATCH: added %d item(s) deterministically: %r, session_id=%s",
                 len(det_added), det_added, session.id,
@@ -1016,7 +1116,7 @@ async def _handle_with_llm(
         det_matches = _extract_items_from_message(msg_text, items)
         if det_matches:
             det_added: list[str] = []
-            for det_item, det_qty in det_matches:
+            for det_item, det_qty, det_modifier in det_matches:
                 state_machine.add_to_cart(
                     session,
                     menu_item_id=str(det_item.id),
@@ -1024,9 +1124,12 @@ async def _handle_with_llm(
                     price_cents=det_item.price_cents,
                     quantity=det_qty,
                     options=None,
-                    special_instructions=None,
+                    special_instructions=det_modifier,
                 )
-                det_added.append(f"{det_qty}x {det_item.name}")
+                label = f"{det_qty}x {det_item.name}"
+                if det_modifier:
+                    label += f" ({det_modifier})"
+                det_added.append(label)
             import copy as _copy
             updated_cart = state_machine.get_cart(session)
             state_machine.set_context(session, "confirmed_cart", _copy.deepcopy(updated_cart))
@@ -1043,6 +1146,41 @@ async def _handle_with_llm(
             parts = ["Added: " + ", ".join(det_added) + " ✅"]
             parts.append("\n" + confirm_msg)
             return ("\n".join(parts), False, None, None, None)
+
+    # ── Deterministic modifier-only update (e.g. "Add extra cheese to the burger") ──
+    # Fires when ORDER_ADD is in CONFIRMING_ORDER, no new menu item was matched
+    # by the extraction above, but the message references an existing cart item.
+    # This avoids a full LLM round-trip for simple ingredient modifier messages.
+    if (
+        intent == MessageIntent.ORDER_ADD
+        and session.state == ConversationState.CONFIRMING_ORDER.value
+    ):
+        current_cart = state_machine.get_cart(session)
+        modifier_match = _detect_modifier_update(msg_text, current_cart)
+        if modifier_match:
+            modifier_text, target_item = modifier_match
+            state_machine.update_cart_item_instructions(
+                session, target_item["name"], modifier_text
+            )
+            import copy as _copy
+            updated_cart = state_machine.get_cart(session)
+            state_machine.set_context(session, "confirmed_cart", _copy.deepcopy(updated_cart))
+            logger.warning(
+                "DET_MODIFIER_UPDATE: applied %r to %r, session_id=%s",
+                modifier_text, target_item["name"], session.id,
+            )
+            order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
+            total = state_machine.cart_total_cents(session)
+            summary = state_machine.cart_summary_text(session, business.currency)
+            confirm_msg = responses.ask_confirmation_response(
+                summary, total, 0, order_mode, business.currency
+            )
+            if order_mode == "DELIVERY":
+                confirm_msg += "\n_Delivery fee will be confirmed by our team._"
+            return (
+                f"Updated ✅ {modifier_text} added to {target_item['name']}.\n\n{confirm_msg}",
+                False, None, None, None,
+            )
 
     pending_options = state_machine.get_context(session, "pending_options")
     # recommended_items is cleared in _handle_message as soon as the customer

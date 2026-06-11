@@ -251,6 +251,13 @@ def is_cart_correction(text: str) -> bool:
         # "actually/no I want only" / "make it just"
         r"|(actually|no)[,!]?\s+(i\s+)?(only\s+want|want\s+only|just\s+want)"
         r"|make\s+it\s+just"
+        # "Make it only..." — e.g. "Make it only one burger" / "Actually make it only one burger"
+        r"|make\s+it\s+only"
+        # "No it must be..." — customer restating what they actually want
+        r"|no[,.]?\s+it\s+must\s+be"
+        # "Actually I only want..." is already covered by the (actually|no) branch above;
+        # this covers "Actually make it..." without a following want/just/only phrase
+        r"|actually\s+make\s+it"
         r")",
         re.I,
     )

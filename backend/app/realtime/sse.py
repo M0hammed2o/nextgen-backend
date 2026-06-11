@@ -7,22 +7,84 @@ Uses Redis pubsub with fallback polling endpoint.
 import asyncio
 import json
 import logging
+import uuid
 
-from fastapi import APIRouter, Depends, Request
+import jwt
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sse_starlette.sse import EventSourceResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.app.core.rbac import AuthUser, require_staff_or_above
+from backend.app.core.rbac import AuthUser
+from backend.app.core.security import decode_access_token
 from backend.app.db.session import get_db, get_redis
 
 logger = logging.getLogger("nextgen.sse")
 router = APIRouter(prefix="/business/orders", tags=["realtime"])
 
+_bearer = HTTPBearer(auto_error=False)
+
+_ALLOWED_SSE_ROLES = {"STAFF", "MANAGER", "OWNER"}
+
+
+async def _get_sse_user(
+    request: Request,
+    token_param: str | None = Query(default=None, alias="token"),
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
+) -> AuthUser:
+    """
+    Auth dependency for SSE endpoints.
+
+    The browser's native EventSource API cannot set custom headers, so the
+    frontend passes the JWT as ?token=<access_token>.  This dependency accepts
+    the token from either source (header preferred, query param as fallback).
+    """
+    raw_token: str | None = None
+    if credentials:
+        raw_token = credentials.credentials
+    elif token_param:
+        raw_token = token_param
+
+    if not raw_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"code": "MISSING_TOKEN", "message": "Authorization required"},
+        )
+
+    try:
+        payload = decode_access_token(raw_token)
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"code": "TOKEN_EXPIRED", "message": "Access token has expired"},
+        )
+    except jwt.InvalidTokenError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"code": "INVALID_TOKEN", "message": "Invalid access token"},
+        )
+
+    bid_str = payload.get("bid")
+    user = AuthUser(
+        user_id=uuid.UUID(payload["sub"]),
+        business_id=uuid.UUID(bid_str) if bid_str else None,
+        role=payload["role"],
+        token_type=payload.get("type", "access"),
+    )
+
+    if user.role not in _ALLOWED_SSE_ROLES or not user.business_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "INSUFFICIENT_ROLE", "message": "Staff or above required"},
+        )
+
+    return user
+
 
 @router.get("/live/stream")
 async def live_order_stream(
     request: Request,
-    user: AuthUser = Depends(require_staff_or_above),
+    user: AuthUser = Depends(_get_sse_user),
 ):
     """
     SSE stream for live order updates.
