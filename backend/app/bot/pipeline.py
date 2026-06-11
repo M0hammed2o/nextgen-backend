@@ -677,10 +677,16 @@ async def _handle_message(
 
     # ── Recommendation acceptance ─────────────────────────────────────────
     # Must come BEFORE the LLM gate: when the customer says "I'll take those"
-    # after a recommendation, we convert stored items to real cart entries
-    # without an LLM call (deterministic, no hallucination possible).
+    # (or any plain confirmation like "yes", "sure") after a recommendation,
+    # convert stored items to real cart entries without an LLM call.
+    # is_confirmation() is safe here: when recommended_items is present the
+    # session is always in BROWSING_MENU, so this cannot accidentally place
+    # an order (that path requires CONFIRMING_ORDER state).
     _recommended = state_machine.get_context(session, "recommended_items")
-    if _recommended and intent_router.is_recommendation_acceptance(msg_text):
+    if _recommended and (
+        intent_router.is_recommendation_acceptance(msg_text)
+        or intent_router.is_confirmation(msg_text)
+    ):
         logger.warning(
             "REC_ACCEPT: acceptance detected, %d stored item(s), session_id=%s, msg=%r",
             len(_recommended), session.id, msg_text[:60],
