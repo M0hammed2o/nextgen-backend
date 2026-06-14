@@ -83,9 +83,10 @@ _PATTERNS: list[tuple[re.Pattern, MessageIntent]] = [
         r"start over|clear|remove all|scratch that)\b", re.I
     ), MessageIntent.ORDER_CANCEL),
 
-    # Remove item from cart
+    # Remove item from cart — covers SA natural-language phrasing
     (re.compile(
-        r"\b(remove|take off|delete|no more|don.?t want the)\b", re.I
+        r"\b(remove|take\s+off|take\s+out|take\s+away|delete|"
+        r"leave\s+out|leave\s+off|drop|no\s+more|don.?t\s+want\s+the)\b", re.I
     ), MessageIntent.ORDER_REMOVE),
 
     # Add more to cart
@@ -161,14 +162,49 @@ def needs_llm(intent: MessageIntent | None, conversation_state: str) -> bool:
 def is_confirmation(text: str) -> bool:
     """
     Check if a message is a clear yes/confirmation.
-    Allows trailing polite words: "yes please", "yes please confirm order", "sure thanks".
-    Does NOT match messages that add new content: "yes but change the chips".
+
+    Covers:
+      - Single-word affirmatives: yes, yep, yeah, sharp, lekker, sho, ya, correct …
+      - Sentence-form affirmatives: "that is correct", "this is right", "place the order" …
+      - SA-specific: "no this is correct" (= "no [changes], this IS correct"), "sho", "ya"
+
+    Allows polite trailing words: "yes please", "yes thanks bru".
+    Does NOT match messages that add or change content: "yes but change the chips".
     """
+    stripped = text.strip()
+
+    # ── Special case: "No, this is correct/right/fine" ───────────────────────
+    # SA customers often use "No" to mean "No [changes needed], this is correct."
+    # Detect "No[,.]? this/that is <affirmative>" before the general pattern so it
+    # is not swallowed by is_negation (which requires "no" at end-of-string).
+    _NO_THIS_IS = re.compile(
+        r"^no[,.]?\s+(?:this|that)\s+is\s+"
+        r"(?:correct|right|fine|good|perfect|the\s+(?:correct|right)\s+order|"
+        r"what\s+i\s+want|my\s+order)\s*[.!]*$",
+        re.I,
+    )
+    if _NO_THIS_IS.match(stripped):
+        return True
+
+    # ── General affirmative pattern ───────────────────────────────────────────
     _CORE = (
-        r"yes|yep|yeah|yah|yebo|ja|jah|sure\s+thing|sure|sharp|confirm|confirmed|"
-        r"that.?s\s+(it|all|correct|right)|looks\s+good|perfect|lekker|"
-        r"100|right|cool|ok|okay|done|place\s+it|send\s+it|"
-        r"go\s+ahead|let.?s\s+go|do\s+it|sounds\s+good|all\s+good|proceed"
+        # Single-word / short-phrase affirmatives
+        r"yes|yep|yeah|yah|ya|yebo|ja|jah|"
+        r"sure\s+thing|sure|sharp|sho|"
+        r"confirm|confirmed|correct|"
+        r"looks\s+good|perfect|lekker|"
+        r"100|right|cool|ok|okay|done|"
+        r"place\s+it|send\s+it|"
+        r"go\s+ahead|let.?s\s+go|do\s+it|sounds\s+good|all\s+good|proceed|carry\s+on|"
+        # Sentence-form affirmatives: "that's correct / right / fine / good"
+        r"that.?s\s+(it|all|correct|right|fine|good|my\s+order|the\s+order|what\s+i\s+want)|"
+        r"that\s+is\s+(correct|right|fine|good|it|my\s+order)|"
+        # "this is correct / right / fine"
+        r"this\s+is\s+(correct|right|fine|good|my\s+order|the\s+(?:correct|right)\s+order)|"
+        # "place [the] order" / "confirm [the] order"
+        r"place\s+(?:the\s+)?order|confirm\s+(?:the\s+)?order|"
+        # "go ahead [with it/the order]"
+        r"go\s+ahead\s+(?:with\s+(?:it|that|the\s+order))?"
     )
     _TRAILING = (
         r"(\s+(please|thanks|thank\s+you|bru|man|mate|now|"
@@ -177,7 +213,7 @@ def is_confirmation(text: str) -> bool:
         r"delivery|for\s+delivery|pickup|for\s+pickup|collection|for\s+collection))*"
     )
     confirmations = re.compile(rf"^({_CORE}){_TRAILING}\s*[,!.]*$", re.I)
-    return bool(confirmations.match(text.strip()))
+    return bool(confirmations.match(stripped))
 
 
 def is_negation(text: str) -> bool:

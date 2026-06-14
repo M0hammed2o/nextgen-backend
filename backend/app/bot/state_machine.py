@@ -155,29 +155,71 @@ def remove_from_cart(
     session: ConversationSession,
     item_name: str,
     quantity: int | None = None,
+    qualifier_hint: str | None = None,
 ) -> tuple[list[dict], bool]:
     """
     Remove or reduce an item from cart by name (fuzzy match).
 
-    If `quantity` is given and the item has more units than that, the quantity
-    is reduced by `quantity` instead of removing the entry entirely.
+    `quantity`       — if provided and item.quantity > quantity, reduce by that
+                       amount instead of removing the entry entirely.
+    `qualifier_hint` — customer's original message used to disambiguate when
+                       multiple items share the same name (e.g. two burgers,
+                       one plain and one with no tomato).
+
+    Disambiguation rules (applied only when multiple same-name matches exist):
+      • "plain", "normal", "original", "regular", "without" in the hint
+        → prefer the item whose special_instructions is empty/None
+      • Specific ingredient word in the hint (e.g. "tomato", "cheese")
+        → prefer the item whose special_instructions contains that word
+      • No distinguishing hint → remove the first match (existing behaviour)
+
     Returns (updated_cart, was_found).
     """
     cart = get_cart(session)
     name_lower = item_name.lower().strip()
 
-    for i, item in enumerate(cart):
-        if name_lower in item["name"].lower():
-            if quantity is not None and item["quantity"] > quantity:
-                item["quantity"] -= quantity
-                item["line_total_cents"] = item["price_cents"] * item["quantity"]
-                set_cart(session, cart)
-                return cart, True
-            cart.pop(i)
-            set_cart(session, cart)
-            return cart, True
+    candidates = [
+        (i, item) for i, item in enumerate(cart)
+        if name_lower in item["name"].lower()
+    ]
 
-    return cart, False
+    if not candidates:
+        return cart, False
+
+    # Choose which candidate to remove / reduce
+    target_idx, target_item = candidates[0]   # default: first match
+
+    if len(candidates) > 1 and qualifier_hint:
+        hint = qualifier_hint.lower()
+
+        # Words signalling the customer wants the UNMODIFIED item
+        _PLAIN_WORDS = {"plain", "normal", "original", "regular", "without"}
+        wants_plain = any(w in hint.split() for w in _PLAIN_WORDS)
+
+        if wants_plain:
+            for idx, item in candidates:
+                if not item.get("special_instructions"):
+                    target_idx, target_item = idx, item
+                    break
+        else:
+            # Look for a specific ingredient word in the hint that matches
+            # one of the candidates' special_instructions
+            for idx, item in candidates:
+                instr = (item.get("special_instructions") or "").lower()
+                if instr and any(word in hint for word in instr.split()):
+                    target_idx, target_item = idx, item
+                    break
+
+    # Apply removal / reduction
+    if quantity is not None and target_item["quantity"] > quantity:
+        target_item["quantity"] -= quantity
+        target_item["line_total_cents"] = target_item["price_cents"] * target_item["quantity"]
+        set_cart(session, cart)
+        return cart, True
+
+    cart.pop(target_idx)
+    set_cart(session, cart)
+    return cart, True
 
 
 def update_cart_item_instructions(

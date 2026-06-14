@@ -169,8 +169,20 @@ async def _process(
         )
         return
 
-    # ── 6. Detect opt-out intent early ───────────────────────────────────
-    intent = intent_router.match_intent(msg_text)
+    # ── 6. Normalise message for deterministic processing ────────────────
+    # norm_text is used for intent routing, confirmation checks, and all
+    # regex-based pattern matching.  msg_text (original) is preserved for
+    # LLM calls, conversation history, and log lines that quote the customer.
+    from backend.app.bot.normalizer import normalize as _normalize_msg
+    norm_text = _normalize_msg(msg_text)
+    if norm_text != msg_text:
+        logger.info(
+            "MSG_NORMALIZED: original=%r normalized=%r",
+            msg_text[:80], norm_text[:80],
+        )
+
+    # ── 6b. Detect opt-out intent early ──────────────────────────────────
+    intent = intent_router.match_intent(norm_text)
     if intent == MessageIntent.OPT_OUT:
         customer.opted_out = True
         _persist_inbound(
@@ -290,6 +302,7 @@ async def _process(
         customer=customer,
         session=session,
         msg_text=msg_text,
+        norm_text=norm_text,
         intent=intent,
     )
 
@@ -353,10 +366,15 @@ async def _handle_message(
     customer: Customer,
     session,
     msg_text: str,
+    norm_text: str,
     intent: MessageIntent | None,
 ) -> tuple[str, bool, int | None, int | None, str | None]:
     """
     Handle the message based on intent and conversation state.
+
+    msg_text  — original customer message (used for LLM, conversation history)
+    norm_text — SA-normalised text (used for all deterministic pattern matching)
+
     Returns:
       (response_text, is_llm, llm_tokens, llm_cost_cents, llm_provider)
     """
@@ -611,8 +629,9 @@ async def _handle_message(
 
     # ── Order confirmation (in CONFIRMING_ORDER state) ───────────────────
     if current_state == ConversationState.CONFIRMING_ORDER.value:
-        is_confirm = intent_router.is_confirmation(msg_text)
-        is_negate = intent_router.is_negation(msg_text)
+        # Use norm_text for all deterministic checks so SA slang/typos are handled.
+        is_confirm = intent_router.is_confirmation(norm_text)
+        is_negate = intent_router.is_negation(norm_text)
         logger.warning(
             "HANDLE_BRANCH: CONFIRMING_ORDER state — is_confirm=%s, is_negate=%s",
             is_confirm,
@@ -622,10 +641,10 @@ async def _handle_message(
             # If the confirmation message mentions delivery/pickup, apply it now
             # before entering order confirmation (e.g. "yes for delivery").
             import re as _re2
-            if _re2.search(r"\b(delivery|deliver)\b", msg_text, _re2.I):
+            if _re2.search(r"\b(delivery|deliver)\b", norm_text, _re2.I):
                 state_machine.set_context(session, "order_mode", "DELIVERY")
                 logger.warning("CONFIRM_MODE_SET: DELIVERY from confirmation msg. session_id=%s", session.id)
-            elif _re2.search(r"\b(pickup|pick\s+up|collection|collect)\b", msg_text, _re2.I):
+            elif _re2.search(r"\b(pickup|pick\s+up|collection|collect)\b", norm_text, _re2.I):
                 state_machine.set_context(session, "order_mode", "PICKUP")
                 logger.warning("CONFIRM_MODE_SET: PICKUP from confirmation msg. session_id=%s", session.id)
             return await _handle_order_confirmation(db, business, customer, session)
@@ -641,19 +660,19 @@ async def _handle_message(
         # Cart correction: customer is restating the full order with corrected quantities.
         # Clear the cart, transition to BUILDING_CART, then call LLM with ORDER_START so that
         # real add_to_cart() logic executes and confirmed_cart is correctly locked afterward.
-        if intent_router.is_cart_correction(msg_text):
+        if intent_router.is_cart_correction(norm_text):
             state_machine.clear_cart(session)
             state_machine.transition_state(session, ConversationState.BUILDING_CART.value)
             logger.warning(
                 "CART_CORRECTION: cleared cart, transitioning to BUILDING_CART, rebuilding via LLM. session_id=%s, msg=%r",
                 session.id, msg_text[:80],
             )
-            return await _handle_with_llm(db, business, customer, session, msg_text, intent=MessageIntent.ORDER_START)
+            return await _handle_with_llm(db, business, customer, session, msg_text, intent=MessageIntent.ORDER_START, norm_text=norm_text)
 
     # ── Choosing options state (e.g. "what size?") ──────────────────────
     if current_state == ConversationState.CHOOSING_OPTIONS.value:
         logger.warning("HANDLE_BRANCH: CHOOSING_OPTIONS → LLM resolves pending item options")
-        return await _handle_with_llm(db, business, customer, session, msg_text, intent=intent)
+        return await _handle_with_llm(db, business, customer, session, msg_text, intent=intent, norm_text=norm_text)
 
     # ── Choosing order mode (pickup vs delivery) ─────────────────────────
     if current_state == ConversationState.CHOOSING_ORDER_MODE.value:
@@ -684,8 +703,8 @@ async def _handle_message(
     # an order (that path requires CONFIRMING_ORDER state).
     _recommended = state_machine.get_context(session, "recommended_items")
     if _recommended and (
-        intent_router.is_recommendation_acceptance(msg_text)
-        or intent_router.is_confirmation(msg_text)
+        intent_router.is_recommendation_acceptance(norm_text)
+        or intent_router.is_confirmation(norm_text)
     ):
         logger.warning(
             "REC_ACCEPT: acceptance detected, %d stored item(s), session_id=%s, msg=%r",
@@ -719,7 +738,7 @@ async def _handle_message(
             return responses.fallback_response(business), False, None, None, None
 
         logger.warning("HANDLE_BRANCH: → LLM call")
-        return await _handle_with_llm(db, business, customer, session, msg_text, intent=intent)
+        return await _handle_with_llm(db, business, customer, session, msg_text, intent=intent, norm_text=norm_text)
 
     # ── Fallback ─────────────────────────────────────────────────────────
     logger.warning(
@@ -838,9 +857,12 @@ def _detect_modifier_update(
       - The message matches "add/put <modifier> to/on <item_ref>" patterns, AND
       - At least one cart item fuzzy-matches the item_ref.
 
-    Examples that match:
-      "Add extra cheese to the burger"  → ("extra cheese", {burger cart entry})
-      "Put no tomato on my pizza"       → ("no tomato", {pizza cart entry})
+    Handles SA WhatsApp phrasings after normalization:
+      "Add extra cheese to the burger"            → ("extra cheese", burger)
+      "can you also add extra cheese to the burger" → ("extra cheese", burger)
+      "Add extra cheese for me on the burger"     → ("extra cheese", burger)
+      "Put no tomato on my pizza"                 → ("no tomato", pizza)
+      "make it spicy for the wings"               → ("spicy", wings)
 
     Returns None when the pattern doesn't match or no cart item matches.
     """
@@ -849,11 +871,18 @@ def _detect_modifier_update(
         return None
 
     pattern = _re.compile(
-        r"^(?:(?:add|put|can\s+you\s+add|please\s+add)\s+)?"
-        # modifier group: no/extra/more/less/without/with no/with extra + ingredient
-        r"((?:no|extra|more|less|without|with\s+no|with\s+extra)\s+[\w]+(?:\s+[\w]+){0,3})"
-        r"\s+(?:to|on|for|in)\s+(?:the\s+|my\s+)?"
-        # item reference (rest of message)
+        # Optional polite/connector preamble before the action verb
+        r"^(?:"
+        r"(?:can\s+you\s+|could\s+you\s+|please\s+|would\s+you\s+)?"
+        r"(?:just\s+|please\s+)?"
+        r"(?:add|put|include|give\s+me|make\s+it)\s+"
+        r")?"
+        # modifier group: no/extra/more/less/without/with no/with extra + ingredient(s)
+        r"((?:no|extra|more|less|without|with\s+no|with\s+extra|spicy|plain)\s*[\w]+(?:\s+[\w]+){0,3})"
+        # flexible separator: "to", "on", "for [me] on", "in", "for the"
+        r"\s+(?:to|on|(?:for\s+(?:me\s+)?(?:on\s+|in\s+)?)|in|from)\s*"
+        r"(?:the\s+|my\s+|a\s+)?"
+        # item reference
         r"([\w][\w\s]*)$",
         _re.I,
     )
@@ -867,7 +896,7 @@ def _detect_modifier_update(
     # Normalise "with no X" → "no X", "with extra X" → "extra X"
     raw_modifier = _re.sub(r"^with\s+", "", raw_modifier)
 
-    # Fuzzy cart-item lookup: any word in item_ref (>3 chars) present in item name
+    # Fuzzy cart-item lookup: any significant word in item_ref present in item name
     ref_words = [w for w in item_ref.split() if len(w) > 3]
     for cart_item in cart:
         name_lower = cart_item["name"].lower()
@@ -1015,8 +1044,16 @@ async def _handle_with_llm(
     session,
     msg_text: str,
     intent: MessageIntent | None = None,
+    norm_text: str | None = None,
 ) -> tuple[str, bool, int | None, int | None, str | None]:
-    """Call LLM with conversation history, parse response, update cart/state."""
+    """Call LLM with conversation history, parse response, update cart/state.
+
+    msg_text  — original text sent to LLM and stored in history
+    norm_text — normalised text used for deterministic pre-LLM checks;
+                defaults to msg_text when not supplied
+    """
+    if norm_text is None:
+        norm_text = msg_text
     categories, items = await _load_menu(db, business.id)
     specials = await _load_specials(db, business.id)
     cart = state_machine.get_cart(session)
@@ -1028,9 +1065,9 @@ async def _handle_with_llm(
     _SIZE_WORDS = _re.compile(r"\b(small|medium|large)\b", _re.I)
     if (
         session.state != ConversationState.CHOOSING_OPTIONS.value
-        and not _SIZE_WORDS.search(msg_text)
+        and not _SIZE_WORDS.search(norm_text)
     ):
-        base_name, variants = _find_size_variants(msg_text, items)
+        base_name, variants = _find_size_variants(norm_text, items)
         if base_name and variants:
             pending = [{"name": base_name, "quantity": 1, "options": None, "special_instructions": None}]
             state_machine.set_context(session, "pending_options", pending)
@@ -1061,7 +1098,7 @@ async def _handle_with_llm(
         and session.state in _det_states_for_add
     )
     if _det_eligible:
-        det_matches = _extract_items_from_message(msg_text, items)
+        det_matches = _extract_items_from_message(norm_text, items)
         if det_matches:
             det_added: list[str] = []
             for det_item, det_qty, det_modifier in det_matches:
@@ -1106,14 +1143,14 @@ async def _handle_with_llm(
     # Complex mutations (remove, swap, without) still go to LLM as before.
     import re as _re
     _CONFIRMING_MUTATION_SIGNALS = _re.compile(
-        r"\b(remove|take\s+off|delete|instead\s+of|replace|swap|without)\b", _re.I
+        r"\b(remove|take\s+off|take\s+out|delete|instead\s+of|replace|swap|without)\b", _re.I
     )
     if (
         intent in (MessageIntent.ORDER_START, MessageIntent.ORDER_ADD)
         and session.state == ConversationState.CONFIRMING_ORDER.value
-        and not _CONFIRMING_MUTATION_SIGNALS.search(msg_text)
+        and not _CONFIRMING_MUTATION_SIGNALS.search(norm_text)
     ):
-        det_matches = _extract_items_from_message(msg_text, items)
+        det_matches = _extract_items_from_message(norm_text, items)
         if det_matches:
             det_added: list[str] = []
             for det_item, det_qty, det_modifier in det_matches:
@@ -1130,11 +1167,41 @@ async def _handle_with_llm(
                 if det_modifier:
                     label += f" ({det_modifier})"
                 det_added.append(label)
+
+            # ── Fix C: mixed intent — also apply any modifier instruction ──────
+            # A message like "Add extra cheese to the burger and add a pizza"
+            # finds the pizza above and returns early, silently dropping the
+            # modifier.  Scan each message chunk independently: if a chunk
+            # didn't produce a new item but looks like a modifier instruction,
+            # apply it to an existing cart item before returning.
+            import re as _re_c
+            _chunks_c = _re_c.split(r"\band\b|\balso\b|,", msg_text, flags=_re_c.I)
+            _matched_item_names = {det_item.name.lower() for det_item, _, _ in det_matches}
+            for _chunk in _chunks_c:
+                _chunk = _chunk.strip()
+                if not _chunk:
+                    continue
+                # Skip chunks whose content was already captured as a new item
+                if any(name in _chunk.lower() for name in _matched_item_names):
+                    continue
+                _current_cart = state_machine.get_cart(session)
+                _mod_match = _detect_modifier_update(_chunk, _current_cart)
+                if _mod_match:
+                    _mod_text, _target = _mod_match
+                    state_machine.update_cart_item_instructions(
+                        session, _target["name"], _mod_text
+                    )
+                    det_added.append(f"{_mod_text} on {_target['name']}")
+                    logger.warning(
+                        "DET_MIXED_INTENT_MODIFIER: applied %r to %r, session_id=%s",
+                        _mod_text, _target["name"], session.id,
+                    )
+
             import copy as _copy
             updated_cart = state_machine.get_cart(session)
             state_machine.set_context(session, "confirmed_cart", _copy.deepcopy(updated_cart))
             logger.warning(
-                "DET_ADD_CONFIRMING: added %d item(s): %r, session_id=%s",
+                "DET_ADD_CONFIRMING: added %d item(s)/modifier(s): %r, session_id=%s",
                 len(det_added), det_added, session.id,
             )
             order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
@@ -1156,7 +1223,7 @@ async def _handle_with_llm(
         and session.state == ConversationState.CONFIRMING_ORDER.value
     ):
         current_cart = state_machine.get_cart(session)
-        modifier_match = _detect_modifier_update(msg_text, current_cart)
+        modifier_match = _detect_modifier_update(norm_text, current_cart)
         if modifier_match:
             modifier_text, target_item = modifier_match
             state_machine.update_cart_item_instructions(
@@ -1293,7 +1360,10 @@ async def _handle_with_llm(
     if parsed.action == "remove_item" and parsed.items:
         for pi in parsed.items:
             if pi.name:
-                state_machine.remove_from_cart(session, pi.name)
+                # Pass the original customer message as qualifier_hint so
+                # remove_from_cart can disambiguate "the plain burger" from
+                # "the no tomato burger" when the cart has two same-name entries.
+                state_machine.remove_from_cart(session, pi.name, qualifier_hint=msg_text)
 
         cart = state_machine.get_cart(session)
         if cart:
