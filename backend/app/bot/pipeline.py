@@ -831,6 +831,18 @@ def _extract_modifier_from_suffix(suffix: str) -> str | None:
 
     parts: list[str] = []
 
+    # "take out/off/away X" / "leave out/off X"  — SA natural removal phrasing
+    for m in _re.finditer(
+        r"(?:take\s+(?:out|off|away)|leave\s+(?:out|off))\s+([\w]+(?:\s+[\w]+){0,2})", s
+    ):
+        parts.append(f"no {m.group(1).strip()}")
+
+    # "don't put X" / "dont put X" / "don't add X"
+    for m in _re.finditer(
+        r"don.?t\s+(?:put|add|include|want)\s+([\w]+(?:\s+[\w]+){0,2})", s
+    ):
+        parts.append(f"no {m.group(1).strip()}")
+
     # "no X" / "with no X"
     for m in _re.finditer(r"(?:with\s+)?no\s+([\w]+(?:\s+[\w]+){0,2})", s):
         parts.append(f"no {m.group(1).strip()}")
@@ -843,7 +855,15 @@ def _extract_modifier_from_suffix(suffix: str) -> str | None:
     for m in _re.finditer(r"(?:with\s+)?extra\s+([\w]+(?:\s+[\w]+){0,2})", s):
         parts.append(f"extra {m.group(1).strip()}")
 
-    return ", ".join(parts) if parts else None
+    # Deduplicate while preserving order
+    seen: set[str] = set()
+    unique_parts: list[str] = []
+    for p in parts:
+        if p not in seen:
+            seen.add(p)
+            unique_parts.append(p)
+
+    return ", ".join(unique_parts) if unique_parts else None
 
 
 def _detect_modifier_update(
@@ -904,6 +924,135 @@ def _detect_modifier_update(
             return raw_modifier, cart_item
 
     return None
+
+
+# ── Common food ingredient words ─────────────────────────────────────────────
+# Used to distinguish "take out tomato" (modifier) from "take out the burger" (cart removal).
+# Customers mention these as things to add or remove FROM an item, not items themselves.
+_INGREDIENT_WORDS: frozenset[str] = frozenset({
+    "tomato", "tomatoes", "onion", "onions", "lettuce", "cheese", "cheeses",
+    "sauce", "sauces", "mayo", "mayonnaise", "pickle", "pickles",
+    "jalapeno", "jalapenos", "jalapeño", "pepper", "peppers",
+    "chili", "chilli", "chillies", "chilies",
+    "bacon", "avocado", "avo", "egg", "eggs", "pineapple", "garlic", "butter",
+    "spice", "spices", "spicy", "salt", "vinegar", "mustard", "ketchup",
+    "bbq", "relish", "coleslaw", "slaw", "mushroom", "mushrooms",
+    "cucumber", "sprouts", "seasoning",
+})
+
+
+def _detect_ingredient_modifier_from_remove(
+    msg_text: str,
+    cart: list[dict],
+    menu_item_names: set[str],
+) -> tuple[str, dict] | None:
+    """
+    Detect when an ORDER_REMOVE-phrased message is actually a modifier operation
+    targeting a food ingredient rather than an entire cart item.
+
+    A message is an INGREDIENT MODIFIER when:
+      - The thing being "removed" is a known food ingredient (tomato, onion, …), AND
+      - That word is not a menu item name.
+
+    A message is a CART REMOVAL (returns None) when:
+      - The thing being "removed" is a known menu item name ("the burger", "the pizza").
+
+    Examples that match:
+      "take out tomato"                         → ("no tomato", <burger_entry>)
+      "remove tomato"                           → ("no tomato", <burger_entry>)
+      "take out tomato from the Classic Smash Burger" → ("no tomato", <burger_entry>)
+      "leave out onion"                         → ("no onion", <first_food_item>)
+      "no tomato please"                        → ("no tomato", <first_food_item>)
+      "dont put tomato"                         → ("no tomato", <first_food_item>)
+
+    Examples that return None (real cart removals):
+      "remove the burger"                       → None
+      "take out the pizza"                      → None
+    """
+    import re as _re
+    if not cart:
+        return None
+
+    msg_lower = msg_text.strip().lower()
+
+    # ── Extract the "target" word(s) after the remove/no verb ────────────────
+    _TARGET_RE = _re.compile(
+        r"(?:"
+        # Explicit remove verbs
+        r"take\s+(?:out|off|away)|leave\s+(?:out|off)|remove|drop|"
+        # Negation verbs
+        r"don.?t\s+(?:put|add|include|want)|"
+        # Standalone "no X" or "without X"
+        r"no|without"
+        r")\s+"
+        r"([\w]+(?:\s+[\w]+){0,3})"   # up to 4 words
+        r"(?:\s+(?:from|on|in|for)\s+.+)?$",   # optional "from/on/in <item>"
+        _re.I,
+    )
+    m = _TARGET_RE.search(msg_lower)
+    if not m:
+        return None
+
+    target_raw = m.group(1).strip().lower()
+    # Strip leading stop-words that crept into the capture
+    _STOP = {"the", "a", "an", "my", "some"}
+    target_words = [w for w in target_raw.split() if w not in _STOP]
+    if not target_words:
+        return None
+
+    # ── Guard: if target matches a menu item name → real cart removal ─────────
+    # Check individual significant words against menu item name tokens.
+    menu_name_tokens: set[str] = set()
+    for name in menu_item_names:
+        menu_name_tokens.update(name.lower().split())
+
+    if any(tw in menu_name_tokens and len(tw) > 4 for tw in target_words):
+        return None  # e.g. "pizza", "burger", "smash" → cart removal
+
+    # ── Confirm target is a food ingredient ───────────────────────────────────
+    is_ingredient = any(w in _INGREDIENT_WORDS for w in target_words)
+    if not is_ingredient:
+        # Single short word not in our list — allow if it's clearly not a menu item
+        if len(target_words) == 1 and len(target_words[0]) >= 3:
+            pass  # proceed as potential ingredient
+        else:
+            return None
+
+    modifier_text = f"no {' '.join(target_words[:3])}"
+
+    # ── Find the target cart item ─────────────────────────────────────────────
+    target_item: dict | None = None
+
+    # Explicit reference: "from/on/for/in the <item>"
+    _REF_RE = _re.compile(r"(?:from|on|for|in)\s+(?:the\s+|my\s+)?(.+?)$", _re.I)
+    ref_m = _REF_RE.search(msg_lower)
+    if ref_m:
+        ref_text = ref_m.group(1).strip().lower()
+        ref_words = [w for w in ref_text.split() if len(w) > 3]
+        for ci in cart:
+            ci_lower = ci["name"].lower()
+            if ref_text in ci_lower or any(rw in ci_lower for rw in ref_words):
+                target_item = ci
+                break
+
+    # No explicit reference — use only cart item if unique, else first non-drink
+    if target_item is None:
+        _DRINK_WORDS = {"cola", "coffee", "juice", "water", "drink", "coke"}
+        food_items = [
+            ci for ci in cart
+            if not any(d in ci["name"].lower() for d in _DRINK_WORDS)
+        ]
+        if len(food_items) == 1:
+            target_item = food_items[0]
+        elif food_items:
+            target_item = food_items[0]   # default to first food item
+        elif len(cart) == 1:
+            target_item = cart[0]
+
+    if target_item is None:
+        return None
+
+    return modifier_text, target_item
 
 
 def _parse_quantity_before(msg_lower: str, item_start: int) -> int:
@@ -1136,6 +1285,96 @@ async def _handle_with_llm(
             parts = ["Added to your order: " + ", ".join(det_added) + " ✅"]
             parts.append("\n" + confirm_msg)
             return ("\n".join(parts), False, None, None, None)
+
+    # ── Deterministic ingredient-modifier interception for ORDER_REMOVE ─────────
+    # Fires when the intent is ORDER_REMOVE to decide whether the customer is:
+    #
+    #   A) Ordering a menu item WITH a modifier:
+    #      "Classic Smash Burger take out tomato" → add Classic Smash Burger (no tomato)
+    #      Intent fired ORDER_REMOVE because "take out" was in the message.
+    #
+    #   B) Modifying an existing cart item's special_instructions:
+    #      "take out tomato" → burger.special_instructions += "no tomato"
+    #      "take out tomato from the Classic Smash Burger" → same
+    #
+    #   C) A real cart item removal → fall through to LLM as before.
+    #
+    # The distinguishing rule: if the target of the remove phrase is a food ingredient
+    # (tomato, onion, cheese …) and NOT a menu item name, it is a modifier, not a removal.
+    if intent == MessageIntent.ORDER_REMOVE:
+        _menu_item_names = {i.name.lower() for i in items if i.is_active and not i.is_deleted}
+
+        # ── Sub-case A: message also names a menu item + extraction found modifier ──
+        # e.g. "Classic Smash Burger take out tomato"
+        _det_remove_matches = _extract_items_from_message(norm_text, items)
+        _with_modifier = [(it, qty, mod) for it, qty, mod in _det_remove_matches if mod]
+        if _with_modifier:
+            import copy as _copy
+            det_added: list[str] = []
+            for _it, _qty, _mod in _with_modifier:
+                state_machine.add_to_cart(
+                    session,
+                    menu_item_id=str(_it.id),
+                    name=_it.name,
+                    price_cents=_it.price_cents,
+                    quantity=_qty,
+                    options=None,
+                    special_instructions=_mod,
+                )
+                det_added.append(f"{_qty}x {_it.name} ({_mod})")
+            updated_cart = state_machine.get_cart(session)
+            state_machine.set_context(session, "confirmed_cart", _copy.deepcopy(updated_cart))
+            state_machine.set_context(session, "pending_options", None)
+            state_machine.transition_state(session, ConversationState.CONFIRMING_ORDER.value)
+            logger.warning(
+                "DET_REMOVE_AS_ORDER: interpreted ORDER_REMOVE as order-with-modifier: %r, session_id=%s",
+                det_added, session.id,
+            )
+            order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
+            total = state_machine.cart_total_cents(session)
+            summary = state_machine.cart_summary_text(session, business.currency)
+            confirm_msg = responses.ask_confirmation_response(summary, total, 0, order_mode, business.currency)
+            if order_mode == "DELIVERY":
+                confirm_msg += "\n_Delivery fee will be confirmed by our team._"
+            return (
+                "Added to your order: " + ", ".join(det_added) + " ✅\n\n" + confirm_msg,
+                False, None, None, None,
+            )
+
+        # ── Sub-case B: standalone ingredient phrase — modify existing cart item ──
+        # e.g. "take out tomato", "take out tomato from the Classic Smash Burger"
+        _current_cart = state_machine.get_cart(session)
+        _ingredient_match = _detect_ingredient_modifier_from_remove(
+            norm_text, _current_cart, _menu_item_names
+        )
+        if _ingredient_match:
+            _mod_text, _target = _ingredient_match
+            state_machine.update_cart_item_instructions(session, _target["name"], _mod_text)
+            import copy as _copy
+            updated_cart = state_machine.get_cart(session)
+            state_machine.set_context(session, "confirmed_cart", _copy.deepcopy(updated_cart))
+            logger.warning(
+                "DET_INGREDIENT_MODIFIER: applied %r to %r, session_id=%s",
+                _mod_text, _target["name"], session.id,
+            )
+            order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
+            total = state_machine.cart_total_cents(session)
+            summary = state_machine.cart_summary_text(session, business.currency)
+            confirm_msg = responses.ask_confirmation_response(
+                summary, total, 0, order_mode, business.currency
+            )
+            if order_mode == "DELIVERY":
+                confirm_msg += "\n_Delivery fee will be confirmed by our team._"
+            return (
+                f"Updated ✅ {_mod_text} on {_target['name']}.\n\n{confirm_msg}",
+                False, None, None, None,
+            )
+
+        # Sub-case C: real cart item removal — fall through to LLM
+        logger.warning(
+            "DET_REMOVE_FALLTHROUGH: no ingredient match, forwarding to LLM. "
+            "session_id=%s, msg=%r", session.id, msg_text[:80],
+        )
 
     # ── Deterministic add-on in CONFIRMING_ORDER (simple add-only messages) ──
     # Handles "Add the ice coffee", "Add wings" while reviewing cart.

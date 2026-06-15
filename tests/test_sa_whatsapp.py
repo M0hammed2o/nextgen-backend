@@ -29,7 +29,13 @@ from backend.app.bot.intent_router import (
     match_intent,
 )
 from backend.app.bot.normalizer import normalize
-from backend.app.bot.pipeline import _detect_modifier_update, _extract_items_from_message
+from backend.app.bot.pipeline import (
+    _detect_ingredient_modifier_from_remove,
+    _detect_modifier_update,
+    _extract_items_from_message,
+    _extract_modifier_from_suffix,
+    _INGREDIENT_WORDS,
+)
 from shared.enums import MessageIntent
 
 
