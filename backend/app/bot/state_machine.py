@@ -251,6 +251,45 @@ def update_cart_item_instructions(
     return cart, False
 
 
+def remove_modifier_from_instructions(
+    session: ConversationSession,
+    item_name: str,
+    modifier_word: str,
+) -> tuple[list[dict], bool]:
+    """
+    Remove a modifier phrase containing *modifier_word* from a cart item's
+    special_instructions.  Used when the customer says "actually leave the tomato"
+    after a "no tomato" was set.
+
+    The modifier_word should be the ingredient (e.g. "tomato"), not the full
+    "no tomato" string — the function strips any clause that contains that word.
+
+    Returns (updated_cart, was_updated).
+    """
+    import re as _re
+    cart = get_cart(session)
+    name_lower = item_name.lower().strip()
+    word_lower = modifier_word.lower().strip()
+
+    for item in cart:
+        if name_lower not in item["name"].lower() and item["name"].lower() not in name_lower:
+            continue
+        existing = item.get("special_instructions") or ""
+        if not existing:
+            return cart, False
+        # Split on comma, drop any clause that contains the ingredient word
+        clauses = [c.strip() for c in existing.split(",")]
+        new_clauses = [c for c in clauses if word_lower not in c.lower()]
+        new_instr = ", ".join(new_clauses) if new_clauses else None
+        if new_instr == existing:
+            return cart, False
+        item["special_instructions"] = new_instr
+        set_cart(session, cart)
+        return cart, True
+
+    return cart, False
+
+
 def clear_cart(session: ConversationSession) -> None:
     """Clear cart, confirmed_cart, and all order-specific context so the next
     order starts completely fresh. Customer name/phone are kept to avoid

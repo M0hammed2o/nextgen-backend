@@ -671,6 +671,49 @@ async def _handle_message(
 
     # ── Choosing options state (e.g. "what size?") ──────────────────────
     if current_state == ConversationState.CHOOSING_OPTIONS.value:
+        # Deterministic: "No" / "no thanks" with pending_options means the
+        # customer doesn't want modifications — commit pending items as-is.
+        _pending_opts = state_machine.get_context(session, "pending_options")
+        if _pending_opts and intent_router.is_negation(norm_text):
+            logger.warning(
+                "CHOOSING_OPTIONS_NO_MOD: negation with %d pending item(s), adding as-is. session_id=%s",
+                len(_pending_opts), session.id,
+            )
+            _, _items_menu = await _load_menu(db, business.id)
+            _items_map = {i.name.lower(): i for i in _items_menu if i.is_active and not i.is_deleted}
+            _added_labels: list[str] = []
+            for _p in _pending_opts:
+                _mi = _items_map.get((_p.get("name") or "").lower())
+                if not _mi:
+                    # Fuzzy fallback
+                    _pn = (_p.get("name") or "").lower()
+                    _cands = [(len(mn), mi) for mn, mi in _items_map.items() if mn in _pn or _pn in mn]
+                    if _cands:
+                        _mi = sorted(_cands, reverse=True)[0][1]
+                if _mi:
+                    _qty = max(1, min(int(_p.get("quantity") or 1), 20))
+                    state_machine.add_to_cart(
+                        session, str(_mi.id), _mi.name, _mi.price_cents,
+                        _qty, options=_p.get("options"), special_instructions=_p.get("special_instructions"),
+                    )
+                    _added_labels.append(f"{_qty}x {_mi.name}")
+            state_machine.set_context(session, "pending_options", None)
+            import copy as _copy
+            _upd_cart = state_machine.get_cart(session)
+            state_machine.set_context(session, "confirmed_cart", _copy.deepcopy(_upd_cart))
+            state_machine.transition_state(session, ConversationState.CONFIRMING_ORDER.value)
+            _order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
+            _total = state_machine.cart_total_cents(session)
+            _summary = state_machine.cart_summary_text(session, business.currency)
+            _confirm = responses.ask_confirmation_response(_summary, _total, 0, _order_mode, business.currency)
+            if _order_mode == "DELIVERY":
+                _confirm += "\n_Delivery fee will be confirmed by our team._"
+            _label_str = ", ".join(_added_labels) if _added_labels else "items"
+            return (
+                f"Added to your order: {_label_str} ✅\n\n{_confirm}",
+                False, None, None, None,
+            )
+
         logger.warning("HANDLE_BRANCH: CHOOSING_OPTIONS → LLM resolves pending item options")
         return await _handle_with_llm(db, business, customer, session, msg_text, intent=intent, norm_text=norm_text)
 
@@ -831,25 +874,32 @@ def _extract_modifier_from_suffix(suffix: str) -> str | None:
 
     parts: list[str] = []
 
+    def _strip_articles(text: str) -> str:
+        """Strip leading articles 'a', 'an', 'the' so 'without a tomato' → 'tomato'."""
+        return _re.sub(r"^(?:a|an|the)\s+", "", text.strip(), flags=_re.I).strip()
+
     # "take out/off/away X" / "leave out/off X"  — SA natural removal phrasing
     for m in _re.finditer(
         r"(?:take\s+(?:out|off|away)|leave\s+(?:out|off))\s+([\w]+(?:\s+[\w]+){0,2})", s
     ):
-        parts.append(f"no {m.group(1).strip()}")
+        # Trim trailing modifier keywords so "take out tomato extra cheese"
+        # yields "tomato" not "tomato extra cheese".
+        _raw = _re.sub(r"\s+(?:extra|with|and|no|without)\b.*$", "", m.group(1), flags=_re.I).strip()
+        parts.append(f"no {_strip_articles(_raw)}")
 
     # "don't put X" / "dont put X" / "don't add X"
     for m in _re.finditer(
         r"don.?t\s+(?:put|add|include|want)\s+([\w]+(?:\s+[\w]+){0,2})", s
     ):
-        parts.append(f"no {m.group(1).strip()}")
+        parts.append(f"no {_strip_articles(m.group(1))}")
 
     # "no X" / "with no X"
     for m in _re.finditer(r"(?:with\s+)?no\s+([\w]+(?:\s+[\w]+){0,2})", s):
-        parts.append(f"no {m.group(1).strip()}")
+        parts.append(f"no {_strip_articles(m.group(1))}")
 
-    # "without X"
+    # "without X" / "without a X" / "without the X"
     for m in _re.finditer(r"without\s+([\w]+(?:\s+[\w]+){0,2})", s):
-        parts.append(f"no {m.group(1).strip()}")
+        parts.append(f"no {_strip_articles(m.group(1))}")
 
     # "extra X" / "with extra X" (must not be double-counted with "no" above)
     for m in _re.finditer(r"(?:with\s+)?extra\s+([\w]+(?:\s+[\w]+){0,2})", s):
@@ -985,7 +1035,9 @@ def _detect_ingredient_modifier_from_remove(
         # Standalone "no X" or "without X"
         r"no|without"
         r")\s+"
-        r"([\w]+(?:\s+[\w]+){0,3})"   # up to 4 words
+        # Capture 1–4 ingredient words, stopping before separator keywords
+        # so "remove tomato from the burger" yields "tomato" not "tomato from the burger".
+        r"([\w]+(?:\s+(?!(?:from|on|in|for|the|my|a|an)\b)[\w]+){0,3})"
         r"(?:\s+(?:from|on|in|for)\s+.+)?$",   # optional "from/on/in <item>"
         _re.I,
     )
@@ -1055,6 +1107,64 @@ def _detect_ingredient_modifier_from_remove(
     return modifier_text, target_item
 
 
+def _detect_modifier_reversal(
+    msg_text: str,
+    cart: list[dict],
+) -> tuple[str, dict] | None:
+    """
+    Detect when the customer wants to RESTORE an ingredient they previously
+    asked to remove (e.g. "actually leave the tomato" after "no tomato" was set).
+
+    Returns (ingredient_word, cart_item) when:
+      - A "keep/leave/include/add back" verb is detected (without "out"), AND
+      - The ingredient word appears in a cart item's special_instructions as "no <word>".
+
+    Examples that match:
+      "actually leave the tomato"    → ("tomato", burger)   (removes "no tomato")
+      "keep the onion"               → ("onion",  burger)
+      "add the tomato back"          → ("tomato", burger)
+      "put tomato in"                → ("tomato", burger)
+      "actually with tomato"         → ("tomato", burger)
+
+    Examples that should NOT match:
+      "leave out tomato"             → None  ("out" present = still a removal)
+      "take out tomato"              → None  (handled by _detect_ingredient_modifier)
+    """
+    import re as _re
+    if not cart:
+        return None
+
+    msg_lower = msg_text.strip().lower()
+
+    # Exclude phrases that are actually removals ("leave OUT", "take OUT", etc.)
+    if _re.search(r"\b(leave\s+out|take\s+out|take\s+off|take\s+away|remove|without|no\s+\w)", msg_lower):
+        return None
+
+    _RESTORE_RE = _re.compile(
+        r"(?:"
+        r"(?:actually\s+)?(?:leave|keep|include|want)\s+(?:the\s+|a\s+|an\s+)?"
+        r"|(?:add|put)\s+(?:the\s+|a\s+|an\s+)?"
+        r"|(?:actually\s+)?with\s+(?:the\s+)?"
+        r")"
+        r"([\w]+(?:\s+[\w]+)?)",
+        _re.I,
+    )
+
+    for m in _RESTORE_RE.finditer(msg_lower):
+        ingredient = m.group(1).strip().lower()
+        # Strip trailing particles like "back" ("add tomato back" → "tomato")
+        ingredient = _re.sub(r"\s+back$", "", ingredient).strip()
+        if not ingredient or len(ingredient) < 3:
+            continue
+        # Only act if a cart item has "no <ingredient>" in its instructions
+        for ci in cart:
+            instr = (ci.get("special_instructions") or "").lower()
+            if f"no {ingredient}" in instr or ingredient in instr:
+                return ingredient, ci
+
+    return None
+
+
 def _parse_quantity_before(msg_lower: str, item_start: int) -> int:
     """Return the quantity token immediately before the item match, defaulting to 1."""
     prefix = msg_lower[:item_start].rstrip()
@@ -1099,8 +1209,9 @@ def _extract_items_from_chunk(
     consumed_positions: set[int] = set()
 
     # ── Alias pass ────────────────────────────────────────────────────────
+    # Use alias + optional 's' so "cokes" matches the "coke" alias, etc.
     for alias, target_substr in _ITEM_ALIASES.items():
-        for m in _re.finditer(rf"\b{_re.escape(alias)}\b", chunk_lower):
+        for m in _re.finditer(rf"\b{_re.escape(alias)}s?\b", chunk_lower):
             a_start, a_end = m.start(), m.end()
             span = set(range(a_start, a_end))
             if span & consumed_positions:
@@ -1139,7 +1250,14 @@ def _extract_items_from_chunk(
                 start = idx + 1
                 continue
             before_ok = idx == 0 or not chunk_lower[idx - 1].isalpha()
-            after_ok = end == len(chunk_lower) or not chunk_lower[end].isalpha()
+            # Allow a trailing plural 's' so "burgers" matches "burger",
+            # "pizzas" matches "pizza", "chips" already ends correctly, etc.
+            # Consume the 's' so the suffix extractor sees the right text.
+            after_char = chunk_lower[end] if end < len(chunk_lower) else ""
+            if after_char == "s" and (end + 1 >= len(chunk_lower) or not chunk_lower[end + 1].isalpha()):
+                end += 1  # consume the plural 's'
+                after_char = chunk_lower[end] if end < len(chunk_lower) else ""
+            after_ok = end == len(chunk_lower) or not after_char.isalpha()
             if not (before_ok and after_ok):
                 start = idx + 1
                 continue
@@ -1375,6 +1493,39 @@ async def _handle_with_llm(
             "DET_REMOVE_FALLTHROUGH: no ingredient match, forwarding to LLM. "
             "session_id=%s, msg=%r", session.id, msg_text[:80],
         )
+
+    # ── Deterministic modifier reversal ("actually leave the tomato") ────────
+    # Fires for any intent when the customer restores an ingredient that was
+    # previously removed (i.e. "no X" appears in a cart item's instructions).
+    # Must run before the LLM so chitchat-style responses don't bypass it.
+    _reversal_cart = state_machine.get_cart(session)
+    if _reversal_cart:
+        _reversal = _detect_modifier_reversal(norm_text, _reversal_cart)
+        if _reversal:
+            _rev_word, _rev_target = _reversal
+            _, _rev_updated = state_machine.remove_modifier_from_instructions(
+                session, _rev_target["name"], _rev_word
+            )
+            if _rev_updated:
+                import copy as _copy
+                updated_cart = state_machine.get_cart(session)
+                state_machine.set_context(session, "confirmed_cart", _copy.deepcopy(updated_cart))
+                logger.warning(
+                    "DET_MOD_REVERSAL: restored %r on %r, session_id=%s",
+                    _rev_word, _rev_target["name"], session.id,
+                )
+                order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
+                total = state_machine.cart_total_cents(session)
+                summary = state_machine.cart_summary_text(session, business.currency)
+                confirm_msg = responses.ask_confirmation_response(
+                    summary, total, 0, order_mode, business.currency
+                )
+                if order_mode == "DELIVERY":
+                    confirm_msg += "\n_Delivery fee will be confirmed by our team._"
+                return (
+                    f"Got it ✅ {_rev_target['name']} will include {_rev_word}.\n\n{confirm_msg}",
+                    False, None, None, None,
+                )
 
     # ── Deterministic add-on in CONFIRMING_ORDER (simple add-only messages) ──
     # Handles "Add the ice coffee", "Add wings" while reviewing cart.
@@ -1675,6 +1826,9 @@ async def _handle_with_llm(
         if cart:
             import copy as _copy
             state_machine.set_context(session, "confirmed_cart", _copy.deepcopy(cart))
+            # Clear any stale pending_options — replace_item resolves the selection,
+            # so the old ask_options context must not linger and confuse future LLM calls.
+            state_machine.set_context(session, "pending_options", None)
             state_machine.transition_state(session, ConversationState.CONFIRMING_ORDER.value)
             order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
             total = state_machine.cart_total_cents(session)
@@ -1684,6 +1838,7 @@ async def _handle_with_llm(
                 confirm_msg += "\n_Delivery fee will be confirmed by our team._"
             parts.append("\n" + confirm_msg)
         else:
+            state_machine.set_context(session, "pending_options", None)
             state_machine.transition_state(session, ConversationState.IDLE.value)
             parts.append("Your cart is now empty. What would you like to order?")
 
