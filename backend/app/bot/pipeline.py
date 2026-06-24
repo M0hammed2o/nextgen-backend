@@ -592,6 +592,9 @@ async def _handle_message(
         ConversationState.CONFIRMING_ORDER.value,
         ConversationState.WAITING_DELIVERY_FEE_APPROVAL.value,
         ConversationState.COLLECTING_PAYMENT.value,
+        # CHOOSING_OPTIONS: "yes" must reach the CHOOSING_OPTIONS confirmation handler
+        # so pending/proposed items can be committed before the gate fires.
+        ConversationState.CHOOSING_OPTIONS.value,
     }
     if intent == MessageIntent.ORDER_CONFIRM and current_state not in _SKIP_CONFIRM_GATE_STATES:
         logger.warning("HANDLE_BRANCH: ORDER_CONFIRM → cart confirmation gate (state=%s)", current_state)
@@ -671,48 +674,97 @@ async def _handle_message(
 
     # ── Choosing options state (e.g. "what size?") ──────────────────────
     if current_state == ConversationState.CHOOSING_OPTIONS.value:
-        # Deterministic: "No" / "no thanks" with pending_options means the
-        # customer doesn't want modifications — commit pending items as-is.
-        _pending_opts = state_machine.get_context(session, "pending_options")
-        if _pending_opts and intent_router.is_negation(norm_text):
-            logger.warning(
-                "CHOOSING_OPTIONS_NO_MOD: negation with %d pending item(s), adding as-is. session_id=%s",
-                len(_pending_opts), session.id,
-            )
-            _, _items_menu = await _load_menu(db, business.id)
-            _items_map = {i.name.lower(): i for i in _items_menu if i.is_active and not i.is_deleted}
-            _added_labels: list[str] = []
-            for _p in _pending_opts:
-                _mi = _items_map.get((_p.get("name") or "").lower())
-                if not _mi:
-                    # Fuzzy fallback
-                    _pn = (_p.get("name") or "").lower()
-                    _cands = [(len(mn), mi) for mn, mi in _items_map.items() if mn in _pn or _pn in mn]
-                    if _cands:
-                        _mi = sorted(_cands, reverse=True)[0][1]
+        _pending_opts  = state_machine.get_context(session, "pending_options")
+        _proposed_items = state_machine.get_context(session, "proposed_items")
+
+        # ── Helper: commit a list of item-dicts to cart and lock ─────────
+        async def _commit_to_cart_and_confirm(items_to_commit: list[dict]) -> tuple:
+            """Add items_to_commit to cart, clear pending/proposed, go to CONFIRMING_ORDER."""
+            _, _menu_items_co = await _load_menu(db, business.id)
+            _map_co = {i.name.lower(): i for i in _menu_items_co if i.is_active and not i.is_deleted}
+            _labels_co: list[str] = []
+            for _p in items_to_commit:
+                _mid = _p.get("menu_item_id")
+                _pname = (_p.get("name") or "").lower()
+                if _mid:
+                    # proposed_items already have menu_item_id
+                    _mi = next((i for i in _menu_items_co if str(i.id) == _mid), None)
+                    if not _mi:
+                        _mi = _map_co.get(_pname)
+                else:
+                    _mi = _map_co.get(_pname)
+                    if not _mi:
+                        _cands = [(len(mn), mi) for mn, mi in _map_co.items() if mn in _pname or _pname in mn]
+                        if _cands:
+                            _mi = sorted(_cands, reverse=True)[0][1]
                 if _mi:
                     _qty = max(1, min(int(_p.get("quantity") or 1), 20))
                     state_machine.add_to_cart(
                         session, str(_mi.id), _mi.name, _mi.price_cents,
-                        _qty, options=_p.get("options"), special_instructions=_p.get("special_instructions"),
+                        _qty, options=_p.get("options"),
+                        special_instructions=_p.get("special_instructions"),
                     )
-                    _added_labels.append(f"{_qty}x {_mi.name}")
+                    _lbl = f"{_qty}x {_mi.name}"
+                    if _p.get("special_instructions"):
+                        _lbl += f" ({_p['special_instructions']})"
+                    _labels_co.append(_lbl)
             state_machine.set_context(session, "pending_options", None)
-            import copy as _copy
-            _upd_cart = state_machine.get_cart(session)
-            state_machine.set_context(session, "confirmed_cart", _copy.deepcopy(_upd_cart))
+            state_machine.set_context(session, "proposed_items", None)
+            import copy as _copy_co
+            _upd = state_machine.get_cart(session)
+            state_machine.set_context(session, "confirmed_cart", _copy_co.deepcopy(_upd))
             state_machine.transition_state(session, ConversationState.CONFIRMING_ORDER.value)
-            _order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
-            _total = state_machine.cart_total_cents(session)
-            _summary = state_machine.cart_summary_text(session, business.currency)
-            _confirm = responses.ask_confirmation_response(_summary, _total, 0, _order_mode, business.currency)
-            if _order_mode == "DELIVERY":
-                _confirm += "\n_Delivery fee will be confirmed by our team._"
-            _label_str = ", ".join(_added_labels) if _added_labels else "items"
-            return (
-                f"Added to your order: {_label_str} ✅\n\n{_confirm}",
-                False, None, None, None,
+            _om = state_machine.get_context(session, "order_mode", "PICKUP")
+            _tot = state_machine.cart_total_cents(session)
+            _summ = state_machine.cart_summary_text(session, business.currency)
+            _cfm = responses.ask_confirmation_response(_summ, _tot, 0, _om, business.currency)
+            if _om == "DELIVERY":
+                _cfm += "\n_Delivery fee will be confirmed by our team._"
+            _lbl_str = ", ".join(_labels_co) if _labels_co else "items"
+            return (f"Added to your order: {_lbl_str} ✅\n\n{_cfm}", False, None, None, None)
+
+        # ── Sub-case: customer confirms the LLM's proposal ("yes") ───────
+        # Fires when the LLM already proposed items in natural language AND
+        # customer says yes — commit proposed_items (preferred) or pending_options.
+        if intent_router.is_confirmation(norm_text) and (_proposed_items or _pending_opts):
+            logger.warning(
+                "CHOOSING_OPTIONS_CONFIRM: confirmation — proposed=%d, pending=%d, session_id=%s",
+                len(_proposed_items or []), len(_pending_opts or []), session.id,
             )
+            _to_commit = _proposed_items or _pending_opts
+            return await _commit_to_cart_and_confirm(_to_commit)
+
+        # ── Sub-case: customer declines modifications ("No") ─────────────
+        if intent_router.is_negation(norm_text) and _pending_opts:
+            logger.warning(
+                "CHOOSING_OPTIONS_NO_MOD: negation with %d pending item(s), session_id=%s",
+                len(_pending_opts), session.id,
+            )
+            return await _commit_to_cart_and_confirm(_pending_opts)
+
+        # ── Sub-case: customer adds an item while in CHOOSING_OPTIONS ─────
+        # e.g. "Add a coke" after bot asked about burger modifications.
+        # Deterministically add the new item AND commit any pending items as-is.
+        if intent in (MessageIntent.ORDER_ADD, MessageIntent.ORDER_START):
+            _, _menu_items_oa = await _load_menu(db, business.id)
+            _det_oa = _extract_items_from_message(norm_text, _menu_items_oa)
+            if _det_oa:
+                logger.warning(
+                    "CHOOSING_OPTIONS_ADD: %d new item(s) found while in CHOOSING_OPTIONS, session_id=%s",
+                    len(_det_oa), session.id,
+                )
+                # Commit pending items first (as-is, no modifications)
+                _items_to_commit_oa: list[dict] = list(_pending_opts or [])
+                # Then add the new items
+                for _it, _qty, _mod in _det_oa:
+                    _items_to_commit_oa.append({
+                        "menu_item_id": str(_it.id),
+                        "name": _it.name,
+                        "price_cents": _it.price_cents,
+                        "quantity": _qty,
+                        "special_instructions": _mod,
+                    })
+                return await _commit_to_cart_and_confirm(_items_to_commit_oa)
 
         logger.warning("HANDLE_BRANCH: CHOOSING_OPTIONS → LLM resolves pending item options")
         return await _handle_with_llm(db, business, customer, session, msg_text, intent=intent, norm_text=norm_text)
@@ -1176,6 +1228,12 @@ def _parse_quantity_before(msg_lower: str, item_start: int) -> int:
     last = tokens[-1].rstrip(".,")
     if last.isdigit():
         return max(1, min(int(last), 20))
+    # Handle "2x" / "x2" shorthand common in LLM proposal messages ("2x Burger")
+    import re as _re
+    _mx = _re.match(r'^(\d+)x$|^x(\d+)$', last, _re.I)
+    if _mx:
+        n = int(_mx.group(1) or _mx.group(2))
+        return max(1, min(n, 20))
     _WORD_NUMS = {
         "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
         "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
@@ -1210,8 +1268,10 @@ def _extract_items_from_chunk(
 
     # ── Alias pass ────────────────────────────────────────────────────────
     # Use alias + optional 's' so "cokes" matches the "coke" alias, etc.
+    # (?<!-) prevents "cola" from matching INSIDE "coca-cola" (hyphen creates a
+    # word boundary so plain \b would otherwise fire mid-compound-word).
     for alias, target_substr in _ITEM_ALIASES.items():
-        for m in _re.finditer(rf"\b{_re.escape(alias)}s?\b", chunk_lower):
+        for m in _re.finditer(rf"(?<!-)\b{_re.escape(alias)}s?\b", chunk_lower):
             a_start, a_end = m.start(), m.end()
             span = set(range(a_start, a_end))
             if span & consumed_positions:
@@ -1883,6 +1943,23 @@ async def _handle_with_llm(
                     "options": pi.options,
                     "special_instructions": pi.special_instructions,
                 })
+        # Fallback: if the LLM sent ask_options with no items, try DET extraction
+        # on the original customer message so the CHOOSING_OPTIONS confirmation/negation
+        # handlers have something to commit (fixes Bug 2: "Classic Smash Burger" → empty pending).
+        if not pending:
+            _det_fallback = _extract_items_from_message(norm_text, items)
+            for _it, _qty, _mod in _det_fallback:
+                pending.append({
+                    "name": _it.name,
+                    "quantity": _qty,
+                    "options": None,
+                    "special_instructions": _mod,
+                })
+            if _det_fallback:
+                logger.warning(
+                    "ASK_OPTIONS_DET_FALLBACK: LLM sent empty items; DET found %d item(s) in norm_text. session_id=%s",
+                    len(_det_fallback), session.id,
+                )
         if pending:
             state_machine.set_context(session, "pending_options", pending)
             logger.warning(
@@ -2007,6 +2084,32 @@ async def _handle_with_llm(
             session.id,
             parsed.message[:80],
         )
+
+    # ── Proposed-order capture in CHOOSING_OPTIONS ───────────────────────
+    # When the LLM proposes items in a chitchat message from CHOOSING_OPTIONS
+    # (e.g. "I'll add 2x Classic Smash Burger and 2x Coca-Cola (330ml). Shall I
+    # proceed?"), extract those items and save as proposed_items so the
+    # CHOOSING_OPTIONS confirmation handler can commit them when customer says "yes".
+    if session.state == ConversationState.CHOOSING_OPTIONS.value and not active_cart:
+        _prop_msg = parsed.message or ""
+        _prop_extracted = _extract_items_from_message(_prop_msg, items)
+        if _prop_extracted:
+            import copy as _copy_prop
+            state_machine.set_context(session, "proposed_items", [
+                {
+                    "menu_item_id": str(_pi.id),
+                    "name": _pi.name,
+                    "price_cents": _pi.price_cents,
+                    "quantity": _qty,
+                    "special_instructions": _mod,
+                }
+                for _pi, _qty, _mod in _prop_extracted
+            ])
+            logger.warning(
+                "PROPOSED_ITEMS_SAVED: %d item(s) extracted from LLM chitchat message. session_id=%s",
+                len(_prop_extracted), session.id,
+            )
+
     return (
         parsed.message,
         True,
