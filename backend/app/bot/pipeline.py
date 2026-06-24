@@ -544,10 +544,15 @@ async def _handle_message(
                 last_order.order_number, last_order.status,
             )
         state_machine.transition_state(session, ConversationState.BUILDING_CART.value)
-        # Return a clear framing message so the customer knows they're starting a
-        # fresh replacement order. Without this the bot falls through with an empty
-        # cart and misprocesses the original ORDER_REMOVE / ORDER_ADD intent.
-        order_ref = f" (replacing {last_order.order_number})" if last_order else ""
+        # Only reference the previous order if it is still open (not terminal).
+        # COLLECTED / DELIVERED / CANCELLED orders must never appear in the message —
+        # they belong to a completed session and the customer is starting fresh.
+        _TERMINAL_STATUSES = {"COLLECTED", "DELIVERED", "CANCELLED"}
+        order_ref = (
+            f" (replacing {last_order.order_number})"
+            if last_order and last_order.status not in _TERMINAL_STATUSES
+            else ""
+        )
         return (
             f"Got it{order_ref}! I've started a new order for you. "
             f"Please tell me what you'd like — just send your full order again and I'll build it from scratch. 🛒",
@@ -1159,6 +1164,88 @@ def _detect_ingredient_modifier_from_remove(
     return modifier_text, target_item
 
 
+def _detect_quantity_modifier_split(
+    msg_text: str,
+    cart: list[dict],
+) -> tuple[int, str, dict] | None:
+    """
+    Detect "N [modifier]" messages sent as follow-up lines after a multi-item
+    order — e.g. customer sends "2 smash burgers" then "1 no tomato" then
+    "1 extra cheese" as separate WhatsApp messages.
+
+    Returns (count, modifier_text, target_cart_item) when:
+      - The message is "N no/extra/without <ingredient>"
+      - Exactly ONE distinct food item type is in the cart
+      - count ≤ total quantity of that item type
+
+    Returns None when the pattern doesn't match or the situation is ambiguous
+    (multiple distinct food item types → let LLM handle).
+
+    Examples:
+      "1 no tomato"    cart=[2x CSB] → (1, "no tomato", CSB)
+      "1 extra cheese" cart=[1x CSB, 1x CSB(no tomato)] → (1, "extra cheese", CSB-plain)
+      "2 no tomato"    cart=[2x CSB] → (2, "no tomato", CSB)
+      "1 no tomato"    cart=[CSB, Pizza] → None  (ambiguous)
+    """
+    import re as _re
+    if not cart:
+        return None
+
+    msg_lower = msg_text.strip().lower()
+
+    _WORD_NUMS = {
+        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+        "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    }
+    _QMS_RE = _re.compile(
+        r"^(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+"
+        r"(no|without|extra|with\s+no|with\s+extra|take\s+out|leave\s+out|don.?t\s+put|dont\s+put)\s+"
+        r"([\w]+(?:\s+[\w]+){0,2})",
+        _re.I,
+    )
+    m = _QMS_RE.match(msg_lower)
+    if not m:
+        return None
+
+    raw_count = m.group(1).lower()
+    count = int(raw_count) if raw_count.isdigit() else _WORD_NUMS.get(raw_count, 0)
+    if count <= 0:
+        return None
+
+    verb = m.group(2).lower().strip()
+    ingredient = m.group(3).strip()
+
+    modifier_text = f"extra {ingredient}" if verb in ("extra", "with extra") else f"no {ingredient}"
+
+    # Only fire when exactly one distinct food item type is in the cart.
+    # Multiple types → ambiguous which item the modifier belongs to; let LLM handle.
+    _DRINK_WORDS = {"cola", "coffee", "juice", "water", "drink", "coke"}
+    food_items = [ci for ci in cart if not any(d in ci["name"].lower() for d in _DRINK_WORDS)]
+    if not food_items:
+        return None
+
+    food_names = {ci["name"].lower() for ci in food_items}
+    if len(food_names) != 1:
+        return None  # Ambiguous — LLM handles
+
+    total_food_qty = sum(ci["quantity"] for ci in food_items)
+    if count > total_food_qty:
+        return None  # Requested more than available
+
+    # Prefer an unmodified item (or one that doesn't already have this modifier)
+    for ci in food_items:
+        existing = (ci.get("special_instructions") or "").lower()
+        if modifier_text.lower() not in existing and ci["quantity"] >= count:
+            return count, modifier_text, ci
+
+    # Fallback: first food item that has enough quantity
+    for ci in food_items:
+        if ci["quantity"] >= count:
+            return count, modifier_text, ci
+
+    return None
+
+
 def _detect_modifier_reversal(
     msg_text: str,
     cart: list[dict],
@@ -1416,7 +1503,14 @@ async def _handle_with_llm(
     # For ORDER_ADD: BUILDING_CART only (add-ons in CONFIRMING_ORDER are handled
     # by the separate DET_ADD_CONFIRMING block below which checks for mutation signals).
     # CHOOSING_OPTIONS is always excluded — customer is answering a size/option question.
-    _det_states_for_add = {ConversationState.BUILDING_CART.value}
+    # ORDER_ADD DET runs in BUILDING_CART, BROWSING_MENU, and IDLE so that
+    # "add a coke" works after a product inquiry (BROWSING_MENU) or as the first
+    # message of a session (IDLE) without requiring a LLM round-trip.
+    _det_states_for_add = {
+        ConversationState.BUILDING_CART.value,
+        ConversationState.BROWSING_MENU.value,
+        ConversationState.IDLE.value,
+    }
     _det_eligible = (
         intent == MessageIntent.ORDER_START
         and session.state != ConversationState.CHOOSING_OPTIONS.value
@@ -1586,6 +1680,54 @@ async def _handle_with_llm(
                     f"Got it ✅ {_rev_target['name']} will include {_rev_word}.\n\n{confirm_msg}",
                     False, None, None, None,
                 )
+
+    # ── Quantity-modifier split ("1 no tomato" with 2x CSB → split cart item) ──
+    # Handles multi-message modifier assignment:
+    #   Msg 1: "2 smash burgers" → [2x CSB]
+    #   Msg 2: "1 no tomato"    → [1x CSB, 1x CSB(no tomato)]
+    #   Msg 3: "1 extra cheese" → [1x CSB(no tomato), 1x CSB(extra cheese)]
+    # Fires for any intent (including None) in CONFIRMING_ORDER or BUILDING_CART.
+    if session.state in {
+        ConversationState.CONFIRMING_ORDER.value,
+        ConversationState.BUILDING_CART.value,
+    }:
+        _qms_cart = state_machine.get_cart(session)
+        _qms = _detect_quantity_modifier_split(norm_text, _qms_cart) if _qms_cart else None
+        if _qms:
+            _qms_count, _qms_mod, _qms_item = _qms
+            # Reduce (or remove) N of the unmodified target item
+            state_machine.remove_from_cart(
+                session, _qms_item["name"], quantity=_qms_count, qualifier_hint="plain"
+            )
+            # Add N of the item WITH the new modifier
+            state_machine.add_to_cart(
+                session,
+                menu_item_id=_qms_item["menu_item_id"],
+                name=_qms_item["name"],
+                price_cents=_qms_item["price_cents"],
+                quantity=_qms_count,
+                special_instructions=_qms_mod,
+            )
+            import copy as _copy
+            _qms_updated = state_machine.get_cart(session)
+            state_machine.set_context(session, "confirmed_cart", _copy.deepcopy(_qms_updated))
+            state_machine.transition_state(session, ConversationState.CONFIRMING_ORDER.value)
+            logger.warning(
+                "DET_QTY_MOD_SPLIT: %dx %r → %r, session_id=%s",
+                _qms_count, _qms_item["name"], _qms_mod, session.id,
+            )
+            order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
+            total = state_machine.cart_total_cents(session)
+            summary = state_machine.cart_summary_text(session, business.currency)
+            confirm_msg = responses.ask_confirmation_response(
+                summary, total, 0, order_mode, business.currency
+            )
+            if order_mode == "DELIVERY":
+                confirm_msg += "\n_Delivery fee will be confirmed by our team._"
+            return (
+                f"Updated ✅ {_qms_count}x {_qms_item['name']} with {_qms_mod}.\n\n{confirm_msg}",
+                False, None, None, None,
+            )
 
     # ── Deterministic add-on in CONFIRMING_ORDER (simple add-only messages) ──
     # Handles "Add the ice coffee", "Add wings" while reviewing cart.
