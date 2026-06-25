@@ -404,6 +404,54 @@ async def _handle_message(
             )
             preview += '\n\nSay *"specials"* for more details!'
             greeting = greeting + preview
+
+        # ── Multi-intent: greeting + embedded order ───────────────────────
+        # "Hello can I please get an ice coffee" must greet AND process the order.
+        # Skip for pure greetings (single word / short phrase) — only load the
+        # menu when the message has content beyond the greeting word itself.
+        import re as _re_greet
+        _PURE_GREET_RE = _re_greet.compile(
+            r'^(hi|hello|hey|howzit|heita|yebo|yo|sup|'
+            r'good\s*(?:morning|afternoon|evening)|'
+            r'sawubona|molo|hola|ola|gday)[!.,\s]*$',
+            _re_greet.I,
+        )
+        if not _PURE_GREET_RE.match(norm_text.strip()):
+            _, _greet_items = await _load_menu(db, business.id)
+            _greet_det = _extract_items_from_message(norm_text, _greet_items)
+            if _greet_det:
+                import copy as _copy_g
+                for _git, _gqty, _gmod in _greet_det:
+                    state_machine.add_to_cart(
+                        session,
+                        str(_git.id), _git.name, _git.price_cents,
+                        _gqty, special_instructions=_gmod,
+                    )
+                _g_cart = state_machine.get_cart(session)
+                state_machine.set_context(session, "confirmed_cart", _copy_g.deepcopy(_g_cart))
+                state_machine.transition_state(session, ConversationState.CONFIRMING_ORDER.value)
+                _g_labels = [
+                    (f"{_gqty}x {_git.name}" + (f" ({_gmod})" if _gmod else ""))
+                    for _git, _gqty, _gmod in _greet_det
+                ]
+                _g_order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
+                _g_total = state_machine.cart_total_cents(session)
+                _g_summary = state_machine.cart_summary_text(session, business.currency)
+                _g_confirm = responses.ask_confirmation_response(
+                    _g_summary, _g_total, 0, _g_order_mode, business.currency
+                )
+                if _g_order_mode == "DELIVERY":
+                    _g_confirm += "\n_Delivery fee will be confirmed by our team._"
+                logger.warning(
+                    "GREETING_WITH_ORDER: added %r deterministically, session_id=%s",
+                    _g_labels, session.id,
+                )
+                return (
+                    greeting
+                    + f"\n\nI've added {', '.join(_g_labels)} to your order 🛒\n\n{_g_confirm}",
+                    False, None, None, None,
+                )
+
         return greeting, False, None, None, None
 
     if intent == MessageIntent.MENU_REQUEST:
@@ -676,6 +724,36 @@ async def _handle_message(
                 session.id, msg_text[:80],
             )
             return await _handle_with_llm(db, business, customer, session, msg_text, intent=MessageIntent.ORDER_START, norm_text=norm_text)
+
+        # "I only want X" / "Just the coke" — full order replacement.
+        # Customer names a specific item as their complete order, replacing
+        # whatever is already in the cart.  Only fires when:
+        #   1. Message contains "only want" or "just want"
+        #   2. No modifier signals (extra/more/less/to add) that would mean
+        #      the customer is adjusting an item, not replacing the whole order
+        #   3. DET finds at least one known menu item in the message
+        import re as _re_ow
+        _ONLY_WANT_RE = _re_ow.compile(r"\b(only\s+want|just\s+want)\b", _re_ow.I)
+        _MOD_SIGNAL_RE = _re_ow.compile(
+            r"\b(extra|more|less|to\s+add|to\s+remove|also|and\s+add)\b", _re_ow.I
+        )
+        if (
+            _ONLY_WANT_RE.search(norm_text)
+            and not _MOD_SIGNAL_RE.search(norm_text)
+        ):
+            _, _ow_items = await _load_menu(db, business.id)
+            _ow_matches = _extract_items_from_message(norm_text, _ow_items)
+            if _ow_matches:
+                state_machine.clear_cart(session)
+                state_machine.transition_state(session, ConversationState.BUILDING_CART.value)
+                logger.warning(
+                    "ONLY_WANT_REPLACEMENT: cleared cart, rebuilding via DET/LLM. "
+                    "session_id=%s, msg=%r", session.id, msg_text[:80],
+                )
+                return await _handle_with_llm(
+                    db, business, customer, session,
+                    msg_text, intent=MessageIntent.ORDER_START, norm_text=norm_text,
+                )
 
     # ── Choosing options state (e.g. "what size?") ──────────────────────
     if current_state == ConversationState.CHOOSING_OPTIONS.value:
@@ -1613,6 +1691,62 @@ async def _handle_with_llm(
                 False, None, None, None,
             )
 
+        # ── Sub-case A2: deterministic cart removal ───────────────────────────────
+        # e.g. "Take out from my order the Classic Smash Burger"
+        #      "Remove the burger"   "Delete the Classic Smash Burger"
+        #
+        # DET found a menu item in the message with NO modifier AND that item is
+        # already in the cart.  Remove it directly — never send to LLM where
+        # CHOOSING_OPTIONS context can cause it to return add_items instead.
+        _det_no_mod = [(it, qty) for it, qty, mod in _det_remove_matches if not mod]
+        if _det_no_mod:
+            _cart_before_remove = state_machine.get_cart(session)
+            _cart_names_lower = {ci["name"].lower() for ci in _cart_before_remove}
+            _confirmed_removals = [
+                (it, qty) for it, qty in _det_no_mod
+                if it.name.lower() in _cart_names_lower
+            ]
+            if _confirmed_removals:
+                for _it, _qty in _confirmed_removals:
+                    state_machine.remove_from_cart(
+                        session, _it.name, qualifier_hint=msg_text
+                    )
+                # Also clear any stale pending/proposed context
+                state_machine.set_context(session, "pending_options", None)
+                state_machine.set_context(session, "proposed_items", None)
+                _updated_after_remove = state_machine.get_cart(session)
+                _removed_labels = [it.name for it, _ in _confirmed_removals]
+                logger.warning(
+                    "DET_REMOVE_CART: deterministically removed %r, cart_remaining=%d, session_id=%s",
+                    _removed_labels, len(_updated_after_remove), session.id,
+                )
+                if _updated_after_remove:
+                    import copy as _copy
+                    state_machine.set_context(
+                        session, "confirmed_cart", _copy.deepcopy(_updated_after_remove)
+                    )
+                    state_machine.transition_state(
+                        session, ConversationState.CONFIRMING_ORDER.value
+                    )
+                    order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
+                    total = state_machine.cart_total_cents(session)
+                    summary = state_machine.cart_summary_text(session, business.currency)
+                    confirm_msg = responses.ask_confirmation_response(
+                        summary, total, 0, order_mode, business.currency
+                    )
+                    if order_mode == "DELIVERY":
+                        confirm_msg += "\n_Delivery fee will be confirmed by our team._"
+                    return (
+                        f"Removed: {', '.join(_removed_labels)} ✅\n\n{confirm_msg}",
+                        False, None, None, None,
+                    )
+                else:
+                    state_machine.transition_state(session, ConversationState.IDLE.value)
+                    return (
+                        "Removed ✅ Your cart is now empty. What would you like to order?",
+                        False, None, None, None,
+                    )
+
         # ── Sub-case B: standalone ingredient phrase — modify existing cart item ──
         # e.g. "take out tomato", "take out tomato from the Classic Smash Burger"
         _current_cart = state_machine.get_cart(session)
@@ -2227,12 +2361,24 @@ async def _handle_with_llm(
             parsed.message[:80],
         )
 
-    # ── Proposed-order capture in CHOOSING_OPTIONS ───────────────────────
-    # When the LLM proposes items in a chitchat message from CHOOSING_OPTIONS
-    # (e.g. "I'll add 2x Classic Smash Burger and 2x Coca-Cola (330ml). Shall I
-    # proceed?"), extract those items and save as proposed_items so the
-    # CHOOSING_OPTIONS confirmation handler can commit them when customer says "yes".
-    if session.state == ConversationState.CHOOSING_OPTIONS.value and not active_cart:
+    # ── Proposed-order capture ───────────────────────────────────────────────
+    # When the LLM proposes items in a chitchat/ask_options message without
+    # directly adding them (e.g. "I'll add an Ice Coffee for you at R75. Shall
+    # I proceed?"), extract those items and save as proposed_items so that
+    # when the customer says "yes", the CHOOSING_OPTIONS confirmation handler
+    # commits them.
+    #
+    # Previously this only fired from CHOOSING_OPTIONS.  Extended to also fire
+    # from IDLE, GREETING, and BROWSING_MENU — the states where a first-message
+    # Ice-Coffee-style order lands before any cart has been built.
+    # The session is transitioned to CHOOSING_OPTIONS so the "yes" handler works.
+    _PROPOSAL_CAPTURABLE_STATES = {
+        ConversationState.CHOOSING_OPTIONS.value,
+        ConversationState.IDLE.value,
+        ConversationState.GREETING.value,
+        ConversationState.BROWSING_MENU.value,
+    }
+    if session.state in _PROPOSAL_CAPTURABLE_STATES and not active_cart:
         _prop_msg = parsed.message or ""
         _prop_extracted = _extract_items_from_message(_prop_msg, items)
         if _prop_extracted:
@@ -2247,8 +2393,14 @@ async def _handle_with_llm(
                 }
                 for _pi, _qty, _mod in _prop_extracted
             ])
+            # Transition to CHOOSING_OPTIONS so the next "yes" commits these items.
+            if session.state != ConversationState.CHOOSING_OPTIONS.value:
+                state_machine.transition_state(
+                    session, ConversationState.CHOOSING_OPTIONS.value
+                )
             logger.warning(
-                "PROPOSED_ITEMS_SAVED: %d item(s) extracted from LLM chitchat message. session_id=%s",
+                "PROPOSED_ITEMS_SAVED: %d item(s) extracted from LLM message, "
+                "session now CHOOSING_OPTIONS. session_id=%s",
                 len(_prop_extracted), session.id,
             )
 

@@ -64,6 +64,15 @@ _PATTERNS: list[tuple[re.Pattern, MessageIntent]] = [
         r"ready.*yet|is it ready|when.*ready|eta)\b", re.I
     ), MessageIntent.ORDER_TRACK),
 
+    # Remove item from cart — must come BEFORE ORDER_START so that phrases like
+    # "Take out from my order the Classic Smash Burger" (which contains "order")
+    # are correctly classified as ORDER_REMOVE instead of ORDER_START.
+    # Covers SA natural-language phrasing.
+    (re.compile(
+        r"\b(remove|take\s+off|take\s+out|take\s+away|delete|"
+        r"leave\s+out|leave\s+off|drop|no\s+more|don.?t\s+want\s+the)\b", re.I
+    ), MessageIntent.ORDER_REMOVE),
+
     # Order start (explicit)
     (re.compile(
         r"\b(order|i.?d like|i want|can i get|give me|"
@@ -82,12 +91,6 @@ _PATTERNS: list[tuple[re.Pattern, MessageIntent]] = [
         r"\b(cancel|nevermind|never mind|forget it|don.?t want|"
         r"start over|clear|remove all|scratch that)\b", re.I
     ), MessageIntent.ORDER_CANCEL),
-
-    # Remove item from cart — covers SA natural-language phrasing
-    (re.compile(
-        r"\b(remove|take\s+off|take\s+out|take\s+away|delete|"
-        r"leave\s+out|leave\s+off|drop|no\s+more|don.?t\s+want\s+the)\b", re.I
-    ), MessageIntent.ORDER_REMOVE),
 
     # Add more to cart
     # NOTE: "also", "and", "with" are intentionally excluded here — they are too
@@ -207,10 +210,16 @@ def is_confirmation(text: str) -> bool:
         r"go\s+ahead\s+(?:with\s+(?:it|that|the\s+order))?"
     )
     _TRAILING = (
-        r"(\s+(please|thanks|thank\s+you|bru|man|mate|now|"
+        r"(\s+("
+        r"please|thanks|thank\s+you|bru|man|mate|now|"
         r"sure\s+thing|great|awesome|for\s+sure|"
         r"confirm|confirmed|proceed|place|order|my\s+order|the\s+order|it|"
-        r"delivery|for\s+delivery|pickup|for\s+pickup|collection|for\s+collection))*"
+        # standalone affirmative words valid as trailing qualifiers
+        r"correct|right|fine|good|"
+        # compound trailing: "that's correct / right / fine" (e.g. "sharp that's correct")
+        r"that.?s\s+(?:correct|right|fine|good|it)|"
+        r"delivery|for\s+delivery|pickup|for\s+pickup|collection|for\s+collection"
+        r"))*"
     )
     confirmations = re.compile(rf"^({_CORE}){_TRAILING}\s*[,!.]*$", re.I)
     return bool(confirmations.match(stripped))
