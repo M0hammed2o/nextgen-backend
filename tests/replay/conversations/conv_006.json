@@ -1,0 +1,63 @@
+{
+  "id": "conv_006",
+  "title": "Cancel and restart — new order after cancel",
+  "category": "cancel_restart",
+  "tags": ["deterministic", "cancel", "restart", "pickup"],
+
+  "turns": [
+    {
+      "message": "Hello",
+      "expect": {"state": "GREETING", "cart": []}
+    },
+    {
+      "message": "Can I get a Classic Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Cancel order",
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_contains": ["cancel"]
+      }
+    },
+    {
+      "message": "Hello",
+      "expect": {"state": "GREETING", "cart": []}
+    },
+    {
+      "message": "Can I get an Ice Coffee",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Ice Coffee", "quantity": 1}],
+        "confirmed_cart": [{"name": "Ice Coffee", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Mohammed",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0837866021",
+      "expect": {"state": "ORDER_PLACED", "cart": []}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Ice Coffee", "quantity": 1}],
+    "subtotal_cents": 7500,
+    "total_cents": 7500,
+    "order_mode": "PICKUP"
+  }
+}

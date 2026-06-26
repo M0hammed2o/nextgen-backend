@@ -1,0 +1,59 @@
+{
+  "id": "conv_013",
+  "title": "Ice coffe typo — LLM proposes, proposed_items captured, yes commits",
+  "category": "proposed_items",
+  "tags": ["llm", "typo", "proposed_items", "regression_failure_3"],
+
+  "turns": [
+    {
+      "message": "Hello",
+      "expect": {"state": "GREETING", "cart": []}
+    },
+    {
+      "message": "Can I get an ice coffe",
+      "llm": {
+        "action": "ask_options",
+        "message": "Sure! An Ice Coffee is R75.00. Would you like to confirm your order?",
+        "items": [{"name": "Ice Coffee", "quantity": 1}]
+      },
+      "expect": {
+        "state": "CHOOSING_OPTIONS",
+        "cart": [],
+        "response_contains": ["ice coffee", "r75"]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Ice Coffee", "quantity": 1}],
+        "confirmed_cart": [{"name": "Ice Coffee", "quantity": 1}],
+        "response_contains": ["ice coffee"],
+        "response_not_contains": ["cart is empty"]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Lerato",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0823456789",
+      "expect": {"state": "ORDER_PLACED", "cart": []}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Ice Coffee", "quantity": 1}],
+    "subtotal_cents": 7500,
+    "total_cents": 7500,
+    "order_mode": "PICKUP"
+  }
+}

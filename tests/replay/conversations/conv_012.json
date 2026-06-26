@@ -1,0 +1,47 @@
+{
+  "id": "conv_012",
+  "title": "SA typos in modifiers — tamato, cheez normalise to tomato, cheese",
+  "category": "sa_slang",
+  "tags": ["deterministic", "typos", "normalizer", "modifiers"],
+
+  "turns": [
+    {
+      "message": "Hello",
+      "expect": {"state": "GREETING"}
+    },
+    {
+      "message": "Can I get a Classic Smash Burger without tamato",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "no tomato"}],
+        "response_contains": ["classic smash burger"]
+      }
+    },
+    {
+      "message": "yebo proceed",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Thabo",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0834567890",
+      "expect": {"state": "ORDER_PLACED", "cart": []}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "no tomato"}],
+    "subtotal_cents": 7500,
+    "total_cents": 7500,
+    "order_mode": "PICKUP",
+    "customer_name": "Thabo"
+  }
+}

@@ -1,0 +1,102 @@
+{
+  "id": "conv_014",
+  "title": "Long conversation — multiple edits before confirming",
+  "category": "long_conversation",
+  "tags": ["deterministic", "mixed", "cart_edit", "multiple_edits"],
+
+  "turns": [
+    {
+      "message": "Hey",
+      "expect": {"state": "GREETING", "cart": []}
+    },
+    {
+      "message": "Can I get 2 Classic Smash Burgers and a Coke",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Classic Smash Burger", "quantity": 2},
+          {"name": "Coca-Cola (330ml)", "quantity": 1}
+        ]
+      }
+    },
+    {
+      "message": "No",
+      "expect": {
+        "state": "BUILDING_CART",
+        "cart": [
+          {"name": "Classic Smash Burger", "quantity": 2},
+          {"name": "Coca-Cola (330ml)", "quantity": 1}
+        ]
+      }
+    },
+    {
+      "message": "1 no tomato",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Classic Smash Burger", "quantity": 1},
+          {"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "no tomato"},
+          {"name": "Coca-Cola (330ml)", "quantity": 1}
+        ]
+      }
+    },
+    {
+      "message": "No",
+      "expect": {"state": "BUILDING_CART"}
+    },
+    {
+      "message": "Take out the Coke",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Classic Smash Burger", "quantity": 1},
+          {"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "no tomato"}
+        ],
+        "response_contains": ["removed", "coca-cola"]
+      }
+    },
+    {
+      "message": "No",
+      "expect": {"state": "BUILDING_CART"}
+    },
+    {
+      "message": "Add 2 Cokes",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Classic Smash Burger", "quantity": 1},
+          {"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "no tomato"},
+          {"name": "Coca-Cola (330ml)", "quantity": 2}
+        ]
+      }
+    },
+    {
+      "message": "Lekker that's correct",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Bongani",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0761234567",
+      "expect": {"state": "ORDER_PLACED", "cart": []}
+    }
+  ],
+
+  "final_order": {
+    "items": [
+      {"name": "Classic Smash Burger", "quantity": 1},
+      {"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "no tomato"},
+      {"name": "Coca-Cola (330ml)", "quantity": 2}
+    ],
+    "subtotal_cents": 19000,
+    "total_cents": 19000,
+    "order_mode": "PICKUP",
+    "customer_name": "Bongani"
+  }
+}

@@ -1,0 +1,60 @@
+{
+  "id": "conv_008",
+  "title": "Only-want correction — I only want the Coke",
+  "category": "cart_edit",
+  "tags": ["deterministic", "only_want", "cart_replacement", "regression_failure_2"],
+
+  "turns": [
+    {
+      "message": "Hello",
+      "expect": {"state": "GREETING", "cart": []}
+    },
+    {
+      "message": "Can I get a Classic Smash Burger and a Coke",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Classic Smash Burger", "quantity": 1},
+          {"name": "Coca-Cola (330ml)", "quantity": 1}
+        ],
+        "confirmed_cart": [
+          {"name": "Classic Smash Burger", "quantity": 1},
+          {"name": "Coca-Cola (330ml)", "quantity": 1}
+        ]
+      }
+    },
+    {
+      "message": "I only want the Coke",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Coca-Cola (330ml)", "quantity": 1}],
+        "confirmed_cart": [{"name": "Coca-Cola (330ml)", "quantity": 1}],
+        "response_contains": ["coca-cola"],
+        "response_not_contains": ["classic smash burger"]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Mohammed",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0837866021",
+      "expect": {"state": "ORDER_PLACED", "cart": []}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Coca-Cola (330ml)", "quantity": 1}],
+    "subtotal_cents": 2000,
+    "total_cents": 2000,
+    "order_mode": "PICKUP"
+  }
+}

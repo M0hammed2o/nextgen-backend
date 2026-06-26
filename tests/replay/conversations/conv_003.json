@@ -1,0 +1,76 @@
+{
+  "id": "conv_003",
+  "title": "South African slang order — smsh brgrs + coks + size selection",
+  "category": "sa_slang",
+  "tags": ["llm", "slang", "ask_options", "pickup"],
+
+  "turns": [
+    {
+      "message": "Hello",
+      "expect": {"state": "GREETING", "cart": []}
+    },
+    {
+      "message": "gimme 2 smsh brgrs n 2 coks",
+      "llm": {
+        "action": "ask_options",
+        "message": "Which Coca-Cola size would you like? 330ml or 500ml?",
+        "items": [
+          {"name": "Classic Smash Burger", "quantity": 2},
+          {"name": "Coca-Cola", "quantity": 2}
+        ]
+      },
+      "expect": {
+        "state": "CHOOSING_OPTIONS",
+        "cart": []
+      }
+    },
+    {
+      "message": "330",
+      "llm": {
+        "action": "add_items",
+        "message": "Added 2x Classic Smash Burger and 2x Coca-Cola (330ml). Here's your order:",
+        "items": [
+          {"name": "Classic Smash Burger", "quantity": 2},
+          {"name": "Coca-Cola (330ml)", "quantity": 2}
+        ]
+      },
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Classic Smash Burger", "quantity": 2},
+          {"name": "Coca-Cola (330ml)", "quantity": 2}
+        ],
+        "confirmed_cart": [
+          {"name": "Classic Smash Burger", "quantity": 2},
+          {"name": "Coca-Cola (330ml)", "quantity": 2}
+        ]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Mohammed",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0837866021",
+      "expect": {"state": "ORDER_PLACED", "cart": []}
+    }
+  ],
+
+  "final_order": {
+    "items": [
+      {"name": "Classic Smash Burger", "quantity": 2},
+      {"name": "Coca-Cola (330ml)", "quantity": 2}
+    ],
+    "subtotal_cents": 19000,
+    "total_cents": 19000,
+    "order_mode": "PICKUP"
+  }
+}

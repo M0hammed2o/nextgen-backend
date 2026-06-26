@@ -1,0 +1,98 @@
+{
+  "id": "conv_001",
+  "title": "Basic order with modifiers — CSB no tomato extra cheese",
+  "category": "modifiers",
+  "tags": ["llm", "modifiers", "pickup", "regression_baseline"],
+
+  "turns": [
+    {
+      "message": "Hello",
+      "expect": {
+        "state": "GREETING",
+        "cart": [],
+        "response_contains": ["welcome"]
+      }
+    },
+    {
+      "message": "Menu",
+      "expect": {
+        "state": "BROWSING_MENU",
+        "response_contains": ["menu"]
+      }
+    },
+    {
+      "message": "Classic Smash Burger",
+      "llm": {
+        "action": "add_items",
+        "message": "Added Classic Smash Burger to your order! Any changes?",
+        "items": [{"name": "Classic Smash Burger", "quantity": 1}]
+      },
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}],
+        "confirmed_cart": [{"name": "Classic Smash Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "No tomato",
+      "llm": {
+        "action": "replace_item",
+        "message": "Updated — Classic Smash Burger with no tomato.",
+        "items": [{"remove": "Classic Smash Burger", "add": "Classic Smash Burger", "quantity": 1, "special_instructions": "no tomato"}]
+      },
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "no tomato"}],
+        "confirmed_cart": [{"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "no tomato"}]
+      }
+    },
+    {
+      "message": "Extra cheese",
+      "llm": {
+        "action": "replace_item",
+        "message": "Updated — Classic Smash Burger with no tomato and extra cheese.",
+        "items": [{"remove": "Classic Smash Burger", "add": "Classic Smash Burger", "quantity": 1, "special_instructions": "no tomato, extra cheese"}]
+      },
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "no tomato, extra cheese"}],
+        "confirmed_cart": [{"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "no tomato, extra cheese"}]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Mohammed",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0837866021",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+
+  "final_order": {
+    "items": [
+      {"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "no tomato, extra cheese"}
+    ],
+    "subtotal_cents": 7500,
+    "total_cents": 7500,
+    "order_mode": "PICKUP",
+    "customer_name": "Mohammed"
+  }
+}

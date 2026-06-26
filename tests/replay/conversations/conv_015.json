@@ -1,0 +1,72 @@
+{
+  "id": "conv_015",
+  "title": "Session restart — new order after ORDER_PLACED, no stale cart",
+  "category": "cancel_restart",
+  "tags": ["deterministic", "restart", "session_cleanup", "repeat_customer"],
+
+  "notes": "Name and phone are retained across orders (clear_cart preserves them). Second order places without re-asking for details.",
+
+  "turns": [
+    {
+      "message": "Hello",
+      "expect": {"state": "GREETING", "cart": []}
+    },
+    {
+      "message": "Can I get a Classic Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Nomsa",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0841234567",
+      "expect": {"state": "ORDER_PLACED", "cart": []}
+    },
+    {
+      "message": "Hello",
+      "expect": {
+        "state": "GREETING",
+        "response_contains": ["welcome"]
+      }
+    },
+    {
+      "message": "Can I get 3 Coca-Cola (330ml)",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Coca-Cola (330ml)", "quantity": 3}],
+        "response_not_contains": ["classic smash burger", "replacing bo-"]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": [],
+        "notes": "Name+phone retained from first order — no re-collection needed"
+      }
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Coca-Cola (330ml)", "quantity": 3}],
+    "subtotal_cents": 6000,
+    "total_cents": 6000,
+    "order_mode": "PICKUP"
+  }
+}

@@ -1,0 +1,43 @@
+{
+  "id": "conv_011",
+  "title": "SA slang greeting + order — howzit boss gimme",
+  "category": "sa_slang",
+  "tags": ["deterministic", "sa_slang", "mixed_intent", "greeting"],
+
+  "turns": [
+    {
+      "message": "Howzit can I get a Classic Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}],
+        "response_contains": ["welcome", "classic smash burger"]
+      }
+    },
+    {
+      "message": "sharp that's correct",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Sipho",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0712345678",
+      "expect": {"state": "ORDER_PLACED", "cart": []}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Classic Smash Burger", "quantity": 1}],
+    "subtotal_cents": 7500,
+    "total_cents": 7500,
+    "order_mode": "PICKUP",
+    "customer_name": "Sipho"
+  }
+}

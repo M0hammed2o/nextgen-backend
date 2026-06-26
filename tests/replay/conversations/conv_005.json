@@ -1,0 +1,56 @@
+{
+  "id": "conv_005",
+  "title": "Replace item — CSB swapped for Spicy Chicken Burger",
+  "category": "cart_edit",
+  "tags": ["llm", "replace_item", "pickup"],
+
+  "turns": [
+    {
+      "message": "Hello",
+      "expect": {"state": "GREETING", "cart": []}
+    },
+    {
+      "message": "Can I get a Classic Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Replace the burger with a Spicy Chicken Burger",
+      "llm": {
+        "action": "replace_item",
+        "message": "Swapped Classic Smash Burger for Spicy Chicken Burger ✅",
+        "items": [{"remove": "Classic Smash Burger", "add": "Spicy Chicken Burger", "quantity": 1}]
+      },
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Spicy Chicken Burger", "quantity": 1}],
+        "confirmed_cart": [{"name": "Spicy Chicken Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Mohammed",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0837866021",
+      "expect": {"state": "ORDER_PLACED", "cart": []}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Spicy Chicken Burger", "quantity": 1}],
+    "subtotal_cents": 8000,
+    "total_cents": 8000,
+    "order_mode": "PICKUP"
+  }
+}

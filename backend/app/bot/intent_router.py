@@ -73,6 +73,13 @@ _PATTERNS: list[tuple[re.Pattern, MessageIntent]] = [
         r"leave\s+out|leave\s+off|drop|no\s+more|don.?t\s+want\s+the)\b", re.I
     ), MessageIntent.ORDER_REMOVE),
 
+    # Order cancel — must come BEFORE ORDER_START so that "cancel order",
+    # "start over", "clear my order" are not swallowed by the \border\b pattern.
+    (re.compile(
+        r"\b(cancel|nevermind|never mind|forget it|don.?t want|"
+        r"start over|clear|remove all|scratch that)\b", re.I
+    ), MessageIntent.ORDER_CANCEL),
+
     # Order start (explicit)
     (re.compile(
         r"\b(order|i.?d like|i want|can i get|give me|"
@@ -85,12 +92,6 @@ _PATTERNS: list[tuple[re.Pattern, MessageIntent]] = [
         r"looks good|perfect|sharp|100|lekker|right|cool|ok|okay|done|"
         r"place it|send it|go ahead)\s*[.!]*$", re.I
     ), MessageIntent.ORDER_CONFIRM),
-
-    # Order cancel
-    (re.compile(
-        r"\b(cancel|nevermind|never mind|forget it|don.?t want|"
-        r"start over|clear|remove all|scratch that)\b", re.I
-    ), MessageIntent.ORDER_CANCEL),
 
     # Add more to cart
     # NOTE: "also", "and", "with" are intentionally excluded here — they are too

@@ -389,70 +389,90 @@ async def _handle_message(
     # ── Template responses (no LLM needed) ───────────────────────────────
 
     if intent == MessageIntent.GREETING:
-        logger.warning(
-            "HANDLE_BRANCH: GREETING → greeting_response (greeting_text=%r)",
-            business.greeting_text,
-        )
-        state_machine.transition_state(session, ConversationState.GREETING.value)
-        greeting = responses.greeting_response(business)
-        # Append today's specials preview if any are active
-        specials = await _load_specials(db, business.id)
-        todays_specials = responses.get_todays_active_specials(specials)
-        if todays_specials:
-            preview = "\n\n🔥 *Today's Specials:*\n" + "\n".join(
-                f"• {s.title}" for s in todays_specials[:3]
+        # SA greeting words like "yebo" and "sharp" also double as confirmations.
+        # When the customer is in an active ordering state AND the message is also
+        # a clear confirmation (e.g. "yebo proceed", "sharp that's correct"),
+        # yield to the state-specific handler instead of responding with a greeting.
+        _CONFIRM_YIELD_STATES = {
+            ConversationState.CONFIRMING_ORDER.value,
+            ConversationState.WAITING_DELIVERY_FEE_APPROVAL.value,
+        }
+        if current_state in _CONFIRM_YIELD_STATES and intent_router.is_confirmation(norm_text):
+            logger.warning(
+                "HANDLE_BRANCH: GREETING → yielding to %s confirmation handler, msg=%r",
+                current_state, msg_text[:40],
             )
-            preview += '\n\nSay *"specials"* for more details!'
-            greeting = greeting + preview
+            # Fall through: do NOT return — let CONFIRMING_ORDER / WAITING_DELIVERY_FEE_APPROVAL
+            # handlers below run for this message.
+        else:
+            logger.warning(
+                "HANDLE_BRANCH: GREETING → greeting_response (greeting_text=%r)",
+                business.greeting_text,
+            )
+            state_machine.transition_state(session, ConversationState.GREETING.value)
+            greeting = responses.greeting_response(business)
+            # Append today's specials preview if any are active
+            specials = await _load_specials(db, business.id)
+            todays_specials = responses.get_todays_active_specials(specials)
+            if todays_specials:
+                preview = "\n\n🔥 *Today's Specials:*\n" + "\n".join(
+                    f"• {s.title}" for s in todays_specials[:3]
+                )
+                preview += '\n\nSay *"specials"* for more details!'
+                greeting = greeting + preview
 
-        # ── Multi-intent: greeting + embedded order ───────────────────────
-        # "Hello can I please get an ice coffee" must greet AND process the order.
-        # Skip for pure greetings (single word / short phrase) — only load the
-        # menu when the message has content beyond the greeting word itself.
-        import re as _re_greet
-        _PURE_GREET_RE = _re_greet.compile(
-            r'^(hi|hello|hey|howzit|heita|yebo|yo|sup|'
-            r'good\s*(?:morning|afternoon|evening)|'
-            r'sawubona|molo|hola|ola|gday)[!.,\s]*$',
-            _re_greet.I,
-        )
-        if not _PURE_GREET_RE.match(norm_text.strip()):
-            _, _greet_items = await _load_menu(db, business.id)
-            _greet_det = _extract_items_from_message(norm_text, _greet_items)
-            if _greet_det:
-                import copy as _copy_g
-                for _git, _gqty, _gmod in _greet_det:
-                    state_machine.add_to_cart(
-                        session,
-                        str(_git.id), _git.name, _git.price_cents,
-                        _gqty, special_instructions=_gmod,
+            # ── Multi-intent: greeting + embedded order ───────────────────────
+            # "Hello can I please get an ice coffee" must greet AND process the order.
+            # Skip for pure greetings (single word / short phrase) — only load the
+            # menu when the message has content beyond the greeting word itself.
+            import re as _re_greet
+            _PURE_GREET_RE = _re_greet.compile(
+                r'^(hi|hello|hey|howzit|heita|yebo|yo|sup|'
+                r'good\s*(?:morning|afternoon|evening)|'
+                r'sawubona|molo|hola|ola|gday)[!.,\s]*$',
+                _re_greet.I,
+            )
+            if not _PURE_GREET_RE.match(norm_text.strip()):
+                _, _greet_items = await _load_menu(db, business.id)
+                _greet_det = _extract_items_from_message(norm_text, _greet_items)
+                if _greet_det:
+                    import copy as _copy_g
+                    for _git, _gqty, _gmod in _greet_det:
+                        state_machine.add_to_cart(
+                            session,
+                            str(_git.id), _git.name, _git.price_cents,
+                            _gqty, special_instructions=_gmod,
+                        )
+                    _g_cart = state_machine.get_cart(session)
+                    state_machine.set_context(
+                        session, "confirmed_cart", _copy_g.deepcopy(_g_cart)
                     )
-                _g_cart = state_machine.get_cart(session)
-                state_machine.set_context(session, "confirmed_cart", _copy_g.deepcopy(_g_cart))
-                state_machine.transition_state(session, ConversationState.CONFIRMING_ORDER.value)
-                _g_labels = [
-                    (f"{_gqty}x {_git.name}" + (f" ({_gmod})" if _gmod else ""))
-                    for _git, _gqty, _gmod in _greet_det
-                ]
-                _g_order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
-                _g_total = state_machine.cart_total_cents(session)
-                _g_summary = state_machine.cart_summary_text(session, business.currency)
-                _g_confirm = responses.ask_confirmation_response(
-                    _g_summary, _g_total, 0, _g_order_mode, business.currency
-                )
-                if _g_order_mode == "DELIVERY":
-                    _g_confirm += "\n_Delivery fee will be confirmed by our team._"
-                logger.warning(
-                    "GREETING_WITH_ORDER: added %r deterministically, session_id=%s",
-                    _g_labels, session.id,
-                )
-                return (
-                    greeting
-                    + f"\n\nI've added {', '.join(_g_labels)} to your order 🛒\n\n{_g_confirm}",
-                    False, None, None, None,
-                )
+                    state_machine.transition_state(
+                        session, ConversationState.CONFIRMING_ORDER.value
+                    )
+                    _g_labels = [
+                        (f"{_gqty}x {_git.name}" + (f" ({_gmod})" if _gmod else ""))
+                        for _git, _gqty, _gmod in _greet_det
+                    ]
+                    _g_order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
+                    _g_total = state_machine.cart_total_cents(session)
+                    _g_summary = state_machine.cart_summary_text(session, business.currency)
+                    _g_confirm = responses.ask_confirmation_response(
+                        _g_summary, _g_total, 0, _g_order_mode, business.currency
+                    )
+                    if _g_order_mode == "DELIVERY":
+                        _g_confirm += "\n_Delivery fee will be confirmed by our team._"
+                    logger.warning(
+                        "GREETING_WITH_ORDER: added %r deterministically, session_id=%s",
+                        _g_labels, session.id,
+                    )
+                    return (
+                        greeting
+                        + f"\n\nI've added {', '.join(_g_labels)} to your order 🛒\n\n{_g_confirm}",
+                        False, None, None, None,
+                    )
 
-        return greeting, False, None, None, None
+            return greeting, False, None, None, None
 
     if intent == MessageIntent.MENU_REQUEST:
         menu_image_url = getattr(business, "menu_image_url", None)
@@ -3102,7 +3122,15 @@ async def _handle_collecting_details(
         return "Please send a valid phone number (e.g., 0812345678).", False, None, None, None
 
     # ── Collect delivery address ──────────────────────────────────────────────
-    if business.require_delivery_address and "delivery_address" not in ctx:
+    # Fire when the business explicitly requires an address OR when the current
+    # order is a delivery (address is always required for delivery orders even if
+    # require_delivery_address is False on the business).
+    _order_mode_for_addr = ctx.get("order_mode", "PICKUP")
+    _need_delivery_addr = (
+        business.require_delivery_address
+        or _order_mode_for_addr == "DELIVERY"
+    )
+    if _need_delivery_addr and "delivery_address" not in ctx:
         state_machine.set_context(session, "delivery_address", text)
         still_missing = _check_missing_details(business, session)
         if still_missing:
@@ -3141,10 +3169,12 @@ def _check_missing_details(business: Business, session) -> str | None:
     if ctx.get("delivery_address"):
         already["delivery_address"] = True
 
+    # Address is required either by business setting or because this is delivery.
+    _need_addr = (business.require_delivery_address or order_mode == "DELIVERY")
     prompt = responses.collecting_details_response(
         business.require_customer_name,
         business.require_phone_number,
-        business.require_delivery_address and order_mode == "DELIVERY",
+        _need_addr and order_mode == "DELIVERY",
         already,
     )
     return prompt if prompt else None

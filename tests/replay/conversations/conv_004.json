@@ -1,0 +1,73 @@
+{
+  "id": "conv_004",
+  "title": "Multi-burger modifiers — 1 no tomato, 1 extra cheese via QMS",
+  "category": "modifiers",
+  "tags": ["deterministic", "quantity_modifier_split", "pickup"],
+
+  "turns": [
+    {
+      "message": "Hello",
+      "expect": {"state": "GREETING", "cart": []}
+    },
+    {
+      "message": "2 Classic Smash Burgers",
+      "llm": {
+        "action": "add_items",
+        "message": "Added 2x Classic Smash Burger ✅",
+        "items": [{"name": "Classic Smash Burger", "quantity": 2}]
+      },
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 2}]
+      }
+    },
+    {
+      "message": "1 no tomato",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Classic Smash Burger", "quantity": 1},
+          {"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "no tomato"}
+        ],
+        "response_contains": ["no tomato"]
+      }
+    },
+    {
+      "message": "1 extra cheese",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "no tomato"},
+          {"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "extra cheese"}
+        ],
+        "response_contains": ["extra cheese"]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Mohammed",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0837866021",
+      "expect": {"state": "ORDER_PLACED", "cart": []}
+    }
+  ],
+
+  "final_order": {
+    "items": [
+      {"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "no tomato"},
+      {"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "extra cheese"}
+    ],
+    "subtotal_cents": 15000,
+    "total_cents": 15000,
+    "order_mode": "PICKUP"
+  }
+}
