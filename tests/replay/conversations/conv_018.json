@@ -1,0 +1,17 @@
+{
+  "id": "conv_018",
+  "title": "Greeting — Good morning",
+  "category": "greeting",
+  "tags": ["deterministic", "greeting"],
+
+  "turns": [
+    {
+      "message": "Good morning",
+      "expect": {
+        "state": "GREETING",
+        "cart": [],
+        "response_contains": ["welcome"]
+      }
+    }
+  ]
+}

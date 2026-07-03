@@ -1,0 +1,29 @@
+{
+  "id": "conv_226",
+  "title": "CX state protection — greeting then browse, no phone number asked early",
+  "category": "cx_state_protection",
+  "tags": ["det", "cx", "protection"],
+
+  "notes": "Customer greets and browses menu. Bot must never ask for name or phone until an order exists.",
+
+  "turns": [
+    {
+      "message": "Hi",
+      "expect": {
+        "state": "GREETING",
+        "cart": [],
+        "response_contains": ["welcome"],
+        "response_not_contains": ["your name", "phone", "pickup", "delivery", "total"]
+      }
+    },
+    {
+      "message": "What do you have?",
+      "expect": {
+        "state": "BROWSING_MENU",
+        "cart": [],
+        "response_contains": ["menu"],
+        "response_not_contains": ["your name", "phone", "pickup", "delivery", "total"]
+      }
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "id": "conv_208",
+  "title": "CX menu question — What's popular — recommend without opening cart",
+  "category": "cx_menu_questions",
+  "tags": ["llm", "recommendation", "cx"],
+
+  "turns": [
+    {
+      "message": "What's popular?",
+      "llm": {
+        "action": "recommend_items",
+        "message": "Our most popular items are the Classic Smash Burger and Double Smash Burger! Want to try one?",
+        "items": [
+          {"name": "Classic Smash Burger", "quantity": 1},
+          {"name": "Double Smash Burger", "quantity": 1}
+        ]
+      },
+      "expect": {
+        "state": "BROWSING_MENU",
+        "cart": [],
+        "context_has": {"recommended_items": true},
+        "response_not_contains": ["added to your order", "total", "confirm", "pickup", "delivery"]
+      }
+    }
+  ]
+}

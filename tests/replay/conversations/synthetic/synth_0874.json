@@ -1,0 +1,27 @@
+{
+  "id": "synth_0874",
+  "title": "Synth options cancel \u2014 'Forget it'",
+  "category": "synthetic_options",
+  "tags": [
+    "synthetic",
+    "det",
+    "options",
+    "cancel"
+  ],
+  "turns": [
+    {
+      "message": "Can I get a cappuccino",
+      "expect": {
+        "state": "CHOOSING_OPTIONS",
+        "cart": []
+      }
+    },
+    {
+      "message": "Forget it",
+      "expect": {
+        "state": "IDLE",
+        "cart": []
+      }
+    }
+  ]
+}

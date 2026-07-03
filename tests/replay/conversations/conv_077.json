@@ -1,0 +1,50 @@
+{
+  "id": "conv_077",
+  "title": "Cart editing — Actually change item (cart_correction + DET rebuild)",
+  "category": "cart_edit",
+  "tags": ["deterministic", "cart_edit", "replace"],
+
+  "notes": "In CONFIRMING_ORDER, 'Actually make it...' matches is_cart_correction() which clears the cart and re-enters _handle_with_llm with ORDER_START. DET then finds 'Double Smash Burger' and adds it deterministically. No LLM is involved — the replace happens via clear+rebuild, not via replace_item.",
+
+  "turns": [
+    {
+      "message": "Can I get a Classic Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}],
+        "confirmed_cart": [{"name": "Classic Smash Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Actually make it a Double Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Double Smash Burger", "quantity": 1}],
+        "confirmed_cart": [{"name": "Double Smash Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Vuyani",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0711000016",
+      "expect": {"state": "ORDER_PLACED"}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Double Smash Burger", "quantity": 1}],
+    "subtotal_cents": 9500,
+    "total_cents": 9500,
+    "order_mode": "PICKUP"
+  }
+}

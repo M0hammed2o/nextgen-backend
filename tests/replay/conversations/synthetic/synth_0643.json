@@ -1,0 +1,39 @@
+{
+  "id": "synth_0643",
+  "title": "Synth browse+cancel \u2014 'Sawubona'/'Items please'",
+  "category": "synthetic_browse",
+  "tags": [
+    "synthetic",
+    "det",
+    "browse",
+    "cancel"
+  ],
+  "turns": [
+    {
+      "message": "Sawubona",
+      "expect": {
+        "state": "GREETING",
+        "cart": [],
+        "response_contains": [
+          "welcome"
+        ]
+      }
+    },
+    {
+      "message": "Items please",
+      "expect": {
+        "state": "BROWSING_MENU",
+        "response_contains": [
+          "menu"
+        ]
+      }
+    },
+    {
+      "message": "Scratch that",
+      "expect": {
+        "state": "IDLE",
+        "cart": []
+      }
+    }
+  ]
+}

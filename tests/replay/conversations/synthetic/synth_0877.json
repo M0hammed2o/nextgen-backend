@@ -1,0 +1,27 @@
+{
+  "id": "synth_0877",
+  "title": "Synth options cancel \u2014 'Start over'",
+  "category": "synthetic_options",
+  "tags": [
+    "synthetic",
+    "det",
+    "options",
+    "cancel"
+  ],
+  "turns": [
+    {
+      "message": "Can I get a cappuccino",
+      "expect": {
+        "state": "CHOOSING_OPTIONS",
+        "cart": []
+      }
+    },
+    {
+      "message": "Start over",
+      "expect": {
+        "state": "IDLE",
+        "cart": []
+      }
+    }
+  ]
+}

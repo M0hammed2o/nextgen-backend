@@ -1,0 +1,44 @@
+{
+  "id": "conv_035",
+  "title": "SA typo modifier — brgr without chiz",
+  "category": "sa_slang",
+  "tags": ["llm", "sa_slang", "modifier", "typo"],
+
+  "turns": [
+    {
+      "message": "Can I get a brgr without chiz please",
+      "llm": {
+        "action": "add_items",
+        "message": "Added Classic Smash Burger without cheese ✅",
+        "items": [{"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "no cheese"}]
+      },
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "no cheese"}]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Mthokozisi",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0710000011",
+      "expect": {"state": "ORDER_PLACED"}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "no cheese"}],
+    "subtotal_cents": 7500,
+    "total_cents": 7500,
+    "order_mode": "PICKUP"
+  }
+}

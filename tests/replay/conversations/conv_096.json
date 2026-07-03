@@ -1,0 +1,54 @@
+{
+  "id": "conv_096",
+  "title": "SA slang — Sharp as greeting, then gimme a smsh brgr (LLM order)",
+  "category": "sa_slang",
+  "tags": ["llm", "sa_slang", "greeting", "order_start"],
+
+  "notes": "Sharp triggers GREETING. The embedded order in the same message is not DET-matchable ('smsh brgr'). Customer sends the order as a separate follow-up message.",
+
+  "turns": [
+    {
+      "message": "Sharp bru",
+      "expect": {
+        "state": "GREETING",
+        "cart": [],
+        "response_contains": ["welcome"]
+      }
+    },
+    {
+      "message": "Gimme a smsh brgr",
+      "llm": {
+        "action": "add_items",
+        "message": "Added Classic Smash Burger to your order ✅",
+        "items": [{"name": "Classic Smash Burger", "quantity": 1}]
+      },
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Yebo",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Lebo",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0821000001",
+      "expect": {"state": "ORDER_PLACED"}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Classic Smash Burger", "quantity": 1}],
+    "subtotal_cents": 7500,
+    "total_cents": 7500,
+    "order_mode": "PICKUP"
+  }
+}

@@ -1,0 +1,39 @@
+{
+  "id": "synth_0645",
+  "title": "Synth browse+cancel \u2014 'Hi there'/'Show menu'",
+  "category": "synthetic_browse",
+  "tags": [
+    "synthetic",
+    "det",
+    "browse",
+    "cancel"
+  ],
+  "turns": [
+    {
+      "message": "Hi there",
+      "expect": {
+        "state": "GREETING",
+        "cart": [],
+        "response_contains": [
+          "welcome"
+        ]
+      }
+    },
+    {
+      "message": "Show menu",
+      "expect": {
+        "state": "BROWSING_MENU",
+        "response_contains": [
+          "menu"
+        ]
+      }
+    },
+    {
+      "message": "Actually never mind",
+      "expect": {
+        "state": "IDLE",
+        "cart": []
+      }
+    }
+  ]
+}

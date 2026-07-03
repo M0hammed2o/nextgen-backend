@@ -1,0 +1,26 @@
+{
+  "id": "conv_303",
+  "title": "Options — cancel during option selection — graceful cancel, cart stays empty",
+  "category": "options",
+  "tags": ["det", "options", "cancel", "cx"],
+
+  "notes": "Bot asks for milk. Customer cancels. ORDER_CANCEL fires deterministically, clears pending, returns to IDLE.",
+
+  "turns": [
+    {
+      "message": "Can I get a cappuccino",
+      "expect": {
+        "state": "CHOOSING_OPTIONS",
+        "cart": []
+      }
+    },
+    {
+      "message": "Actually never mind",
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_contains": ["cancel", "order"]
+      }
+    }
+  ]
+}

@@ -1,0 +1,42 @@
+{
+  "id": "synth_0850",
+  "title": "Synth no-change then cancel \u2014 Spicy Chicken Burger",
+  "category": "synthetic_cancel",
+  "tags": [
+    "synthetic",
+    "det",
+    "cancel",
+    "no_change"
+  ],
+  "turns": [
+    {
+      "message": "Can I get a Spicy Chicken Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Spicy Chicken Burger",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "Nope",
+      "expect": {
+        "state": "BUILDING_CART"
+      }
+    },
+    {
+      "message": "Scratch that",
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_contains": [
+          "cancel",
+          "order"
+        ]
+      }
+    }
+  ]
+}

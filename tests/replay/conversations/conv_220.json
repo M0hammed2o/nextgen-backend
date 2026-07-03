@@ -1,0 +1,24 @@
+{
+  "id": "conv_220",
+  "title": "CX clarification — Pizza — not on menu, graceful response, no cart",
+  "category": "cx_clarification",
+  "tags": ["llm", "chitchat", "cx", "clarification", "off_menu"],
+
+  "notes": "Customer asks for an item not on the menu. Bot must respond gracefully and NOT create a cart entry.",
+
+  "turns": [
+    {
+      "message": "Pizza",
+      "llm": {
+        "action": "chitchat",
+        "message": "Sorry, we don't currently have pizza on the menu. Can I help you with something else? Our burgers are amazing!",
+        "items": []
+      },
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_not_contains": ["added to your order", "total", "confirm"]
+      }
+    }
+  ]
+}

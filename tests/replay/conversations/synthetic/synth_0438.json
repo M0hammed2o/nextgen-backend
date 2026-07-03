@@ -1,0 +1,35 @@
+{
+  "id": "synth_0438",
+  "title": "Synth cancel after order \u2014 Chips",
+  "category": "synthetic_cancel",
+  "tags": [
+    "synthetic",
+    "det",
+    "cancel"
+  ],
+  "turns": [
+    {
+      "message": "I'd like a Chips",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Chips",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "Actually never mind",
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_contains": [
+          "cancel",
+          "order"
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "id": "synth_0985",
+  "title": "Synth idle cancel \u2014 'Cancel'",
+  "category": "synthetic_cancel",
+  "tags": [
+    "synthetic",
+    "det",
+    "cancel",
+    "idle"
+  ],
+  "turns": [
+    {
+      "message": "Cancel",
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_contains": [
+          "cancel",
+          "order"
+        ]
+      }
+    }
+  ]
+}

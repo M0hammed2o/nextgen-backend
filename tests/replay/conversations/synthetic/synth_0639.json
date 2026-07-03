@@ -1,0 +1,22 @@
+{
+  "id": "synth_0639",
+  "title": "Synth greeting only \u2014 'Howzit china'",
+  "category": "synthetic_greeting",
+  "tags": [
+    "synthetic",
+    "det",
+    "greeting"
+  ],
+  "turns": [
+    {
+      "message": "Howzit china",
+      "expect": {
+        "state": "GREETING",
+        "cart": [],
+        "response_contains": [
+          "welcome"
+        ]
+      }
+    }
+  ]
+}

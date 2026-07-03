@@ -1,0 +1,41 @@
+{
+  "id": "conv_030",
+  "title": "Multiple modifiers — no tomato no onion extra cheese in one suffix",
+  "category": "modifiers",
+  "tags": ["deterministic", "multi_modifier", "suffix_extraction"],
+
+  "notes": "Suffix extractor captures multiple 'no X' tokens. 'no tomato no onion' becomes a single special_instructions string. Extra cheese is a separate capture.",
+
+  "turns": [
+    {
+      "message": "Can I get a Classic Smash Burger no tomato no onion extra cheese",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}],
+        "response_contains": ["classic smash burger"]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Zintle",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0710000006",
+      "expect": {"state": "ORDER_PLACED"}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Classic Smash Burger", "quantity": 1}],
+    "subtotal_cents": 7500,
+    "total_cents": 7500
+  }
+}

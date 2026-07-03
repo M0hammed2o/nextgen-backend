@@ -1,0 +1,42 @@
+{
+  "id": "synth_0847",
+  "title": "Synth no-change then cancel \u2014 Double Smash Burger",
+  "category": "synthetic_cancel",
+  "tags": [
+    "synthetic",
+    "det",
+    "cancel",
+    "no_change"
+  ],
+  "turns": [
+    {
+      "message": "Can I get a Double Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Double Smash Burger",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "No",
+      "expect": {
+        "state": "BUILDING_CART"
+      }
+    },
+    {
+      "message": "Forget it",
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_contains": [
+          "cancel",
+          "order"
+        ]
+      }
+    }
+  ]
+}

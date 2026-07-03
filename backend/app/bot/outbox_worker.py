@@ -69,6 +69,7 @@ async def _process_batch(db: AsyncSession) -> int:
         )
         .order_by(MessageOutbox.scheduled_at)
         .limit(BATCH_SIZE)
+        .with_for_update(skip_locked=True)  # Safe concurrent workers — skip rows locked by another batch
     )
     messages = list(result.scalars().all())
 
@@ -136,8 +137,21 @@ async def _process_single(db: AsyncSession, msg: MessageOutbox) -> None:
 
 
 # ── Entry point for standalone worker ────────────────────────────────────────
+# DEPRECATED: In production, outbox delivery is handled by the ARQ cron job
+# `run_outbox_batch` in backend/app/worker.py.
+# Running this standalone AND the ARQ worker simultaneously will cause two
+# workers to compete for the same outbox messages.  Only run this standalone
+# entry point for local development when the ARQ worker is not running.
 
 if __name__ == "__main__":
+    import warnings
+    warnings.warn(
+        "Running outbox_worker.py standalone is intended for local development only. "
+        "In production, outbox delivery is managed by the ARQ worker cron (run_outbox_batch). "
+        "Do NOT run both simultaneously.",
+        DeprecationWarning,
+        stacklevel=1,
+    )
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",

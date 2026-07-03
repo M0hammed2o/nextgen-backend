@@ -10,7 +10,7 @@ from shared.models.asset import Asset
 from shared.models.audit import AuditEvent, MessageOutbox
 from shared.models.business import Business
 from shared.models.customer import ConversationSession, Customer
-from shared.models.menu import MenuCategory, MenuItem
+from shared.models.menu import MenuAddOn, MenuCategory, MenuItem
 from shared.models.message import Message
 from shared.models.order import Order, OrderEvent, OrderItem
 from shared.models.specials import Special
@@ -27,6 +27,7 @@ __all__ = [
     "ConversationSession",
     "Customer",
     "DailyUsage",
+    "MenuAddOn",
     "MenuCategory",
     "MenuItem",
     "Message",

@@ -1,0 +1,42 @@
+{
+  "id": "conv_080",
+  "title": "Confirmation — Yes explicit in CONFIRMING_ORDER moves to order mode",
+  "category": "confirmation",
+  "tags": ["deterministic", "confirmation", "pickup"],
+
+  "turns": [
+    {
+      "message": "Can I get a Classic Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE",
+        "response_contains": ["pickup", "delivery"]
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Kagiso",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0711000017",
+      "expect": {"state": "ORDER_PLACED"}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Classic Smash Burger", "quantity": 1}],
+    "subtotal_cents": 7500,
+    "total_cents": 7500,
+    "order_mode": "PICKUP"
+  }
+}

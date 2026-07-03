@@ -1,0 +1,18 @@
+{
+  "id": "conv_201",
+  "title": "CX casual — standalone Hello greeting",
+  "category": "cx_casual",
+  "tags": ["det", "greeting", "cx"],
+
+  "turns": [
+    {
+      "message": "Hello",
+      "expect": {
+        "state": "GREETING",
+        "cart": [],
+        "response_contains": ["welcome"],
+        "response_not_contains": ["pickup", "delivery", "your name", "phone"]
+      }
+    }
+  ]
+}

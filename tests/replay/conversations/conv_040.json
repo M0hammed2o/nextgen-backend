@@ -1,0 +1,85 @@
+{
+  "id": "conv_040",
+  "title": "Multiple edits — add, remove, replace before confirming",
+  "category": "cart_edit",
+  "tags": ["deterministic", "llm", "multiple_edits"],
+
+  "turns": [
+    {
+      "message": "Can I get a Classic Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "No",
+      "expect": {"state": "BUILDING_CART"}
+    },
+    {
+      "message": "Add a Coke",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Classic Smash Burger", "quantity": 1},
+          {"name": "Coca-Cola (330ml)", "quantity": 1}
+        ]
+      }
+    },
+    {
+      "message": "No",
+      "expect": {"state": "BUILDING_CART"}
+    },
+    {
+      "message": "Add Chips",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Classic Smash Burger", "quantity": 1},
+          {"name": "Coca-Cola (330ml)", "quantity": 1},
+          {"name": "Chips", "quantity": 1}
+        ]
+      }
+    },
+    {
+      "message": "No",
+      "expect": {"state": "BUILDING_CART"}
+    },
+    {
+      "message": "Take out the Coke",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Classic Smash Burger", "quantity": 1},
+          {"name": "Chips", "quantity": 1}
+        ]
+      }
+    },
+    {
+      "message": "Lekker that's correct",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Sanele",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0720000014",
+      "expect": {"state": "ORDER_PLACED"}
+    }
+  ],
+
+  "final_order": {
+    "items": [
+      {"name": "Classic Smash Burger", "quantity": 1},
+      {"name": "Chips", "quantity": 1}
+    ],
+    "subtotal_cents": 11000,
+    "total_cents": 11000,
+    "order_mode": "PICKUP"
+  }
+}

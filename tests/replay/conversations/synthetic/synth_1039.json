@@ -1,0 +1,72 @@
+{
+  "id": "synth_1039",
+  "title": "Synth multi + coffee \u2014 Sprite (330ml) + Cappuccino",
+  "category": "synthetic_multi_item",
+  "tags": [
+    "synthetic",
+    "det",
+    "pickup",
+    "multi_item",
+    "options"
+  ],
+  "turns": [
+    {
+      "message": "Can I get a Sprite (330ml) and a Cappuccino with almond milk",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Sprite (330ml)",
+            "quantity": 1
+          },
+          {
+            "name": "Cappuccino",
+            "quantity": 1,
+            "special_instructions": "almond milk"
+          }
+        ]
+      }
+    },
+    {
+      "message": "OK",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Lindiwe",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0831234567",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Sprite (330ml)",
+        "quantity": 1
+      },
+      {
+        "name": "Cappuccino",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 6500,
+    "total_cents": 6500,
+    "order_mode": "PICKUP",
+    "customer_name": "Lindiwe"
+  }
+}

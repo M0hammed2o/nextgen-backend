@@ -1,0 +1,25 @@
+{
+  "id": "conv_209",
+  "title": "CX menu question — What do you recommend — recommendation without cart",
+  "category": "cx_menu_questions",
+  "tags": ["llm", "recommendation", "cx"],
+
+  "turns": [
+    {
+      "message": "What do you recommend?",
+      "llm": {
+        "action": "recommend_items",
+        "message": "I'd recommend the Classic Smash Burger — it's our fan favourite! Would you like to order one?",
+        "items": [
+          {"name": "Classic Smash Burger", "quantity": 1}
+        ]
+      },
+      "expect": {
+        "state": "BROWSING_MENU",
+        "cart": [],
+        "context_has": {"recommended_items": true},
+        "response_not_contains": ["added to your order", "total", "confirm", "pickup", "delivery"]
+      }
+    }
+  ]
+}

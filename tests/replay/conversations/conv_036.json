@@ -1,0 +1,57 @@
+{
+  "id": "conv_036",
+  "title": "Add Sprite to existing burger order in CONFIRMING_ORDER",
+  "category": "cart_edit",
+  "tags": ["deterministic", "det_add_confirming", "add_item"],
+
+  "turns": [
+    {
+      "message": "Can I get a Classic Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Add a Sprite",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Classic Smash Burger", "quantity": 1},
+          {"name": "Sprite (330ml)", "quantity": 1}
+        ],
+        "confirmed_cart": [
+          {"name": "Classic Smash Burger", "quantity": 1},
+          {"name": "Sprite (330ml)", "quantity": 1}
+        ],
+        "response_contains": ["sprite"]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Nolwazi",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0720000010",
+      "expect": {"state": "ORDER_PLACED"}
+    }
+  ],
+
+  "final_order": {
+    "items": [
+      {"name": "Classic Smash Burger", "quantity": 1},
+      {"name": "Sprite (330ml)", "quantity": 1}
+    ],
+    "subtotal_cents": 9500,
+    "total_cents": 9500,
+    "order_mode": "PICKUP"
+  }
+}

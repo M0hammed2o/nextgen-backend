@@ -1,0 +1,24 @@
+{
+  "id": "conv_233",
+  "title": "CX clarification — ORDER_ADD without named item — clarifies without looping",
+  "category": "cx_clarification",
+  "tags": ["llm", "cx", "clarification", "order_add"],
+
+  "notes": "ORDER_ADD intent fires (the word 'add' is present) but no specific menu item is found in the message. Mutation guard skips because cart is empty and no items are extractable. Bot clarifies once without looping.",
+
+  "turns": [
+    {
+      "message": "Can you add something for me?",
+      "llm": {
+        "action": "chitchat",
+        "message": "Of course! What would you like to add? Take a look at our menu and let me know.",
+        "items": []
+      },
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_not_contains": ["added to your order", "total", "confirm", "pickup", "delivery"]
+      }
+    }
+  ]
+}

@@ -1,0 +1,48 @@
+{
+  "id": "conv_p002",
+  "title": "Pricing — paid add-on: Loaded Smash Burger with Extra Patty (+R25)",
+  "category": "pricing",
+  "tags": ["llm", "pricing", "add_on", "pickup"],
+
+  "notes": "Customer orders Loaded Smash Burger with Extra Patty. LLM returns add_ons=[{name: Extra Patty, quantity: 1}]. Pipeline resolves price_cents=2500. unit_price=10000, subtotal=10000.",
+
+  "turns": [
+    {
+      "message": "Loaded Smash Burger with extra patty please",
+      "llm": {
+        "action": "add_items",
+        "message": "Loaded Smash Burger + Extra Patty — R100.00 ✅",
+        "items": [{"name": "Loaded Smash Burger", "quantity": 1, "options": {}, "add_ons": [{"name": "Extra Patty", "quantity": 1}], "special_instructions": ""}]
+      },
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Loaded Smash Burger", "quantity": 1}],
+        "response_contains": ["loaded smash burger", "extra patty"]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Sipho",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0829876543",
+      "expect": {"state": "ORDER_PLACED", "cart": []}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Loaded Smash Burger", "quantity": 1}],
+    "subtotal_cents": 10000,
+    "total_cents": 10000,
+    "order_mode": "PICKUP",
+    "customer_name": "Sipho"
+  }
+}

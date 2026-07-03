@@ -1,0 +1,63 @@
+{
+  "id": "conv_097",
+  "title": "SA slang — Yebo boss greeting, then plz gimme a smsh brgr n a cok",
+  "category": "sa_slang",
+  "tags": ["llm", "sa_slang", "normalizer"],
+
+  "notes": "Yebo triggers GREETING. plz normalises to 'please'. gimme to 'give me'. smsh brgr and cok are not DET-matchable — LLM handles the separate order message.",
+
+  "turns": [
+    {
+      "message": "Yebo boss",
+      "expect": {
+        "state": "GREETING",
+        "cart": [],
+        "response_contains": ["welcome"]
+      }
+    },
+    {
+      "message": "plz gimme a smsh brgr n a cok",
+      "llm": {
+        "action": "add_items",
+        "message": "Added Classic Smash Burger and Coca-Cola (330ml) to your order ✅",
+        "items": [
+          {"name": "Classic Smash Burger", "quantity": 1},
+          {"name": "Coca-Cola (330ml)", "quantity": 1}
+        ]
+      },
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Classic Smash Burger", "quantity": 1},
+          {"name": "Coca-Cola (330ml)", "quantity": 1}
+        ]
+      }
+    },
+    {
+      "message": "Lekker",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Siphamandla",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0821000002",
+      "expect": {"state": "ORDER_PLACED"}
+    }
+  ],
+
+  "final_order": {
+    "items": [
+      {"name": "Classic Smash Burger", "quantity": 1},
+      {"name": "Coca-Cola (330ml)", "quantity": 1}
+    ],
+    "subtotal_cents": 9500,
+    "total_cents": 9500,
+    "order_mode": "PICKUP"
+  }
+}

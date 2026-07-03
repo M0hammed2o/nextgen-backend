@@ -1,0 +1,72 @@
+{
+  "id": "synth_0943",
+  "title": "Synth hours then order \u2014 Still Water",
+  "category": "synthetic_business",
+  "tags": [
+    "synthetic",
+    "det",
+    "hours",
+    "pickup"
+  ],
+  "turns": [
+    {
+      "message": "When do you open?",
+      "expect": {
+        "state": "IDLE",
+        "response_contains": [
+          "contact",
+          "hours"
+        ]
+      }
+    },
+    {
+      "message": "Can I get a Still Water",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Still Water",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Brendan",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0729999999",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Still Water",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 1500,
+    "total_cents": 1500,
+    "order_mode": "PICKUP",
+    "customer_name": "Brendan"
+  }
+}

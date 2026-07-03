@@ -1,0 +1,42 @@
+{
+  "id": "synth_0852",
+  "title": "Synth no-change then cancel \u2014 Grilled Chicken Burger",
+  "category": "synthetic_cancel",
+  "tags": [
+    "synthetic",
+    "det",
+    "cancel",
+    "no_change"
+  ],
+  "turns": [
+    {
+      "message": "Can I get a Grilled Chicken Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Grilled Chicken Burger",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "Wait",
+      "expect": {
+        "state": "BUILDING_CART"
+      }
+    },
+    {
+      "message": "Scratch that",
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_contains": [
+          "cancel",
+          "order"
+        ]
+      }
+    }
+  ]
+}

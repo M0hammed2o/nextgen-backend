@@ -1,0 +1,71 @@
+{
+  "id": "synth_0064",
+  "title": "Synth pickup \u2014 Grilled Chicken Burger \u2014 'Good morning'",
+  "category": "synthetic_pickup",
+  "tags": [
+    "synthetic",
+    "det",
+    "pickup"
+  ],
+  "turns": [
+    {
+      "message": "Good morning",
+      "expect": {
+        "state": "GREETING",
+        "cart": [],
+        "response_contains": [
+          "welcome"
+        ]
+      }
+    },
+    {
+      "message": "Can I get a Grilled Chicken Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Grilled Chicken Burger",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "Sharp",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup please",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Lindiwe",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0831111111",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Grilled Chicken Burger",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 8500,
+    "total_cents": 8500,
+    "order_mode": "PICKUP",
+    "customer_name": "Lindiwe"
+  }
+}

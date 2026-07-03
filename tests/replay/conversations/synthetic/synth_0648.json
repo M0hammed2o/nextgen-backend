@@ -1,0 +1,70 @@
+{
+  "id": "synth_0648",
+  "title": "Synth multi-item \u2014 Double Smash Burger + Onion Rings",
+  "category": "synthetic_multi_item",
+  "tags": [
+    "synthetic",
+    "det",
+    "pickup",
+    "multi_item"
+  ],
+  "turns": [
+    {
+      "message": "Can I get a Double Smash Burger and Onion Rings",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Double Smash Burger",
+            "quantity": 1
+          },
+          {
+            "name": "Onion Rings",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "OK",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Kgotso",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0840000001",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Double Smash Burger",
+        "quantity": 1
+      },
+      {
+        "name": "Onion Rings",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 12500,
+    "total_cents": 12500,
+    "order_mode": "PICKUP",
+    "customer_name": "Kgotso"
+  }
+}

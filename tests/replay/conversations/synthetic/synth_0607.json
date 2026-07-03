@@ -1,0 +1,22 @@
+{
+  "id": "synth_0607",
+  "title": "Synth business hours \u2014 'What are the closing hours?'",
+  "category": "synthetic_business",
+  "tags": [
+    "synthetic",
+    "det",
+    "hours"
+  ],
+  "turns": [
+    {
+      "message": "What are the closing hours?",
+      "expect": {
+        "state": "IDLE",
+        "response_contains": [
+          "contact",
+          "hours"
+        ]
+      }
+    }
+  ]
+}

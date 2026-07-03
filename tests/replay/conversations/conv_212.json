@@ -1,0 +1,18 @@
+{
+  "id": "conv_212",
+  "title": "CX business — What time do you close — hours info, no ordering state",
+  "category": "cx_business",
+  "tags": ["det", "hours", "cx"],
+
+  "turns": [
+    {
+      "message": "What time do you close?",
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_contains": ["contact", "hours"],
+        "response_not_contains": ["added to your order", "total", "pickup", "delivery", "your name"]
+      }
+    }
+  ]
+}

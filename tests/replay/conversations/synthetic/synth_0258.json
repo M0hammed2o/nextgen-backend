@@ -1,0 +1,61 @@
+{
+  "id": "synth_0258",
+  "title": "Synth pickup (no greeting) \u2014 Grilled Chicken Burger",
+  "category": "synthetic_pickup",
+  "tags": [
+    "synthetic",
+    "det",
+    "pickup"
+  ],
+  "turns": [
+    {
+      "message": "Can I get a Grilled Chicken Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Grilled Chicken Burger",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "OK",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Collect",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Riya",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0712345678",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Grilled Chicken Burger",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 8500,
+    "total_cents": 8500,
+    "order_mode": "PICKUP",
+    "customer_name": "Riya"
+  }
+}

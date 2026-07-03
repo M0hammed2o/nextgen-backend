@@ -1,0 +1,48 @@
+{
+  "id": "conv_062",
+  "title": "Menu — Burgers only request",
+  "category": "menu",
+  "tags": ["deterministic", "menu", "browsing"],
+
+  "notes": "Customer asks to see burger options specifically. The menu response lists all items including burgers.",
+
+  "turns": [
+    {
+      "message": "Show me your burgers",
+      "expect": {
+        "state": "BROWSING_MENU",
+        "response_contains": ["menu", "burger"]
+      }
+    },
+    {
+      "message": "Can I get a Classic Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Nomsa",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0711000001",
+      "expect": {"state": "ORDER_PLACED"}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Classic Smash Burger", "quantity": 1}],
+    "subtotal_cents": 7500,
+    "total_cents": 7500,
+    "order_mode": "PICKUP"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "id": "synth_0602",
+  "title": "Synth business hours \u2014 'What are your opening hours?'",
+  "category": "synthetic_business",
+  "tags": [
+    "synthetic",
+    "det",
+    "hours"
+  ],
+  "turns": [
+    {
+      "message": "What are your opening hours?",
+      "expect": {
+        "state": "IDLE",
+        "response_contains": [
+          "contact",
+          "hours"
+        ]
+      }
+    }
+  ]
+}

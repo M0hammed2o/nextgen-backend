@@ -1,0 +1,59 @@
+{
+  "id": "conv_049",
+  "title": "Recovery — customer returns after ORDER_PLACED and places different order",
+  "category": "recovery",
+  "tags": ["deterministic", "session_restart", "second_order"],
+
+  "turns": [
+    {
+      "message": "Can I get a Double Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Double Smash Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Ayabonga",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0730000002",
+      "expect": {"state": "ORDER_PLACED", "cart": []}
+    },
+    {
+      "message": "Hello",
+      "expect": {"state": "GREETING", "response_contains": ["welcome"]}
+    },
+    {
+      "message": "Can I get 3 Chips",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Chips", "quantity": 3}],
+        "response_not_contains": ["double smash burger"]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "ORDER_PLACED", "cart": []}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Chips", "quantity": 3}],
+    "subtotal_cents": 10500,
+    "total_cents": 10500,
+    "order_mode": "PICKUP"
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "id": "synth_0366",
+  "title": "Synth cancel after order \u2014 Classic Smash Burger",
+  "category": "synthetic_cancel",
+  "tags": [
+    "synthetic",
+    "det",
+    "cancel"
+  ],
+  "turns": [
+    {
+      "message": "I'll have a Classic Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Classic Smash Burger",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "Actually never mind",
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_contains": [
+          "cancel",
+          "order"
+        ]
+      }
+    }
+  ]
+}

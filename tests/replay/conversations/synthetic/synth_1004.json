@@ -1,0 +1,72 @@
+{
+  "id": "synth_1004",
+  "title": "Synth burger + coffee \u2014 Double Smash Burger + Cappuccino almond milk",
+  "category": "synthetic_multi_item",
+  "tags": [
+    "synthetic",
+    "det",
+    "pickup",
+    "multi_item",
+    "options"
+  ],
+  "turns": [
+    {
+      "message": "Can I get a Double Smash Burger and a Cappuccino with almond milk",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Double Smash Burger",
+            "quantity": 1
+          },
+          {
+            "name": "Cappuccino",
+            "quantity": 1,
+            "special_instructions": "almond milk"
+          }
+        ]
+      }
+    },
+    {
+      "message": "Yeah",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Keegan",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0611111111",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Double Smash Burger",
+        "quantity": 1
+      },
+      {
+        "name": "Cappuccino",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 14000,
+    "total_cents": 14000,
+    "order_mode": "PICKUP",
+    "customer_name": "Keegan"
+  }
+}

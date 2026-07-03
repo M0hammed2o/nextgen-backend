@@ -1,0 +1,21 @@
+{
+  "id": "synth_0618",
+  "title": "Synth location \u2014 'Where is the store?'",
+  "category": "synthetic_business",
+  "tags": [
+    "synthetic",
+    "det",
+    "location"
+  ],
+  "turns": [
+    {
+      "message": "Where is the store?",
+      "expect": {
+        "state": "IDLE",
+        "response_contains": [
+          "contact us for location"
+        ]
+      }
+    }
+  ]
+}

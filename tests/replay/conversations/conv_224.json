@@ -1,0 +1,20 @@
+{
+  "id": "conv_224",
+  "title": "CX confirmation guard — Yes without pending cart — empty cart message, no checkout",
+  "category": "cx_confirmation_guard",
+  "tags": ["det", "cx", "guard", "negative"],
+
+  "notes": "ORDER_CONFIRM intent with empty cart must return an empty-cart message, not attempt checkout. No LLM is called. State stays IDLE.",
+
+  "turns": [
+    {
+      "message": "Yes",
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_contains": ["empty"],
+        "response_not_contains": ["order confirmed", "payment", "checkout", "total", "your name"]
+      }
+    }
+  ]
+}

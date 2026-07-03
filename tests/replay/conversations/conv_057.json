@@ -1,0 +1,19 @@
+{
+  "id": "conv_057",
+  "title": "Greeting — Sharp as SA greeting opener",
+  "category": "greeting",
+  "tags": ["deterministic", "greeting", "sa_slang"],
+
+  "notes": "Sharp is a SA multi-use word. As the first message it is a casual greeting. intent_router includes sharp in GREETING pattern so state transitions to GREETING.",
+
+  "turns": [
+    {
+      "message": "Sharp",
+      "expect": {
+        "state": "GREETING",
+        "cart": [],
+        "response_contains": ["welcome"]
+      }
+    }
+  ]
+}

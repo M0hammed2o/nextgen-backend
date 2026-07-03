@@ -1,0 +1,62 @@
+{
+  "id": "conv_066",
+  "title": "Menu — Browse menu mid-order preserves cart",
+  "category": "menu",
+  "tags": ["deterministic", "menu", "cart_edit"],
+
+  "notes": "Customer orders an item, then requests the menu again. Bot shows menu but keeps the cart intact. Customer then adds another item.",
+
+  "turns": [
+    {
+      "message": "Can I get a Classic Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Menu",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}],
+        "response_contains": ["menu", "current order"]
+      }
+    },
+    {
+      "message": "Add a Sprite (330ml)",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Classic Smash Burger", "quantity": 1},
+          {"name": "Sprite (330ml)", "quantity": 1}
+        ]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Zanele",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0711000005",
+      "expect": {"state": "ORDER_PLACED"}
+    }
+  ],
+
+  "final_order": {
+    "items": [
+      {"name": "Classic Smash Burger", "quantity": 1},
+      {"name": "Sprite (330ml)", "quantity": 1}
+    ],
+    "subtotal_cents": 9500,
+    "total_cents": 9500,
+    "order_mode": "PICKUP"
+  }
+}

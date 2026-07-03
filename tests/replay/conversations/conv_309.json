@@ -1,0 +1,29 @@
+{
+  "id": "conv_309",
+  "title": "Bug regression — Coffee with milk added via CONFIRMING_ORDER DET path captures option",
+  "category": "options",
+  "tags": ["det", "options", "required_options", "regression", "bug_fix"],
+
+  "notes": "Bug: DET_ADD_CONFIRMING 'all-ready' path did not call _capture_options_from_message, so adding a cappuccino with oat milk while reviewing a cart would miss the oat milk special_instructions. Fixed by applying _capture_options_from_message in that path.",
+
+  "turns": [
+    {
+      "message": "Can I get a Classic Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Add a cappuccino with oat milk",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Classic Smash Burger", "quantity": 1},
+          {"name": "Cappuccino", "quantity": 1, "special_instructions": "oat milk"}
+        ],
+        "response_contains": ["added", "oat milk"]
+      }
+    }
+  ]
+}

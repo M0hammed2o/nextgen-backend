@@ -1,0 +1,62 @@
+{
+  "id": "synth_0734",
+  "title": "Synth SA order \u2014 'Cn i get a {}' / Sprite (330ml)",
+  "category": "synthetic_sa_slang",
+  "tags": [
+    "synthetic",
+    "det",
+    "pickup",
+    "sa_slang"
+  ],
+  "turns": [
+    {
+      "message": "Cn i get a Sprite (330ml)",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Sprite (330ml)",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "Perfect",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Pieter",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0611111111",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Sprite (330ml)",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 2000,
+    "total_cents": 2000,
+    "order_mode": "PICKUP",
+    "customer_name": "Pieter"
+  }
+}

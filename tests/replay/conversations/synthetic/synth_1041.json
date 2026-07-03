@@ -1,0 +1,72 @@
+{
+  "id": "synth_1041",
+  "title": "Synth multi + coffee \u2014 Chips + Cappuccino",
+  "category": "synthetic_multi_item",
+  "tags": [
+    "synthetic",
+    "det",
+    "pickup",
+    "multi_item",
+    "options"
+  ],
+  "turns": [
+    {
+      "message": "Can I get a Chips and a Cappuccino with soy milk",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Chips",
+            "quantity": 1
+          },
+          {
+            "name": "Cappuccino",
+            "quantity": 1,
+            "special_instructions": "soy milk"
+          }
+        ]
+      }
+    },
+    {
+      "message": "Sharp",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Zanele",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0831111111",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Chips",
+        "quantity": 1
+      },
+      {
+        "name": "Cappuccino",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 8000,
+    "total_cents": 8000,
+    "order_mode": "PICKUP",
+    "customer_name": "Zanele"
+  }
+}

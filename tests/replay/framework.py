@@ -276,6 +276,23 @@ class ReplayRunner:
             for idx, turn in enumerate(self.conv["turns"]):
                 await self._process_turn(idx, turn)
 
+        # ── Post-run: verify no scripts were left unconsumed in the queue ──────
+        # A leftover script means a turn had an 'llm' key but DET intercepted the
+        # message before the LLM was called — the script was enqueued but never
+        # dequeued.  This produces a stale script that would corrupt the next real
+        # LLM turn.  Catch it here as a final safety net (per-turn checks also
+        # fire earlier for better diagnostics).
+        leftover = len(self.scripted_llm._queue)
+        if leftover:
+            raise AssertionError(
+                f"Replay finished with {leftover} unconsumed LLM script(s) in the queue.\n"
+                f"  conversation: {self.conv.get('id', '?')} — "
+                f"{self.conv.get('title', '')}\n"
+                f"  An 'llm' key was provided for a turn that the pipeline handled "
+                f"deterministically; the script was enqueued but never dequeued.\n"
+                f"  Remove the 'llm' key from any deterministic turn."
+            )
+
         if "final_order" in self.conv:
             self._assert_final_order(self.conv["final_order"])
 
@@ -297,15 +314,89 @@ class ReplayRunner:
 
         msg_text = turn["message"]
 
+        # Snapshot call count before execution so we can detect whether the LLM
+        # was actually invoked during this turn.
+        calls_before = self.scripted_llm.call_count
+
         # Pre-load scripted LLM response for this turn
         llm_spec = turn.get("llm")
         self.scripted_llm.enqueue(llm_spec)
 
         response_text = await self._execute(msg_text)
+
+        # ── LLM integrity checks (must run before appending to .responses) ────
+        calls_this_turn = self.scripted_llm.call_count - calls_before
+        self._assert_llm_integrity(idx, msg_text, llm_spec, calls_this_turn, response_text)
+
         self.responses.append(response_text)
 
         if "expect" in turn:
             self._assert_turn(idx, turn["expect"], response_text)
+
+    # ── LLM integrity enforcement ─────────────────────────────────────────────
+
+    def _assert_llm_integrity(
+        self,
+        idx: int,
+        msg_text: str,
+        llm_spec: dict | None,
+        calls_this_turn: int,
+        response_text: str,
+    ) -> None:
+        """
+        Enforce that the LLM was called exactly when (and only when) a script
+        was provided.
+
+        Three failure modes:
+
+        1. Script provided but LLM not called — the pipeline handled the turn
+           deterministically (DET intercepted).  The script is dead code and the
+           LLM path is untested.  Remove the 'llm' key to mark the turn as
+           deterministic.
+
+        2. No script provided but LLM was called — the pipeline reached the LLM
+           unexpectedly.  ScriptedLLMProvider returned a REPLAY ERROR response,
+           which means the turn cannot be tested correctly.  Add an 'llm' key or
+           fix the message to be handled deterministically.
+
+        3. REPLAY ERROR in the response text — a safety-net catch for the case
+           where the queue is empty but the LLM was called (e.g. queue corruption
+           from a prior stale script).
+        """
+        prefix = f"[turn {idx}]"
+
+        # ── Case 1: dead script ───────────────────────────────────────────────
+        if llm_spec is not None and calls_this_turn == 0:
+            raise AssertionError(
+                f"{prefix} DEAD LLM SCRIPT — a script was provided but the LLM "
+                f"was never called.\n"
+                f"  message: {msg_text!r}\n"
+                f"  The pipeline handled this turn deterministically (DET intercepted "
+                f"the message before reaching the LLM).\n"
+                f"  Fix: remove the 'llm' key from this turn to mark it deterministic, "
+                f"or change the message so DET does not intercept it."
+            )
+
+        # ── Case 2: unexpected LLM call ───────────────────────────────────────
+        if llm_spec is None and calls_this_turn > 0:
+            raise AssertionError(
+                f"{prefix} UNEXPECTED LLM CALL — the LLM was called but no script "
+                f"was provided for this turn.\n"
+                f"  message: {msg_text!r}\n"
+                f"  response preview: {response_text[:200]!r}\n"
+                f"  Fix: add an 'llm' key with the expected scripted response, or "
+                f"rewrite the message so DET handles it without reaching the LLM."
+            )
+
+        # ── Case 3: REPLAY ERROR in response (belt-and-braces) ────────────────
+        if "[REPLAY ERROR:" in response_text:
+            raise AssertionError(
+                f"{prefix} REPLAY ERROR in response — ScriptedLLMProvider returned "
+                f"its error sentinel, meaning the LLM was called with an empty queue.\n"
+                f"  message: {msg_text!r}\n"
+                f"  response: {response_text[:300]!r}\n"
+                f"  Fix: add an 'llm' key to this turn."
+            )
 
     # ── Message execution ─────────────────────────────────────────────────────
 
@@ -376,7 +467,8 @@ class ReplayRunner:
                 last.delivery_fee_cents = fee
                 last.total_cents = last.subtotal_cents + fee
                 last.status = "NEW"
-                last.payment_status = payment_method
+                # Store real payment_status value (matches _finalize_pending_delivery_order logic)
+                last.payment_status = "CASH_ON_COLLECTION" if payment_method == "CASH_ON_COLLECTION" else "PENDING"
                 order_number = last.order_number
                 subtotal = last.subtotal_cents
             else:
@@ -395,8 +487,17 @@ class ReplayRunner:
                 False, None, None, None,
             )
 
+        # ── Build add-ons map from FakeMenuItem.add_ons (Phase 8) ───────────
+        _add_ons_map = {
+            str(item.id): item.add_ons
+            for item in self.menu_items
+            if getattr(item, "add_ons", None)
+        }
+
         # ── Patch everything ──────────────────────────────────────────────────
-        with patch("backend.app.bot.pipeline._load_menu",
+        with patch("backend.app.bot.pipeline._load_add_ons_map",
+                   return_value=_add_ons_map):
+          with patch("backend.app.bot.pipeline._load_menu",
                    return_value=([], self.menu_items)):
             with patch("backend.app.bot.pipeline._load_specials",
                        return_value=[]):
@@ -472,6 +573,22 @@ class ReplayRunner:
                 f"  response: {response[:300]}"
             )
 
+        # Session context assertions
+        for key, expected_val in (expect.get("context_has") or {}).items():
+            actual_val = state_machine.get_context(self.session, key)
+            if expected_val is True:
+                assert actual_val is not None and actual_val is not False, (
+                    f"{prefix} context_has: {key!r} must be set, got {actual_val!r}"
+                )
+            elif expected_val is False:
+                assert not actual_val, (
+                    f"{prefix} context_has: {key!r} should be unset/falsy, got {actual_val!r}"
+                )
+            else:
+                assert actual_val == expected_val, (
+                    f"{prefix} context_has: {key!r} expected {expected_val!r}, got {actual_val!r}"
+                )
+
     # ── Final order assertion ─────────────────────────────────────────────────
 
     def _assert_final_order(self, expected: dict) -> None:
@@ -513,4 +630,10 @@ class ReplayRunner:
             assert order.delivery_fee_cents == expected["delivery_fee_cents"], (
                 f"final_order.delivery_fee_cents: "
                 f"expected {expected['delivery_fee_cents']}, got {order.delivery_fee_cents}"
+            )
+
+        if "payment_status" in expected:
+            assert (order.payment_status or "").upper() == expected["payment_status"].upper(), (
+                f"final_order.payment_status: "
+                f"expected {expected['payment_status']!r}, got {order.payment_status!r}"
             )

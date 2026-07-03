@@ -1,0 +1,61 @@
+{
+  "id": "synth_0248",
+  "title": "Synth pickup (no greeting) \u2014 Spicy Chicken Burger",
+  "category": "synthetic_pickup",
+  "tags": [
+    "synthetic",
+    "det",
+    "pickup"
+  ],
+  "turns": [
+    {
+      "message": "Can I get a Spicy Chicken Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Spicy Chicken Burger",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "Sharp",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Collect",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Aisha",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0834567890",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Spicy Chicken Burger",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 8000,
+    "total_cents": 8000,
+    "order_mode": "PICKUP",
+    "customer_name": "Aisha"
+  }
+}

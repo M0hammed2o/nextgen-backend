@@ -1,0 +1,78 @@
+{
+  "id": "conv_105",
+  "title": "SA slang — Full delivery order in SA English (eish, lekker, yebo shot)",
+  "category": "sa_slang",
+  "tags": ["llm", "sa_slang", "delivery", "delivery_fee"],
+
+  "business": {
+    "delivery_enabled": true,
+    "require_customer_name": false,
+    "require_phone_number": false,
+    "require_delivery_address": false
+  },
+
+  "turns": [
+    {
+      "message": "Howzit",
+      "expect": {"state": "GREETING", "cart": []}
+    },
+    {
+      "message": "Can I get 2 smsh brgrs",
+      "llm": {
+        "action": "add_items",
+        "message": "Lekker! Added 2x Classic Smash Burger ✅",
+        "items": [{"name": "Classic Smash Burger", "quantity": 2}]
+      },
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 2}]
+      }
+    },
+    {
+      "message": "Yebo",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Delivery",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "4 Bree Street, Cape Town",
+      "expect": {
+        "state": "WAITING_DELIVERY_FEE_APPROVAL",
+        "cart": []
+      }
+    },
+    {
+      "_type": "staff_action",
+      "description": "Staff sets delivery fee R30",
+      "context_updates": {
+        "delivery_fee_cents": 3000,
+        "delivery_fee_status": "FEE_SENT"
+      }
+    },
+    {
+      "message": "Lekker",
+      "expect": {
+        "state": "COLLECTING_PAYMENT",
+        "response_contains": ["cash", "card"]
+      }
+    },
+    {
+      "message": "Cash",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Classic Smash Burger", "quantity": 2}],
+    "subtotal_cents": 15000,
+    "delivery_fee_cents": 3000,
+    "total_cents": 18000,
+    "order_mode": "DELIVERY",
+    "payment_status": "CASH_ON_COLLECTION"
+  }
+}

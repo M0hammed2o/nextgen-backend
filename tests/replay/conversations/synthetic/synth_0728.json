@@ -1,0 +1,62 @@
+{
+  "id": "synth_0728",
+  "title": "Synth SA order \u2014 'Cn i get a {}' / Spicy Chicken Burger",
+  "category": "synthetic_sa_slang",
+  "tags": [
+    "synthetic",
+    "det",
+    "pickup",
+    "sa_slang"
+  ],
+  "turns": [
+    {
+      "message": "Cn i get a Spicy Chicken Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Spicy Chicken Burger",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "Perfect",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Yusuf",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0831234567",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Spicy Chicken Burger",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 8000,
+    "total_cents": 8000,
+    "order_mode": "PICKUP",
+    "customer_name": "Yusuf"
+  }
+}

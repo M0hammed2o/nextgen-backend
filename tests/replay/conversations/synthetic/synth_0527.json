@@ -1,0 +1,35 @@
+{
+  "id": "synth_0527",
+  "title": "Synth cancel after order \u2014 Still Water",
+  "category": "synthetic_cancel",
+  "tags": [
+    "synthetic",
+    "det",
+    "cancel"
+  ],
+  "turns": [
+    {
+      "message": "Give me a Still Water",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Still Water",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "Actually never mind",
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_contains": [
+          "cancel",
+          "order"
+        ]
+      }
+    }
+  ]
+}

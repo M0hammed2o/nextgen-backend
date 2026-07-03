@@ -1,0 +1,35 @@
+{
+  "id": "synth_0449",
+  "title": "Synth cancel after order \u2014 Onion Rings",
+  "category": "synthetic_cancel",
+  "tags": [
+    "synthetic",
+    "det",
+    "cancel"
+  ],
+  "turns": [
+    {
+      "message": "I want a Onion Rings",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Onion Rings",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "Forget it",
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_contains": [
+          "cancel",
+          "order"
+        ]
+      }
+    }
+  ]
+}

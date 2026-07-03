@@ -1,0 +1,17 @@
+{
+  "id": "conv_056",
+  "title": "Greeting — Hello standalone",
+  "category": "greeting",
+  "tags": ["deterministic", "greeting"],
+
+  "turns": [
+    {
+      "message": "Hello",
+      "expect": {
+        "state": "GREETING",
+        "cart": [],
+        "response_contains": ["welcome"]
+      }
+    }
+  ]
+}

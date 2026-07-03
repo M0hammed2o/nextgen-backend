@@ -1,0 +1,61 @@
+{
+  "id": "synth_0316",
+  "title": "Synth pickup (no greeting) \u2014 Coca-Cola (500ml)",
+  "category": "synthetic_pickup",
+  "tags": [
+    "synthetic",
+    "det",
+    "pickup"
+  ],
+  "turns": [
+    {
+      "message": "Can I get a Coca-Cola (500ml)",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Coca-Cola (500ml)",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "Sharp",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup please",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Sipho",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0729876543",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Coca-Cola (500ml)",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 2500,
+    "total_cents": 2500,
+    "order_mode": "PICKUP",
+    "customer_name": "Sipho"
+  }
+}

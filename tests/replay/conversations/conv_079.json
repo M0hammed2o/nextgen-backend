@@ -1,0 +1,27 @@
+{
+  "id": "conv_079",
+  "title": "Cart editing — Remove last item makes cart empty",
+  "category": "cart_edit",
+  "tags": ["deterministic", "cart_edit", "remove_all"],
+
+  "notes": "Customer orders one item then removes it by name. DET_REMOVE_CART intercepts 'Remove the chips' — 'Chips' is a named menu item found in the cart, so the deterministic path handles removal without calling the LLM. Cart empties and state transitions to IDLE.",
+
+  "turns": [
+    {
+      "message": "Can I get Chips",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Chips", "quantity": 1}],
+        "confirmed_cart": [{"name": "Chips", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Remove the chips",
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_contains": ["empty"]
+      }
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "id": "conv_207",
+  "title": "CX general — Cool thanks — friendly close, no ordering triggered",
+  "category": "cx_general",
+  "tags": ["llm", "chitchat", "cx"],
+
+  "turns": [
+    {
+      "message": "Cool thanks",
+      "llm": {
+        "action": "chitchat",
+        "message": "Of course! Let me know if you need anything else.",
+        "items": []
+      },
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_not_contains": ["pickup", "delivery", "your name", "added to your order", "total"]
+      }
+    }
+  ]
+}

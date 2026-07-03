@@ -1,0 +1,56 @@
+{
+  "id": "conv_053",
+  "title": "SA slang — ice coffe typo without greeting prefix, LLM handles via ask_options",
+  "category": "sa_slang",
+  "tags": ["llm", "sa_slang", "typo", "proposed_items", "ask_options"],
+
+  "notes": "When a message starts with a greeting word, GREETING fires and DET runs but can't resolve typos. This test sends the order without a greeting prefix so the LLM path is taken. The proposed_items flow is tested separately in conv_013.",
+
+  "turns": [
+    {
+      "message": "Can I get an ice coffe",
+      "llm": {
+        "action": "ask_options",
+        "message": "Sure! An Ice Coffee is R75.00. Would you like to confirm?",
+        "items": [{"name": "Ice Coffee", "quantity": 1}]
+      },
+      "expect": {
+        "state": "CHOOSING_OPTIONS",
+        "cart": [],
+        "context_has": {"pending_options": true},
+        "response_contains": ["ice coffee", "r75"]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Ice Coffee", "quantity": 1}],
+        "response_not_contains": ["cart is empty"]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Lungelo",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0730000006",
+      "expect": {"state": "ORDER_PLACED"}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Ice Coffee", "quantity": 1}],
+    "subtotal_cents": 7500,
+    "total_cents": 7500,
+    "order_mode": "PICKUP"
+  }
+}

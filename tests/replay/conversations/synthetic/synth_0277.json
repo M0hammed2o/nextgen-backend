@@ -1,0 +1,61 @@
+{
+  "id": "synth_0277",
+  "title": "Synth pickup (no greeting) \u2014 Chips",
+  "category": "synthetic_pickup",
+  "tags": [
+    "synthetic",
+    "det",
+    "pickup"
+  ],
+  "turns": [
+    {
+      "message": "Can I get a Chips",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Chips",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "Correct",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Collect",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Thabo",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0821234567",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Chips",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 3500,
+    "total_cents": 3500,
+    "order_mode": "PICKUP",
+    "customer_name": "Thabo"
+  }
+}

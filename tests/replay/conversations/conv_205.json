@@ -1,0 +1,23 @@
+{
+  "id": "conv_205",
+  "title": "CX general — Thank you — polite acknowledgement, no state change",
+  "category": "cx_general",
+  "tags": ["llm", "chitchat", "cx"],
+
+  "turns": [
+    {
+      "message": "Thank you",
+      "llm": {
+        "action": "chitchat",
+        "message": "You're welcome! Feel free to ask if you need anything.",
+        "items": []
+      },
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_contains": ["welcome"],
+        "response_not_contains": ["pickup", "delivery", "your name", "added to your order"]
+      }
+    }
+  ]
+}

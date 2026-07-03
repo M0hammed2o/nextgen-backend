@@ -1,0 +1,48 @@
+{
+  "id": "conv_p006",
+  "title": "Pricing — priced option + paid add-on combined (Latte: Soy Milk + Extra Shot)",
+  "category": "pricing",
+  "tags": ["llm", "pricing", "option_pricing", "add_on", "pickup"],
+
+  "notes": "Latte base=4500, Soy Milk +1000 (option), Extra Shot +1500 (add-on). unit_price=7000, subtotal=7000.",
+
+  "turns": [
+    {
+      "message": "A latte with soy milk and an extra shot",
+      "llm": {
+        "action": "add_items",
+        "message": "Latte with Soy Milk and Extra Shot — R70.00 ✅",
+        "items": [{"name": "Latte", "quantity": 1, "options": {"Milk": "Soy Milk"}, "add_ons": [{"name": "Extra Shot", "quantity": 1}], "special_instructions": ""}]
+      },
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Latte", "quantity": 1}],
+        "response_contains": ["latte"]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Priya",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0823456789",
+      "expect": {"state": "ORDER_PLACED", "cart": []}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Latte", "quantity": 1}],
+    "subtotal_cents": 7000,
+    "total_cents": 7000,
+    "order_mode": "PICKUP",
+    "customer_name": "Priya"
+  }
+}

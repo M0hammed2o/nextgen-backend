@@ -427,7 +427,7 @@ async def _handle_message(
             # menu when the message has content beyond the greeting word itself.
             import re as _re_greet
             _PURE_GREET_RE = _re_greet.compile(
-                r'^(hi|hello|hey|howzit|heita|yebo|yo|sup|'
+                r'^(hi|hello|hey|howzit|heita|yebo|yo|sup|sharp|morning|afternoon|'
                 r'good\s*(?:morning|afternoon|evening)|'
                 r'sawubona|molo|hola|ola|gday)[!.,\s]*$',
                 _re_greet.I,
@@ -839,6 +839,29 @@ async def _handle_message(
 
         # ── Sub-case: customer declines modifications ("No") ─────────────
         if intent_router.is_negation(norm_text) and _pending_opts:
+            # If any pending item still has unsatisfied REQUIRED option groups,
+            # "no" means the customer doesn't want to answer — cancel the pending
+            # item rather than adding it without a required selection.
+            _pending_has_required = any(
+                _get_missing_required_groups(
+                    type("_P", (), {"options_json": p.get("options_json") or {}})(),
+                    p.get("special_instructions"),
+                )
+                for p in _pending_opts
+            )
+            if _pending_has_required:
+                state_machine.set_context(session, "pending_options", None)
+                state_machine.transition_state(session, ConversationState.IDLE.value)
+                logger.warning(
+                    "CHOOSING_OPTIONS_CANCEL_REQUIRED: negation with required options "
+                    "unsatisfied — cancelling pending item(s), session_id=%s", session.id,
+                )
+                return (
+                    "No problem! That item's been removed. "
+                    "Let me know if you'd like to order something else. 😊",
+                    False, None, None, None,
+                )
+            # No required options pending — commit as-is (e.g. "no extra cheese")
             logger.warning(
                 "CHOOSING_OPTIONS_NO_MOD: negation with %d pending item(s), session_id=%s",
                 len(_pending_opts), session.id,
@@ -948,6 +971,194 @@ async def _handle_message(
     return responses.fallback_response(business), False, None, None, None
 
 
+# ── Phase 8: Pricing resolution helpers ─────────────────────────────────────
+
+async def _load_add_ons_map(
+    db: AsyncSession,
+    business_id,
+) -> dict[str, list[dict]]:
+    """
+    Load all active add-ons for this business, keyed by menu_item_id (str).
+    Returns {menu_item_id: [{add_on_id, name, price_cents, min_qty, max_qty, default_qty}]}.
+    """
+    from shared.models.menu import MenuAddOn, menu_item_add_ons as _join
+    stmt = (
+        select(MenuAddOn, _join.c.menu_item_id)
+        .join(_join, _join.c.add_on_id == MenuAddOn.id)
+        .where(
+            MenuAddOn.business_id == business_id,
+            MenuAddOn.is_active.is_(True),
+            MenuAddOn.is_deleted.is_(False),
+        )
+        .order_by(MenuAddOn.sort_order, MenuAddOn.name)
+    )
+    result = await db.execute(stmt)
+    rows = result.all()
+    out: dict[str, list[dict]] = {}
+    for add_on, item_id in rows:
+        key = str(item_id)
+        out.setdefault(key, []).append({
+            "add_on_id": str(add_on.id),
+            "name": add_on.name,
+            "price_cents": add_on.price_cents,
+            "min_qty": add_on.min_qty,
+            "max_qty": add_on.max_qty,
+            "default_qty": add_on.default_qty,
+        })
+    return out
+
+
+def _resolve_option_prices(item, options_dict: dict | None) -> list[dict]:
+    """
+    Convert {group_name: option_name} dict from the LLM into a structured list
+    of selected options with price_delta_cents looked up from options_json.
+
+    Matching is case-insensitive and tolerates partial name overlap.
+    Returns [] when options_dict is empty or the item has no options_json.
+    """
+    if not options_dict:
+        return []
+    opts_json = getattr(item, "options_json", None)
+    if not opts_json:
+        return []
+    groups = opts_json.get("option_groups", [])
+    if not groups:
+        return []
+
+    group_map = {g["name"].lower(): g for g in groups}
+
+    resolved: list[dict] = []
+    for gname_key, opt_name_val in options_dict.items():
+        if not gname_key or not opt_name_val:
+            continue
+        gk = gname_key.lower()
+        group = group_map.get(gk)
+        if not group:
+            group = next(
+                (g for gn, g in group_map.items() if gn in gk or gk in gn), None
+            )
+        if not group:
+            continue
+
+        opt_map = {o["name"].lower(): o for o in group.get("options", [])}
+        ov = opt_name_val.lower()
+        opt = opt_map.get(ov)
+        if not opt:
+            opt = next(
+                (o for on, o in opt_map.items() if on in ov or ov in on), None
+            )
+        if not opt:
+            continue
+
+        resolved.append({
+            "group_id": group["id"],
+            "group_name": group["name"],
+            "option_id": opt["id"],
+            "option_name": opt["name"],
+            "price_delta_cents": opt.get("price_delta_cents", 0),
+        })
+
+    return resolved
+
+
+def _resolve_add_ons(
+    item,
+    llm_add_ons: list[dict] | None,
+    add_ons_map: dict[str, list[dict]],
+) -> list[dict]:
+    """
+    Match LLM-returned add-on names against available add-ons for this item.
+    Validates quantity against min/max constraints.
+
+    llm_add_ons: [{"name": "Extra Cheese", "quantity": 1}, ...]
+    add_ons_map: {menu_item_id_str: [{add_on_id, name, price_cents, min_qty, max_qty}, ...]}
+    Returns resolved list ready for add_to_cart(add_ons=...).
+    """
+    if not llm_add_ons:
+        return []
+    item_id = str(getattr(item, "id", ""))
+    available = add_ons_map.get(item_id, [])
+    if not available:
+        return []
+
+    avail_map = {a["name"].lower(): a for a in available}
+    resolved: list[dict] = []
+
+    for req in llm_add_ons:
+        req_name = (req.get("name") or "").lower().strip()
+        if not req_name:
+            continue
+        match = avail_map.get(req_name)
+        if not match:
+            match = next(
+                (a for n, a in avail_map.items() if req_name in n or n in req_name),
+                None,
+            )
+        if not match:
+            continue
+
+        qty = int(req.get("quantity") or match.get("default_qty", 1))
+        qty = max(match.get("min_qty", 0), min(match.get("max_qty", 10), qty))
+        if qty == 0:
+            continue
+
+        resolved.append({
+            "add_on_id": match["add_on_id"],
+            "name": match["name"],
+            "price_cents": match["price_cents"],
+            "quantity": qty,
+        })
+
+    return resolved
+
+
+def _det_has_add_on_conflict(
+    det_matches: list,
+    modifier: str | None,
+    add_ons_map: dict[str, list[dict]],
+) -> bool:
+    """
+    Return True if the message suffix looks like a paid add-on name for any
+    matched item. Handles plurals via 4-char stem matching so "extra patties"
+    matches the "Extra Patty" add-on. Yields to LLM when True so the LLM can
+    apply the correct add-on price.
+    """
+    if not modifier:
+        return False
+    mod_lower = modifier.lower()
+    mod_words = mod_lower.split()
+    for item, _qty, _m in det_matches:
+        avail = add_ons_map.get(str(getattr(item, "id", "")), [])
+        for ao in avail:
+            ao_name = ao["name"].lower()
+            if ao_name in mod_lower or mod_lower in ao_name:
+                return True
+            # Word-level stem match: "patties"[:4]="patt" == "patty"[:4]="patt"
+            ao_words = [w for w in ao_name.split() if len(w) >= 4]
+            if any(
+                any(mw[:4] == aw[:4] for mw in mod_words if len(mw) >= 4)
+                for aw in ao_words
+            ):
+                return True
+    return False
+
+
+def _det_has_priced_option(item, norm_text: str) -> bool:
+    """
+    Return True if the message appears to select a PRICED option
+    (price_delta_cents != 0) for this item. Yields to LLM so
+    _resolve_option_prices applies the correct delta. Free modifiers (delta=0)
+    continue through DET unchanged.
+    """
+    opts_json = getattr(item, "options_json", None) or {}
+    for group in opts_json.get("option_groups", []):
+        for opt in group.get("options", []):
+            if opt.get("price_delta_cents", 0) != 0:
+                if opt["name"].lower() in norm_text.lower():
+                    return True
+    return False
+
+
 # ── Size-variant helpers ─────────────────────────────────────────────────────
 # Words that indicate a size choice inside an item name.
 _SIZE_KEYWORDS: frozenset[str] = frozenset({
@@ -958,9 +1169,11 @@ _SIZE_KEYWORDS: frozenset[str] = frozenset({
 # Customer shorthand → substring that must appear in a menu item name.
 # All keys and values lowercase. Add new entries here for each deployment.
 _ITEM_ALIASES: dict[str, str] = {
-    "coke":  "coca-cola",
-    "cola":  "coca-cola",
-    "wings": "wings",   # matches "Wings (6 pcs)", "Wings (12 pcs)", etc.
+    "coke":   "coca-cola",
+    "cola":   "coca-cola",
+    "sprite": "sprite",      # matches "Sprite (330ml)", "Sprite (500ml)", etc.
+    "fanta":  "fanta",       # future-proof
+    "wings":  "wings",       # matches "Wings (6 pcs)", "Wings (12 pcs)", etc.
 }
 
 
@@ -1549,6 +1762,90 @@ def _extract_items_from_message(
     return all_matched
 
 
+# ── Required-option helpers ───────────────────────────────────────────────────
+
+def _get_missing_required_groups(
+    item,
+    modifier_text: str | None,
+    full_msg: str | None = None,
+) -> list[dict]:
+    """
+    Return required option groups from item.options_json that are not satisfied
+    by the customer message.
+
+    Searches both the extracted modifier_text (e.g. "no tomato") AND the full
+    normalised message (catches "with oat milk" style phrasing that the modifier
+    extractor doesn't capture as a recognised modifier token).
+
+    A group is satisfied when any enabled option name appears as a substring of
+    the combined search text.  Returns [] when all required groups are satisfied
+    or the item has no option groups.
+    """
+    options_json = getattr(item, "options_json", None) or {}
+    groups = options_json.get("option_groups", [])
+    required = [g for g in groups if g.get("required") and g.get("is_enabled", True)]
+    if not required:
+        return []
+
+    # Build a single search corpus from both the extracted modifier and the raw message.
+    parts: list[str] = []
+    if modifier_text:
+        parts.append(modifier_text.lower())
+    if full_msg:
+        parts.append(full_msg.lower())
+    search = " ".join(parts).strip()
+
+    if not search:
+        return required
+
+    missing = []
+    for group in required:
+        enabled_opts = [o for o in group.get("options", []) if o.get("is_enabled", True)]
+        satisfied = any(opt["name"].lower() in search for opt in enabled_opts)
+        if not satisfied:
+            missing.append(group)
+    return missing
+
+
+def _build_option_question(item_name: str, missing_groups: list[dict]) -> str:
+    """Build a natural single-question prompt for the first missing required group."""
+    first = missing_groups[0]
+    enabled = [o for o in first.get("options", []) if o.get("is_enabled", True)]
+    sorted_opts = sorted(enabled, key=lambda x: x.get("sort_order", 0))
+    opts_text = "\n".join(f"• {o['name']}" for o in sorted_opts)
+    return (
+        f"What {first['name'].lower()} would you like for your {item_name}?\n\n"
+        f"{opts_text}"
+    )
+
+
+def _capture_options_from_message(item, norm_text: str) -> str | None:
+    """
+    Scan the full normalised message for option names belonging to this item.
+    Returns a comma-joined string of matched option names, or None.
+
+    Used to capture "with oat milk" style phrasing where _extract_modifier_from_suffix
+    returns None (it only handles no-X / extra-X modifier tokens).
+    Only returns names that explicitly appear in the message — never invents choices.
+    """
+    options_json = getattr(item, "options_json", None) or {}
+    groups = options_json.get("option_groups", [])
+    if not groups:
+        return None
+    text_lower = norm_text.lower()
+    found: list[str] = []
+    seen: set[str] = set()
+    for group in sorted(groups, key=lambda g: g.get("sort_order", 0)):
+        for opt in group.get("options", []):
+            if not opt.get("is_enabled", True):
+                continue
+            name = opt["name"]
+            if name.lower() in text_lower and name not in seen:
+                found.append(name)
+                seen.add(name)
+    return ", ".join(found) if found else None
+
+
 async def _handle_with_llm(
     db: AsyncSession,
     business: Business,
@@ -1568,6 +1865,8 @@ async def _handle_with_llm(
         norm_text = msg_text
     categories, items = await _load_menu(db, business.id)
     specials = await _load_specials(db, business.id)
+    # Phase 8: load add-ons map once per LLM turn (lightweight — small table)
+    add_ons_map = await _load_add_ons_map(db, business.id)
     cart = state_machine.get_cart(session)
 
     # ── Deterministic size-ambiguity check (no LLM for the question) ────────
@@ -1619,42 +1918,109 @@ async def _handle_with_llm(
     if _det_eligible:
         det_matches = _extract_items_from_message(norm_text, items)
         if det_matches:
-            det_added: list[str] = []
-            for det_item, det_qty, det_modifier in det_matches:
-                state_machine.add_to_cart(
-                    session,
-                    menu_item_id=str(det_item.id),
-                    name=det_item.name,
-                    price_cents=det_item.price_cents,
-                    quantity=det_qty,
-                    options=None,
-                    special_instructions=det_modifier,
+            # ── Required-option guard ────────────────────────────────────────
+            # If any matched item has required option groups that the customer
+            # hasn't specified in the message, ask for them before adding to cart.
+            _needs_opts = [
+                (it, qty, mod) for it, qty, mod in det_matches
+                if _get_missing_required_groups(it, mod, norm_text)
+            ]
+            _ready = [
+                (it, qty, mod) for it, qty, mod in det_matches
+                if not _get_missing_required_groups(it, mod, norm_text)
+            ]
+            if _needs_opts:
+                # Add any items that are fully specified
+                for _ri, _rq, _rm in _ready:
+                    _si = _rm or _capture_options_from_message(_ri, norm_text)
+                    state_machine.add_to_cart(
+                        session,
+                        menu_item_id=str(_ri.id), name=_ri.name,
+                        price_cents=_ri.price_cents, quantity=_rq,
+                        options=None, special_instructions=_si,
+                    )
+                # Save the first item needing options to pending context
+                _pend_item, _pend_qty, _pend_mod = _needs_opts[0]
+                _missing_groups = _get_missing_required_groups(_pend_item, _pend_mod)
+                state_machine.set_context(session, "pending_options", [{
+                    "name": _pend_item.name,
+                    "quantity": _pend_qty,
+                    "special_instructions": _pend_mod,
+                    "menu_item_id": str(_pend_item.id),
+                    "options_json": getattr(_pend_item, "options_json", None) or {},
+                }])
+                state_machine.transition_state(session, ConversationState.CHOOSING_OPTIONS.value)
+                logger.warning(
+                    "DET_OPTIONS_REQUIRED: item=%r, missing=%r, session_id=%s",
+                    _pend_item.name, [g["name"] for g in _missing_groups], session.id,
                 )
-                label = f"{det_qty}x {det_item.name}"
-                if det_modifier:
-                    label += f" ({det_modifier})"
-                det_added.append(label)
-            logger.warning(
-                "DET_MATCH: added %d item(s) deterministically: %r, session_id=%s",
-                len(det_added), det_added, session.id,
+                return (_build_option_question(_pend_item.name, _missing_groups),
+                        False, None, None, None)
+            # ── Phase 8: pricing conflict guard ──────────────────────────────
+            # Yield to LLM when:
+            # (a) The message suffix matches a paid add-on name (e.g. "extra patty")
+            # (b) The message selects a PRICED option (e.g. "oat milk" with +R10 delta)
+            # In both cases the LLM path applies the correct price via
+            # _resolve_option_prices / _resolve_add_ons.
+            _has_pricing_conflict = (
+                _det_has_add_on_conflict(
+                    [(it, qty, mod) for it, qty, mod in det_matches],
+                    " ".join(mod for _, _, mod in det_matches if mod),
+                    add_ons_map,
+                )
+                or any(
+                    _det_has_priced_option(it, norm_text)
+                    for it, _, _ in det_matches
+                )
             )
-            import copy as _copy
-            updated_cart = state_machine.get_cart(session)
-            state_machine.set_context(session, "confirmed_cart", _copy.deepcopy(updated_cart))
-            state_machine.transition_state(session, ConversationState.CONFIRMING_ORDER.value)
-            logger.warning(
-                "CART_LOCKED_DET: items=%d, total_cents=%d, session_id=%s",
-                len(updated_cart), sum(i["line_total_cents"] for i in updated_cart), session.id,
-            )
-            order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
-            total = state_machine.cart_total_cents(session)
-            summary = state_machine.cart_summary_text(session, business.currency)
-            confirm_msg = responses.ask_confirmation_response(summary, total, 0, order_mode, business.currency)
-            if order_mode == "DELIVERY":
-                confirm_msg += "\n_Delivery fee will be confirmed by our team._"
-            parts = ["Added to your order: " + ", ".join(det_added) + " ✅"]
-            parts.append("\n" + confirm_msg)
-            return ("\n".join(parts), False, None, None, None)
+            if _has_pricing_conflict:
+                logger.warning(
+                    "DET_PRICING_CONFLICT: message contains paid add-on or priced option, "
+                    "yielding to LLM for price resolution. session_id=%s", session.id,
+                )
+                # Fall through to LLM path (do NOT return here)
+                pass
+            else:
+                # ── All items ready — normal DET flow ────────────────────────
+                det_added: list[str] = []
+                for det_item, det_qty, det_modifier in det_matches:
+                    # If suffix extraction found no modifier, also check the full
+                    # message for option names (catches "with oat milk" style phrasing).
+                    _eff_mod = det_modifier or _capture_options_from_message(det_item, norm_text)
+                    state_machine.add_to_cart(
+                        session,
+                        menu_item_id=str(det_item.id),
+                        name=det_item.name,
+                        price_cents=det_item.price_cents,
+                        quantity=det_qty,
+                        options=None,
+                        special_instructions=_eff_mod,
+                    )
+                    label = f"{det_qty}x {det_item.name}"
+                    if _eff_mod:
+                        label += f" ({_eff_mod})"
+                    det_added.append(label)
+                logger.warning(
+                    "DET_MATCH: added %d item(s) deterministically: %r, session_id=%s",
+                    len(det_added), det_added, session.id,
+                )
+                import copy as _copy
+                updated_cart = state_machine.get_cart(session)
+                state_machine.set_context(session, "confirmed_cart", _copy.deepcopy(updated_cart))
+                state_machine.transition_state(session, ConversationState.CONFIRMING_ORDER.value)
+                logger.warning(
+                    "CART_LOCKED_DET: items=%d, total_cents=%d, session_id=%s",
+                    len(updated_cart), sum(i["line_total_cents"] for i in updated_cart), session.id,
+                )
+                order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
+                total = state_machine.cart_total_cents(session)
+                summary = state_machine.cart_summary_text(session, business.currency)
+                confirm_msg = responses.ask_confirmation_response(summary, total, 0, order_mode, business.currency)
+                if order_mode == "DELIVERY":
+                    confirm_msg += "\n_Delivery fee will be confirmed by our team._"
+                parts = ["Added to your order: " + ", ".join(det_added) + " ✅"]
+                parts.append("\n" + confirm_msg)
+                return ("\n".join(parts), False, None, None, None)
 
     # ── Deterministic ingredient-modifier interception for ORDER_REMOVE ─────────
     # Fires when the intent is ORDER_REMOVE to decide whether the customer is:
@@ -1898,8 +2264,40 @@ async def _handle_with_llm(
     ):
         det_matches = _extract_items_from_message(norm_text, items)
         if det_matches:
+            # Required-option guard (same as main DET block)
+            _needs_opts_c = [
+                (it, qty, mod) for it, qty, mod in det_matches
+                if _get_missing_required_groups(it, mod, norm_text)
+            ]
+            _ready_c = [
+                (it, qty, mod) for it, qty, mod in det_matches
+                if not _get_missing_required_groups(it, mod, norm_text)
+            ]
+            if _needs_opts_c:
+                for _ri, _rq, _rm in _ready_c:
+                    state_machine.add_to_cart(
+                        session,
+                        menu_item_id=str(_ri.id), name=_ri.name,
+                        price_cents=_ri.price_cents, quantity=_rq,
+                        options=None, special_instructions=_rm,
+                    )
+                _pi, _pq, _pm = _needs_opts_c[0]
+                _mg = _get_missing_required_groups(_pi, _pm)
+                state_machine.set_context(session, "pending_options", [{
+                    "name": _pi.name, "quantity": _pq,
+                    "special_instructions": _pm,
+                    "menu_item_id": str(_pi.id),
+                    "options_json": getattr(_pi, "options_json", None) or {},
+                }])
+                state_machine.transition_state(session, ConversationState.CHOOSING_OPTIONS.value)
+                logger.warning(
+                    "DET_OPTIONS_REQUIRED (CONFIRMING): item=%r, missing=%r, session_id=%s",
+                    _pi.name, [g["name"] for g in _mg], session.id,
+                )
+                return (_build_option_question(_pi.name, _mg), False, None, None, None)
             det_added: list[str] = []
             for det_item, det_qty, det_modifier in det_matches:
+                _eff_mod_c = det_modifier or _capture_options_from_message(det_item, norm_text)
                 state_machine.add_to_cart(
                     session,
                     menu_item_id=str(det_item.id),
@@ -1907,11 +2305,11 @@ async def _handle_with_llm(
                     price_cents=det_item.price_cents,
                     quantity=det_qty,
                     options=None,
-                    special_instructions=det_modifier,
+                    special_instructions=_eff_mod_c,
                 )
                 label = f"{det_qty}x {det_item.name}"
-                if det_modifier:
-                    label += f" ({det_modifier})"
+                if _eff_mod_c:
+                    label += f" ({_eff_mod_c})"
                 det_added.append(label)
 
             # ── Fix C: mixed intent — also apply any modifier instruction ──────
@@ -2051,16 +2449,28 @@ async def _handle_with_llm(
 
             if matched_item:
                 safe_qty = max(1, min(int(pi.quantity or 1), 20))
+                # Phase 8: resolve priced options and paid add-ons
+                sel_opts = _resolve_option_prices(matched_item, pi.options)
+                res_add_ons = _resolve_add_ons(matched_item, pi.add_ons, add_ons_map)
                 state_machine.add_to_cart(
                     session,
                     menu_item_id=str(matched_item.id),
                     name=matched_item.name,
                     price_cents=matched_item.price_cents,
                     quantity=safe_qty,
+                    selected_options=sel_opts,
+                    add_ons=res_add_ons,
                     options=pi.options if pi.options else None,
                     special_instructions=pi.special_instructions,
                 )
-                added.append(f"{safe_qty}x {matched_item.name}")
+                label = f"{safe_qty}x {matched_item.name}"
+                if sel_opts:
+                    opts_str = ", ".join(o["option_name"] for o in sel_opts)
+                    label += f" ({opts_str})"
+                if res_add_ons:
+                    ao_str = ", ".join(f"+{a['name']}" for a in res_add_ons)
+                    label += f" [{ao_str}]"
+                added.append(label)
             else:
                 unmatched.append(pi.name)
 

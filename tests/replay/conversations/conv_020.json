@@ -1,0 +1,17 @@
+{
+  "id": "conv_020",
+  "title": "SA greeting — Heita",
+  "category": "greeting",
+  "tags": ["deterministic", "sa_slang", "greeting"],
+
+  "turns": [
+    {
+      "message": "Heita",
+      "expect": {
+        "state": "GREETING",
+        "cart": [],
+        "response_contains": ["welcome"]
+      }
+    }
+  ]
+}

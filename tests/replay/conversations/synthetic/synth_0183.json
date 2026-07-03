@@ -1,0 +1,71 @@
+{
+  "id": "synth_0183",
+  "title": "Synth pickup \u2014 Still Water \u2014 'Good morning'",
+  "category": "synthetic_pickup",
+  "tags": [
+    "synthetic",
+    "det",
+    "pickup"
+  ],
+  "turns": [
+    {
+      "message": "Good morning",
+      "expect": {
+        "state": "GREETING",
+        "cart": [],
+        "response_contains": [
+          "welcome"
+        ]
+      }
+    },
+    {
+      "message": "Can I get a Still Water",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Still Water",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "Place it",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup please",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Ntombi",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0712345678",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Still Water",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 1500,
+    "total_cents": 1500,
+    "order_mode": "PICKUP",
+    "customer_name": "Ntombi"
+  }
+}

@@ -1,0 +1,63 @@
+{
+  "id": "conv_102",
+  "title": "SA slang — Morning greeting, then ice coffe and cok order",
+  "category": "sa_slang",
+  "tags": ["llm", "sa_slang", "greeting", "normalizer"],
+
+  "notes": "Morning triggers GREETING (intent_router fix). Then LLM handles 'ice coffe' typo and 'cok' — neither is DET-matchable from the separate order message.",
+
+  "turns": [
+    {
+      "message": "Morning!",
+      "expect": {
+        "state": "GREETING",
+        "cart": [],
+        "response_contains": ["welcome"]
+      }
+    },
+    {
+      "message": "can i plz get an ice coffe n a cok",
+      "llm": {
+        "action": "add_items",
+        "message": "Added Ice Coffee and Coca-Cola (330ml) ✅",
+        "items": [
+          {"name": "Ice Coffee", "quantity": 1},
+          {"name": "Coca-Cola (330ml)", "quantity": 1}
+        ]
+      },
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Ice Coffee", "quantity": 1},
+          {"name": "Coca-Cola (330ml)", "quantity": 1}
+        ]
+      }
+    },
+    {
+      "message": "Lekker shot",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Zinhle",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0821000007",
+      "expect": {"state": "ORDER_PLACED"}
+    }
+  ],
+
+  "final_order": {
+    "items": [
+      {"name": "Ice Coffee", "quantity": 1},
+      {"name": "Coca-Cola (330ml)", "quantity": 1}
+    ],
+    "subtotal_cents": 9500,
+    "total_cents": 9500,
+    "order_mode": "PICKUP"
+  }
+}

@@ -1,0 +1,74 @@
+{
+  "id": "synth_0928",
+  "title": "Synth coffee pickup \u2014 Flat White soy milk \u2014 'Sawubona'",
+  "category": "synthetic_options",
+  "tags": [
+    "synthetic",
+    "det",
+    "pickup",
+    "options",
+    "coffee"
+  ],
+  "turns": [
+    {
+      "message": "Sawubona",
+      "expect": {
+        "state": "GREETING",
+        "cart": [],
+        "response_contains": [
+          "welcome"
+        ]
+      }
+    },
+    {
+      "message": "Can I get a Flat White with soy milk",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Flat White",
+            "quantity": 1,
+            "special_instructions": "soy milk"
+          }
+        ]
+      }
+    },
+    {
+      "message": "Sharp",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Fatima",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0821000001",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Flat White",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 4000,
+    "total_cents": 4000,
+    "order_mode": "PICKUP",
+    "customer_name": "Fatima"
+  }
+}

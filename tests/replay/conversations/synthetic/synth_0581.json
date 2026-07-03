@@ -1,0 +1,41 @@
+{
+  "id": "synth_0581",
+  "title": "Synth cancel after confirm \u2014 Coca-Cola (500ml)",
+  "category": "synthetic_cancel",
+  "tags": [
+    "synthetic",
+    "det",
+    "cancel"
+  ],
+  "turns": [
+    {
+      "message": "Can I get a Coca-Cola (500ml)",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Coca-Cola (500ml)",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "100",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Cancel",
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_contains": [
+          "cancel",
+          "order"
+        ]
+      }
+    }
+  ]
+}

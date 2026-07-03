@@ -1,0 +1,71 @@
+{
+  "id": "synth_0871",
+  "title": "Synth view cart then confirm \u2014 Still Water",
+  "category": "synthetic_cart",
+  "tags": [
+    "synthetic",
+    "det",
+    "cart",
+    "pickup"
+  ],
+  "turns": [
+    {
+      "message": "Can I get a Still Water",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Still Water",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "Cart please",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "response_contains": [
+          "still water"
+        ]
+      }
+    },
+    {
+      "message": "100",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Mohammed",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0729999999",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Still Water",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 1500,
+    "total_cents": 1500,
+    "order_mode": "PICKUP",
+    "customer_name": "Mohammed"
+  }
+}

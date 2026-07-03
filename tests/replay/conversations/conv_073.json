@@ -1,0 +1,75 @@
+{
+  "id": "conv_073",
+  "title": "Modifiers — Mixed modifiers across quantities via QMS (3 burgers: 2 no tomato, 1 extra cheese)",
+  "category": "modifiers",
+  "tags": ["deterministic", "modifiers", "qms", "large_quantity"],
+
+  "notes": "QMS (quantity modifier split) fires when customer sends '2 no tomato' with 3x CSB in cart. It splits the cart item: remove 2 from CSB(plain), add 2x CSB(no tomato). Then '1 extra cheese' splits the remaining 1x CSB(plain) into 1x CSB(extra cheese). Cart and final_order verify the exact split line items.",
+
+  "turns": [
+    {
+      "message": "Can I get 3 Classic Smash Burgers",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 3}],
+        "confirmed_cart": [{"name": "Classic Smash Burger", "quantity": 3}]
+      }
+    },
+    {
+      "message": "2 no tomato",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "response_contains": ["no tomato"],
+        "cart": [
+          {"name": "Classic Smash Burger", "quantity": 2, "special_instructions": "no tomato"},
+          {"name": "Classic Smash Burger", "quantity": 1}
+        ],
+        "confirmed_cart": [
+          {"name": "Classic Smash Burger", "quantity": 2, "special_instructions": "no tomato"},
+          {"name": "Classic Smash Burger", "quantity": 1}
+        ]
+      }
+    },
+    {
+      "message": "1 extra cheese",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "response_contains": ["extra cheese"],
+        "cart": [
+          {"name": "Classic Smash Burger", "quantity": 2, "special_instructions": "no tomato"},
+          {"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "extra cheese"}
+        ],
+        "confirmed_cart": [
+          {"name": "Classic Smash Burger", "quantity": 2, "special_instructions": "no tomato"},
+          {"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "extra cheese"}
+        ]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Ntsako",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0711000012",
+      "expect": {"state": "ORDER_PLACED"}
+    }
+  ],
+
+  "final_order": {
+    "items": [
+      {"name": "Classic Smash Burger", "quantity": 2, "special_instructions": "no tomato"},
+      {"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "extra cheese"}
+    ],
+    "subtotal_cents": 22500,
+    "total_cents": 22500,
+    "order_mode": "PICKUP"
+  }
+}

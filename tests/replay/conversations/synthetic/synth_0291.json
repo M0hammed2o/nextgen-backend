@@ -1,0 +1,61 @@
+{
+  "id": "synth_0291",
+  "title": "Synth pickup (no greeting) \u2014 Onion Rings",
+  "category": "synthetic_pickup",
+  "tags": [
+    "synthetic",
+    "det",
+    "pickup"
+  ],
+  "turns": [
+    {
+      "message": "Can I get a Onion Rings",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Onion Rings",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "Sharp",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Collect",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Nompilo",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0834567890",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Onion Rings",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 3000,
+    "total_cents": 3000,
+    "order_mode": "PICKUP",
+    "customer_name": "Nompilo"
+  }
+}

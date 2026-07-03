@@ -1,0 +1,72 @@
+{
+  "id": "synth_0934",
+  "title": "Synth hours then order \u2014 Onion Rings",
+  "category": "synthetic_business",
+  "tags": [
+    "synthetic",
+    "det",
+    "hours",
+    "pickup"
+  ],
+  "turns": [
+    {
+      "message": "Are you currently open?",
+      "expect": {
+        "state": "IDLE",
+        "response_contains": [
+          "contact",
+          "hours"
+        ]
+      }
+    },
+    {
+      "message": "Can I get a Onion Rings",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Onion Rings",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Thabo",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0729876543",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Onion Rings",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 3000,
+    "total_cents": 3000,
+    "order_mode": "PICKUP",
+    "customer_name": "Thabo"
+  }
+}

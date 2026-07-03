@@ -1,0 +1,62 @@
+{
+  "id": "synth_0755",
+  "title": "Synth SA order \u2014 'Let me get a {}' / Coca-Cola (500ml)",
+  "category": "synthetic_sa_slang",
+  "tags": [
+    "synthetic",
+    "det",
+    "pickup",
+    "sa_slang"
+  ],
+  "turns": [
+    {
+      "message": "Let me get a Coca-Cola (500ml)",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Coca-Cola (500ml)",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Brendan",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0821000001",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Coca-Cola (500ml)",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 2500,
+    "total_cents": 2500,
+    "order_mode": "PICKUP",
+    "customer_name": "Brendan"
+  }
+}

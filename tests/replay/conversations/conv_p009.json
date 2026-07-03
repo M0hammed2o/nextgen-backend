@@ -1,0 +1,47 @@
+{
+  "id": "conv_p009",
+  "title": "Pricing — unknown add-on is ignored (not on item's available list)",
+  "category": "pricing",
+  "tags": ["llm", "pricing", "add_on", "unknown_addon", "pickup"],
+
+  "notes": "LLM returns an add-on name ('Stuffed Crust') that does not exist for Classic Smash Burger. _resolve_add_ons finds no match → ignored. subtotal=7500 (base only).",
+
+  "turns": [
+    {
+      "message": "Classic Smash Burger with stuffed crust",
+      "llm": {
+        "action": "add_items",
+        "message": "Classic Smash Burger added ✅",
+        "items": [{"name": "Classic Smash Burger", "quantity": 1, "options": {}, "add_ons": [{"name": "Stuffed Crust", "quantity": 1}], "special_instructions": ""}]
+      },
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Zanele",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0876543210",
+      "expect": {"state": "ORDER_PLACED", "cart": []}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Classic Smash Burger", "quantity": 1}],
+    "subtotal_cents": 7500,
+    "total_cents": 7500,
+    "order_mode": "PICKUP",
+    "customer_name": "Zanele"
+  }
+}

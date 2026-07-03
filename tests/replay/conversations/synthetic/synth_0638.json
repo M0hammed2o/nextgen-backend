@@ -1,0 +1,22 @@
+{
+  "id": "synth_0638",
+  "title": "Synth greeting only \u2014 'Howzit my guy'",
+  "category": "synthetic_greeting",
+  "tags": [
+    "synthetic",
+    "det",
+    "greeting"
+  ],
+  "turns": [
+    {
+      "message": "Howzit my guy",
+      "expect": {
+        "state": "GREETING",
+        "cart": [],
+        "response_contains": [
+          "welcome"
+        ]
+      }
+    }
+  ]
+}

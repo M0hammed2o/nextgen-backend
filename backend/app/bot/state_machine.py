@@ -114,23 +114,39 @@ def add_to_cart(
     name: str,
     price_cents: int,
     quantity: int = 1,
+    selected_options: list[dict] | None = None,
+    add_ons: list[dict] | None = None,
     options: dict | None = None,
     special_instructions: str | None = None,
 ) -> list[dict]:
     """Add an item to the cart. Returns updated cart.
 
-    Modifier-aware: items with different special_instructions are treated as
-    separate line items. When special_instructions is None (the common case),
-    behaviour is identical to before — same item + same options accumulates qty.
+    Phase 8: accepts selected_options (with price_delta_cents) and add_ons
+    (with price_cents per unit). The effective unit price is computed via the
+    pricing engine. All callers without these new params behave identically to
+    before — price_cents remains the base price, unit_price = base price.
+
+    Matching: items are accumulated (quantity++) only when menu_item_id,
+    selected_options, add_ons, and special_instructions all match. Different
+    option/add-on combinations are separate line items.
     """
+    from shared.pricing.engine import calculate_line_item
+
+    _sel_opts = selected_options or []
+    _add_ons = add_ons or []
+
+    breakdown = calculate_line_item(price_cents, _sel_opts, _add_ons, quantity)
+    unit_price = breakdown.unit_price_cents
+
     cart = get_cart(session)
 
-    # Match on menu_item_id + options + special_instructions so that e.g.
-    # "Burger (no tomato)" and "Burger (extra cheese)" are distinct line items.
+    # Match on all fields that make two cart entries distinct.
+    # (item.get("selected_options") or []) handles old cart items without the field.
     for item in cart:
         if (
             item["menu_item_id"] == menu_item_id
-            and item.get("options") == options
+            and (item.get("selected_options") or []) == _sel_opts
+            and (item.get("add_ons") or []) == _add_ons
             and item.get("special_instructions") == special_instructions
         ):
             item["quantity"] += quantity
@@ -141,9 +157,17 @@ def add_to_cart(
     cart.append({
         "menu_item_id": menu_item_id,
         "name": name,
-        "price_cents": price_cents,
+        # price_cents = unit_price so that all legacy callers reading
+        # item["price_cents"] for line-total recalculation stay correct.
+        "price_cents": unit_price,
+        "base_price_cents": price_cents,
+        "selected_options": _sel_opts,
+        "add_ons": _add_ons,
+        "option_adjustment_cents": breakdown.option_adjustment_cents,
+        "add_on_total_cents": breakdown.add_on_total_cents,
+        "unit_price_cents": unit_price,
         "quantity": quantity,
-        "line_total_cents": price_cents * quantity,
+        "line_total_cents": breakdown.line_total_cents,
         "options": options,
         "special_instructions": special_instructions,
     })
@@ -330,9 +354,31 @@ def cart_summary_text(session: ConversationSession, currency: str = "ZAR") -> st
     for item in cart:
         price_str = format_currency(item["line_total_cents"], currency)
         lines.append(f"  {item['quantity']}x {item['name']} — {price_str}")
-        if item.get("options"):
+
+        # Show priced option selections (e.g. "Oat Milk +R10.00")
+        _sel_opts_shown: set[str] = set()
+        for opt in (item.get("selected_options") or []):
+            opt_name = opt.get("option_name", "")
+            delta = opt.get("price_delta_cents", 0)
+            if delta != 0:
+                sign = "+" if delta > 0 else ""
+                lines.append(f"      ↳ {opt_name} {sign}{format_currency(delta, currency)}")
+            else:
+                lines.append(f"      ↳ {opt_name}")
+            _sel_opts_shown.add(opt_name.lower())
+
+        # Fall back to legacy options dict for items stored before Phase 8
+        if item.get("options") and not item.get("selected_options"):
             for key, val in item["options"].items():
                 lines.append(f"      ↳ {key}: {val}")
+
+        # Show paid add-ons with price breakdown
+        for ao in (item.get("add_ons") or []):
+            ao_qty = ao.get("quantity", 1)
+            ao_total = ao.get("price_cents", 0) * ao_qty
+            qty_str = f"×{ao_qty}" if ao_qty > 1 else ""
+            lines.append(f"      ✦ {ao['name']}{qty_str} +{format_currency(ao_total, currency)}")
+
         if item.get("special_instructions"):
             lines.append(f"      📝 {item['special_instructions']}")
 

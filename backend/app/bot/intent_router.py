@@ -17,9 +17,10 @@ _PATTERNS: list[tuple[re.Pattern, MessageIntent]] = [
     # Opt-out (highest priority — Meta compliance)
     (re.compile(r"\b(stop|unsubscribe|opt.?out|cancel.?sub)\b", re.I), MessageIntent.OPT_OUT),
 
-    # Greetings
+    # Greetings — includes standalone SA informals: sharp (hi/ok), morning, afternoon
     (re.compile(
-        r"^(hi|hello|hey|howzit|heita|yebo|yo|sup|good\s*(morning|afternoon|evening)|"
+        r"^(hi|hello|hey|howzit|heita|yebo|yo|sup|sharp|morning|afternoon|"
+        r"good\s*(morning|afternoon|evening)|"
         r"sawubona|molo|hola|ola|gday)\b", re.I
     ), MessageIntent.GREETING),
 
@@ -212,8 +213,8 @@ def is_confirmation(text: str) -> bool:
     )
     _TRAILING = (
         r"(\s+("
-        r"please|thanks|thank\s+you|bru|man|mate|now|"
-        r"sure\s+thing|great|awesome|for\s+sure|"
+        r"please|thanks|thank\s+you|bru|man|mate|now|china|"
+        r"sure\s+thing|great|awesome|for\s+sure|shot|"   # SA: "shot" = thanks/done
         r"confirm|confirmed|proceed|place|order|my\s+order|the\s+order|it|"
         # standalone affirmative words valid as trailing qualifiers
         r"correct|right|fine|good|"

@@ -1,0 +1,20 @@
+{
+  "id": "conv_300",
+  "title": "Options — required option missing — bot asks naturally, no cart yet",
+  "category": "options",
+  "tags": ["det", "options", "required_options", "cx"],
+
+  "notes": "Cappuccino has a required Milk Type group. Customer does not specify milk. DET intercepts, saves item to pending_options, transitions to CHOOSING_OPTIONS and asks deterministically. LLM is NOT called.",
+
+  "turns": [
+    {
+      "message": "Can I get a cappuccino",
+      "expect": {
+        "state": "CHOOSING_OPTIONS",
+        "cart": [],
+        "response_contains": ["milk", "cappuccino", "regular", "oat"],
+        "response_not_contains": ["added to your order", "total", "confirm", "your name"]
+      }
+    }
+  ]
+}

@@ -1,0 +1,48 @@
+{
+  "id": "conv_076",
+  "title": "Cart editing — Add more of same item changes quantity",
+  "category": "cart_edit",
+  "tags": ["deterministic", "cart_edit", "quantity"],
+
+  "notes": "Customer orders 2 CSBs then says 'add another Classic Smash Burger'. DET ORDER_ADD fires and adds 1 more, accumulating to 3.",
+
+  "turns": [
+    {
+      "message": "Can I get 2 Classic Smash Burgers",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 2}]
+      }
+    },
+    {
+      "message": "Add another Classic Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 3}]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Ntombi",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0711000015",
+      "expect": {"state": "ORDER_PLACED"}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Classic Smash Burger", "quantity": 3}],
+    "subtotal_cents": 22500,
+    "total_cents": 22500,
+    "order_mode": "PICKUP"
+  }
+}

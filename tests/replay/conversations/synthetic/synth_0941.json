@@ -1,0 +1,72 @@
+{
+  "id": "synth_0941",
+  "title": "Synth hours then order \u2014 Double Smash Burger",
+  "category": "synthetic_business",
+  "tags": [
+    "synthetic",
+    "det",
+    "hours",
+    "pickup"
+  ],
+  "turns": [
+    {
+      "message": "Are you still open?",
+      "expect": {
+        "state": "IDLE",
+        "response_contains": [
+          "contact",
+          "hours"
+        ]
+      }
+    },
+    {
+      "message": "Can I get a Double Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Double Smash Burger",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Nompilo",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0831111111",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Double Smash Burger",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 9500,
+    "total_cents": 9500,
+    "order_mode": "PICKUP",
+    "customer_name": "Nompilo"
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "id": "conv_304",
+  "title": "Options — optional group not asked about when required group is satisfied",
+  "category": "options",
+  "tags": ["det", "options", "optional", "cx"],
+
+  "notes": "Flat White has required Milk Type and optional Extras. Customer provides oat milk — Milk Type is satisfied. Bot must NOT ask about optional Extras group.",
+
+  "turns": [
+    {
+      "message": "Can I get a flat white with oat milk",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Flat White", "quantity": 1, "special_instructions": "oat milk"}],
+        "response_contains": ["added", "oat milk"],
+        "response_not_contains": ["extra shot", "decaf", "extras", "what else", "anything else"]
+      }
+    }
+  ]
+}

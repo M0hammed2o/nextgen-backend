@@ -1,0 +1,46 @@
+{
+  "id": "conv_104",
+  "title": "SA slang — brgr without chiz (chiz = cheese, not normalised — LLM handles)",
+  "category": "sa_slang",
+  "tags": ["llm", "sa_slang", "modifier"],
+
+  "notes": "chiz is SA slang for 'cheese' — not in the normalizer (only cheez/cheezz are). LLM interprets 'brgr without chiz' as Classic Smash Burger with no cheese.",
+
+  "turns": [
+    {
+      "message": "Gimme a brgr without chiz",
+      "llm": {
+        "action": "add_items",
+        "message": "Added Classic Smash Burger without cheese ✅",
+        "items": [{"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "no cheese"}]
+      },
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "no cheese"}]
+      }
+    },
+    {
+      "message": "Yebo",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Philani",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0821000009",
+      "expect": {"state": "ORDER_PLACED"}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "no cheese"}],
+    "subtotal_cents": 7500,
+    "total_cents": 7500,
+    "order_mode": "PICKUP"
+  }
+}

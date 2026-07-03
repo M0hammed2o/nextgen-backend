@@ -1,0 +1,55 @@
+{
+  "id": "conv_070",
+  "title": "Basic ordering — Order from recommendation (accept LLM suggestion)",
+  "category": "basic_ordering",
+  "tags": ["llm", "basic_ordering", "recommendation", "pickup"],
+
+  "turns": [
+    {
+      "message": "Hello",
+      "expect": {"state": "GREETING", "cart": []}
+    },
+    {
+      "message": "What do you recommend?",
+      "llm": {
+        "action": "recommend_items",
+        "message": "I'd recommend our Double Smash Burger (R95) — crispy smash patties and all the fixings. One of our best sellers! Want to add it?",
+        "items": [{"name": "Double Smash Burger", "quantity": 1}]
+      },
+      "expect": {
+        "state": "BROWSING_MENU",
+        "response_contains": ["double smash burger"]
+      }
+    },
+    {
+      "message": "Give me what you recommended",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Double Smash Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Phumzile",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0711000009",
+      "expect": {"state": "ORDER_PLACED"}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Double Smash Burger", "quantity": 1}],
+    "subtotal_cents": 9500,
+    "total_cents": 9500,
+    "order_mode": "PICKUP"
+  }
+}

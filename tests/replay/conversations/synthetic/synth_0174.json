@@ -1,0 +1,71 @@
+{
+  "id": "synth_0174",
+  "title": "Synth pickup \u2014 Sprite (330ml) \u2014 'Good evening'",
+  "category": "synthetic_pickup",
+  "tags": [
+    "synthetic",
+    "det",
+    "pickup"
+  ],
+  "turns": [
+    {
+      "message": "Good evening",
+      "expect": {
+        "state": "GREETING",
+        "cart": [],
+        "response_contains": [
+          "welcome"
+        ]
+      }
+    },
+    {
+      "message": "Can I get a Sprite (330ml)",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Sprite (330ml)",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "Yebo",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Collect",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Brendan",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0712345678",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Sprite (330ml)",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 2000,
+    "total_cents": 2000,
+    "order_mode": "PICKUP",
+    "customer_name": "Brendan"
+  }
+}

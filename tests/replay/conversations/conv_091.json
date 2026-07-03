@@ -1,0 +1,88 @@
+{
+  "id": "conv_091",
+  "title": "Delivery — Full flow with name and phone collected before address, then cash payment",
+  "category": "delivery",
+  "tags": ["deterministic", "delivery", "delivery_fee", "collecting_details"],
+
+  "notes": "Pipeline collects details in order: name → phone → delivery address. Name/phone collected in COLLECTING_DETAILS before address, then fee approval, then payment method.",
+
+  "business": {
+    "delivery_enabled": true,
+    "require_customer_name": true,
+    "require_phone_number": true,
+    "require_delivery_address": false
+  },
+
+  "turns": [
+    {
+      "message": "Can I get a Classic Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Delivery",
+      "expect": {
+        "state": "COLLECTING_DETAILS",
+        "response_contains": ["name"]
+      }
+    },
+    {
+      "message": "Precious",
+      "expect": {
+        "state": "COLLECTING_DETAILS",
+        "response_contains": ["phone"]
+      }
+    },
+    {
+      "message": "0811000004",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "10 Long Street, Cape Town",
+      "expect": {
+        "state": "WAITING_DELIVERY_FEE_APPROVAL",
+        "cart": []
+      }
+    },
+    {
+      "_type": "staff_action",
+      "description": "Staff sets delivery fee R20",
+      "context_updates": {
+        "delivery_fee_cents": 2000,
+        "delivery_fee_status": "FEE_SENT"
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {
+        "state": "COLLECTING_PAYMENT",
+        "response_contains": ["cash", "card"]
+      }
+    },
+    {
+      "message": "Cash",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Classic Smash Burger", "quantity": 1}],
+    "subtotal_cents": 7500,
+    "delivery_fee_cents": 2000,
+    "total_cents": 9500,
+    "order_mode": "DELIVERY",
+    "customer_name": "Precious",
+    "payment_status": "CASH_ON_COLLECTION"
+  }
+}

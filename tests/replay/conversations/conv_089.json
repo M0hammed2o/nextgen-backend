@@ -1,0 +1,78 @@
+{
+  "id": "conv_089",
+  "title": "Delivery — Restart after fee rejection (cancel then new pickup order)",
+  "category": "delivery",
+  "tags": ["deterministic", "delivery", "recovery", "pickup"],
+
+  "notes": "Simplified business (no name/phone required) to focus purely on the fee rejection + restart flow.",
+
+  "business": {
+    "delivery_enabled": true,
+    "require_customer_name": false,
+    "require_phone_number": false,
+    "require_delivery_address": false
+  },
+
+  "turns": [
+    {
+      "message": "Can I get a Classic Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Delivery",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "5 Pine Avenue, Claremont",
+      "expect": {
+        "state": "WAITING_DELIVERY_FEE_APPROVAL",
+        "cart": []
+      }
+    },
+    {
+      "_type": "staff_action",
+      "description": "Staff sets delivery fee R50",
+      "context_updates": {
+        "delivery_fee_cents": 5000,
+        "delivery_fee_status": "FEE_SENT"
+      }
+    },
+    {
+      "message": "No",
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_contains": ["cancelled", "pickup"]
+      }
+    },
+    {
+      "message": "Can I get a Classic Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "ORDER_PLACED", "cart": []}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Classic Smash Burger", "quantity": 1}],
+    "subtotal_cents": 7500,
+    "total_cents": 7500,
+    "order_mode": "PICKUP"
+  }
+}

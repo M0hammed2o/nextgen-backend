@@ -1,0 +1,64 @@
+{
+  "id": "conv_038",
+  "title": "Swap Coke for Sprite — LLM replace_item",
+  "category": "cart_edit",
+  "tags": ["llm", "replace_item", "swap_drink"],
+
+  "turns": [
+    {
+      "message": "Can I get a Classic Smash Burger and a Coke",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Classic Smash Burger", "quantity": 1},
+          {"name": "Coca-Cola (330ml)", "quantity": 1}
+        ]
+      }
+    },
+    {
+      "message": "Change the Coke to a Sprite",
+      "llm": {
+        "action": "replace_item",
+        "message": "Swapped Coca-Cola for Sprite ✅",
+        "items": [{"remove": "Coca-Cola", "add": "Sprite (330ml)", "quantity": 1}]
+      },
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Classic Smash Burger", "quantity": 1},
+          {"name": "Sprite (330ml)", "quantity": 1}
+        ],
+        "confirmed_cart": [
+          {"name": "Classic Smash Burger", "quantity": 1},
+          {"name": "Sprite (330ml)", "quantity": 1}
+        ]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Khanya",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0720000012",
+      "expect": {"state": "ORDER_PLACED"}
+    }
+  ],
+
+  "final_order": {
+    "items": [
+      {"name": "Classic Smash Burger", "quantity": 1},
+      {"name": "Sprite (330ml)", "quantity": 1}
+    ],
+    "subtotal_cents": 9500,
+    "total_cents": 9500,
+    "order_mode": "PICKUP"
+  }
+}

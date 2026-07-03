@@ -1,0 +1,35 @@
+{
+  "id": "synth_0513",
+  "title": "Synth cancel after order \u2014 Sprite (330ml)",
+  "category": "synthetic_cancel",
+  "tags": [
+    "synthetic",
+    "det",
+    "cancel"
+  ],
+  "turns": [
+    {
+      "message": "I want a Sprite (330ml)",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Sprite (330ml)",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "Start over",
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_contains": [
+          "cancel",
+          "order"
+        ]
+      }
+    }
+  ]
+}

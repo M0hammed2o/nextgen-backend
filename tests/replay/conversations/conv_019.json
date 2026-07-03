@@ -1,0 +1,56 @@
+{
+  "id": "conv_019",
+  "title": "Greeting sequence — Hello then menu then order",
+  "category": "greeting",
+  "tags": ["deterministic", "greeting", "menu"],
+
+  "turns": [
+    {
+      "message": "Hello",
+      "expect": {
+        "state": "GREETING",
+        "cart": [],
+        "response_contains": ["welcome"]
+      }
+    },
+    {
+      "message": "Menu",
+      "expect": {
+        "state": "BROWSING_MENU",
+        "cart": [],
+        "response_contains": ["menu", "classic smash burger"]
+      }
+    },
+    {
+      "message": "Can I get a Classic Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}],
+        "confirmed_cart": [{"name": "Classic Smash Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Ayasha",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0720000001",
+      "expect": {"state": "ORDER_PLACED", "cart": []}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Classic Smash Burger", "quantity": 1}],
+    "subtotal_cents": 7500,
+    "total_cents": 7500,
+    "order_mode": "PICKUP"
+  }
+}

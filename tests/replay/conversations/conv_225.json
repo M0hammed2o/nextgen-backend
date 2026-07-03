@@ -1,0 +1,24 @@
+{
+  "id": "conv_225",
+  "title": "CX confirmation guard — No without pending — natural reply, no cart change",
+  "category": "cx_confirmation_guard",
+  "tags": ["llm", "chitchat", "cx", "guard"],
+
+  "notes": "Standalone 'No' in IDLE state matches no deterministic pattern. Goes to LLM as chitchat. Bot must not cancel or reset anything.",
+
+  "turns": [
+    {
+      "message": "No",
+      "llm": {
+        "action": "chitchat",
+        "message": "No problem at all! Is there something I can help you with?",
+        "items": []
+      },
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_not_contains": ["order cancelled", "cart cleared", "added to your order", "total"]
+      }
+    }
+  ]
+}

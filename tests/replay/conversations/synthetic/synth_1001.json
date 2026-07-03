@@ -1,0 +1,72 @@
+{
+  "id": "synth_1001",
+  "title": "Synth burger + coffee \u2014 Double Smash Burger + Flat White soy milk",
+  "category": "synthetic_multi_item",
+  "tags": [
+    "synthetic",
+    "det",
+    "pickup",
+    "multi_item",
+    "options"
+  ],
+  "turns": [
+    {
+      "message": "Can I get a Double Smash Burger and a Flat White with soy milk",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Double Smash Burger",
+            "quantity": 1
+          },
+          {
+            "name": "Flat White",
+            "quantity": 1,
+            "special_instructions": "soy milk"
+          }
+        ]
+      }
+    },
+    {
+      "message": "Sharp",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Ntombi",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0840000001",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Double Smash Burger",
+        "quantity": 1
+      },
+      {
+        "name": "Flat White",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 13500,
+    "total_cents": 13500,
+    "order_mode": "PICKUP",
+    "customer_name": "Ntombi"
+  }
+}

@@ -1,0 +1,62 @@
+{
+  "id": "synth_0719",
+  "title": "Synth SA order \u2014 'Can i get a {}' / Chips",
+  "category": "synthetic_sa_slang",
+  "tags": [
+    "synthetic",
+    "det",
+    "pickup",
+    "sa_slang"
+  ],
+  "turns": [
+    {
+      "message": "Can i get a Chips",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Chips",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "Lekker",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Mohammed",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0821000001",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Chips",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 3500,
+    "total_cents": 3500,
+    "order_mode": "PICKUP",
+    "customer_name": "Mohammed"
+  }
+}

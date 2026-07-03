@@ -1,0 +1,24 @@
+{
+  "id": "synth_0981",
+  "title": "Synth idle cancel \u2014 'Forget it'",
+  "category": "synthetic_cancel",
+  "tags": [
+    "synthetic",
+    "det",
+    "cancel",
+    "idle"
+  ],
+  "turns": [
+    {
+      "message": "Forget it",
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_contains": [
+          "cancel",
+          "order"
+        ]
+      }
+    }
+  ]
+}

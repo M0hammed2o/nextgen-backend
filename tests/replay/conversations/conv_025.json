@@ -1,0 +1,52 @@
+{
+  "id": "conv_025",
+  "title": "Three items from different categories — burger, drink, chips",
+  "category": "basic_ordering",
+  "tags": ["deterministic", "multi_item", "multi_category"],
+
+  "turns": [
+    {
+      "message": "Can I get a Classic Smash Burger, a Coca-Cola (330ml) and Chips",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Classic Smash Burger", "quantity": 1},
+          {"name": "Coca-Cola (330ml)", "quantity": 1},
+          {"name": "Chips", "quantity": 1}
+        ],
+        "confirmed_cart": [
+          {"name": "Classic Smash Burger", "quantity": 1},
+          {"name": "Coca-Cola (330ml)", "quantity": 1},
+          {"name": "Chips", "quantity": 1}
+        ]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Sipho",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0710000001",
+      "expect": {"state": "ORDER_PLACED"}
+    }
+  ],
+
+  "final_order": {
+    "items": [
+      {"name": "Classic Smash Burger", "quantity": 1},
+      {"name": "Coca-Cola (330ml)", "quantity": 1},
+      {"name": "Chips", "quantity": 1}
+    ],
+    "subtotal_cents": 13000,
+    "total_cents": 13000,
+    "order_mode": "PICKUP"
+  }
+}

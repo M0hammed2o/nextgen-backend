@@ -1,0 +1,61 @@
+{
+  "id": "synth_0319",
+  "title": "Synth pickup (no greeting) \u2014 Sprite (330ml)",
+  "category": "synthetic_pickup",
+  "tags": [
+    "synthetic",
+    "det",
+    "pickup"
+  ],
+  "turns": [
+    {
+      "message": "Can I get a Sprite (330ml)",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Sprite (330ml)",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "Correct",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup please",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Pieter",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0729876543",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Sprite (330ml)",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 2000,
+    "total_cents": 2000,
+    "order_mode": "PICKUP",
+    "customer_name": "Pieter"
+  }
+}

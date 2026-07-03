@@ -1,0 +1,44 @@
+{
+  "id": "conv_061",
+  "title": "Greeting — Mixed greeting + order in same message (Howzit + Double Smash Burger)",
+  "category": "greeting",
+  "tags": ["deterministic", "greeting", "order_start", "mixed_intent"],
+
+  "notes": "Howzit triggers GREETING intent. The message also contains a known menu item (Double Smash Burger), so DET adds it and transitions directly to CONFIRMING_ORDER within the greeting handler.",
+
+  "turns": [
+    {
+      "message": "Howzit, can I get a Double Smash Burger please",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Double Smash Burger", "quantity": 1}],
+        "confirmed_cart": [{"name": "Double Smash Burger", "quantity": 1}],
+        "response_contains": ["welcome", "double smash burger"]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Thabo",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0710000010",
+      "expect": {"state": "ORDER_PLACED", "cart": []}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Double Smash Burger", "quantity": 1}],
+    "subtotal_cents": 9500,
+    "total_cents": 9500,
+    "order_mode": "PICKUP",
+    "customer_name": "Thabo"
+  }
+}

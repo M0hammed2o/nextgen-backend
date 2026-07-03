@@ -1,0 +1,54 @@
+{
+  "id": "conv_046",
+  "title": "Customer rejects delivery fee — order cancelled",
+  "category": "delivery",
+  "tags": ["deterministic", "delivery", "reject_fee"],
+
+  "business": {
+    "delivery_enabled": true,
+    "require_customer_name": false,
+    "require_phone_number": false
+  },
+
+  "turns": [
+    {
+      "message": "Can I get a Classic Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Delivery",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "14 Park Lane, Sandton",
+      "expect": {
+        "state": "WAITING_DELIVERY_FEE_APPROVAL",
+        "cart": [],
+        "context_has": {"pending_order_id": true}
+      }
+    },
+    {
+      "_type": "staff_action",
+      "description": "Staff sets R25 delivery fee",
+      "context_updates": {
+        "delivery_fee_cents": 2500,
+        "delivery_fee_status": "FEE_SENT"
+      }
+    },
+    {
+      "message": "No",
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_contains": ["cancelled"]
+      }
+    }
+  ]
+}

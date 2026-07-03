@@ -1,0 +1,22 @@
+{
+  "id": "synth_0605",
+  "title": "Synth business hours \u2014 'Are you open on weekends?'",
+  "category": "synthetic_business",
+  "tags": [
+    "synthetic",
+    "det",
+    "hours"
+  ],
+  "turns": [
+    {
+      "message": "Are you open on weekends?",
+      "expect": {
+        "state": "IDLE",
+        "response_contains": [
+          "contact",
+          "hours"
+        ]
+      }
+    }
+  ]
+}

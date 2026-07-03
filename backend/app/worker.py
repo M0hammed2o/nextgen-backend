@@ -81,7 +81,7 @@ async def shutdown(ctx: dict) -> None:
         from backend.app.db.session import close_redis
         await close_redis()
     except Exception:
-        pass
+        logger.warning("Redis pool close failed during worker shutdown — may already be closed.")
     logger.info("ARQ worker stopped.")
 
 
@@ -166,24 +166,40 @@ async def cancel_stale_delivery_fee_orders(ctx: dict) -> None:
 
     async with ctx["session_factory"]() as db:
         try:
-            result = await db.execute(
-                select(Order).where(
+            # Single query joining Customer and Business so we avoid N+1 lookups.
+            from sqlalchemy import and_, outerjoin
+            from sqlalchemy.orm import aliased
+
+            _Cust = aliased(Customer)
+            _Biz  = aliased(Business)
+
+            rows = await db.execute(
+                select(
+                    Order,
+                    _Cust.wa_id,
+                    _Biz.whatsapp_phone_number_id,
+                )
+                .select_from(
+                    outerjoin(Order, _Cust, and_(Order.customer_id == _Cust.id))
+                    .outerjoin(_Biz, Order.business_id == _Biz.id)
+                )
+                .where(
                     Order.status == "PENDING_DELIVERY_FEE",
                     Order.created_at < cutoff,
                 )
             )
-            stale = result.scalars().all()
+            stale_rows = rows.all()
 
-            if not stale:
+            if not stale_rows:
                 return
 
             logger.warning(
                 "Delivery fee timeout: cancelling %d order(s) older than %s min.",
-                len(stale),
+                len(stale_rows),
                 DELIVERY_FEE_TIMEOUT_MINUTES,
             )
 
-            for order in stale:
+            for order, wa_id, phone_number_id in stale_rows:
                 order.status = "CANCELLED"
                 order.cancelled_reason = (
                     f"Delivery fee not confirmed within {DELIVERY_FEE_TIMEOUT_MINUTES} minutes"
@@ -196,27 +212,8 @@ async def cancel_stale_delivery_fee_orders(ctx: dict) -> None:
                     reason="Automated timeout: delivery fee not set by staff",
                 ))
 
-                # Look up customer wa_id and business phone_number_id for notification.
-                try:
-                    if order.customer_id:
-                        cust_row = await db.execute(
-                            select(Customer.wa_id).where(Customer.id == order.customer_id)
-                        )
-                        wa_id = cust_row.scalar_one_or_none()
-
-                        biz_row = await db.execute(
-                            select(Business.whatsapp_phone_number_id).where(
-                                Business.id == order.business_id
-                            )
-                        )
-                        phone_number_id = biz_row.scalar_one_or_none()
-
-                        if wa_id and phone_number_id:
-                            notifications.append((phone_number_id, wa_id, order.order_number))
-                except Exception:
-                    logger.exception(
-                        "Failed to collect notification data for order %s", order.id
-                    )
+                if wa_id and phone_number_id:
+                    notifications.append((phone_number_id, wa_id, order.order_number))
 
             await db.commit()
 

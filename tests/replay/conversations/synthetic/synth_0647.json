@@ -1,0 +1,70 @@
+{
+  "id": "synth_0647",
+  "title": "Synth multi-item \u2014 Classic Smash Burger + Chips",
+  "category": "synthetic_multi_item",
+  "tags": [
+    "synthetic",
+    "det",
+    "pickup",
+    "multi_item"
+  ],
+  "turns": [
+    {
+      "message": "Can I get a Classic Smash Burger and Chips",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Classic Smash Burger",
+            "quantity": 1
+          },
+          {
+            "name": "Chips",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "Looks good",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Shameel",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0821000001",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Classic Smash Burger",
+        "quantity": 1
+      },
+      {
+        "name": "Chips",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 11000,
+    "total_cents": 11000,
+    "order_mode": "PICKUP",
+    "customer_name": "Shameel"
+  }
+}

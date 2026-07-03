@@ -1,0 +1,63 @@
+{
+  "id": "conv_052",
+  "title": "SA slang — Howzit then gimme 2 smsh brgrs n 2 coks then lekker shot",
+  "category": "sa_slang",
+  "tags": ["llm", "sa_slang", "slang_order", "confirmation"],
+
+  "notes": "Greeting and order are separate messages. When 'howzit' starts the message, GREETING fires first; the order intent in the same message would only be processed via DET, which can't resolve 'smsh brgrs'. Two separate messages is realistic SA WhatsApp behaviour.",
+
+  "turns": [
+    {
+      "message": "Howzit",
+      "expect": {
+        "state": "GREETING",
+        "cart": [],
+        "response_contains": ["welcome"]
+      }
+    },
+    {
+      "message": "gimme 2 smsh brgrs n 2 coks",
+      "llm": {
+        "action": "add_items",
+        "message": "Added 2x Classic Smash Burger and 2x Coca-Cola (330ml) ✅",
+        "items": [
+          {"name": "Classic Smash Burger", "quantity": 2},
+          {"name": "Coca-Cola (330ml)", "quantity": 2}
+        ]
+      },
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Classic Smash Burger", "quantity": 2},
+          {"name": "Coca-Cola (330ml)", "quantity": 2}
+        ]
+      }
+    },
+    {
+      "message": "Lekker shot",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Sizwe",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0730000005",
+      "expect": {"state": "ORDER_PLACED"}
+    }
+  ],
+
+  "final_order": {
+    "items": [
+      {"name": "Classic Smash Burger", "quantity": 2},
+      {"name": "Coca-Cola (330ml)", "quantity": 2}
+    ],
+    "subtotal_cents": 19000,
+    "total_cents": 19000,
+    "order_mode": "PICKUP"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "id": "conv_059",
+  "title": "Greeting — Morning standalone",
+  "category": "greeting",
+  "tags": ["deterministic", "greeting"],
+
+  "notes": "Standalone 'Morning' (without 'Good') is a common SA WhatsApp opener. Added to GREETING pattern in intent_router.",
+
+  "turns": [
+    {
+      "message": "Morning",
+      "expect": {
+        "state": "GREETING",
+        "cart": [],
+        "response_contains": ["welcome"]
+      }
+    }
+  ]
+}

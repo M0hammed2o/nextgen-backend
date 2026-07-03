@@ -1,0 +1,42 @@
+{
+  "id": "synth_0853",
+  "title": "Synth no-change then cancel \u2014 Chips",
+  "category": "synthetic_cancel",
+  "tags": [
+    "synthetic",
+    "det",
+    "cancel",
+    "no_change"
+  ],
+  "turns": [
+    {
+      "message": "Can I get a Chips",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Chips",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "Nah",
+      "expect": {
+        "state": "BUILDING_CART"
+      }
+    },
+    {
+      "message": "Start over",
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_contains": [
+          "cancel",
+          "order"
+        ]
+      }
+    }
+  ]
+}

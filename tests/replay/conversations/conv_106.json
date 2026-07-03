@@ -1,0 +1,137 @@
+{
+  "id": "conv_106",
+  "title": "Long conversation — Multiple edits, modifier changes, then delivery",
+  "category": "long_conversation",
+  "tags": ["llm", "long_conversation", "modifiers", "cart_edit", "delivery"],
+
+  "notes": "Remove the chips is handled deterministically by DET_REMOVE_CART — no LLM script for that turn so the queue stays clean for the later replace_item call.",
+
+  "business": {
+    "delivery_enabled": true,
+    "require_customer_name": false,
+    "require_phone_number": false,
+    "require_delivery_address": false
+  },
+
+  "turns": [
+    {
+      "message": "Hello",
+      "expect": {"state": "GREETING", "cart": []}
+    },
+    {
+      "message": "Menu",
+      "expect": {
+        "state": "BROWSING_MENU",
+        "response_contains": ["menu"]
+      }
+    },
+    {
+      "message": "Can I get a Classic Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Take out the tomato",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "response_contains": ["no tomato"]
+      }
+    },
+    {
+      "message": "Also add Chips",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Classic Smash Burger", "quantity": 1},
+          {"name": "Chips", "quantity": 1}
+        ]
+      }
+    },
+    {
+      "message": "Remove the chips",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Add a Sprite (330ml) and a Coca-Cola (330ml)",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Classic Smash Burger", "quantity": 1},
+          {"name": "Sprite (330ml)", "quantity": 1},
+          {"name": "Coca-Cola (330ml)", "quantity": 1}
+        ]
+      }
+    },
+    {
+      "message": "Actually change the Classic Smash Burger to a Double Smash Burger",
+      "llm": {
+        "action": "replace_item",
+        "message": "Changed Classic Smash Burger to Double Smash Burger ✅",
+        "items": [{"remove": "Classic Smash Burger", "add": "Double Smash Burger", "quantity": 1}]
+      },
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Double Smash Burger", "quantity": 1},
+          {"name": "Sprite (330ml)", "quantity": 1},
+          {"name": "Coca-Cola (330ml)", "quantity": 1}
+        ]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Delivery",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "12 Loop Street, Cape Town",
+      "expect": {
+        "state": "WAITING_DELIVERY_FEE_APPROVAL",
+        "cart": []
+      }
+    },
+    {
+      "_type": "staff_action",
+      "description": "Staff sets delivery fee R30",
+      "context_updates": {
+        "delivery_fee_cents": 3000,
+        "delivery_fee_status": "FEE_SENT"
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {
+        "state": "COLLECTING_PAYMENT",
+        "response_contains": ["cash", "card"]
+      }
+    },
+    {
+      "message": "Card",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+
+  "final_order": {
+    "items": [
+      {"name": "Double Smash Burger", "quantity": 1},
+      {"name": "Sprite (330ml)", "quantity": 1},
+      {"name": "Coca-Cola (330ml)", "quantity": 1}
+    ],
+    "subtotal_cents": 13500,
+    "delivery_fee_cents": 3000,
+    "total_cents": 16500,
+    "order_mode": "DELIVERY",
+    "payment_status": "PENDING"
+  }
+}

@@ -1,0 +1,42 @@
+{
+  "id": "conv_231",
+  "title": "CX state protection — multi-message casual session stays conversational",
+  "category": "cx_state_protection",
+  "tags": ["det", "llm", "cx", "protection"],
+
+  "notes": "Several conversational messages in sequence. Bot must never jump into ordering mode, ask for a name, or request pickup/delivery mode without an explicit order.",
+
+  "turns": [
+    {
+      "message": "Hello",
+      "expect": {
+        "state": "GREETING",
+        "cart": [],
+        "response_contains": ["welcome"],
+        "response_not_contains": ["your name", "phone", "pickup", "delivery"]
+      }
+    },
+    {
+      "message": "How are you?",
+      "llm": {
+        "action": "chitchat",
+        "message": "I'm doing great, thank you for asking! How can I help you today?",
+        "items": []
+      },
+      "expect": {
+        "state": "GREETING",
+        "cart": [],
+        "response_not_contains": ["your name", "phone", "pickup", "delivery", "total"]
+      }
+    },
+    {
+      "message": "What time do you close?",
+      "expect": {
+        "state": "GREETING",
+        "cart": [],
+        "response_contains": ["contact", "hours"],
+        "response_not_contains": ["your name", "phone", "pickup", "delivery", "total"]
+      }
+    }
+  ]
+}

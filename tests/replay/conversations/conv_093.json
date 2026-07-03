@@ -1,0 +1,59 @@
+{
+  "id": "conv_093",
+  "title": "Recovery — Start fresh order after cancellation",
+  "category": "recovery",
+  "tags": ["deterministic", "recovery", "cancel", "restart"],
+
+  "turns": [
+    {
+      "message": "Can I get a Classic Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Cancel",
+      "expect": {
+        "state": "IDLE",
+        "cart": []
+      }
+    },
+    {
+      "message": "Can I get Chips and a Coca-Cola (330ml)",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Chips", "quantity": 1},
+          {"name": "Coca-Cola (330ml)", "quantity": 1}
+        ]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Zintle",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0811000005",
+      "expect": {"state": "ORDER_PLACED"}
+    }
+  ],
+
+  "final_order": {
+    "items": [
+      {"name": "Chips", "quantity": 1},
+      {"name": "Coca-Cola (330ml)", "quantity": 1}
+    ],
+    "subtotal_cents": 5500,
+    "total_cents": 5500,
+    "order_mode": "PICKUP"
+  }
+}

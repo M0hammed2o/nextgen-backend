@@ -1,0 +1,70 @@
+{
+  "id": "synth_0655",
+  "title": "Synth multi-item \u2014 Ice Coffee + Classic Smash Burger",
+  "category": "synthetic_multi_item",
+  "tags": [
+    "synthetic",
+    "det",
+    "pickup",
+    "multi_item"
+  ],
+  "turns": [
+    {
+      "message": "Can I get a Ice Coffee and Classic Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Ice Coffee",
+            "quantity": 1
+          },
+          {
+            "name": "Classic Smash Burger",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "Yeah",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Keegan",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0831111111",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Ice Coffee",
+        "quantity": 1
+      },
+      {
+        "name": "Classic Smash Burger",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 15000,
+    "total_cents": 15000,
+    "order_mode": "PICKUP",
+    "customer_name": "Keegan"
+  }
+}

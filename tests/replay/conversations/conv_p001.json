@@ -1,0 +1,48 @@
+{
+  "id": "conv_p001",
+  "title": "Pricing — priced option: Latte with Oat Milk (+R10)",
+  "category": "pricing",
+  "tags": ["llm", "pricing", "option_pricing", "pickup"],
+
+  "notes": "Customer orders a Latte with Oat Milk. LLM returns options={Milk: Oat Milk}. Pipeline resolves price_delta_cents=1000. unit_price=5500, subtotal=5500.",
+
+  "turns": [
+    {
+      "message": "Can I get a latte with oat milk",
+      "llm": {
+        "action": "add_items",
+        "message": "Added Latte with Oat Milk! That's R55.00 (base R45.00 + Oat Milk +R10.00) ✅",
+        "items": [{"name": "Latte", "quantity": 1, "options": {"Milk": "Oat Milk"}, "add_ons": [], "special_instructions": ""}]
+      },
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Latte", "quantity": 1}],
+        "response_contains": ["latte", "oat"]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Fatima",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0821234567",
+      "expect": {"state": "ORDER_PLACED", "cart": []}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Latte", "quantity": 1}],
+    "subtotal_cents": 5500,
+    "total_cents": 5500,
+    "order_mode": "PICKUP",
+    "customer_name": "Fatima"
+  }
+}

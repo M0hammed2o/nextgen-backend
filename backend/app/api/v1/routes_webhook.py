@@ -125,10 +125,12 @@ async def receive_webhook(
 
     body = await request.body()
 
-    logger.warning(
-        "WEBHOOK_POST_BODY: body_len=%d, body_preview=%s",
-        len(body),
-        body[:2000].decode("utf-8", errors="replace"),
+    # Log size at WARNING so it's always visible; full body only at DEBUG
+    # to avoid customer message content appearing in production log streams.
+    logger.warning("WEBHOOK_POST_BODY: body_len=%d", len(body))
+    logger.debug(
+        "WEBHOOK_POST_BODY_DETAIL: %s",
+        body[:500].decode("utf-8", errors="replace"),
     )
 
     # ── Step 1: HMAC Signature Verification ──────────────────────────────

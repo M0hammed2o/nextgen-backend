@@ -1,0 +1,39 @@
+{
+  "id": "conv_041",
+  "title": "Confirmation — lekker as SA affirmative",
+  "category": "confirmation",
+  "tags": ["deterministic", "sa_slang", "confirmation"],
+
+  "turns": [
+    {
+      "message": "Can I get a Classic Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Lekker",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Neo",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0720000015",
+      "expect": {"state": "ORDER_PLACED"}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Classic Smash Burger", "quantity": 1}],
+    "subtotal_cents": 7500,
+    "total_cents": 7500,
+    "order_mode": "PICKUP"
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "id": "conv_216",
+  "title": "CX order intent — I'm thinking of getting food — shows menu, no cart",
+  "category": "cx_order_intent",
+  "tags": ["det", "menu", "cx"],
+
+  "notes": "Food keyword triggers MENU_REQUEST deterministically. Bot shows menu but must not create a cart or ask for pickup/delivery.",
+
+  "turns": [
+    {
+      "message": "I'm thinking of getting food.",
+      "expect": {
+        "state": "BROWSING_MENU",
+        "cart": [],
+        "response_contains": ["menu"],
+        "response_not_contains": ["your name", "phone", "pickup", "delivery", "total"]
+      }
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "id": "synth_0631",
+  "title": "Synth greeting only \u2014 'Hey'",
+  "category": "synthetic_greeting",
+  "tags": [
+    "synthetic",
+    "det",
+    "greeting"
+  ],
+  "turns": [
+    {
+      "message": "Hey",
+      "expect": {
+        "state": "GREETING",
+        "cart": [],
+        "response_contains": [
+          "welcome"
+        ]
+      }
+    }
+  ]
+}

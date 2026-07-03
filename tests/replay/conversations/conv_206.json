@@ -1,0 +1,22 @@
+{
+  "id": "conv_206",
+  "title": "CX general — Awesome — positive acknowledgement, no ordering triggered",
+  "category": "cx_general",
+  "tags": ["llm", "chitchat", "cx"],
+
+  "turns": [
+    {
+      "message": "Awesome",
+      "llm": {
+        "action": "chitchat",
+        "message": "Great to hear! Is there anything else I can help you with?",
+        "items": []
+      },
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_not_contains": ["pickup", "delivery", "your name", "added to your order", "total"]
+      }
+    }
+  ]
+}

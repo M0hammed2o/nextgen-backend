@@ -1,0 +1,23 @@
+{
+  "id": "synth_0763",
+  "title": "Synth empty cart yes \u2014 '100'",
+  "category": "synthetic_guard",
+  "tags": [
+    "synthetic",
+    "det",
+    "guard",
+    "empty_cart"
+  ],
+  "turns": [
+    {
+      "message": "100",
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_contains": [
+          "empty"
+        ]
+      }
+    }
+  ]
+}

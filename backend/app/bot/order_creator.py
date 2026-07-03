@@ -102,15 +102,26 @@ async def create_order_from_cart(
 
     # ── 4. Create order items (snapshots) ────────────────────────────────
     for cart_item in cart:
+        # Phase 8: capture full pricing breakdown from cart item.
+        # Falls back gracefully for old cart items that pre-date Phase 8.
+        base_price = cart_item.get("base_price_cents", cart_item["price_cents"])
+        opt_adj = cart_item.get("option_adjustment_cents", 0)
+        add_on_total = cart_item.get("add_on_total_cents", 0)
+        unit_price = cart_item.get("unit_price_cents", cart_item["price_cents"])
         oi = OrderItem(
             order_id=order.id,
             business_id=business.id,
             menu_item_id=_parse_uuid(cart_item.get("menu_item_id")),
             name_snapshot=cart_item["name"],
-            unit_price_cents=cart_item["price_cents"],
+            base_price_cents=base_price,
+            option_adjustment_cents=opt_adj,
+            add_on_total_cents=add_on_total,
+            unit_price_cents=unit_price,
             quantity=cart_item["quantity"],
             line_total_cents=cart_item["line_total_cents"],
             options_snapshot=cart_item.get("options"),
+            selected_options_snapshot=cart_item.get("selected_options") or None,
+            add_ons_snapshot=cart_item.get("add_ons") or None,
             special_instructions=cart_item.get("special_instructions"),
         )
         db.add(oi)

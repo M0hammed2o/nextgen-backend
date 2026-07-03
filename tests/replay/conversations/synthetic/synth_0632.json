@@ -1,0 +1,22 @@
+{
+  "id": "synth_0632",
+  "title": "Synth greeting only \u2014 'Sawubona'",
+  "category": "synthetic_greeting",
+  "tags": [
+    "synthetic",
+    "det",
+    "greeting"
+  ],
+  "turns": [
+    {
+      "message": "Sawubona",
+      "expect": {
+        "state": "GREETING",
+        "cart": [],
+        "response_contains": [
+          "welcome"
+        ]
+      }
+    }
+  ]
+}

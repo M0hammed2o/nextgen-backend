@@ -1,0 +1,22 @@
+{
+  "id": "synth_0637",
+  "title": "Synth greeting only \u2014 'Sharp sharp'",
+  "category": "synthetic_greeting",
+  "tags": [
+    "synthetic",
+    "det",
+    "greeting"
+  ],
+  "turns": [
+    {
+      "message": "Sharp sharp",
+      "expect": {
+        "state": "GREETING",
+        "cart": [],
+        "response_contains": [
+          "welcome"
+        ]
+      }
+    }
+  ]
+}

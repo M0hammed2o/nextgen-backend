@@ -1,0 +1,39 @@
+{
+  "id": "conv_042",
+  "title": "Confirmation — 100 as SA affirmative",
+  "category": "confirmation",
+  "tags": ["deterministic", "sa_slang", "confirmation"],
+
+  "turns": [
+    {
+      "message": "Can I get 2 Coca-Cola (330ml)",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Coca-Cola (330ml)", "quantity": 2}]
+      }
+    },
+    {
+      "message": "100",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Tumi",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0720000016",
+      "expect": {"state": "ORDER_PLACED"}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Coca-Cola (330ml)", "quantity": 2}],
+    "subtotal_cents": 4000,
+    "total_cents": 4000,
+    "order_mode": "PICKUP"
+  }
+}

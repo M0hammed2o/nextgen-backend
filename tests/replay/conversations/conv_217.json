@@ -1,0 +1,22 @@
+{
+  "id": "conv_217",
+  "title": "CX order intent — Maybe later — polite close, no cart",
+  "category": "cx_order_intent",
+  "tags": ["llm", "chitchat", "cx"],
+
+  "turns": [
+    {
+      "message": "Maybe later.",
+      "llm": {
+        "action": "chitchat",
+        "message": "No problem! We'll be here whenever you're ready. Have a great day!",
+        "items": []
+      },
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_not_contains": ["added to your order", "total", "pickup", "delivery", "your name"]
+      }
+    }
+  ]
+}

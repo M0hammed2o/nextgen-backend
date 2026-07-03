@@ -1,0 +1,20 @@
+{
+  "id": "conv_306",
+  "title": "Options — soy milk variant provided upfront — correct special_instructions captured",
+  "category": "options",
+  "tags": ["det", "options", "required_options"],
+
+  "notes": "Tests that any valid option name (not just oat milk) satisfies the required group. 'soy milk' matches the Soy milk option in Milk Type group.",
+
+  "turns": [
+    {
+      "message": "Can I get a cappuccino with soy milk",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Cappuccino", "quantity": 1, "special_instructions": "soy milk"}],
+        "response_contains": ["added", "soy milk"],
+        "response_not_contains": ["what milk", "which milk"]
+      }
+    }
+  ]
+}

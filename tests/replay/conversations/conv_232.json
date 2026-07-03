@@ -1,0 +1,20 @@
+{
+  "id": "conv_232",
+  "title": "CX natural — human handoff requested — direct to staff, no cart",
+  "category": "cx_natural_conversation",
+  "tags": ["det", "cx", "handoff"],
+
+  "notes": "Customer wants to speak to a human. HUMAN_HANDOFF intent fires deterministically. State transitions to HANDOFF. No cart created.",
+
+  "turns": [
+    {
+      "message": "Can I speak to someone?",
+      "expect": {
+        "state": "HANDOFF",
+        "cart": [],
+        "response_contains": ["staff", "assist"],
+        "response_not_contains": ["added to your order", "total", "confirm", "pickup", "delivery"]
+      }
+    }
+  ]
+}

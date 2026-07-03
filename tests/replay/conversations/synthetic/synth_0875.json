@@ -1,0 +1,27 @@
+{
+  "id": "synth_0875",
+  "title": "Synth options cancel \u2014 'Scratch that'",
+  "category": "synthetic_options",
+  "tags": [
+    "synthetic",
+    "det",
+    "options",
+    "cancel"
+  ],
+  "turns": [
+    {
+      "message": "Can I get a cappuccino",
+      "expect": {
+        "state": "CHOOSING_OPTIONS",
+        "cart": []
+      }
+    },
+    {
+      "message": "Scratch that",
+      "expect": {
+        "state": "IDLE",
+        "cart": []
+      }
+    }
+  ]
+}

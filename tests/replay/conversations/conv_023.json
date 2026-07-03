@@ -1,0 +1,16 @@
+{
+  "id": "conv_023",
+  "title": "Menu request — Show me the food",
+  "category": "menu",
+  "tags": ["deterministic", "menu_request"],
+
+  "turns": [
+    {
+      "message": "Show me the food",
+      "expect": {
+        "state": "BROWSING_MENU",
+        "response_contains": ["menu"]
+      }
+    }
+  ]
+}

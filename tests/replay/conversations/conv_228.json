@@ -1,0 +1,39 @@
+{
+  "id": "conv_228",
+  "title": "CX natural — recommendation then maybe later — no cart, no loop",
+  "category": "cx_natural_conversation",
+  "tags": ["llm", "cx", "recommendation", "no_loop"],
+
+  "notes": "Customer gets recommendation then declines. Bot must not loop back to ordering or repeat the menu. No cart created at any point.",
+
+  "turns": [
+    {
+      "message": "What's popular?",
+      "llm": {
+        "action": "recommend_items",
+        "message": "Our most popular item is the Classic Smash Burger! Want to try it?",
+        "items": [
+          {"name": "Classic Smash Burger", "quantity": 1}
+        ]
+      },
+      "expect": {
+        "state": "BROWSING_MENU",
+        "cart": [],
+        "context_has": {"recommended_items": true}
+      }
+    },
+    {
+      "message": "Maybe later",
+      "llm": {
+        "action": "chitchat",
+        "message": "No worries! We'll be here whenever you're ready.",
+        "items": []
+      },
+      "expect": {
+        "state": "BROWSING_MENU",
+        "cart": [],
+        "response_not_contains": ["added to your order", "total", "confirm", "pickup", "delivery"]
+      }
+    }
+  ]
+}

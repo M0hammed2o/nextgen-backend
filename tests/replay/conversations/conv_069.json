@@ -1,0 +1,49 @@
+{
+  "id": "conv_069",
+  "title": "Basic ordering — Multiple items from two categories",
+  "category": "basic_ordering",
+  "tags": ["deterministic", "basic_ordering", "pickup"],
+
+  "turns": [
+    {
+      "message": "I want a Spicy Chicken Burger and a Sprite (330ml)",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Spicy Chicken Burger", "quantity": 1},
+          {"name": "Sprite (330ml)", "quantity": 1}
+        ],
+        "confirmed_cart": [
+          {"name": "Spicy Chicken Burger", "quantity": 1},
+          {"name": "Sprite (330ml)", "quantity": 1}
+        ]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Lindiwe",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0711000008",
+      "expect": {"state": "ORDER_PLACED", "cart": []}
+    }
+  ],
+
+  "final_order": {
+    "items": [
+      {"name": "Spicy Chicken Burger", "quantity": 1},
+      {"name": "Sprite (330ml)", "quantity": 1}
+    ],
+    "subtotal_cents": 10000,
+    "total_cents": 10000,
+    "order_mode": "PICKUP"
+  }
+}

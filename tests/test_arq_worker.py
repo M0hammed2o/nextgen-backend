@@ -186,9 +186,9 @@ class TestCancelStaleDeliveryFeeOrders:
         """When the DB returns no stale orders the function returns without error."""
         mock_db = AsyncMock()
 
-        # execute() returns an object whose .scalars().all() returns []
+        # Worker now uses a JOIN query returning (Order, wa_id, phone_number_id) tuples.
         mock_result = MagicMock()
-        mock_result.scalars.return_value.all.return_value = []
+        mock_result.all.return_value = []
         mock_db.execute = AsyncMock(return_value=mock_result)
 
         ctx = _make_ctx(mock_db)
@@ -202,16 +202,11 @@ class TestCancelStaleDeliveryFeeOrders:
 
         mock_db = AsyncMock()
 
-        # First execute() call returns the stale order list.
-        # Subsequent calls (customer, business lookups) return empty results.
-        empty_result = MagicMock()
-        empty_result.scalars.return_value.all.return_value = []
-        empty_result.scalar_one_or_none.return_value = None
-
+        # Worker uses a single JOIN query returning (Order, wa_id, phone_number_id).
         stale_result = MagicMock()
-        stale_result.scalars.return_value.all.return_value = [stale]
+        stale_result.all.return_value = [(stale, None, None)]
 
-        mock_db.execute = AsyncMock(side_effect=[stale_result, empty_result, empty_result])
+        mock_db.execute = AsyncMock(return_value=stale_result)
         mock_db.add = MagicMock()
 
         ctx = _make_ctx(mock_db)
@@ -229,15 +224,11 @@ class TestCancelStaleDeliveryFeeOrders:
 
         mock_db = AsyncMock()
 
+        # Single JOIN query returns all rows at once.
         stale_result = MagicMock()
-        stale_result.scalars.return_value.all.return_value = orders
+        stale_result.all.return_value = [(o, None, None) for o in orders]
 
-        # Each order triggers 2 additional lookups (customer + business).
-        empty = MagicMock()
-        empty.scalar_one_or_none.return_value = None
-        mock_db.execute = AsyncMock(
-            side_effect=[stale_result] + [empty] * (len(orders) * 2)
-        )
+        mock_db.execute = AsyncMock(return_value=stale_result)
         mock_db.add = MagicMock()
 
         ctx = _make_ctx(mock_db)
@@ -251,24 +242,19 @@ class TestCancelStaleDeliveryFeeOrders:
 
     async def test_notification_sent_when_wa_id_available(self):
         """
-        When both customer wa_id and business phone_number_id are found,
-        send_notification_message must be called with the correct arguments.
+        When both customer wa_id and business phone_number_id are found in the
+        JOIN query result, send_notification_message must be called correctly.
         """
         stale = self._make_stale_order()
         stale.order_number = "NG-042"
 
         mock_db = AsyncMock()
 
+        # JOIN query returns wa_id and phone_number_id in the tuple.
         stale_result = MagicMock()
-        stale_result.scalars.return_value.all.return_value = [stale]
+        stale_result.all.return_value = [(stale, "27831234567", "111222333")]
 
-        wa_id_result = MagicMock()
-        wa_id_result.scalar_one_or_none.return_value = "27831234567"
-
-        pnid_result = MagicMock()
-        pnid_result.scalar_one_or_none.return_value = "111222333"
-
-        mock_db.execute = AsyncMock(side_effect=[stale_result, wa_id_result, pnid_result])
+        mock_db.execute = AsyncMock(return_value=stale_result)
         mock_db.add = MagicMock()
 
         ctx = _make_ctx(mock_db)
@@ -286,20 +272,18 @@ class TestCancelStaleDeliveryFeeOrders:
 
     async def test_no_notification_when_wa_id_missing(self):
         """
-        When the customer wa_id is not found, send_notification_message must
+        When the JOIN query returns no wa_id, send_notification_message must
         NOT be called — the cancellation still commits.
         """
         stale = self._make_stale_order()
 
         mock_db = AsyncMock()
 
+        # wa_id=None → no notification sent
         stale_result = MagicMock()
-        stale_result.scalars.return_value.all.return_value = [stale]
+        stale_result.all.return_value = [(stale, None, None)]
 
-        none_result = MagicMock()
-        none_result.scalar_one_or_none.return_value = None
-
-        mock_db.execute = AsyncMock(side_effect=[stale_result, none_result, none_result])
+        mock_db.execute = AsyncMock(return_value=stale_result)
         mock_db.add = MagicMock()
 
         ctx = _make_ctx(mock_db)

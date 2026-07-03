@@ -1,0 +1,24 @@
+{
+  "id": "conv_215",
+  "title": "CX order intent — My wife likes burgers — conversation only, no cart",
+  "category": "cx_order_intent",
+  "tags": ["llm", "chitchat", "cx", "negative"],
+
+  "notes": "Customer mentions a food preference without ordering intent. Bot must not add items to cart.",
+
+  "turns": [
+    {
+      "message": "My wife likes burgers.",
+      "llm": {
+        "action": "chitchat",
+        "message": "That's wonderful! We have some amazing burgers she might enjoy. Would you like to see the menu or place an order?",
+        "items": []
+      },
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_not_contains": ["added to your order", "total", "confirm", "pickup", "delivery", "your name"]
+      }
+    }
+  ]
+}

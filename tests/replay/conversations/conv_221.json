@@ -1,0 +1,31 @@
+{
+  "id": "conv_221",
+  "title": "CX context — cancel mid-flow — graceful cancel, no cart",
+  "category": "cx_context_awareness",
+  "tags": ["llm", "det", "cx", "cancel"],
+
+  "notes": "Customer starts to order then changes mind. Turn 1: ORDER_START with no resolvable item → LLM ask_options (CHOOSING_OPTIONS). Turn 2: 'Actually never mind' matches ORDER_CANCEL deterministically → IDLE, empty cart.",
+
+  "turns": [
+    {
+      "message": "Can I get a burger?",
+      "llm": {
+        "action": "ask_options",
+        "message": "Which burger would you like? We have a few options — just let me know!",
+        "items": []
+      },
+      "expect": {
+        "state": "CHOOSING_OPTIONS",
+        "cart": []
+      }
+    },
+    {
+      "message": "Actually never mind",
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_contains": ["cancel", "order"]
+      }
+    }
+  ]
+}

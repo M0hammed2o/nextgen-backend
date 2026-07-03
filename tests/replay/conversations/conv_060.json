@@ -1,0 +1,17 @@
+{
+  "id": "conv_060",
+  "title": "Greeting — Afternoon standalone",
+  "category": "greeting",
+  "tags": ["deterministic", "greeting"],
+
+  "turns": [
+    {
+      "message": "Afternoon",
+      "expect": {
+        "state": "GREETING",
+        "cart": [],
+        "response_contains": ["welcome"]
+      }
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "id": "conv_210",
+  "title": "CX menu question — cheapest burger — recommendation only, no order",
+  "category": "cx_menu_questions",
+  "tags": ["llm", "chitchat", "cx"],
+
+  "turns": [
+    {
+      "message": "What's your cheapest burger?",
+      "llm": {
+        "action": "chitchat",
+        "message": "Our most affordable burger is a great smash burger! Would you like to know more or place an order?",
+        "items": []
+      },
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_not_contains": ["added to your order", "total", "pickup", "delivery", "your name", "phone"]
+      }
+    }
+  ]
+}

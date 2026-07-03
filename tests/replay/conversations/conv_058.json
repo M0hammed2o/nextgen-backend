@@ -1,0 +1,17 @@
+{
+  "id": "conv_058",
+  "title": "Greeting — Yebo standalone",
+  "category": "greeting",
+  "tags": ["deterministic", "greeting", "sa_slang"],
+
+  "turns": [
+    {
+      "message": "Yebo",
+      "expect": {
+        "state": "GREETING",
+        "cart": [],
+        "response_contains": ["welcome"]
+      }
+    }
+  ]
+}

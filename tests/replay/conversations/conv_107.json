@@ -1,0 +1,103 @@
+{
+  "id": "conv_107",
+  "title": "Long conversation — SA slang full ordering journey with QMS modifiers and pickup",
+  "category": "long_conversation",
+  "tags": ["llm", "long_conversation", "sa_slang", "qms", "modifiers", "pickup"],
+
+  "notes": "QMS splits the 3x CSB into separate line items per modifier. Cart assertions after each QMS turn verify the exact split items. final_order also verifies the split line items stored in the created order.",
+
+  "turns": [
+    {
+      "message": "Howzit boss",
+      "expect": {"state": "GREETING", "cart": []}
+    },
+    {
+      "message": "3 smsh brgrs n 2 coks",
+      "llm": {
+        "action": "add_items",
+        "message": "Added 3x Classic Smash Burger and 2x Coca-Cola (330ml) ✅",
+        "items": [
+          {"name": "Classic Smash Burger", "quantity": 3},
+          {"name": "Coca-Cola (330ml)", "quantity": 2}
+        ]
+      },
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Classic Smash Burger", "quantity": 3},
+          {"name": "Coca-Cola (330ml)", "quantity": 2}
+        ],
+        "confirmed_cart": [
+          {"name": "Classic Smash Burger", "quantity": 3},
+          {"name": "Coca-Cola (330ml)", "quantity": 2}
+        ]
+      }
+    },
+    {
+      "message": "2 no tomato",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "response_contains": ["no tomato"],
+        "cart": [
+          {"name": "Classic Smash Burger", "quantity": 2, "special_instructions": "no tomato"},
+          {"name": "Classic Smash Burger", "quantity": 1},
+          {"name": "Coca-Cola (330ml)", "quantity": 2}
+        ]
+      }
+    },
+    {
+      "message": "1 extra cheese",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "response_contains": ["extra cheese"],
+        "cart": [
+          {"name": "Classic Smash Burger", "quantity": 2, "special_instructions": "no tomato"},
+          {"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "extra cheese"},
+          {"name": "Coca-Cola (330ml)", "quantity": 2}
+        ]
+      }
+    },
+    {
+      "message": "Also add Onion Rings",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "response_contains": ["onion rings"],
+        "cart": [
+          {"name": "Classic Smash Burger", "quantity": 2, "special_instructions": "no tomato"},
+          {"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "extra cheese"},
+          {"name": "Coca-Cola (330ml)", "quantity": 2},
+          {"name": "Onion Rings", "quantity": 1}
+        ]
+      }
+    },
+    {
+      "message": "Lekker",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Siyanda",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0821000010",
+      "expect": {"state": "ORDER_PLACED"}
+    }
+  ],
+
+  "final_order": {
+    "items": [
+      {"name": "Classic Smash Burger", "quantity": 2, "special_instructions": "no tomato"},
+      {"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "extra cheese"},
+      {"name": "Coca-Cola (330ml)", "quantity": 2},
+      {"name": "Onion Rings", "quantity": 1}
+    ],
+    "subtotal_cents": 29500,
+    "total_cents": 29500,
+    "order_mode": "PICKUP",
+    "customer_name": "Siyanda"
+  }
+}

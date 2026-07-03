@@ -1,0 +1,36 @@
+{
+  "id": "conv_095",
+  "title": "Recovery — Interrupted detail collection then cancel",
+  "category": "recovery",
+  "tags": ["deterministic", "recovery", "cancel", "collecting_details"],
+
+  "notes": "Customer reaches COLLECTING_DETAILS for name, then cancels instead of providing their name. ORDER_CANCEL resets to IDLE.",
+
+  "turns": [
+    {
+      "message": "Can I get a Classic Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS",
+        "response_contains": ["name"]
+      }
+    },
+    {
+      "message": "Cancel",
+      "expect": {
+        "state": "IDLE",
+        "response_contains": ["call", "store"]
+      }
+    }
+  ]
+}

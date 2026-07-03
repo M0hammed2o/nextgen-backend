@@ -1,0 +1,28 @@
+{
+  "id": "conv_092",
+  "title": "Recovery — Cancel order mid-flow clears cart and resets to IDLE",
+  "category": "recovery",
+  "tags": ["deterministic", "recovery", "cancel"],
+
+  "turns": [
+    {
+      "message": "Hello",
+      "expect": {"state": "GREETING", "cart": []}
+    },
+    {
+      "message": "Can I get a Classic Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Cancel",
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_contains": ["call", "store"]
+      }
+    }
+  ]
+}

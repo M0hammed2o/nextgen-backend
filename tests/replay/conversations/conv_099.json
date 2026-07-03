@@ -1,0 +1,54 @@
+{
+  "id": "conv_099",
+  "title": "SA slang — Howzit greeting, then gimme a dbl smsh brgr pls",
+  "category": "sa_slang",
+  "tags": ["llm", "sa_slang", "greeting"],
+
+  "notes": "howzit triggers GREETING. pls normalises to 'please'. 'dbl smsh brgr' = Double Smash Burger, not DET-matchable — LLM handles the separate order turn.",
+
+  "turns": [
+    {
+      "message": "Howzit",
+      "expect": {
+        "state": "GREETING",
+        "cart": [],
+        "response_contains": ["welcome"]
+      }
+    },
+    {
+      "message": "Gimme a dbl smsh brgr pls",
+      "llm": {
+        "action": "add_items",
+        "message": "Added Double Smash Burger to your order! ✅",
+        "items": [{"name": "Double Smash Burger", "quantity": 1}]
+      },
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Double Smash Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Sho",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Mlungisi",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0821000004",
+      "expect": {"state": "ORDER_PLACED"}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Double Smash Burger", "quantity": 1}],
+    "subtotal_cents": 9500,
+    "total_cents": 9500,
+    "order_mode": "PICKUP"
+  }
+}

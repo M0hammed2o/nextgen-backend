@@ -1,0 +1,51 @@
+{
+  "id": "conv_064",
+  "title": "Menu — Cheapest meal request via LLM recommendation",
+  "category": "menu",
+  "tags": ["llm", "menu", "recommendation"],
+
+  "turns": [
+    {
+      "message": "What's the cheapest thing I can order?",
+      "llm": {
+        "action": "recommend_items",
+        "message": "Our cheapest option is the Still Water at R15.00, or Chips for R35.00 — both great value! Would you like to add one?",
+        "items": [{"name": "Still Water", "quantity": 1}]
+      },
+      "expect": {
+        "state": "BROWSING_MENU",
+        "response_contains": ["water"]
+      }
+    },
+    {
+      "message": "Yes I'll take that",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Still Water", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Lebo",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0711000003",
+      "expect": {"state": "ORDER_PLACED"}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Still Water", "quantity": 1}],
+    "subtotal_cents": 1500,
+    "total_cents": 1500,
+    "order_mode": "PICKUP"
+  }
+}

@@ -1,0 +1,44 @@
+{
+  "id": "conv_050",
+  "title": "SA slang — Eish boss gimme a smsh brgr no tamato",
+  "category": "sa_slang",
+  "tags": ["llm", "sa_slang", "normalizer", "modifier"],
+
+  "turns": [
+    {
+      "message": "Eish boss gimme a smsh brgr no tamato",
+      "llm": {
+        "action": "add_items",
+        "message": "Added Classic Smash Burger without tomato ✅",
+        "items": [{"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "no tomato"}]
+      },
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "no tomato"}]
+      }
+    },
+    {
+      "message": "Yebo",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Mzwandile",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0730000003",
+      "expect": {"state": "ORDER_PLACED"}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "no tomato"}],
+    "subtotal_cents": 7500,
+    "total_cents": 7500,
+    "order_mode": "PICKUP"
+  }
+}

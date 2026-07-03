@@ -1,0 +1,23 @@
+{
+  "id": "synth_0971",
+  "title": "Synth session recovery \u2014 'Hi there'",
+  "category": "synthetic_recovery",
+  "tags": [
+    "synthetic",
+    "det",
+    "greeting",
+    "recovery"
+  ],
+  "turns": [
+    {
+      "message": "Hi there",
+      "expect": {
+        "state": "GREETING",
+        "cart": [],
+        "response_contains": [
+          "welcome"
+        ]
+      }
+    }
+  ]
+}

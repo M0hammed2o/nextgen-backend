@@ -1,0 +1,74 @@
+{
+  "id": "synth_0885",
+  "title": "Synth coffee pickup \u2014 Cappuccino oat milk \u2014 'Hi there'",
+  "category": "synthetic_options",
+  "tags": [
+    "synthetic",
+    "det",
+    "pickup",
+    "options",
+    "coffee"
+  ],
+  "turns": [
+    {
+      "message": "Hi there",
+      "expect": {
+        "state": "GREETING",
+        "cart": [],
+        "response_contains": [
+          "welcome"
+        ]
+      }
+    },
+    {
+      "message": "Can I get a Cappuccino with oat milk",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Cappuccino",
+            "quantity": 1,
+            "special_instructions": "oat milk"
+          }
+        ]
+      }
+    },
+    {
+      "message": "Okay",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Amara",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0729876543",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Cappuccino",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 4500,
+    "total_cents": 4500,
+    "order_mode": "PICKUP",
+    "customer_name": "Amara"
+  }
+}

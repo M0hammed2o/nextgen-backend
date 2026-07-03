@@ -1,0 +1,44 @@
+{
+  "id": "conv_082",
+  "title": "Confirmation — Sharp as confirmation in CONFIRMING_ORDER (SA slang affirmative)",
+  "category": "confirmation",
+  "tags": ["deterministic", "confirmation", "sa_slang"],
+
+  "notes": "Sharp triggers GREETING intent but the GREETING handler yields to the CONFIRMING_ORDER confirmation path because is_confirmation('sharp') is True and the state is in _CONFIRM_YIELD_STATES.",
+
+  "turns": [
+    {
+      "message": "Can I get a Double Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Double Smash Burger", "quantity": 1}],
+        "confirmed_cart": [{"name": "Double Smash Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Sharp",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Themba",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0711000019",
+      "expect": {"state": "ORDER_PLACED"}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Double Smash Burger", "quantity": 1}],
+    "subtotal_cents": 9500,
+    "total_cents": 9500,
+    "order_mode": "PICKUP"
+  }
+}

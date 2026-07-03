@@ -32,10 +32,21 @@ CONVERSATIONS_DIR = Path(__file__).parent / "conversations"
 
 def _load_conversations() -> list[pytest.param]:
     params = []
+    # Load hand-crafted conversations from root, then synthetic from subdirectories.
+    # Sorted within each group so the run order is deterministic.
     for path in sorted(CONVERSATIONS_DIR.glob("*.json")):
         with path.open(encoding="utf-8") as fh:
             data = json.load(fh)
-        label = f"{data['id']} — {data.get('title', '')}"
+        category = data.get("category", "uncategorized")
+        label = f"{data['id']} [{category}] {data.get('title', '')}"
+        params.append(pytest.param(data, id=label))
+    for path in sorted(CONVERSATIONS_DIR.glob("**/*.json")):
+        if path.parent == CONVERSATIONS_DIR:
+            continue  # already loaded above
+        with path.open(encoding="utf-8") as fh:
+            data = json.load(fh)
+        category = data.get("category", "uncategorized")
+        label = f"{data['id']} [{category}] {data.get('title', '')}"
         params.append(pytest.param(data, id=label))
     return params
 

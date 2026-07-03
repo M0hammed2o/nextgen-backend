@@ -1,0 +1,74 @@
+{
+  "id": "synth_0886",
+  "title": "Synth coffee pickup \u2014 Cappuccino regular milk \u2014 'Hola'",
+  "category": "synthetic_options",
+  "tags": [
+    "synthetic",
+    "det",
+    "pickup",
+    "options",
+    "coffee"
+  ],
+  "turns": [
+    {
+      "message": "Hola",
+      "expect": {
+        "state": "GREETING",
+        "cart": [],
+        "response_contains": [
+          "welcome"
+        ]
+      }
+    },
+    {
+      "message": "Can I get a Cappuccino with regular milk",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Cappuccino",
+            "quantity": 1,
+            "special_instructions": "regular milk"
+          }
+        ]
+      }
+    },
+    {
+      "message": "100",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Fatima",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0821234567",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Cappuccino",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 4500,
+    "total_cents": 4500,
+    "order_mode": "PICKUP",
+    "customer_name": "Fatima"
+  }
+}

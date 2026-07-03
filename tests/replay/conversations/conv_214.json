@@ -1,0 +1,23 @@
+{
+  "id": "conv_214",
+  "title": "CX business — Do you deliver — delivery explanation, no order started",
+  "category": "cx_business",
+  "tags": ["llm", "chitchat", "delivery", "cx"],
+
+  "turns": [
+    {
+      "message": "Do you deliver?",
+      "llm": {
+        "action": "chitchat",
+        "message": "Yes, we do offer delivery! Just place your order and our team will confirm the delivery fee and arrange it for you.",
+        "items": []
+      },
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_contains": ["delivery"],
+        "response_not_contains": ["added to your order", "total", "your name", "phone"]
+      }
+    }
+  ]
+}

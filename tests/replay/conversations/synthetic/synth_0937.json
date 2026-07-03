@@ -1,0 +1,72 @@
+{
+  "id": "synth_0937",
+  "title": "Synth hours then order \u2014 Chips",
+  "category": "synthetic_business",
+  "tags": [
+    "synthetic",
+    "det",
+    "hours",
+    "pickup"
+  ],
+  "turns": [
+    {
+      "message": "Opening times?",
+      "expect": {
+        "state": "IDLE",
+        "response_contains": [
+          "contact",
+          "hours"
+        ]
+      }
+    },
+    {
+      "message": "Can I get a Chips",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Chips",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Fatima",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0831234567",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Chips",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 3500,
+    "total_cents": 3500,
+    "order_mode": "PICKUP",
+    "customer_name": "Fatima"
+  }
+}

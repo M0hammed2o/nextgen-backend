@@ -1,0 +1,27 @@
+{
+  "id": "synth_0876",
+  "title": "Synth options cancel \u2014 'Actually never mind'",
+  "category": "synthetic_options",
+  "tags": [
+    "synthetic",
+    "det",
+    "options",
+    "cancel"
+  ],
+  "turns": [
+    {
+      "message": "Can I get a cappuccino",
+      "expect": {
+        "state": "CHOOSING_OPTIONS",
+        "cart": []
+      }
+    },
+    {
+      "message": "Actually never mind",
+      "expect": {
+        "state": "IDLE",
+        "cart": []
+      }
+    }
+  ]
+}

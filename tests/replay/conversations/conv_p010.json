@@ -1,0 +1,47 @@
+{
+  "id": "conv_p010",
+  "title": "Pricing — Almond Milk option (+R15 delta)",
+  "category": "pricing",
+  "tags": ["llm", "pricing", "option_pricing", "pickup"],
+
+  "notes": "Latte base=4500, Almond Milk price_delta=1500. unit_price=6000. subtotal=6000.",
+
+  "turns": [
+    {
+      "message": "Latte with almond milk",
+      "llm": {
+        "action": "add_items",
+        "message": "Latte with Almond Milk — R60.00 ✅",
+        "items": [{"name": "Latte", "quantity": 1, "options": {"Milk": "Almond Milk"}, "add_ons": [], "special_instructions": ""}]
+      },
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Latte", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Naledi",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0843456789",
+      "expect": {"state": "ORDER_PLACED", "cart": []}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Latte", "quantity": 1}],
+    "subtotal_cents": 6000,
+    "total_cents": 6000,
+    "order_mode": "PICKUP",
+    "customer_name": "Naledi"
+  }
+}

@@ -1,0 +1,60 @@
+{
+  "id": "conv_065",
+  "title": "Menu — Vegetarian request — LLM recommends Chips and Still Water",
+  "category": "menu",
+  "tags": ["llm", "menu", "vegetarian"],
+
+  "turns": [
+    {
+      "message": "I'm vegetarian, what can I order?",
+      "llm": {
+        "action": "recommend_items",
+        "message": "Great news! Our Chips (R35) and Still Water (R15) are vegetarian-friendly. Would you like to add them to your order?",
+        "items": [
+          {"name": "Chips", "quantity": 1},
+          {"name": "Still Water", "quantity": 1}
+        ]
+      },
+      "expect": {
+        "state": "BROWSING_MENU",
+        "response_contains": ["chips"]
+      }
+    },
+    {
+      "message": "Yes please add those",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Chips", "quantity": 1},
+          {"name": "Still Water", "quantity": 1}
+        ]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Thandeka",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0711000004",
+      "expect": {"state": "ORDER_PLACED"}
+    }
+  ],
+
+  "final_order": {
+    "items": [
+      {"name": "Chips", "quantity": 1},
+      {"name": "Still Water", "quantity": 1}
+    ],
+    "subtotal_cents": 5000,
+    "total_cents": 5000,
+    "order_mode": "PICKUP"
+  }
+}

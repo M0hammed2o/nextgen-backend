@@ -1,0 +1,74 @@
+{
+  "id": "synth_0901",
+  "title": "Synth coffee pickup \u2014 Cappuccino soy milk \u2014 'Sawubona'",
+  "category": "synthetic_options",
+  "tags": [
+    "synthetic",
+    "det",
+    "pickup",
+    "options",
+    "coffee"
+  ],
+  "turns": [
+    {
+      "message": "Sawubona",
+      "expect": {
+        "state": "GREETING",
+        "cart": [],
+        "response_contains": [
+          "welcome"
+        ]
+      }
+    },
+    {
+      "message": "Can I get a Cappuccino with soy milk",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Cappuccino",
+            "quantity": 1,
+            "special_instructions": "soy milk"
+          }
+        ]
+      }
+    },
+    {
+      "message": "Perfect",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Nompilo",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0821000001",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Cappuccino",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 4500,
+    "total_cents": 4500,
+    "order_mode": "PICKUP",
+    "customer_name": "Nompilo"
+  }
+}

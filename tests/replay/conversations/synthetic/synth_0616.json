@@ -1,0 +1,21 @@
+{
+  "id": "synth_0616",
+  "title": "Synth location \u2014 'How do I find you?'",
+  "category": "synthetic_business",
+  "tags": [
+    "synthetic",
+    "det",
+    "location"
+  ],
+  "turns": [
+    {
+      "message": "How do I find you?",
+      "expect": {
+        "state": "IDLE",
+        "response_contains": [
+          "contact us for location"
+        ]
+      }
+    }
+  ]
+}

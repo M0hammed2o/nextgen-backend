@@ -1,0 +1,41 @@
+{
+  "id": "conv_098",
+  "title": "SA slang — China gimme 2 coks (SA 'china' = bro/friend)",
+  "category": "sa_slang",
+  "tags": ["deterministic", "sa_slang", "drinks"],
+
+  "notes": "china = SA slang for friend/bro (like 'bru'). gimme → 'give me'. '2 coks' matches 'coke' alias → Coca-Cola (330ml). ORDER_START intent; DET finds 2x Coca-Cola (330ml).",
+
+  "turns": [
+    {
+      "message": "China gimme 2 cokes",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Coca-Cola (330ml)", "quantity": 2}]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Mpendulo",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0821000003",
+      "expect": {"state": "ORDER_PLACED"}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Coca-Cola (330ml)", "quantity": 2}],
+    "subtotal_cents": 4000,
+    "total_cents": 4000,
+    "order_mode": "PICKUP"
+  }
+}

@@ -1,0 +1,39 @@
+{
+  "id": "synth_0642",
+  "title": "Synth browse+cancel \u2014 'Heita'/\"What's available?\"",
+  "category": "synthetic_browse",
+  "tags": [
+    "synthetic",
+    "det",
+    "browse",
+    "cancel"
+  ],
+  "turns": [
+    {
+      "message": "Heita",
+      "expect": {
+        "state": "GREETING",
+        "cart": [],
+        "response_contains": [
+          "welcome"
+        ]
+      }
+    },
+    {
+      "message": "What's available?",
+      "expect": {
+        "state": "BROWSING_MENU",
+        "response_contains": [
+          "menu"
+        ]
+      }
+    },
+    {
+      "message": "Forget it",
+      "expect": {
+        "state": "IDLE",
+        "cart": []
+      }
+    }
+  ]
+}

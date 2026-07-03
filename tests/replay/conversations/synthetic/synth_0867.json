@@ -1,0 +1,71 @@
+{
+  "id": "synth_0867",
+  "title": "Synth view cart then confirm \u2014 Spicy Chicken Burger",
+  "category": "synthetic_cart",
+  "tags": [
+    "synthetic",
+    "det",
+    "cart",
+    "pickup"
+  ],
+  "turns": [
+    {
+      "message": "Can I get a Spicy Chicken Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Spicy Chicken Burger",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "View my cart",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "response_contains": [
+          "spicy chicken burger"
+        ]
+      }
+    },
+    {
+      "message": "Sho",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Yusuf",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0831234567",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Spicy Chicken Burger",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 8000,
+    "total_cents": 8000,
+    "order_mode": "PICKUP",
+    "customer_name": "Yusuf"
+  }
+}

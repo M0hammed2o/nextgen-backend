@@ -1,0 +1,48 @@
+{
+  "id": "conv_p004",
+  "title": "Pricing — free modifier has zero price impact",
+  "category": "pricing",
+  "tags": ["llm", "pricing", "free_modifier"],
+
+  "notes": "No tomato is a free modifier — special_instructions only, no add-on. subtotal=7500 unchanged. LLM is called (intent=None from IDLE) but free modifier has no price effect.",
+
+  "turns": [
+    {
+      "message": "Classic Smash Burger no tomato",
+      "llm": {
+        "action": "add_items",
+        "message": "Classic Smash Burger with no tomato added ✅",
+        "items": [{"name": "Classic Smash Burger", "quantity": 1, "options": {}, "add_ons": [], "special_instructions": "no tomato"}]
+      },
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "no tomato"}],
+        "response_contains": ["classic smash burger"]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Mohammed",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0837866021",
+      "expect": {"state": "ORDER_PLACED", "cart": []}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "no tomato"}],
+    "subtotal_cents": 7500,
+    "total_cents": 7500,
+    "order_mode": "PICKUP",
+    "customer_name": "Mohammed"
+  }
+}

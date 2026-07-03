@@ -1,0 +1,48 @@
+{
+  "id": "conv_p007",
+  "title": "Pricing — priced option: Latte with Full Cream (no charge)",
+  "category": "pricing",
+  "tags": ["llm", "pricing", "option_pricing", "no_charge", "pickup"],
+
+  "notes": "Full Cream has price_delta_cents=0. unit_price=4500 (base only). subtotal=4500.",
+
+  "turns": [
+    {
+      "message": "Latte with full cream please",
+      "llm": {
+        "action": "add_items",
+        "message": "Latte with Full Cream — R45.00 ✅",
+        "items": [{"name": "Latte", "quantity": 1, "options": {"Milk": "Full Cream"}, "add_ons": [], "special_instructions": ""}]
+      },
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Latte", "quantity": 1}],
+        "response_contains": ["latte"]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Lerato",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0851234567",
+      "expect": {"state": "ORDER_PLACED", "cart": []}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Latte", "quantity": 1}],
+    "subtotal_cents": 4500,
+    "total_cents": 4500,
+    "order_mode": "PICKUP",
+    "customer_name": "Lerato"
+  }
+}

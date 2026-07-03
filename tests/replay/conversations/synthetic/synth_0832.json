@@ -1,0 +1,97 @@
+{
+  "id": "synth_0832",
+  "title": "Synth delivery \u2014 Coca-Cola (330ml) \u2014 5 Jan Smuts Avenue J",
+  "category": "synthetic_delivery",
+  "tags": [
+    "synthetic",
+    "det",
+    "delivery"
+  ],
+  "business": {
+    "delivery_enabled": true,
+    "require_customer_name": false,
+    "require_phone_number": false,
+    "require_delivery_address": false
+  },
+  "turns": [
+    {
+      "message": "Howzit",
+      "expect": {
+        "state": "GREETING",
+        "cart": [],
+        "response_contains": [
+          "welcome"
+        ]
+      }
+    },
+    {
+      "message": "Can I get a Coca-Cola (330ml)",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Coca-Cola (330ml)",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "Yeah",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Delivery",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "5 Jan Smuts Avenue Joburg",
+      "expect": {
+        "state": "WAITING_DELIVERY_FEE_APPROVAL",
+        "cart": []
+      }
+    },
+    {
+      "_type": "staff_action",
+      "description": "Staff sets R30 delivery fee",
+      "context_updates": {
+        "delivery_fee_cents": 3000,
+        "delivery_fee_status": "FEE_SENT"
+      }
+    },
+    {
+      "message": "Yeah",
+      "expect": {
+        "state": "COLLECTING_PAYMENT",
+        "response_contains": [
+          "cash",
+          "card"
+        ]
+      }
+    },
+    {
+      "message": "Cash",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Coca-Cola (330ml)",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 2000,
+    "delivery_fee_cents": 3000,
+    "total_cents": 5000,
+    "order_mode": "DELIVERY",
+    "payment_status": "CASH_ON_COLLECTION"
+  }
+}

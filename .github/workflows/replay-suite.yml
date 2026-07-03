@@ -1,0 +1,82 @@
+name: Conversation Replay Suite
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+# Cancel in-progress runs on the same branch when a new push arrives
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  replay:
+    name: Conversation Replay Regression Suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      # Redis is needed if any test reaches the outbox worker.
+      # The replay suite mocks WhatsApp sender so Redis is only needed for
+      # background tasks that aren't exercised here — kept for safety.
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run unit + integration tests
+        run: python -m pytest tests/ --ignore=tests/replay --tb=short -q
+        env:
+          DATABASE_URL: "postgresql+asyncpg://postgres:postgres@localhost/nextgen"
+          REDIS_URL: "redis://localhost:6379/0"
+          JWT_SECRET_KEY: "ci-test-secret"
+          META_VERIFY_TOKEN: "ci-verify-token"
+          WHATSAPP_DEFAULT_ACCESS_TOKEN: "ci-token"
+          OPENAI_API_KEY: "ci-key"
+
+      - name: Run Conversation Replay Suite
+        run: python -m pytest tests/replay/ -v --tb=short
+        env:
+          DATABASE_URL: "postgresql+asyncpg://postgres:postgres@localhost/nextgen"
+          REDIS_URL: "redis://localhost:6379/0"
+          JWT_SECRET_KEY: "ci-test-secret"
+          META_VERIFY_TOKEN: "ci-verify-token"
+          WHATSAPP_DEFAULT_ACCESS_TOKEN: "ci-token"
+          OPENAI_API_KEY: "ci-key"
+
+      # Upload replay results as an artifact so engineers can inspect failures
+      - name: Upload replay results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: replay-results-${{ github.run_id }}
+          path: replay-results.xml
+          if-no-files-found: ignore
+
+      # Fail the build explicitly with a clear message when replays fail
+      - name: Check replay status
+        if: failure()
+        run: |
+          echo "::error::Conversation Replay Suite FAILED — deployment blocked."
+          echo "::error::Fix all failing replays before merging this PR."
+          exit 1

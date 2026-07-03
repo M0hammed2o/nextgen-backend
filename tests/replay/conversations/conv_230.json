@@ -1,0 +1,24 @@
+{
+  "id": "conv_230",
+  "title": "CX natural — partial description without item name — clarification, no cart",
+  "category": "cx_natural_conversation",
+  "tags": ["llm", "cx", "clarification", "no_cart"],
+
+  "notes": "ORDER_START intent, but no resolvable menu item in the message. Mutation guard skips because cart is empty and no items are extractable. Bot clarifies without adding to cart.",
+
+  "turns": [
+    {
+      "message": "I want the one with cheese",
+      "llm": {
+        "action": "chitchat",
+        "message": "Could you be more specific? We have several options with cheese! Which burger are you thinking of?",
+        "items": []
+      },
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_not_contains": ["added to your order", "total", "confirm", "pickup", "delivery"]
+      }
+    }
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "id": "conv_222",
+  "title": "CX context — Can I see drinks — shows drinks only, no cart",
+  "category": "cx_context_awareness",
+  "tags": ["llm", "recommendation", "cx"],
+
+  "notes": "Customer asks to browse a specific category. Bot uses recommend_items to surface the drinks without opening a cart.",
+
+  "turns": [
+    {
+      "message": "Can I see drinks?",
+      "llm": {
+        "action": "recommend_items",
+        "message": "Here are our drinks! We have Coca-Cola (330ml), Coca-Cola (500ml), Sprite (330ml), Still Water, and Ice Coffee. What sounds good?",
+        "items": [
+          {"name": "Coca-Cola (330ml)", "quantity": 1},
+          {"name": "Coca-Cola (500ml)", "quantity": 1},
+          {"name": "Sprite (330ml)", "quantity": 1},
+          {"name": "Still Water", "quantity": 1},
+          {"name": "Ice Coffee", "quantity": 1}
+        ]
+      },
+      "expect": {
+        "state": "BROWSING_MENU",
+        "cart": [],
+        "response_not_contains": ["added to your order", "total", "pickup", "delivery", "confirm"]
+      }
+    }
+  ]
+}

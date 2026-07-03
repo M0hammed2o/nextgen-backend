@@ -1,0 +1,17 @@
+{
+  "id": "conv_021",
+  "title": "Menu request — Menu",
+  "category": "menu",
+  "tags": ["deterministic", "menu_request"],
+
+  "turns": [
+    {
+      "message": "Menu",
+      "expect": {
+        "state": "BROWSING_MENU",
+        "cart": [],
+        "response_contains": ["menu", "classic smash burger"]
+      }
+    }
+  ]
+}

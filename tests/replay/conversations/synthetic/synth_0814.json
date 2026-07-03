@@ -1,0 +1,97 @@
+{
+  "id": "synth_0814",
+  "title": "Synth delivery \u2014 Chips \u2014 4 Bree Street Cape T",
+  "category": "synthetic_delivery",
+  "tags": [
+    "synthetic",
+    "det",
+    "delivery"
+  ],
+  "business": {
+    "delivery_enabled": true,
+    "require_customer_name": false,
+    "require_phone_number": false,
+    "require_delivery_address": false
+  },
+  "turns": [
+    {
+      "message": "Good morning",
+      "expect": {
+        "state": "GREETING",
+        "cart": [],
+        "response_contains": [
+          "welcome"
+        ]
+      }
+    },
+    {
+      "message": "Can I get a Chips",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Chips",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "Done",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Delivery",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "4 Bree Street Cape Town",
+      "expect": {
+        "state": "WAITING_DELIVERY_FEE_APPROVAL",
+        "cart": []
+      }
+    },
+    {
+      "_type": "staff_action",
+      "description": "Staff sets R30 delivery fee",
+      "context_updates": {
+        "delivery_fee_cents": 3000,
+        "delivery_fee_status": "FEE_SENT"
+      }
+    },
+    {
+      "message": "Done",
+      "expect": {
+        "state": "COLLECTING_PAYMENT",
+        "response_contains": [
+          "cash",
+          "card"
+        ]
+      }
+    },
+    {
+      "message": "Cash",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Chips",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 3500,
+    "delivery_fee_cents": 3000,
+    "total_cents": 6500,
+    "order_mode": "DELIVERY",
+    "payment_status": "CASH_ON_COLLECTION"
+  }
+}

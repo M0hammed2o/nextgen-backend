@@ -1,0 +1,28 @@
+{
+  "id": "conv_308",
+  "title": "Bug regression — No in CHOOSING_OPTIONS with required option pending — cancels gracefully",
+  "category": "options",
+  "tags": ["det", "options", "required_options", "regression", "bug_fix"],
+
+  "notes": "Bug: previously 'No' in CHOOSING_OPTIONS committed the pending Cappuccino without any milk type selected, violating the required Milk Type group. Fix: detect unsatisfied required groups on negation and cancel gracefully to IDLE instead.",
+
+  "turns": [
+    {
+      "message": "Can I get a cappuccino",
+      "expect": {
+        "state": "CHOOSING_OPTIONS",
+        "cart": [],
+        "response_contains": ["milk"]
+      }
+    },
+    {
+      "message": "No",
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_contains": ["removed", "let me know"],
+        "response_not_contains": ["added to your order", "total", "confirm", "cappuccino"]
+      }
+    }
+  ]
+}

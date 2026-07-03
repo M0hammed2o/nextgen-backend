@@ -1,0 +1,22 @@
+{
+  "id": "synth_0610",
+  "title": "Synth business hours \u2014 'Hours please'",
+  "category": "synthetic_business",
+  "tags": [
+    "synthetic",
+    "det",
+    "hours"
+  ],
+  "turns": [
+    {
+      "message": "Hours please",
+      "expect": {
+        "state": "IDLE",
+        "response_contains": [
+          "contact",
+          "hours"
+        ]
+      }
+    }
+  ]
+}

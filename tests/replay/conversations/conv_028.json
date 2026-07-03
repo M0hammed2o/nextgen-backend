@@ -1,0 +1,44 @@
+{
+  "id": "conv_028",
+  "title": "SA slang order — gimme a smsh brgr",
+  "category": "sa_slang",
+  "tags": ["llm", "sa_slang", "basic_ordering"],
+
+  "turns": [
+    {
+      "message": "Gimme a smsh brgr",
+      "llm": {
+        "action": "add_items",
+        "message": "Added Classic Smash Burger ✅",
+        "items": [{"name": "Classic Smash Burger", "quantity": 1}]
+      },
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Leroy",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0710000004",
+      "expect": {"state": "ORDER_PLACED"}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Classic Smash Burger", "quantity": 1}],
+    "subtotal_cents": 7500,
+    "total_cents": 7500,
+    "order_mode": "PICKUP"
+  }
+}

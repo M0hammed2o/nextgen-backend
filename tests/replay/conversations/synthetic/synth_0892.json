@@ -1,0 +1,74 @@
+{
+  "id": "synth_0892",
+  "title": "Synth coffee pickup \u2014 Cappuccino regular milk \u2014 'Heita'",
+  "category": "synthetic_options",
+  "tags": [
+    "synthetic",
+    "det",
+    "pickup",
+    "options",
+    "coffee"
+  ],
+  "turns": [
+    {
+      "message": "Heita",
+      "expect": {
+        "state": "GREETING",
+        "cart": [],
+        "response_contains": [
+          "welcome"
+        ]
+      }
+    },
+    {
+      "message": "Can I get a Cappuccino with regular milk",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Cappuccino",
+            "quantity": 1,
+            "special_instructions": "regular milk"
+          }
+        ]
+      }
+    },
+    {
+      "message": "Yep",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Keegan",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0611111111",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Cappuccino",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 4500,
+    "total_cents": 4500,
+    "order_mode": "PICKUP",
+    "customer_name": "Keegan"
+  }
+}

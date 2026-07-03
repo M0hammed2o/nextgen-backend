@@ -1,0 +1,22 @@
+{
+  "id": "synth_0609",
+  "title": "Synth business hours \u2014 'What time does the restaurant close?'",
+  "category": "synthetic_business",
+  "tags": [
+    "synthetic",
+    "det",
+    "hours"
+  ],
+  "turns": [
+    {
+      "message": "What time does the restaurant close?",
+      "expect": {
+        "state": "IDLE",
+        "response_contains": [
+          "contact",
+          "hours"
+        ]
+      }
+    }
+  ]
+}

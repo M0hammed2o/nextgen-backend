@@ -1,0 +1,39 @@
+{
+  "id": "synth_0646",
+  "title": "Synth browse+cancel \u2014 'Howzit'/'What food do you have?'",
+  "category": "synthetic_browse",
+  "tags": [
+    "synthetic",
+    "det",
+    "browse",
+    "cancel"
+  ],
+  "turns": [
+    {
+      "message": "Howzit",
+      "expect": {
+        "state": "GREETING",
+        "cart": [],
+        "response_contains": [
+          "welcome"
+        ]
+      }
+    },
+    {
+      "message": "What food do you have?",
+      "expect": {
+        "state": "BROWSING_MENU",
+        "response_contains": [
+          "menu"
+        ]
+      }
+    },
+    {
+      "message": "Cancel",
+      "expect": {
+        "state": "IDLE",
+        "cart": []
+      }
+    }
+  ]
+}

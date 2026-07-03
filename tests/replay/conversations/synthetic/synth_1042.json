@@ -1,0 +1,72 @@
+{
+  "id": "synth_1042",
+  "title": "Synth multi + coffee \u2014 Still Water + Cappuccino",
+  "category": "synthetic_multi_item",
+  "tags": [
+    "synthetic",
+    "det",
+    "pickup",
+    "multi_item",
+    "options"
+  ],
+  "turns": [
+    {
+      "message": "Can I get a Still Water and a Cappuccino with regular milk",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Still Water",
+            "quantity": 1
+          },
+          {
+            "name": "Cappuccino",
+            "quantity": 1,
+            "special_instructions": "regular milk"
+          }
+        ]
+      }
+    },
+    {
+      "message": "Sharp",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Priya",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0611111111",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Still Water",
+        "quantity": 1
+      },
+      {
+        "name": "Cappuccino",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 6000,
+    "total_cents": 6000,
+    "order_mode": "PICKUP",
+    "customer_name": "Priya"
+  }
+}

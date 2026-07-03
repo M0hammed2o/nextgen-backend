@@ -110,10 +110,41 @@ class OrderItem(Base, UUIDPrimaryKeyMixin):
 
     # ── Snapshot at time of order (immutable) ────────────────────────────
     name_snapshot: Mapped[str] = mapped_column(String(255), nullable=False)
-    unit_price_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    # Phase 8: full pricing breakdown — base + option deltas + add-ons = unit_price
+    # Existing rows have base_price_cents = unit_price_cents and adjustments = 0.
+    base_price_cents: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0,
+        comment="MenuItem.price_cents at order time, before adjustments"
+    )
+    option_adjustment_cents: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0,
+        comment="Sum of selected option price_delta_cents (may be negative)"
+    )
+    add_on_total_cents: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0,
+        comment="Sum of add-on price_cents × quantity for this line item"
+    )
+    unit_price_cents: Mapped[int] = mapped_column(
+        Integer, nullable=False,
+        comment="base + option_adjustment + add_on_total (effective per-unit price)"
+    )
     quantity: Mapped[int] = mapped_column(Integer, nullable=False)
     line_total_cents: Mapped[int] = mapped_column(Integer, nullable=False)
-    options_snapshot: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+
+    # Snapshots for display and audit — these never change after order creation
+    options_snapshot: Mapped[dict | None] = mapped_column(
+        JSONB, nullable=True,
+        comment="Raw {group_name: option_name} dict from LLM (backward compat)"
+    )
+    selected_options_snapshot: Mapped[list | None] = mapped_column(
+        JSONB, nullable=True,
+        comment="[{group_id, group_name, option_id, option_name, price_delta_cents}]"
+    )
+    add_ons_snapshot: Mapped[list | None] = mapped_column(
+        JSONB, nullable=True,
+        comment="[{add_on_id, name, price_cents, quantity}]"
+    )
     special_instructions: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # ── Relationships ────────────────────────────────────────────────────

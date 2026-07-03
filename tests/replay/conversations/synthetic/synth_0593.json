@@ -1,0 +1,41 @@
+{
+  "id": "synth_0593",
+  "title": "Synth cancel after confirm \u2014 Ice Coffee",
+  "category": "synthetic_cancel",
+  "tags": [
+    "synthetic",
+    "det",
+    "cancel"
+  ],
+  "turns": [
+    {
+      "message": "Can I get a Ice Coffee",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Ice Coffee",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "Sho",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Never mind",
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_contains": [
+          "cancel",
+          "order"
+        ]
+      }
+    }
+  ]
+}

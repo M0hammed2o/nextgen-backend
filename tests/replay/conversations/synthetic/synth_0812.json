@@ -1,0 +1,97 @@
+{
+  "id": "synth_0812",
+  "title": "Synth delivery \u2014 Classic Smash Burger \u2014 88 Juta Street Braam",
+  "category": "synthetic_delivery",
+  "tags": [
+    "synthetic",
+    "det",
+    "delivery"
+  ],
+  "business": {
+    "delivery_enabled": true,
+    "require_customer_name": false,
+    "require_phone_number": false,
+    "require_delivery_address": false
+  },
+  "turns": [
+    {
+      "message": "Hello",
+      "expect": {
+        "state": "GREETING",
+        "cart": [],
+        "response_contains": [
+          "welcome"
+        ]
+      }
+    },
+    {
+      "message": "Can I get a Classic Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Classic Smash Burger",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "100",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Delivery",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "88 Juta Street Braamfontein",
+      "expect": {
+        "state": "WAITING_DELIVERY_FEE_APPROVAL",
+        "cart": []
+      }
+    },
+    {
+      "_type": "staff_action",
+      "description": "Staff sets R30 delivery fee",
+      "context_updates": {
+        "delivery_fee_cents": 3000,
+        "delivery_fee_status": "FEE_SENT"
+      }
+    },
+    {
+      "message": "100",
+      "expect": {
+        "state": "COLLECTING_PAYMENT",
+        "response_contains": [
+          "cash",
+          "card"
+        ]
+      }
+    },
+    {
+      "message": "Cash",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Classic Smash Burger",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 7500,
+    "delivery_fee_cents": 3000,
+    "total_cents": 10500,
+    "order_mode": "DELIVERY",
+    "payment_status": "CASH_ON_COLLECTION"
+  }
+}

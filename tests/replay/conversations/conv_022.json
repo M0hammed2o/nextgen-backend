@@ -1,0 +1,16 @@
+{
+  "id": "conv_022",
+  "title": "Menu request — What do you have?",
+  "category": "menu",
+  "tags": ["deterministic", "menu_request"],
+
+  "turns": [
+    {
+      "message": "What do you have?",
+      "expect": {
+        "state": "BROWSING_MENU",
+        "response_contains": ["menu", "classic smash burger"]
+      }
+    }
+  ]
+}

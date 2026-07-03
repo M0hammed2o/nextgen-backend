@@ -1,0 +1,24 @@
+{
+  "id": "conv_229",
+  "title": "CX natural — vague order intent without item — clarify, no cart",
+  "category": "cx_natural_conversation",
+  "tags": ["llm", "cx", "order_intent", "clarification"],
+
+  "notes": "ORDER_START intent fires but DET extraction finds no menu items in the message. Mutation guard allows chitchat through because cart is empty and no items are named. State stays IDLE.",
+
+  "turns": [
+    {
+      "message": "I want something",
+      "llm": {
+        "action": "chitchat",
+        "message": "Of course! What are you in the mood for? I can show you our menu.",
+        "items": []
+      },
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_not_contains": ["added to your order", "total", "confirm", "pickup", "delivery"]
+      }
+    }
+  ]
+}

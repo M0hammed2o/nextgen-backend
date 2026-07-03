@@ -1,0 +1,71 @@
+{
+  "id": "conv_307",
+  "title": "Options — mixed order: item needing options + item without options in one message",
+  "category": "options",
+  "tags": ["det", "llm", "options", "required_options", "multi_item", "cx"],
+
+  "notes": "DET finds both Flat White (required Milk Type, unsatisfied) and Classic Smash Burger (no options). CSB is added to cart immediately. Flat White is saved to pending_options. Bot asks for milk. LLM resolves with oat milk.",
+
+  "turns": [
+    {
+      "message": "Can I get a flat white and a classic smash burger",
+      "expect": {
+        "state": "CHOOSING_OPTIONS",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}],
+        "response_contains": ["milk", "flat white"],
+        "response_not_contains": ["added to your order: 1x flat white", "total"]
+      }
+    },
+    {
+      "message": "Oat milk",
+      "llm": {
+        "action": "add_items",
+        "message": "Added Flat White with oat milk! ✅",
+        "items": [{"name": "Flat White", "quantity": 1, "special_instructions": "oat milk"}]
+      },
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Classic Smash Burger", "quantity": 1},
+          {"name": "Flat White", "quantity": 1, "special_instructions": "oat milk"}
+        ]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Sipho",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0821234567",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+
+  "final_order": {
+    "items": [
+      {"name": "Classic Smash Burger", "quantity": 1},
+      {"name": "Flat White", "quantity": 1, "special_instructions": "oat milk"}
+    ],
+    "subtotal_cents": 11500,
+    "total_cents": 11500,
+    "order_mode": "PICKUP",
+    "customer_name": "Sipho"
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "id": "conv_084",
+  "title": "Confirmation — That's correct as affirmative",
+  "category": "confirmation",
+  "tags": ["deterministic", "confirmation", "pickup"],
+
+  "turns": [
+    {
+      "message": "Can I get a Classic Smash Burger and Chips",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Classic Smash Burger", "quantity": 1},
+          {"name": "Chips", "quantity": 1}
+        ]
+      }
+    },
+    {
+      "message": "That's correct",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Luyanda",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0711000021",
+      "expect": {"state": "ORDER_PLACED"}
+    }
+  ],
+
+  "final_order": {
+    "items": [
+      {"name": "Classic Smash Burger", "quantity": 1},
+      {"name": "Chips", "quantity": 1}
+    ],
+    "subtotal_cents": 11000,
+    "total_cents": 11000,
+    "order_mode": "PICKUP"
+  }
+}

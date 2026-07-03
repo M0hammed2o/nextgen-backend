@@ -1,0 +1,38 @@
+{
+  "id": "conv_087",
+  "title": "Pickup — Name and phone sent in same message (opportunistic capture)",
+  "category": "pickup",
+  "tags": ["deterministic", "pickup", "multi_line"],
+
+  "notes": "_parse_name_and_phone splits a two-line message: name line + phone line. Both are captured in a single turn.",
+
+  "turns": [
+    {
+      "message": "Can I get a Grilled Chicken Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Grilled Chicken Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Nomvula\n0811000002",
+      "expect": {"state": "ORDER_PLACED", "cart": []}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Grilled Chicken Burger", "quantity": 1}],
+    "subtotal_cents": 8500,
+    "total_cents": 8500,
+    "order_mode": "PICKUP",
+    "customer_name": "Nomvula"
+  }
+}

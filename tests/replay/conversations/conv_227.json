@@ -1,0 +1,20 @@
+{
+  "id": "conv_227",
+  "title": "CX state protection — cancel with no active order — no crash, IDLE state",
+  "category": "cx_state_protection",
+  "tags": ["det", "cx", "protection", "cancel"],
+
+  "notes": "ORDER_CANCEL from IDLE with empty cart must not crash. Bot clears (empty) cart and returns to IDLE with a polite message.",
+
+  "turns": [
+    {
+      "message": "Cancel",
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_contains": ["cancel", "order"],
+        "response_not_contains": ["error", "sorry i didn't understand"]
+      }
+    }
+  ]
+}

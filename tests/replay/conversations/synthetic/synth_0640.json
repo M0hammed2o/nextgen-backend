@@ -1,0 +1,22 @@
+{
+  "id": "synth_0640",
+  "title": "Synth greeting only \u2014 'Howzit bra'",
+  "category": "synthetic_greeting",
+  "tags": [
+    "synthetic",
+    "det",
+    "greeting"
+  ],
+  "turns": [
+    {
+      "message": "Howzit bra",
+      "expect": {
+        "state": "GREETING",
+        "cart": [],
+        "response_contains": [
+          "welcome"
+        ]
+      }
+    }
+  ]
+}

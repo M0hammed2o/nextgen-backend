@@ -1,0 +1,71 @@
+{
+  "id": "synth_0869",
+  "title": "Synth view cart then confirm \u2014 Double Smash Burger",
+  "category": "synthetic_cart",
+  "tags": [
+    "synthetic",
+    "det",
+    "cart",
+    "pickup"
+  ],
+  "turns": [
+    {
+      "message": "Can I get a Double Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Double Smash Burger",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "My cart",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "response_contains": [
+          "double smash burger"
+        ]
+      }
+    },
+    {
+      "message": "Sharp",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Kgotso",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0834567890",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Double Smash Burger",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 9500,
+    "total_cents": 9500,
+    "order_mode": "PICKUP",
+    "customer_name": "Kgotso"
+  }
+}

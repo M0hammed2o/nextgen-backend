@@ -1,0 +1,42 @@
+{
+  "id": "conv_054",
+  "title": "SA slang — tomatoe typo in modifier (not normalised, passes through)",
+  "category": "sa_slang",
+  "tags": ["deterministic", "sa_slang", "typo", "modifier"],
+
+  "turns": [
+    {
+      "message": "Can I get a Classic Smash Burger without tomatoe",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}],
+        "response_contains": ["classic smash burger"]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Teboho",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0730000007",
+      "expect": {"state": "ORDER_PLACED"}
+    }
+  ],
+
+  "notes": "Typo 'tomatoe' is not in the normalizer. The suffix extractor captures 'no tomatoe' as special_instructions. Kitchen can still read it. No assertions on the exact si value.",
+
+  "final_order": {
+    "items": [{"name": "Classic Smash Burger", "quantity": 1}],
+    "subtotal_cents": 7500,
+    "total_cents": 7500,
+    "order_mode": "PICKUP"
+  }
+}

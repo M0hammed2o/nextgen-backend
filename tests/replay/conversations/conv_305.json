@@ -1,0 +1,19 @@
+{
+  "id": "conv_305",
+  "title": "Options — item with no options_json — existing DET behaviour unchanged",
+  "category": "options",
+  "tags": ["det", "options", "backward_compat", "regression_baseline"],
+
+  "notes": "Classic Smash Burger has no option groups. Required-option guard finds nothing and the normal DET add-to-cart path runs unchanged.",
+
+  "turns": [
+    {
+      "message": "Can I get a Classic Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}],
+        "response_contains": ["added", "classic smash burger"]
+      }
+    }
+  ]
+}

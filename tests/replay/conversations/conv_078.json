@@ -1,0 +1,26 @@
+{
+  "id": "conv_078",
+  "title": "Cart editing — Never mind (ORDER_CANCEL) after adding items clears cart",
+  "category": "cart_edit",
+  "tags": ["deterministic", "cart_edit", "cancel"],
+
+  "notes": "Customer adds a burger then says 'never mind'. ORDER_CANCEL intent fires, cart is cleared, session resets to IDLE.",
+
+  "turns": [
+    {
+      "message": "Can I get a Classic Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Never mind",
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_contains": ["cancel"]
+      }
+    }
+  ]
+}

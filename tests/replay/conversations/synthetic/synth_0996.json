@@ -1,0 +1,24 @@
+{
+  "id": "synth_0996",
+  "title": "Synth idle cancel \u2014 'Start over'",
+  "category": "synthetic_cancel",
+  "tags": [
+    "synthetic",
+    "det",
+    "cancel",
+    "idle"
+  ],
+  "turns": [
+    {
+      "message": "Start over",
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_contains": [
+          "cancel",
+          "order"
+        ]
+      }
+    }
+  ]
+}

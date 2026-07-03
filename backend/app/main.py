@@ -28,8 +28,37 @@ logger = logging.getLogger("nextgen")
 
 # ── Lifespan ─────────────────────────────────────────────────────────────────
 
+def _validate_production_secrets() -> None:
+    """
+    Crash immediately if placeholder secrets are present in production.
+    A misconfigured production deployment is worse than a failed startup.
+    """
+    if settings.ENVIRONMENT != "production":
+        return
+
+    _PLACEHOLDER_JWT = "CHANGE-ME-IN-PRODUCTION"
+    _PLACEHOLDER_META = {"CHANGE-ME", "", "your-app-secret", "your-webhook-verify-token"}
+
+    errors: list[str] = []
+    if settings.JWT_SECRET_KEY == _PLACEHOLDER_JWT:
+        errors.append("JWT_SECRET_KEY is set to the default placeholder — all JWTs are forgeable")
+    if settings.META_APP_SECRET in _PLACEHOLDER_META:
+        errors.append("META_APP_SECRET is set to a placeholder — webhook signatures cannot be verified")
+    if settings.META_VERIFY_TOKEN in _PLACEHOLDER_META:
+        errors.append("META_VERIFY_TOKEN is set to a placeholder — webhook registration will fail")
+    if not settings.WHATSAPP_DEFAULT_ACCESS_TOKEN or settings.WHATSAPP_DEFAULT_ACCESS_TOKEN == "CHANGE-ME":
+        errors.append("WHATSAPP_DEFAULT_ACCESS_TOKEN is not configured — cannot send WhatsApp messages")
+
+    if errors:
+        msg = "FATAL: Production deployment with unconfigured secrets:\n" + "\n".join(f"  • {e}" for e in errors)
+        logger.critical(msg)
+        raise RuntimeError(msg)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _validate_production_secrets()
+
     logger.warning(
         "STARTUP: NextGen Backend v%s [env=%s] — "
         "webhook public at %s/webhook/meta — "

@@ -18,6 +18,9 @@ class ParsedItem:
     name: str | None
     quantity: int = 1
     options: dict = field(default_factory=dict)
+    # Phase 8: paid add-ons requested by the customer
+    # Format: [{"name": "Extra Cheese", "quantity": 1}, ...]
+    add_ons: list[dict] = field(default_factory=list)
     special_instructions: str | None = None
     original_text: str | None = None  # For unmatched items
     # replace_item fields (only used when action == "replace_item")
@@ -50,10 +53,17 @@ def parse_llm_response(raw_text: str) -> ParsedLLMResponse:
             items = []
             for item_data in items_raw:
                 if isinstance(item_data, dict):
+                    raw_add_ons = item_data.get("add_ons") or []
+                    # Normalise: ensure each entry is a dict with at least "name"
+                    parsed_add_ons = [
+                        ao for ao in raw_add_ons
+                        if isinstance(ao, dict) and ao.get("name")
+                    ]
                     items.append(ParsedItem(
                         name=item_data.get("name"),
                         quantity=item_data.get("quantity", 1),
                         options=item_data.get("options", {}),
+                        add_ons=parsed_add_ons,
                         special_instructions=item_data.get("special_instructions"),
                         original_text=item_data.get("original_text"),
                         remove=item_data.get("remove"),

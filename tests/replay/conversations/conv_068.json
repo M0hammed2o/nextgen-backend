@@ -1,0 +1,41 @@
+{
+  "id": "conv_068",
+  "title": "Basic ordering — Single item, no greeting, direct order",
+  "category": "basic_ordering",
+  "tags": ["deterministic", "basic_ordering", "pickup"],
+
+  "turns": [
+    {
+      "message": "Can I get a Grilled Chicken Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Grilled Chicken Burger", "quantity": 1}],
+        "confirmed_cart": [{"name": "Grilled Chicken Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Bongani",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0711000007",
+      "expect": {"state": "ORDER_PLACED", "cart": []}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Grilled Chicken Burger", "quantity": 1}],
+    "subtotal_cents": 8500,
+    "total_cents": 8500,
+    "order_mode": "PICKUP",
+    "customer_name": "Bongani"
+  }
+}

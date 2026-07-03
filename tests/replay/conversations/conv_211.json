@@ -1,0 +1,22 @@
+{
+  "id": "conv_211",
+  "title": "CX menu question — What's spicy — recommendation only, no order",
+  "category": "cx_menu_questions",
+  "tags": ["llm", "chitchat", "cx"],
+
+  "turns": [
+    {
+      "message": "What's spicy?",
+      "llm": {
+        "action": "chitchat",
+        "message": "If you like heat, we have a great spicy option on our menu! Would you like to see it?",
+        "items": []
+      },
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_not_contains": ["added to your order", "total", "pickup", "delivery", "your name"]
+      }
+    }
+  ]
+}

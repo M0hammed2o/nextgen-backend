@@ -1,0 +1,70 @@
+{
+  "id": "synth_0649",
+  "title": "Synth multi-item \u2014 Spicy Chicken Burger + Coca-Cola (330ml)",
+  "category": "synthetic_multi_item",
+  "tags": [
+    "synthetic",
+    "det",
+    "pickup",
+    "multi_item"
+  ],
+  "turns": [
+    {
+      "message": "Can I get a Spicy Chicken Burger and Coca-Cola (330ml)",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Spicy Chicken Burger",
+            "quantity": 1
+          },
+          {
+            "name": "Coca-Cola (330ml)",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "Yep",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Yusuf",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0831234567",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Spicy Chicken Burger",
+        "quantity": 1
+      },
+      {
+        "name": "Coca-Cola (330ml)",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 10000,
+    "total_cents": 10000,
+    "order_mode": "PICKUP",
+    "customer_name": "Yusuf"
+  }
+}

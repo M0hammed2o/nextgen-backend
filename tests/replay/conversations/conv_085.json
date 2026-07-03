@@ -1,0 +1,59 @@
+{
+  "id": "conv_085",
+  "title": "Pickup — Complete flow with both name and phone required",
+  "category": "pickup",
+  "tags": ["deterministic", "pickup", "full_flow"],
+
+  "turns": [
+    {
+      "message": "Hello",
+      "expect": {"state": "GREETING", "cart": []}
+    },
+    {
+      "message": "Can I get a Spicy Chicken Burger and Chips",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Spicy Chicken Burger", "quantity": 1},
+          {"name": "Chips", "quantity": 1}
+        ]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS",
+        "response_contains": ["name"]
+      }
+    },
+    {
+      "message": "Nkosinathi",
+      "expect": {
+        "state": "COLLECTING_DETAILS",
+        "response_contains": ["phone"]
+      }
+    },
+    {
+      "message": "0711000022",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+
+  "final_order": {
+    "items": [
+      {"name": "Spicy Chicken Burger", "quantity": 1},
+      {"name": "Chips", "quantity": 1}
+    ],
+    "subtotal_cents": 11500,
+    "total_cents": 11500,
+    "order_mode": "PICKUP",
+    "customer_name": "Nkosinathi"
+  }
+}

@@ -1,0 +1,56 @@
+{
+  "id": "conv_039",
+  "title": "Remove chips — LLM remove_item in CONFIRMING_ORDER",
+  "category": "cart_edit",
+  "tags": ["llm", "remove_item", "confirming_order"],
+
+  "turns": [
+    {
+      "message": "Can I get a Classic Smash Burger and Chips",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Classic Smash Burger", "quantity": 1},
+          {"name": "Chips", "quantity": 1}
+        ]
+      }
+    },
+    {
+      "message": "Actually forget the chips",
+      "llm": {
+        "action": "remove_item",
+        "message": "Removed Chips ✅",
+        "items": [{"name": "Chips"}]
+      },
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}],
+        "confirmed_cart": [{"name": "Classic Smash Burger", "quantity": 1}],
+        "response_contains": ["removed"]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Lungisa",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0720000013",
+      "expect": {"state": "ORDER_PLACED"}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Classic Smash Burger", "quantity": 1}],
+    "subtotal_cents": 7500,
+    "total_cents": 7500,
+    "order_mode": "PICKUP"
+  }
+}

@@ -261,8 +261,8 @@ class TestModifierPromptContent:
         )
 
     def test_prompt_contains_ingredient_modifier_section(self):
-        """Prompt must contain the INGREDIENT MODIFIERS label."""
-        assert "INGREDIENT MODIFIERS" in self._prompt()
+        """Prompt must instruct LLM on free modifiers (Phase 8: renamed to FREE MODIFIERS)."""
+        assert "FREE MODIFIERS" in self._prompt()
 
     def test_prompt_add_items_mentions_special_instructions_for_modifiers(self):
         """Prompt must instruct LLM to use special_instructions for ingredient changes."""
@@ -327,7 +327,7 @@ class TestModifierPromptContent:
         because customers often say 'no tomato' while reviewing their order.
         """
         prompt = self._prompt(state="CONFIRMING_ORDER")
-        assert "INGREDIENT MODIFIERS" in prompt
+        assert "FREE MODIFIERS" in prompt
         assert "never use remove_item for ingredient" in prompt.lower()
 
 

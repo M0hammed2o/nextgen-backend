@@ -1,0 +1,42 @@
+{
+  "id": "conv_074",
+  "title": "Modifiers — Remove multiple ingredients in one message",
+  "category": "modifiers",
+  "tags": ["deterministic", "modifiers", "multi_modifier"],
+
+  "notes": "DET suffix extractor captures multiple 'no X' tokens from a single message.",
+
+  "turns": [
+    {
+      "message": "Can I get a Classic Smash Burger with no tomato no onion and no sauce",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}],
+        "response_contains": ["classic smash burger"]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Mpho",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0711000013",
+      "expect": {"state": "ORDER_PLACED"}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Classic Smash Burger", "quantity": 1}],
+    "subtotal_cents": 7500,
+    "total_cents": 7500,
+    "order_mode": "PICKUP"
+  }
+}

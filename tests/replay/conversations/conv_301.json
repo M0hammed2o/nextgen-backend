@@ -1,0 +1,20 @@
+{
+  "id": "conv_301",
+  "title": "Options — required option provided upfront — no question asked",
+  "category": "options",
+  "tags": ["det", "options", "required_options", "cx"],
+
+  "notes": "Customer specifies 'oat milk' in the same message. DET extracts modifier, matches it against the Milk Type group, satisfies the required option, and adds the item to cart immediately. No CHOOSING_OPTIONS, no question.",
+
+  "turns": [
+    {
+      "message": "Can I get a cappuccino with oat milk",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Cappuccino", "quantity": 1, "special_instructions": "oat milk"}],
+        "response_contains": ["added", "oat milk"],
+        "response_not_contains": ["what milk", "which milk", "choose"]
+      }
+    }
+  ]
+}

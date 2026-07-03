@@ -1,0 +1,49 @@
+{
+  "id": "conv_071",
+  "title": "Basic ordering — Large quantities multi-item order",
+  "category": "basic_ordering",
+  "tags": ["deterministic", "basic_ordering", "large_quantity"],
+
+  "turns": [
+    {
+      "message": "I want 3 Classic Smash Burgers and 3 Coca-Cola (330ml)",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Classic Smash Burger", "quantity": 3},
+          {"name": "Coca-Cola (330ml)", "quantity": 3}
+        ],
+        "confirmed_cart": [
+          {"name": "Classic Smash Burger", "quantity": 3},
+          {"name": "Coca-Cola (330ml)", "quantity": 3}
+        ]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Sifiso",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0711000010",
+      "expect": {"state": "ORDER_PLACED", "cart": []}
+    }
+  ],
+
+  "final_order": {
+    "items": [
+      {"name": "Classic Smash Burger", "quantity": 3},
+      {"name": "Coca-Cola (330ml)", "quantity": 3}
+    ],
+    "subtotal_cents": 28500,
+    "total_cents": 28500,
+    "order_mode": "PICKUP"
+  }
+}

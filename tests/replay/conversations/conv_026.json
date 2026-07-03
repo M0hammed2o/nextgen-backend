@@ -1,0 +1,40 @@
+{
+  "id": "conv_026",
+  "title": "Large quantity — 5 Cokes",
+  "category": "basic_ordering",
+  "tags": ["deterministic", "large_quantity"],
+
+  "turns": [
+    {
+      "message": "Can I get 5 Cokes",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Coca-Cola (330ml)", "quantity": 5}],
+        "confirmed_cart": [{"name": "Coca-Cola (330ml)", "quantity": 5}]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Zara",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0710000002",
+      "expect": {"state": "ORDER_PLACED"}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Coca-Cola (330ml)", "quantity": 5}],
+    "subtotal_cents": 10000,
+    "total_cents": 10000,
+    "order_mode": "PICKUP"
+  }
+}

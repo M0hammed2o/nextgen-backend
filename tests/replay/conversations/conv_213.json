@@ -1,0 +1,18 @@
+{
+  "id": "conv_213",
+  "title": "CX business — Where are you — location response, no ordering state",
+  "category": "cx_business",
+  "tags": ["det", "location", "cx"],
+
+  "turns": [
+    {
+      "message": "Where are you?",
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_contains": ["contact us for location"],
+        "response_not_contains": ["added to your order", "total", "pickup", "delivery", "your name"]
+      }
+    }
+  ]
+}

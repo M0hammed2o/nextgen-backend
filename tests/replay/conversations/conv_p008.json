@@ -1,0 +1,47 @@
+{
+  "id": "conv_p008",
+  "title": "Pricing — add-on max quantity enforced: clamps 5 extra patty to max=3",
+  "category": "pricing",
+  "tags": ["llm", "pricing", "add_on", "quantity_limit", "pickup"],
+
+  "notes": "Customer asks for 5 extra patty. DET detects 'extra patty' as paid add-on conflict and yields to LLM. LLM returns quantity=5. Pipeline clamps to max_qty=3. 3 × R25 = R75. unit_price=7500+7500=15000. subtotal=15000.",
+
+  "turns": [
+    {
+      "message": "Loaded Smash Burger with 5 extra patty",
+      "llm": {
+        "action": "add_items",
+        "message": "Loaded Smash Burger with Extra Patty added ✅",
+        "items": [{"name": "Loaded Smash Burger", "quantity": 1, "options": {}, "add_ons": [{"name": "Extra Patty", "quantity": 5}], "special_instructions": ""}]
+      },
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Loaded Smash Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Thabo",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0867654321",
+      "expect": {"state": "ORDER_PLACED", "cart": []}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Loaded Smash Burger", "quantity": 1}],
+    "subtotal_cents": 15000,
+    "total_cents": 15000,
+    "order_mode": "PICKUP",
+    "customer_name": "Thabo"
+  }
+}

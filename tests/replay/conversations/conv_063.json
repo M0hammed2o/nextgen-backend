@@ -1,0 +1,46 @@
+{
+  "id": "conv_063",
+  "title": "Menu — Drinks only request",
+  "category": "menu",
+  "tags": ["deterministic", "menu", "browsing"],
+
+  "turns": [
+    {
+      "message": "What drinks do you have?",
+      "expect": {
+        "state": "BROWSING_MENU",
+        "response_contains": ["menu"]
+      }
+    },
+    {
+      "message": "Can I get 2 Coca-Cola (330ml)",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Coca-Cola (330ml)", "quantity": 2}]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Sipho",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0711000002",
+      "expect": {"state": "ORDER_PLACED"}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Coca-Cola (330ml)", "quantity": 2}],
+    "subtotal_cents": 4000,
+    "total_cents": 4000,
+    "order_mode": "PICKUP"
+  }
+}

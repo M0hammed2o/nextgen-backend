@@ -1,0 +1,24 @@
+{
+  "id": "synth_0986",
+  "title": "Synth idle cancel \u2014 'Never mind'",
+  "category": "synthetic_cancel",
+  "tags": [
+    "synthetic",
+    "det",
+    "cancel",
+    "idle"
+  ],
+  "turns": [
+    {
+      "message": "Never mind",
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_contains": [
+          "cancel",
+          "order"
+        ]
+      }
+    }
+  ]
+}

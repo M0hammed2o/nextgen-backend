@@ -1,0 +1,72 @@
+{
+  "id": "synth_1003",
+  "title": "Synth burger + coffee \u2014 Spicy Chicken Burger + Cappuccino oat milk",
+  "category": "synthetic_multi_item",
+  "tags": [
+    "synthetic",
+    "det",
+    "pickup",
+    "multi_item",
+    "options"
+  ],
+  "turns": [
+    {
+      "message": "Can I get a Spicy Chicken Burger and a Cappuccino with oat milk",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Spicy Chicken Burger",
+            "quantity": 1
+          },
+          {
+            "name": "Cappuccino",
+            "quantity": 1,
+            "special_instructions": "oat milk"
+          }
+        ]
+      }
+    },
+    {
+      "message": "Place it",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Fatima",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0729876543",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Spicy Chicken Burger",
+        "quantity": 1
+      },
+      {
+        "name": "Cappuccino",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 12500,
+    "total_cents": 12500,
+    "order_mode": "PICKUP",
+    "customer_name": "Fatima"
+  }
+}

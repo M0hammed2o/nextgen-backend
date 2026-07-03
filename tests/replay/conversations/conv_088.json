@@ -1,0 +1,76 @@
+{
+  "id": "conv_088",
+  "title": "Delivery — Multi-item order with delivery fee correctly totalled",
+  "category": "delivery",
+  "tags": ["deterministic", "delivery", "delivery_fee", "totals"],
+
+  "business": {
+    "delivery_enabled": true,
+    "require_customer_name": false,
+    "require_phone_number": false,
+    "require_delivery_address": false
+  },
+
+  "turns": [
+    {
+      "message": "Can I get a Classic Smash Burger and Chips",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Classic Smash Burger", "quantity": 1},
+          {"name": "Chips", "quantity": 1}
+        ]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Delivery",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "15 Oak Street, Bellville",
+      "expect": {
+        "state": "WAITING_DELIVERY_FEE_APPROVAL",
+        "cart": [],
+        "response_contains": ["delivery fee", "location"]
+      }
+    },
+    {
+      "_type": "staff_action",
+      "description": "Staff sets delivery fee R25",
+      "context_updates": {
+        "delivery_fee_cents": 2500,
+        "delivery_fee_status": "FEE_SENT"
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {
+        "state": "COLLECTING_PAYMENT",
+        "response_contains": ["cash", "card"]
+      }
+    },
+    {
+      "message": "Cash",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+
+  "final_order": {
+    "items": [
+      {"name": "Classic Smash Burger", "quantity": 1},
+      {"name": "Chips", "quantity": 1}
+    ],
+    "subtotal_cents": 11000,
+    "delivery_fee_cents": 2500,
+    "total_cents": 13500,
+    "order_mode": "DELIVERY",
+    "payment_status": "CASH_ON_COLLECTION"
+  }
+}

@@ -78,12 +78,17 @@ Your response MUST end with a JSON block on a new line in this exact format:
 ```
 
 ACTION must be one of:
-- "add_items" — customer wants to add items. items = [{{"name": "exact menu item name", "quantity": 1, "options": {{}}, "special_instructions": ""}}]
-  INGREDIENT MODIFIERS: When a customer asks to modify an ingredient ("no tomato", "without onion",
-  "extra cheese", "add jalapeños", "remove the pickles from my burger"), this is a MODIFICATION —
-  capture it in special_instructions on the add_items entry. NEVER use remove_item for ingredient changes.
-  Examples: "burger without tomato" → add_items, special_instructions="no tomato"
-            "chips with extra salt"  → add_items, special_instructions="extra salt"
+- "add_items" — customer wants to add items. items = [{{"name": "exact menu item name", "quantity": 1, "options": {{}}, "add_ons": [], "special_instructions": ""}}]
+  PAID ADD-ONS: When a customer requests an item listed under ✦ Add-ons for a menu item, capture
+  it in the add_ons list: add_ons = [{{"name": "exact add-on name", "quantity": 1}}]
+  These have a price — show the customer the correct total including the add-on cost.
+  Examples: "burger with extra cheese"  → add_ons=[{{"name":"Extra Cheese","quantity":1}}]
+            "2 extra patties"           → add_ons=[{{"name":"Extra Patty","quantity":2}}]
+  FREE MODIFIERS: When a customer asks to modify an ingredient with NO listed add-on price
+  ("no tomato", "without onion", "extra salt", "sauce on the side"), capture it in
+  special_instructions. NEVER use remove_item for ingredient changes.
+  Examples: "burger without tomato" → add_ons=[], special_instructions="no tomato"
+            "chips with extra salt"  → add_ons=[], special_instructions="extra salt"
 - "remove_item" — customer wants to remove an ENTIRE ITEM from the cart (e.g. "take off the burger",
   "I don't want the chips anymore", "cancel the pizza"). items = [{{"name": "item to remove"}}]
   NEVER use remove_item for ingredient modifications — "remove the tomato from my burger" means
@@ -105,6 +110,13 @@ For "replace_item", both "remove" and "add" must exactly match menu item names.
 Use "replace_item" whenever the customer says: change X to Y, swap X for Y, instead of X give me Y.
 Use "recommend_items" (never "chitchat") whenever you suggest specific menu items to a customer.
 NEVER summarize or echo back cart contents in a chitchat message — the system builds all order summaries from the real cart.
+
+OPTION HANDLING:
+- Items may have option groups listed in the menu (marked ▸). Required groups MUST be collected.
+- If the customer orders an item without specifying a REQUIRED option, use "ask_options". Ask for ONE group at a time. List the choices clearly.
+- When the customer provides an option choice, capture it in special_instructions of the add_items entry (e.g. special_instructions="oat milk").
+- NEVER ask about OPTIONAL option groups unless the customer brings them up.
+- NEVER invent options that are not listed for the item.
 """
 
 
@@ -123,10 +135,15 @@ def build_item_parsing_prompt(
         if not item.is_active or item.is_deleted:
             continue
         price = format_currency(item.price_cents, currency)
-        entry = f"- {item.name} ({price})"
-        if item.options_json:
-            entry += f" [options: {json.dumps(item.options_json)}]"
-        items_list.append(entry)
+        parts = [f"- {item.name} ({price})"]
+        opts_text = _format_options_for_prompt(item.options_json, currency)
+        if opts_text:
+            parts.append(opts_text)
+        item_add_ons = getattr(item, "add_ons", None) or []
+        add_ons_text = _format_add_ons_for_prompt(item_add_ons, currency)
+        if add_ons_text:
+            parts.append(add_ons_text)
+        items_list.append("\n".join(parts))
 
     menu_str = "\n".join(items_list)
 
@@ -148,6 +165,70 @@ If a requested item doesn't match any menu item, include it with "name": null an
 Example: [{{"name": "Classic Beef Burger", "quantity": 2, "options": {{}}, "special_instructions": null}}]
 
 JSON only, no other text:"""
+
+
+def _format_options_for_prompt(options_json: dict | None, currency: str = "ZAR") -> str:
+    """
+    Render option groups as compact, LLM-readable lines.
+    Includes price_delta_cents so the LLM can quote accurate totals.
+    Returns an empty string when there are no groups.
+    """
+    if not options_json:
+        return ""
+    groups = options_json.get("option_groups", [])
+    if not groups:
+        return ""
+
+    from shared.utils.money import format_currency as _fmt
+
+    lines = []
+    for group in sorted(groups, key=lambda g: g.get("sort_order", 0)):
+        if not group.get("is_enabled", True):
+            continue
+        req_label = "required" if group.get("required") else "optional"
+        max_sel = group.get("max_selections", 1)
+        choose = "choose 1" if max_sel == 1 else f"choose up to {max_sel}"
+        choices = []
+        for o in group.get("options", []):
+            if not o.get("is_enabled", True):
+                continue
+            delta = o.get("price_delta_cents", 0)
+            if delta > 0:
+                choices.append(f"{o['name']} (+{_fmt(delta, currency)})")
+            elif delta < 0:
+                choices.append(f"{o['name']} ({_fmt(delta, currency)})")
+            else:
+                choices.append(f"{o['name']} (no charge)")
+        lines.append(
+            f"    ▸ {group['name']} ({req_label}, {choose}): "
+            + " | ".join(choices)
+        )
+    return "\n".join(lines)
+
+
+def _format_add_ons_for_prompt(add_ons: list, currency: str = "ZAR") -> str:
+    """
+    Render available paid add-ons for a menu item.
+    Returns an empty string when there are no add-ons.
+    """
+    if not add_ons:
+        return ""
+
+    from shared.utils.money import format_currency as _fmt
+
+    active = [a for a in add_ons if getattr(a, "is_active", True) and not getattr(a, "is_deleted", False)]
+    if not active:
+        return ""
+
+    parts = []
+    for ao in sorted(active, key=lambda a: getattr(a, "sort_order", 0)):
+        name = getattr(ao, "name", ao.get("name", "") if isinstance(ao, dict) else "")
+        price = getattr(ao, "price_cents", ao.get("price_cents", 0) if isinstance(ao, dict) else 0)
+        max_q = getattr(ao, "max_qty", ao.get("max_qty", 10) if isinstance(ao, dict) else 10)
+        limit = f" (max {max_q})" if max_q > 1 else ""
+        parts.append(f"{name} +{_fmt(price, currency)}{limit}")
+
+    return f"    ✦ Add-ons: " + " | ".join(parts)
 
 
 def _format_menu_for_prompt(
@@ -173,9 +254,16 @@ def _format_menu_for_prompt(
         line = f"  - {item.name}: {price}"
         if item.description:
             line += f" ({item.description})"
-        if item.options_json:
-            line += f" [Options: {json.dumps(item.options_json)}]"
-        cat_map.setdefault(key, []).append(line)
+        parts = [line]
+        opts_text = _format_options_for_prompt(item.options_json, currency)
+        if opts_text:
+            parts.append(opts_text)
+        # Add-ons may be a SQLAlchemy relationship list or a plain list on FakeMenuItem
+        item_add_ons = getattr(item, "add_ons", None) or []
+        add_ons_text = _format_add_ons_for_prompt(item_add_ons, currency)
+        if add_ons_text:
+            parts.append(add_ons_text)
+        cat_map.setdefault(key, []).append("\n".join(parts))
 
     lines = []
     for cat in sorted(categories, key=lambda c: c.sort_order):
@@ -230,20 +318,47 @@ def _format_recommended_items_for_prompt(recommended_items: list[dict] | None) -
 
 
 def _format_pending_options_for_prompt(pending_options: list[dict] | None) -> str:
-    """Format pending items waiting for option clarification."""
+    """Format pending items waiting for option clarification, including available choices."""
     if not pending_options:
         return ""
     lines = []
     for p in pending_options:
         line = f"- {p['name']} (qty: {p.get('quantity', 1)})"
         if p.get("special_instructions"):
-            line += f" — note: {p['special_instructions']}"
+            line += f" — already noted: {p['special_instructions']}"
         lines.append(line)
+        # Show available option groups so the LLM can resolve the customer's answer
+        opts_json = p.get("options_json") or {}
+        for group in sorted(
+            opts_json.get("option_groups", []),
+            key=lambda g: g.get("sort_order", 0),
+        ):
+            if not group.get("is_enabled", True):
+                continue
+            req_label = "REQUIRED" if group.get("required") else "optional"
+            enabled = [
+                o["name"] for o in group.get("options", [])
+                if o.get("is_enabled", True)
+            ]
+            lines.append(
+                f"  {group['name']} ({req_label}): " + " | ".join(enabled)
+            )
     return "\n".join(lines)
 
 
 def _format_state_rules(conversation_state: str) -> str:
     """Return extra state-specific instructions injected into the system prompt."""
+    if conversation_state == "CHOOSING_OPTIONS":
+        return (
+            "The customer is answering a question about required options or sizes.\n"
+            "Look at the PENDING ITEM section above to understand what they're choosing from.\n"
+            "- Identify the option they chose from the listed choices.\n"
+            "- Return add_items with that item, putting the chosen option in special_instructions.\n"
+            "- If the customer is unsure or asks again, use ask_options to re-present the choices.\n"
+            "- If the customer wants to cancel, use cancel_order.\n"
+            "- Do NOT re-ask for an option the customer just provided.\n"
+            "- Do NOT ask about optional groups — only resolve the required option."
+        )
     if conversation_state == "CONFIRMING_ORDER":
         return (
             "The customer is currently reviewing their order (CONFIRMING_ORDER).\n"

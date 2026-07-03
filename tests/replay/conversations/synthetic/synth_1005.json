@@ -1,0 +1,72 @@
+{
+  "id": "synth_1005",
+  "title": "Synth burger + coffee \u2014 Classic Smash Burger + Flat White regular milk",
+  "category": "synthetic_multi_item",
+  "tags": [
+    "synthetic",
+    "det",
+    "pickup",
+    "multi_item",
+    "options"
+  ],
+  "turns": [
+    {
+      "message": "Can I get a Classic Smash Burger and a Flat White with regular milk",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Classic Smash Burger",
+            "quantity": 1
+          },
+          {
+            "name": "Flat White",
+            "quantity": 1,
+            "special_instructions": "regular milk"
+          }
+        ]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Amara",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0821000001",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Classic Smash Burger",
+        "quantity": 1
+      },
+      {
+        "name": "Flat White",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 11500,
+    "total_cents": 11500,
+    "order_mode": "PICKUP",
+    "customer_name": "Amara"
+  }
+}

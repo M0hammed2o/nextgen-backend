@@ -1,0 +1,64 @@
+{
+  "id": "conv_067",
+  "title": "Menu — What's popular recommendation then order",
+  "category": "menu",
+  "tags": ["llm", "menu", "recommendation", "basic_ordering"],
+
+  "turns": [
+    {
+      "message": "Hello",
+      "expect": {"state": "GREETING", "cart": []}
+    },
+    {
+      "message": "What's popular?",
+      "llm": {
+        "action": "recommend_items",
+        "message": "Our top sellers are the Classic Smash Burger (R75) and Chips (R35) — the perfect combo! Want me to add them?",
+        "items": [
+          {"name": "Classic Smash Burger", "quantity": 1},
+          {"name": "Chips", "quantity": 1}
+        ]
+      },
+      "expect": {
+        "state": "BROWSING_MENU",
+        "response_contains": ["classic smash burger"]
+      }
+    },
+    {
+      "message": "Yes please",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Classic Smash Burger", "quantity": 1},
+          {"name": "Chips", "quantity": 1}
+        ]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Katlego",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0711000006",
+      "expect": {"state": "ORDER_PLACED"}
+    }
+  ],
+
+  "final_order": {
+    "items": [
+      {"name": "Classic Smash Burger", "quantity": 1},
+      {"name": "Chips", "quantity": 1}
+    ],
+    "subtotal_cents": 11000,
+    "total_cents": 11000,
+    "order_mode": "PICKUP"
+  }
+}

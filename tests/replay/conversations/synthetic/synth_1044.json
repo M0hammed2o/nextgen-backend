@@ -1,0 +1,72 @@
+{
+  "id": "synth_1044",
+  "title": "Synth multi + coffee \u2014 Coca-Cola (330ml) + Flat White",
+  "category": "synthetic_multi_item",
+  "tags": [
+    "synthetic",
+    "det",
+    "pickup",
+    "multi_item",
+    "options"
+  ],
+  "turns": [
+    {
+      "message": "Can I get a Coca-Cola (330ml) and a Flat White with soy milk",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Coca-Cola (330ml)",
+            "quantity": 1
+          },
+          {
+            "name": "Flat White",
+            "quantity": 1,
+            "special_instructions": "soy milk"
+          }
+        ]
+      }
+    },
+    {
+      "message": "OK",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Kgotso",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0821234567",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Coca-Cola (330ml)",
+        "quantity": 1
+      },
+      {
+        "name": "Flat White",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 6000,
+    "total_cents": 6000,
+    "order_mode": "PICKUP",
+    "customer_name": "Kgotso"
+  }
+}

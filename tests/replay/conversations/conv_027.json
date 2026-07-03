@@ -1,0 +1,54 @@
+{
+  "id": "conv_027",
+  "title": "Add another — ORDER_ADD after first item placed",
+  "category": "basic_ordering",
+  "tags": ["deterministic", "order_add", "building_cart"],
+
+  "turns": [
+    {
+      "message": "Can I get a Classic Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "No",
+      "expect": {
+        "state": "BUILDING_CART",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Add another Classic Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 2}],
+        "confirmed_cart": [{"name": "Classic Smash Burger", "quantity": 2}]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Kabelo",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0710000003",
+      "expect": {"state": "ORDER_PLACED"}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Classic Smash Burger", "quantity": 2}],
+    "subtotal_cents": 15000,
+    "total_cents": 15000,
+    "order_mode": "PICKUP"
+  }
+}

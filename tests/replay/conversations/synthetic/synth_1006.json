@@ -1,0 +1,72 @@
+{
+  "id": "synth_1006",
+  "title": "Synth burger + coffee \u2014 Spicy Chicken Burger + Flat White oat milk",
+  "category": "synthetic_multi_item",
+  "tags": [
+    "synthetic",
+    "det",
+    "pickup",
+    "multi_item",
+    "options"
+  ],
+  "turns": [
+    {
+      "message": "Can I get a Spicy Chicken Burger and a Flat White with oat milk",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Spicy Chicken Burger",
+            "quantity": 1
+          },
+          {
+            "name": "Flat White",
+            "quantity": 1,
+            "special_instructions": "oat milk"
+          }
+        ]
+      }
+    },
+    {
+      "message": "OK",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Lindiwe",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0831111111",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Spicy Chicken Burger",
+        "quantity": 1
+      },
+      {
+        "name": "Flat White",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 12000,
+    "total_cents": 12000,
+    "order_mode": "PICKUP",
+    "customer_name": "Lindiwe"
+  }
+}

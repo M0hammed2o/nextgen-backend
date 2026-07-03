@@ -1,0 +1,54 @@
+{
+  "id": "conv_094",
+  "title": "Recovery — Start over mid-order via 'start over' phrase",
+  "category": "recovery",
+  "tags": ["deterministic", "recovery", "restart"],
+
+  "turns": [
+    {
+      "message": "Can I get 2 Classic Smash Burgers",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 2}]
+      }
+    },
+    {
+      "message": "Start over",
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_contains": ["call", "store"]
+      }
+    },
+    {
+      "message": "Can I get a Spicy Chicken Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Spicy Chicken Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Gcina",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0811000006",
+      "expect": {"state": "ORDER_PLACED"}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Spicy Chicken Burger", "quantity": 1}],
+    "subtotal_cents": 8000,
+    "total_cents": 8000,
+    "order_mode": "PICKUP"
+  }
+}

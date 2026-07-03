@@ -1,0 +1,46 @@
+{
+  "id": "conv_100",
+  "title": "SA slang — smsh brgr no tomatoe pls (tomatoe typo not normalised, passes through)",
+  "category": "sa_slang",
+  "tags": ["llm", "sa_slang", "normalizer", "modifier"],
+
+  "notes": "tomatoe is a common misspelling not in the normalizer (only tamato/tamarto are). It passes to the LLM as-is. The LLM understands it and adds the modifier correctly. pls normalises to 'please'.",
+
+  "turns": [
+    {
+      "message": "smsh brgr no tomatoe pls",
+      "llm": {
+        "action": "add_items",
+        "message": "Added Classic Smash Burger without tomato ✅",
+        "items": [{"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "no tomato"}]
+      },
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "no tomato"}]
+      }
+    },
+    {
+      "message": "100",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Thandeka",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0821000005",
+      "expect": {"state": "ORDER_PLACED"}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "no tomato"}],
+    "subtotal_cents": 7500,
+    "total_cents": 7500,
+    "order_mode": "PICKUP"
+  }
+}
