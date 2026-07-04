@@ -1,33 +1,33 @@
 {
   "id": "conv_c004",
-  "title": "Cancel regression — 'No thanks' clears cart, new order starts fresh",
+  "title": "Cancel vs edit — 'Forget it' clears cart (CANCEL), new order starts fresh",
   "category": "cancel_restart",
-  "tags": ["deterministic", "cancel", "negate", "cart_clear"],
+  "tags": ["deterministic", "order_cancel", "cart_cleared"],
 
-  "notes": "'No thanks' was previously not caught by is_negation, falling through to LLM which returned chitchat without clearing the cart. With the fix it is caught deterministically, cart is cleared, and the new order starts fresh.",
+  "notes": "ORDER_CANCEL scenario: 'Forget it' matches ORDER_CANCEL keyword intent — cart is cleared and session resets to IDLE. Re-ordering the same item produces exactly 1 entry (not 2). Verifies 'Burger → Forget it → Burger → New cart only'.",
 
   "turns": [
     {
-      "message": "Can I get a Double Smash Burger",
+      "message": "Can I get a Classic Smash Burger",
       "expect": {
         "state": "CONFIRMING_ORDER",
-        "cart": [{"name": "Double Smash Burger", "quantity": 1}]
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}]
       }
     },
     {
-      "message": "No thanks",
+      "message": "Forget it",
       "expect": {
         "state": "IDLE",
         "cart": [],
-        "response_contains": ["cancelled"]
+        "response_contains": ["cancel"]
       }
     },
     {
-      "message": "Can I get an Ice Coffee",
+      "message": "Can I get a Classic Smash Burger",
       "expect": {
         "state": "CONFIRMING_ORDER",
-        "cart": [{"name": "Ice Coffee", "quantity": 1}],
-        "response_contains": ["ice coffee"]
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}],
+        "response_contains": ["classic smash burger"]
       }
     },
     {
@@ -49,7 +49,7 @@
   ],
 
   "final_order": {
-    "items": [{"name": "Ice Coffee", "quantity": 1}],
+    "items": [{"name": "Classic Smash Burger", "quantity": 1}],
     "subtotal_cents": 7500,
     "total_cents": 7500,
     "order_mode": "PICKUP",

@@ -1,0 +1,63 @@
+{
+  "id": "conv_c005",
+  "title": "Cancel vs edit — 'No thanks' keeps cart (EDIT intent)",
+  "category": "cancel_restart",
+  "tags": ["deterministic", "order_edit", "cart_preserved"],
+
+  "notes": "ORDER_EDIT scenario: 'No thanks' is a polite soft negation. Cart is PRESERVED and state returns to BUILDING_CART. Customer then removes the burger and only the Coke remains. Confirms the EDIT flow for polite negation phrases.",
+
+  "turns": [
+    {
+      "message": "Can I get a Classic Smash Burger and a Coke",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Classic Smash Burger", "quantity": 1},
+          {"name": "Coca-Cola (330ml)", "quantity": 1}
+        ]
+      }
+    },
+    {
+      "message": "No thanks",
+      "expect": {
+        "state": "BUILDING_CART",
+        "cart": [
+          {"name": "Classic Smash Burger", "quantity": 1},
+          {"name": "Coca-Cola (330ml)", "quantity": 1}
+        ],
+        "response_contains": ["change"]
+      }
+    },
+    {
+      "message": "Take out the Classic Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Coca-Cola (330ml)", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Lungelo",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0843210987",
+      "expect": {"state": "ORDER_PLACED", "cart": []}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Coca-Cola (330ml)", "quantity": 1}],
+    "subtotal_cents": 2000,
+    "total_cents": 2000,
+    "order_mode": "PICKUP",
+    "customer_name": "Lungelo"
+  }
+}

@@ -38,7 +38,7 @@
       }
     },
     {
-      "message": "Wait",
+      "message": "No",
       "expect": {
         "state": "BUILDING_CART",
         "cart": [
@@ -79,7 +79,7 @@
       }
     },
     {
-      "message": "Wait",
+      "message": "No",
       "expect": {
         "state": "BUILDING_CART",
         "cart": [

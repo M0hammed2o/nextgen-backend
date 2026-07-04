@@ -1,36 +1,33 @@
 {
   "id": "conv_c003",
-  "title": "Cancel regression — multi-item order cleared on 'Nah'",
+  "title": "Cancel vs edit — 'Actually never mind' clears cart (CANCEL)",
   "category": "cancel_restart",
-  "tags": ["deterministic", "cancel", "negate", "cart_clear", "multi_item"],
+  "tags": ["deterministic", "order_cancel", "cart_cleared"],
 
-  "notes": "Customer orders two items (CSB + Ice Coffee) then says 'Nah'. Both items must be cleared. Fresh order of a single Spicy Chicken Burger should contain only that item.",
+  "notes": "ORDER_CANCEL scenario via keyword: 'Actually never mind' contains 'never mind' which matches ORDER_CANCEL intent — cart is cleared and session resets to IDLE. Next order starts with an empty cart. Verifies 'Burger → Actually never mind → Chicken → Chicken only'.",
 
   "turns": [
     {
-      "message": "Can I get a Classic Smash Burger and an Ice Coffee",
+      "message": "Can I get a Classic Smash Burger",
       "expect": {
         "state": "CONFIRMING_ORDER",
-        "cart": [
-          {"name": "Classic Smash Burger", "quantity": 1},
-          {"name": "Ice Coffee", "quantity": 1}
-        ]
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}]
       }
     },
     {
-      "message": "Nah",
+      "message": "Actually never mind",
       "expect": {
         "state": "IDLE",
         "cart": [],
-        "response_contains": ["cancelled"]
+        "response_contains": ["cancel"]
       }
     },
     {
-      "message": "Give me a Spicy Chicken Burger",
+      "message": "Can I get a Spicy Chicken Burger",
       "expect": {
         "state": "CONFIRMING_ORDER",
         "cart": [{"name": "Spicy Chicken Burger", "quantity": 1}],
-        "response_contains": ["spicy chicken burger"]
+        "response_contains": ["spicy chicken"]
       }
     },
     {

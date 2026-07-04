@@ -281,6 +281,71 @@ def is_pause(text: str) -> bool:
     return bool(pauses.match(text.strip()))
 
 
+def is_order_edit(text: str) -> bool:
+    """
+    In CONFIRMING_ORDER: customer wants to EDIT the order (keep cart, BUILDING_CART).
+
+    Covers all "soft no" signals — the customer doesn't want to confirm THIS version
+    of the order but still wants to order *something*.  The cart is preserved so they
+    can add/remove items before re-confirming.
+
+    Distinct from is_order_cancel: no explicit "cancel" / "never mind" / "forget it"
+    language — just hesitation, pause, or a request to change something.
+
+    Examples: "No", "No thanks", "Not quite", "Wait", "Hold on",
+              "I'd like to change something"
+    """
+    edits = re.compile(
+        r"^("
+        # Bare negations (soft)
+        r"no|nah|nope|"
+        # "no" + polite/SA trailing
+        r"no\s+(thanks|thank\s+you|please|ta|man|bru|more)|"
+        # "nah" + polite/SA trailing
+        r"nah\s+(thanks|thank\s+you|please|man|bru)|"
+        # "not quite / exactly / really"
+        r"not\s+(quite|exactly|really)|"
+        # Pause signals (keep cart, rethink)
+        r"wait|hold\s+on|not\s+yet|not\s+now|hang\s+on|"
+        r"one\s+(sec|second|mo|moment)|just\s+a\s+(sec|moment)|"
+        # "actually" alone — rethinking without explicit cancel direction
+        r"actually|"
+        # Explicit "change" requests
+        r"i.?d?\s+(like|want)\s+to\s+(change|edit|adjust|modify)(\s+something)?|"
+        r"let\s+me\s+(change|reconsider|think)"
+        r")\s*[,!.?]*$",
+        re.I,
+    )
+    return bool(edits.match(text.strip()))
+
+
+def is_order_cancel(text: str) -> bool:
+    """
+    In CONFIRMING_ORDER: customer wants to CANCEL the order entirely (clear cart, IDLE).
+
+    Only catches phrases that are NOT intercepted by the ORDER_CANCEL keyword intent
+    earlier in the pipeline (which handles: cancel, nevermind, never mind, forget it,
+    start over, scratch that, don't want, clear, remove all).
+
+    This function catches the remaining "I'm taking the whole order back" edge cases
+    such as "actually no" or "I changed my mind".
+
+    If this fires, the bot MUST say the order is cancelled AND the cart MUST be empty.
+    """
+    cancels = re.compile(
+        r"^("
+        # "actually no" / "no actually" — explicitly taking order back
+        r"actually\s+no|no\s+actually|"
+        # "i changed my mind"
+        r"i\s+(changed|change)\s+my\s+mind|"
+        # "i don't want it (anymore)"
+        r"i\s+don.?t\s+want\s+it(\s+anymore)?"
+        r")\s*[,!.?]*$",
+        re.I,
+    )
+    return bool(cancels.match(text.strip()))
+
+
 def is_recommendation_acceptance(text: str) -> bool:
     """
     Check if a message is accepting a prior recommendation from the bot.

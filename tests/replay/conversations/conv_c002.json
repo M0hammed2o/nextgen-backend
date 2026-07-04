@@ -1,10 +1,10 @@
 {
   "id": "conv_c002",
-  "title": "Cancel regression — bare 'No' must clear cart, not accumulate",
+  "title": "Cancel vs edit — 'No' keeps cart (EDIT), then add item",
   "category": "cancel_restart",
-  "tags": ["deterministic", "cancel", "negate", "cart_clear"],
+  "tags": ["deterministic", "order_edit", "cart_preserved"],
 
-  "notes": "Customer orders Classic Smash Burger then says bare 'No'. Without the fix the cart stays and a second order of the same item produces 2x in the cart. With the fix, 'No' clears the cart and the re-order produces exactly 1x.",
+  "notes": "ORDER_EDIT scenario: customer says 'No' (soft negation) in CONFIRMING_ORDER. Cart must be PRESERVED and state returns to BUILDING_CART. Customer then adds a Coke — the original burger must still be in the cart alongside the Coke. Verifies 'Burger → No → Add Coke → Burger remains'.",
 
   "turns": [
     {
@@ -17,16 +17,19 @@
     {
       "message": "No",
       "expect": {
-        "state": "IDLE",
-        "cart": [],
-        "response_contains": ["cancelled"]
+        "state": "BUILDING_CART",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}],
+        "response_contains": ["change"]
       }
     },
     {
-      "message": "Can I get a Classic Smash Burger",
+      "message": "Add a Coke",
       "expect": {
         "state": "CONFIRMING_ORDER",
-        "cart": [{"name": "Classic Smash Burger", "quantity": 1}]
+        "cart": [
+          {"name": "Classic Smash Burger", "quantity": 1},
+          {"name": "Coca-Cola (330ml)", "quantity": 1}
+        ]
       }
     },
     {
@@ -48,9 +51,12 @@
   ],
 
   "final_order": {
-    "items": [{"name": "Classic Smash Burger", "quantity": 1}],
-    "subtotal_cents": 7500,
-    "total_cents": 7500,
+    "items": [
+      {"name": "Classic Smash Burger", "quantity": 1},
+      {"name": "Coca-Cola (330ml)", "quantity": 1}
+    ],
+    "subtotal_cents": 9500,
+    "total_cents": 9500,
     "order_mode": "PICKUP",
     "customer_name": "Thabo"
   }

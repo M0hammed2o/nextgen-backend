@@ -708,13 +708,13 @@ async def _handle_message(
     if current_state == ConversationState.CONFIRMING_ORDER.value:
         # Use norm_text for all deterministic checks so SA slang/typos are handled.
         is_confirm = intent_router.is_confirmation(norm_text)
-        is_negate = intent_router.is_negation(norm_text)
-        is_pause_edit = intent_router.is_pause(norm_text)
+        is_edit = intent_router.is_order_edit(norm_text)
+        is_cancel = intent_router.is_order_cancel(norm_text)
         logger.warning(
-            "HANDLE_BRANCH: CONFIRMING_ORDER state — is_confirm=%s, is_negate=%s, is_pause=%s",
+            "HANDLE_BRANCH: CONFIRMING_ORDER state — is_confirm=%s, is_edit=%s, is_cancel=%s",
             is_confirm,
-            is_negate,
-            is_pause_edit,
+            is_edit,
+            is_cancel,
         )
         if is_confirm:
             # If the confirmation message mentions delivery/pickup, apply it now
@@ -727,30 +727,35 @@ async def _handle_message(
                 state_machine.set_context(session, "order_mode", "PICKUP")
                 logger.warning("CONFIRM_MODE_SET: PICKUP from confirmation msg. session_id=%s", session.id)
             return await _handle_order_confirmation(db, business, customer, session)
-        if is_pause_edit:
-            # "Wait" / "hold on" / "not yet" — customer wants to reconsider or
-            # make a change, but has NOT cancelled.  Keep the cart; let them edit.
-            state_machine.transition_state(session, ConversationState.BUILDING_CART.value)
-            logger.warning(
-                "CONFIRMING_ORDER_PAUSE: keeping cart, transitioning to BUILDING_CART. session_id=%s",
-                session.id,
-            )
-            return (
-                'No problem! What would you like to change?\n• Add more items\n• Remove something\n• Cancel the order',
-                False, None, None, None,
-            )
-        if is_negate:
-            # "No" / "nah" / "actually no" / "no thanks" — customer does NOT
-            # want this order at all.  Clear the cart completely so any subsequent
-            # order starts fresh (prevents old items accumulating in the next cart).
+
+        if is_cancel:
+            # "Actually no" / "I changed my mind" — customer is taking the entire
+            # order back.  Clear cart and reset so the next order starts fresh.
+            # NOTE: Most explicit cancel phrases ("cancel order", "never mind",
+            # "forget it", "start over") are caught by ORDER_CANCEL keyword earlier
+            # in the pipeline; this catches the remaining edge cases.
             state_machine.clear_cart(session)
             state_machine.transition_state(session, ConversationState.IDLE.value)
             logger.warning(
-                "CONFIRMING_ORDER_NEGATE: cleared cart and reset to IDLE. session_id=%s",
+                "CONFIRMING_ORDER_CANCEL: cleared cart and reset to IDLE. session_id=%s",
                 session.id,
             )
             return (
                 "No problem! Order cancelled. 🗑️ What would you like to order instead?",
+                False, None, None, None,
+            )
+
+        if is_edit:
+            # "No" / "No thanks" / "Wait" / "Not quite" etc. — customer wants to
+            # EDIT the order, not cancel it entirely.  Keep the cart so they can
+            # add/remove items, then re-confirm.
+            state_machine.transition_state(session, ConversationState.BUILDING_CART.value)
+            logger.warning(
+                "CONFIRMING_ORDER_EDIT: keeping cart, transitioning to BUILDING_CART. session_id=%s",
+                session.id,
+            )
+            return (
+                'No problem! What would you like to change?\n• Add more items\n• Remove something\n• Cancel the order',
                 False, None, None, None,
             )
         # Cart correction: customer is restating the full order with corrected quantities.
