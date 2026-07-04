@@ -1,53 +1,89 @@
 {
   "id": "conv_037",
-  "title": "Remove Sprite from cart — Sub-case A2",
+  "title": "Remove Sprite from cart \u2014 Wait then Sub-case A2",
   "category": "cart_edit",
-  "tags": ["deterministic", "remove_item", "sub_case_a2"],
-
+  "tags": [
+    "deterministic",
+    "remove_item",
+    "sub_case_a2"
+  ],
   "turns": [
     {
       "message": "Can I get a Classic Smash Burger and a Sprite",
       "expect": {
         "state": "CONFIRMING_ORDER",
         "cart": [
-          {"name": "Classic Smash Burger", "quantity": 1},
-          {"name": "Sprite (330ml)", "quantity": 1}
+          {
+            "name": "Classic Smash Burger",
+            "quantity": 1
+          },
+          {
+            "name": "Sprite (330ml)",
+            "quantity": 1
+          }
         ]
       }
     },
     {
-      "message": "No",
-      "expect": {"state": "BUILDING_CART"}
+      "message": "Wait",
+      "expect": {
+        "state": "BUILDING_CART"
+      }
     },
     {
       "message": "Take out the Sprite",
       "expect": {
         "state": "CONFIRMING_ORDER",
-        "cart": [{"name": "Classic Smash Burger", "quantity": 1}],
-        "confirmed_cart": [{"name": "Classic Smash Burger", "quantity": 1}],
-        "response_contains": ["removed", "sprite"]
+        "cart": [
+          {
+            "name": "Classic Smash Burger",
+            "quantity": 1
+          }
+        ],
+        "confirmed_cart": [
+          {
+            "name": "Classic Smash Burger",
+            "quantity": 1
+          }
+        ],
+        "response_contains": [
+          "removed",
+          "sprite"
+        ]
       }
     },
     {
       "message": "Yes",
-      "expect": {"state": "CHOOSING_ORDER_MODE"}
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
     },
     {
       "message": "Pickup",
-      "expect": {"state": "COLLECTING_DETAILS"}
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
     },
     {
       "message": "Ntombi",
-      "expect": {"state": "COLLECTING_DETAILS"}
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
     },
     {
       "message": "0720000011",
-      "expect": {"state": "ORDER_PLACED"}
+      "expect": {
+        "state": "ORDER_PLACED"
+      }
     }
   ],
-
   "final_order": {
-    "items": [{"name": "Classic Smash Burger", "quantity": 1}],
+    "items": [
+      {
+        "name": "Classic Smash Burger",
+        "quantity": 1
+      }
+    ],
     "subtotal_cents": 7500,
     "total_cents": 7500,
     "order_mode": "PICKUP"

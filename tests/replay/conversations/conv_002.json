@@ -1,28 +1,52 @@
 {
   "id": "conv_002",
-  "title": "Remove burger, keep Coke — Sub-case A2 deterministic removal",
+  "title": "Cart editing \u2014 Wait + add + remove \u2014 Sub-case A2 deterministic removal",
   "category": "cart_edit",
-  "tags": ["deterministic", "remove_item", "pickup", "regression_failure_1"],
-
+  "tags": [
+    "deterministic",
+    "remove_item",
+    "pickup",
+    "regression_failure_1"
+  ],
   "turns": [
     {
       "message": "Hello",
-      "expect": {"state": "GREETING", "cart": []}
+      "expect": {
+        "state": "GREETING",
+        "cart": []
+      }
     },
     {
       "message": "Can I get a Classic Smash Burger",
       "expect": {
         "state": "CONFIRMING_ORDER",
-        "cart": [{"name": "Classic Smash Burger", "quantity": 1}],
-        "confirmed_cart": [{"name": "Classic Smash Burger", "quantity": 1}],
-        "response_contains": ["classic smash burger"]
+        "cart": [
+          {
+            "name": "Classic Smash Burger",
+            "quantity": 1
+          }
+        ],
+        "confirmed_cart": [
+          {
+            "name": "Classic Smash Burger",
+            "quantity": 1
+          }
+        ],
+        "response_contains": [
+          "classic smash burger"
+        ]
       }
     },
     {
-      "message": "No",
+      "message": "Wait",
       "expect": {
         "state": "BUILDING_CART",
-        "cart": [{"name": "Classic Smash Burger", "quantity": 1}]
+        "cart": [
+          {
+            "name": "Classic Smash Burger",
+            "quantity": 1
+          }
+        ]
       }
     },
     {
@@ -30,23 +54,43 @@
       "expect": {
         "state": "CONFIRMING_ORDER",
         "cart": [
-          {"name": "Classic Smash Burger", "quantity": 1},
-          {"name": "Coca-Cola (330ml)", "quantity": 1}
+          {
+            "name": "Classic Smash Burger",
+            "quantity": 1
+          },
+          {
+            "name": "Coca-Cola (330ml)",
+            "quantity": 1
+          }
         ],
         "confirmed_cart": [
-          {"name": "Classic Smash Burger", "quantity": 1},
-          {"name": "Coca-Cola (330ml)", "quantity": 1}
+          {
+            "name": "Classic Smash Burger",
+            "quantity": 1
+          },
+          {
+            "name": "Coca-Cola (330ml)",
+            "quantity": 1
+          }
         ],
-        "response_contains": ["coca-cola"]
+        "response_contains": [
+          "coca-cola"
+        ]
       }
     },
     {
-      "message": "No",
+      "message": "Wait",
       "expect": {
         "state": "BUILDING_CART",
         "cart": [
-          {"name": "Classic Smash Burger", "quantity": 1},
-          {"name": "Coca-Cola (330ml)", "quantity": 1}
+          {
+            "name": "Classic Smash Burger",
+            "quantity": 1
+          },
+          {
+            "name": "Coca-Cola (330ml)",
+            "quantity": 1
+          }
         ]
       }
     },
@@ -54,32 +98,61 @@
       "message": "Take out the Classic Smash Burger",
       "expect": {
         "state": "CONFIRMING_ORDER",
-        "cart": [{"name": "Coca-Cola (330ml)", "quantity": 1}],
-        "confirmed_cart": [{"name": "Coca-Cola (330ml)", "quantity": 1}],
-        "response_contains": ["removed", "classic smash burger"],
-        "response_not_contains": ["2x classic smash burger", "2 classic smash burger"]
+        "cart": [
+          {
+            "name": "Coca-Cola (330ml)",
+            "quantity": 1
+          }
+        ],
+        "confirmed_cart": [
+          {
+            "name": "Coca-Cola (330ml)",
+            "quantity": 1
+          }
+        ],
+        "response_contains": [
+          "removed",
+          "classic smash burger"
+        ],
+        "response_not_contains": [
+          "2x classic smash burger",
+          "2 classic smash burger"
+        ]
       }
     },
     {
       "message": "Yes",
-      "expect": {"state": "CHOOSING_ORDER_MODE"}
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
     },
     {
       "message": "Pickup",
-      "expect": {"state": "COLLECTING_DETAILS"}
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
     },
     {
       "message": "Mohammed",
-      "expect": {"state": "COLLECTING_DETAILS"}
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
     },
     {
       "message": "0837866021",
-      "expect": {"state": "ORDER_PLACED", "cart": []}
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
     }
   ],
-
   "final_order": {
-    "items": [{"name": "Coca-Cola (330ml)", "quantity": 1}],
+    "items": [
+      {
+        "name": "Coca-Cola (330ml)",
+        "quantity": 1
+      }
+    ],
     "subtotal_cents": 2000,
     "total_cents": 2000,
     "order_mode": "PICKUP",

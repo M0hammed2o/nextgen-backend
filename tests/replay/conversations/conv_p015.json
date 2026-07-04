@@ -1,0 +1,62 @@
+{
+  "id": "conv_p015",
+  "title": "Modifier editing — Test 5: Latte → Add Soy Milk → Change to Full Cream",
+  "category": "pricing",
+  "tags": ["pricing", "options", "addon_replace", "llm", "modifier_editing"],
+
+  "notes": "Latte (R45) + Soy Milk option (+R10) = R55. Customer then changes to Full Cream (free). Final total R45. Coffee never disappears.",
+
+  "menu": ["Latte"],
+
+  "turns": [
+    {
+      "message": "Latte with soy milk please",
+      "llm": {
+        "action": "add_items",
+        "message": "Latte with Soy Milk — R55.00 ✅",
+        "items": [{"name": "Latte", "quantity": 1, "options": {"Milk": "Soy Milk"}, "add_ons": [], "special_instructions": ""}]
+      },
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Latte", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Change to full cream",
+      "llm": {
+        "action": "replace_item",
+        "message": "Changed to Full Cream milk — R45.00 ✅",
+        "items": [{"remove": "Latte", "add": "Latte", "quantity": 1, "options": {"Milk": "Full Cream"}, "add_ons": [], "special_instructions": ""}]
+      },
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Latte", "quantity": 1}],
+        "response_contains": ["full cream", "latte"]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Lungelo",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0834567890",
+      "expect": {"state": "ORDER_PLACED", "cart": []}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Latte", "quantity": 1}],
+    "subtotal_cents": 4500,
+    "total_cents": 4500,
+    "order_mode": "PICKUP",
+    "customer_name": "Lungelo"
+  }
+}

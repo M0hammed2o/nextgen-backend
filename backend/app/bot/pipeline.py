@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import select, update as _sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from backend.app.bot import (
     intent_router,
@@ -708,10 +709,12 @@ async def _handle_message(
         # Use norm_text for all deterministic checks so SA slang/typos are handled.
         is_confirm = intent_router.is_confirmation(norm_text)
         is_negate = intent_router.is_negation(norm_text)
+        is_pause_edit = intent_router.is_pause(norm_text)
         logger.warning(
-            "HANDLE_BRANCH: CONFIRMING_ORDER state — is_confirm=%s, is_negate=%s",
+            "HANDLE_BRANCH: CONFIRMING_ORDER state — is_confirm=%s, is_negate=%s, is_pause=%s",
             is_confirm,
             is_negate,
+            is_pause_edit,
         )
         if is_confirm:
             # If the confirmation message mentions delivery/pickup, apply it now
@@ -724,14 +727,31 @@ async def _handle_message(
                 state_machine.set_context(session, "order_mode", "PICKUP")
                 logger.warning("CONFIRM_MODE_SET: PICKUP from confirmation msg. session_id=%s", session.id)
             return await _handle_order_confirmation(db, business, customer, session)
-        if is_negate:
+        if is_pause_edit:
+            # "Wait" / "hold on" / "not yet" — customer wants to reconsider or
+            # make a change, but has NOT cancelled.  Keep the cart; let them edit.
             state_machine.transition_state(session, ConversationState.BUILDING_CART.value)
+            logger.warning(
+                "CONFIRMING_ORDER_PAUSE: keeping cart, transitioning to BUILDING_CART. session_id=%s",
+                session.id,
+            )
             return (
                 'No problem! What would you like to change?\n• Add more items\n• Remove something\n• Cancel the order',
-                False,
-                None,
-                None,
-                None,
+                False, None, None, None,
+            )
+        if is_negate:
+            # "No" / "nah" / "actually no" / "no thanks" — customer does NOT
+            # want this order at all.  Clear the cart completely so any subsequent
+            # order starts fresh (prevents old items accumulating in the next cart).
+            state_machine.clear_cart(session)
+            state_machine.transition_state(session, ConversationState.IDLE.value)
+            logger.warning(
+                "CONFIRMING_ORDER_NEGATE: cleared cart and reset to IDLE. session_id=%s",
+                session.id,
+            )
+            return (
+                "No problem! Order cancelled. 🗑️ What would you like to order instead?",
+                False, None, None, None,
             )
         # Cart correction: customer is restating the full order with corrected quantities.
         # Clear the cart, transition to BUILDING_CART, then call LLM with ORDER_START so that
@@ -973,39 +993,56 @@ async def _handle_message(
 
 # ── Phase 8: Pricing resolution helpers ─────────────────────────────────────
 
-async def _load_add_ons_map(
-    db: AsyncSession,
-    business_id,
-) -> dict[str, list[dict]]:
+def _load_add_ons_map(items: list) -> dict[str, list[dict]]:
     """
-    Load all active add-ons for this business, keyed by menu_item_id (str).
-    Returns {menu_item_id: [{add_on_id, name, price_cents, min_qty, max_qty, default_qty}]}.
+    Top-level wrapper around _build_add_ons_map_from_items.
+    Exists as a named module-level function so the replay test framework
+    can patch it independently of _load_menu.
     """
-    from shared.models.menu import MenuAddOn, menu_item_add_ons as _join
-    stmt = (
-        select(MenuAddOn, _join.c.menu_item_id)
-        .join(_join, _join.c.add_on_id == MenuAddOn.id)
-        .where(
-            MenuAddOn.business_id == business_id,
-            MenuAddOn.is_active.is_(True),
-            MenuAddOn.is_deleted.is_(False),
-        )
-        .order_by(MenuAddOn.sort_order, MenuAddOn.name)
-    )
-    result = await db.execute(stmt)
-    rows = result.all()
-    out: dict[str, list[dict]] = {}
-    for add_on, item_id in rows:
-        key = str(item_id)
-        out.setdefault(key, []).append({
-            "add_on_id": str(add_on.id),
-            "name": add_on.name,
-            "price_cents": add_on.price_cents,
-            "min_qty": add_on.min_qty,
-            "max_qty": add_on.max_qty,
-            "default_qty": add_on.default_qty,
-        })
-    return out
+    return _build_add_ons_map_from_items(items)
+
+
+def _build_add_ons_map_from_items(items: list) -> dict[str, list[dict]]:
+    """
+    Build {menu_item_id: [add_on_dict, ...]} from the already-loaded menu items.
+
+    Uses MenuItem.add_ons (loaded via selectin relationship by _load_menu) rather
+    than an extra DB query.  Works for both real SQLAlchemy MenuItem objects and
+    replay FakeMenuItem objects (which carry add_ons as plain dicts).
+    """
+    result: dict[str, list[dict]] = {}
+    for item in items:
+        if not getattr(item, "is_active", True) or getattr(item, "is_deleted", False):
+            continue
+        raw_add_ons = getattr(item, "add_ons", None) or []
+        ao_list: list[dict] = []
+        for ao in raw_add_ons:
+            if isinstance(ao, dict):
+                if not ao.get("is_active", True) or ao.get("is_deleted", False):
+                    continue
+                ao_list.append({
+                    "add_on_id": ao.get("add_on_id", ""),
+                    "name": ao.get("name", ""),
+                    "price_cents": int(ao.get("price_cents", 0)),
+                    "min_qty": int(ao.get("min_qty", 0)),
+                    "max_qty": int(ao.get("max_qty", 10)),
+                    "default_qty": int(ao.get("default_qty", 1)),
+                })
+            else:
+                # Real SQLAlchemy MenuAddOn object
+                if not ao.is_active or ao.is_deleted:
+                    continue
+                ao_list.append({
+                    "add_on_id": str(ao.id),
+                    "name": ao.name,
+                    "price_cents": ao.price_cents,
+                    "min_qty": ao.min_qty,
+                    "max_qty": ao.max_qty,
+                    "default_qty": ao.default_qty,
+                })
+        if ao_list:
+            result[str(getattr(item, "id", ""))] = ao_list
+    return result
 
 
 def _resolve_option_prices(item, options_dict: dict | None) -> list[dict]:
@@ -1475,6 +1512,151 @@ def _detect_ingredient_modifier_from_remove(
     return modifier_text, target_item
 
 
+def _detect_addon_addition(
+    norm_text: str,
+    cart: list[dict],
+    add_ons_map: dict[str, list[dict]],
+) -> tuple[dict, dict] | None:
+    """
+    Detect when an ORDER_ADD message targets a paid add-on for an existing cart item
+    (not a new menu item).
+
+    Returns (add_on_dict, cart_item) when:
+    - Exactly ONE available add-on name appears in the message (prevents compound matches)
+    - That add-on is not already on the target cart item
+    - The message has no remove/swap signals
+
+    Handles:
+      "Add extra patty"      → (Extra Patty, burger_item)
+      "Extra cheese please"  → (Extra Cheese, burger_item)
+      "Can I get extra shot" → (Extra Shot, latte_item)
+
+    Returns None for compound additions ("Add extra cheese and extra patty" → LLM handles)
+    or when no cart item has the named add-on available.
+    """
+    import re as _re
+    if not cart or not add_ons_map:
+        return None
+
+    msg_lower = norm_text.strip().lower()
+
+    # Skip messages with remove/swap signals — those go to LLM or other DET handlers
+    if _re.search(r"\b(remove|take\s+off|take\s+out|delete|instead\s+of|replace|swap|without)\b", msg_lower):
+        return None
+
+    candidates: list[tuple[dict, dict]] = []
+    for cart_item in cart:
+        item_id = cart_item.get("menu_item_id", "")
+        available = add_ons_map.get(item_id, [])
+        if not available:
+            continue
+        for ao in available:
+            ao_name_lower = ao["name"].lower()
+            if ao_name_lower not in msg_lower:
+                continue
+            # Already on this item — skip (idempotent)
+            existing = cart_item.get("add_ons") or []
+            if any(ea["name"].lower() == ao_name_lower for ea in existing):
+                continue
+            candidates.append((ao, cart_item))
+
+    # Multiple distinct add-ons mentioned → compound message, let LLM handle atomically
+    if len(candidates) != 1:
+        return None
+
+    ao_raw, ci = candidates[0]
+    # Ensure the ao dict has a `quantity` key (use default_qty if available, else 1)
+    ao_with_qty = {**ao_raw, "quantity": ao_raw.get("quantity") or ao_raw.get("default_qty", 1)}
+    return ao_with_qty, ci
+
+
+def _detect_addon_removal(
+    norm_text: str,
+    cart: list[dict],
+    add_ons_map: dict[str, list[dict]],
+) -> tuple[str, dict] | None:
+    """
+    Detect when an ORDER_REMOVE message targets a paid add-on on a cart item
+    rather than an entire menu item.
+
+    Handles:
+      "Remove the extra cheese"         → ("Extra Cheese", burger_cart_item)
+      "Remove extra patty"              → ("Extra Patty", burger_cart_item)
+      "Take off the soy milk"           → ("Soy Milk", latte_cart_item)
+      "Remove extra cheese from burger" → ("Extra Cheese", burger_cart_item)
+
+    Returns None for compound messages ("remove X and add Y") — those go to LLM.
+    Returns None when no cart item has a matching add-on.
+    """
+    import re as _re
+    if not cart:
+        return None
+
+    msg_lower = norm_text.strip().lower()
+
+    # Compound message early-exit: "remove X and add/give Y" — yield to LLM to
+    # handle atomically as a replace_item so both sides are applied together.
+    if _re.search(
+        r"\b(?:and\s+(?:add|give|give\s+me|include)|and\s+instead|plus\s+add)\b",
+        msg_lower,
+    ):
+        return None
+
+    _REMOVE_RE = _re.compile(
+        r"(?:remove|take\s+off|take\s+out|drop|delete)\s+(?:the\s+)?"
+        r"([\w]+(?:\s+[\w]+){0,3})",
+        _re.I,
+    )
+    m = _REMOVE_RE.search(msg_lower)
+    if not m:
+        return None
+
+    target_raw = m.group(1).strip().lower()
+    # Strip trailing "from/on/in the <item>" so "extra cheese from the burger" → "extra cheese"
+    target = _re.sub(r"\s+(?:from|on|in|for)\s+.*$", "", target_raw).strip()
+    # Strip leading/trailing stop-words
+    target = _re.sub(r"^(?:the|a|an)\s+", "", target).strip()
+
+    if not target:
+        return None
+
+    # Check every cart item's add-ons for a name match
+    for cart_item in cart:
+        cart_addons = cart_item.get("add_ons") or []
+        for ao in cart_addons:
+            ao_name_lower = ao["name"].lower()
+            if ao_name_lower in target or target in ao_name_lower:
+                return ao["name"], cart_item
+
+    # Also check the add_ons_map for available add-ons (even if not yet in cart)
+    # to distinguish "remove extra cheese" targeting an available but missing add-on
+    # from an ingredient-modifier request — in both cases we fall back to LLM.
+    return None
+
+
+def _is_reference_not_target(item_name: str, msg_lower: str) -> bool:
+    """
+    Return True if item_name appears in msg_lower preceded by a preposition
+    ("on", "from", "in", "for", "of") indicating it is the PARENT item, not
+    the thing being removed.
+
+    Example: "remove the extra cheese on the classic smash burger"
+      → "classic smash burger" is a reference → True
+
+    Example: "remove the classic smash burger"
+      → "classic smash burger" is the target → False
+    """
+    import re as _re
+    name_lower = item_name.lower()
+    idx = msg_lower.find(name_lower)
+    if idx < 0:
+        return False
+    before = msg_lower[:idx].rstrip()
+    # Strip trailing articles (the / a / an) that sit between the preposition and the item name
+    before = _re.sub(r"\s+(?:the|a|an)\s*$", "", before).rstrip()
+    return bool(_re.search(r"\b(?:on|from|in|for|of)\s*$", before))
+
+
 def _detect_quantity_modifier_split(
     msg_text: str,
     cart: list[dict],
@@ -1865,8 +2047,9 @@ async def _handle_with_llm(
         norm_text = msg_text
     categories, items = await _load_menu(db, business.id)
     specials = await _load_specials(db, business.id)
-    # Phase 8: load add-ons map once per LLM turn (lightweight — small table)
-    add_ons_map = await _load_add_ons_map(db, business.id)
+    # Phase 8: build add-ons map from the already-loaded items (uses selectin relationship,
+    # no extra DB query needed — avoids UUID key-mismatch issues with the old JOIN query).
+    add_ons_map = _load_add_ons_map(items)
     cart = state_machine.get_cart(session)
 
     # ── Deterministic size-ambiguity check (no LLM for the question) ────────
@@ -2091,6 +2274,12 @@ async def _handle_with_llm(
             _confirmed_removals = [
                 (it, qty) for it, qty in _det_no_mod
                 if it.name.lower() in _cart_names_lower
+                # Guard: skip items that appear as a REFERENCE in the message
+                # e.g. "remove extra cheese on the Classic Smash Burger" must NOT
+                # remove the burger — it is the parent item, not the removal target.
+                # Pass norm_text.lower() because _is_reference_not_target does a
+                # case-sensitive find() and norm_text may retain original casing.
+                and not _is_reference_not_target(it.name, norm_text.lower())
             ]
             if _confirmed_removals:
                 for _it, _qty in _confirmed_removals:
@@ -2133,9 +2322,52 @@ async def _handle_with_llm(
                         False, None, None, None,
                     )
 
+        _current_cart = state_machine.get_cart(session)
+
+        # ── Sub-case B2: paid add-on removal (checked BEFORE ingredient modifier) ──
+        # "Remove the extra cheese" when cart has Extra Cheese as a PAID add-on.
+        # Must fire before Sub-case B so that "cheese" (an ingredient word) doesn't
+        # accidentally get routed to the free-modifier path and append "no cheese" to
+        # special_instructions when the customer meant to remove a paid Extra Cheese.
+        # Compound messages ("remove X and add Y") return None and fall through to LLM.
+        _addon_removal = _detect_addon_removal(norm_text, _current_cart, add_ons_map)
+        if _addon_removal:
+            _ao_name, _ao_target = _addon_removal
+            _, _ao_found = state_machine.remove_addon_from_cart_item(
+                session, _ao_target["name"], _ao_name
+            )
+            if _ao_found:
+                import copy as _copy
+                _ao_updated = state_machine.get_cart(session)
+                state_machine.set_context(session, "confirmed_cart", _copy.deepcopy(_ao_updated))
+                logger.warning(
+                    "DET_ADDON_REMOVE: removed add-on %r from %r, session_id=%s",
+                    _ao_name, _ao_target["name"], session.id,
+                )
+                if _ao_updated:
+                    order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
+                    state_machine.transition_state(session, ConversationState.CONFIRMING_ORDER.value)
+                    total = state_machine.cart_total_cents(session)
+                    summary = state_machine.cart_summary_text(session, business.currency)
+                    confirm_msg = responses.ask_confirmation_response(
+                        summary, total, 0, order_mode, business.currency
+                    )
+                    if order_mode == "DELIVERY":
+                        confirm_msg += "\n_Delivery fee will be confirmed by our team._"
+                    return (
+                        f"Removed {_ao_name} ✅\n\n{confirm_msg}",
+                        False, None, None, None,
+                    )
+                else:
+                    state_machine.transition_state(session, ConversationState.IDLE.value)
+                    return (
+                        "Removed ✅ Your cart is now empty. What would you like to order?",
+                        False, None, None, None,
+                    )
+
         # ── Sub-case B: standalone ingredient phrase — modify existing cart item ──
         # e.g. "take out tomato", "take out tomato from the Classic Smash Burger"
-        _current_cart = state_machine.get_cart(session)
+        # Only fires when the target is NOT a paid add-on already handled by B2.
         _ingredient_match = _detect_ingredient_modifier_from_remove(
             norm_text, _current_cart, _menu_item_names
         )
@@ -2358,6 +2590,49 @@ async def _handle_with_llm(
             parts.append("\n" + confirm_msg)
             return ("\n".join(parts), False, None, None, None)
 
+    # ── DET: add paid add-on to existing cart item in CONFIRMING_ORDER ──────────
+    # "Add extra patty" → no menu item found above, but Extra Patty is an available
+    # add-on for the burger in the cart → add it directly without going to LLM.
+    # Fires for ORDER_ADD/ORDER_START in CONFIRMING_ORDER when exactly ONE add-on
+    # name is mentioned (compound "add X and Y" still falls through to LLM).
+    if (
+        intent in (MessageIntent.ORDER_ADD, MessageIntent.ORDER_START)
+        and session.state == ConversationState.CONFIRMING_ORDER.value
+    ):
+        _ao_add = _detect_addon_addition(
+            norm_text, state_machine.get_cart(session), add_ons_map
+        )
+        if _ao_add:
+            _new_ao, _ao_add_target = _ao_add
+            _, _ao_added = state_machine.add_addon_to_cart_item(
+                session, _ao_add_target["name"], _new_ao
+            )
+            if _ao_added:
+                import copy as _copy
+                _ao_add_updated = state_machine.get_cart(session)
+                state_machine.set_context(
+                    session, "confirmed_cart", _copy.deepcopy(_ao_add_updated)
+                )
+                logger.warning(
+                    "DET_ADDON_ADD: added add-on %r to %r, session_id=%s",
+                    _new_ao["name"], _ao_add_target["name"], session.id,
+                )
+                order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
+                state_machine.transition_state(
+                    session, ConversationState.CONFIRMING_ORDER.value
+                )
+                total = state_machine.cart_total_cents(session)
+                summary = state_machine.cart_summary_text(session, business.currency)
+                confirm_msg = responses.ask_confirmation_response(
+                    summary, total, 0, order_mode, business.currency
+                )
+                if order_mode == "DELIVERY":
+                    confirm_msg += "\n_Delivery fee will be confirmed by our team._"
+                return (
+                    f"Added {_new_ao['name']} ✅\n\n{confirm_msg}",
+                    False, None, None, None,
+                )
+
     # ── Deterministic modifier-only update (e.g. "Add extra cheese to the burger") ──
     # Fires when ORDER_ADD is in CONFIRMING_ORDER, no new menu item was matched
     # by the extraction above, but the message references an existing cart item.
@@ -2569,13 +2844,25 @@ async def _handle_with_llm(
                     new_item = sorted(candidates, reverse=True)[0][1]
             if new_item:
                 safe_qty = max(1, min(int(pi.quantity or 1), 20))
+                # Phase 8: resolve priced options and add-ons for the replacement item.
+                # This handles add-on modifications (same item, different add_ons list)
+                # as well as genuine item swaps with options.
+                sel_opts = _resolve_option_prices(new_item, pi.options)
+                res_add_ons = _resolve_add_ons(new_item, pi.add_ons, add_ons_map)
                 state_machine.add_to_cart(
                     session, str(new_item.id), new_item.name,
                     new_item.price_cents, safe_qty,
+                    selected_options=sel_opts,
+                    add_ons=res_add_ons,
                     options=pi.options if pi.options else None,
                     special_instructions=pi.special_instructions,
                 )
-                replaced.append(f"{remove_name} → {new_item.name}")
+                label = new_item.name
+                if sel_opts:
+                    label += f" ({', '.join(o['option_name'] for o in sel_opts)})"
+                if res_add_ons:
+                    label += " [" + ", ".join(f"+{a['name']}" for a in res_add_ons) + "]"
+                replaced.append(f"{remove_name} → {label}")
             else:
                 if was_removed and remove_name:
                     orig = items_map.get(remove_name.lower())
@@ -3718,6 +4005,7 @@ async def _load_menu(
             MenuItem.is_active.is_(True),
             MenuItem.is_deleted.is_(False),
         )
+        .options(selectinload(MenuItem.add_ons))
         .order_by(MenuItem.sort_order)
     )
     return list(cats_result.scalars().all()), list(items_result.scalars().all())

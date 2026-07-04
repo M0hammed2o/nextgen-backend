@@ -314,6 +314,91 @@ def remove_modifier_from_instructions(
     return cart, False
 
 
+def remove_addon_from_cart_item(
+    session: ConversationSession,
+    item_name: str,
+    addon_name: str,
+) -> tuple[list[dict], bool]:
+    """
+    Remove a specific paid add-on from a cart item by name (fuzzy match on both).
+    Reprices the cart item after removal.
+
+    Returns (updated_cart, was_found).
+    """
+    from shared.pricing.engine import calculate_line_item
+
+    cart = get_cart(session)
+    item_name_lower = item_name.lower().strip()
+    addon_name_lower = addon_name.lower().strip()
+
+    for item in cart:
+        cart_name_lower = item["name"].lower()
+        if item_name_lower not in cart_name_lower and cart_name_lower not in item_name_lower:
+            continue
+        current_addons = list(item.get("add_ons") or [])
+        new_addons = [ao for ao in current_addons if addon_name_lower not in ao["name"].lower()]
+        if len(new_addons) == len(current_addons):
+            return cart, False  # add-on not present on this item
+        item["add_ons"] = new_addons
+        breakdown = calculate_line_item(
+            item.get("base_price_cents") or item["price_cents"],
+            item.get("selected_options") or [],
+            new_addons,
+            item["quantity"],
+        )
+        item["price_cents"] = breakdown.unit_price_cents
+        item["unit_price_cents"] = breakdown.unit_price_cents
+        item["add_on_total_cents"] = breakdown.add_on_total_cents
+        item["line_total_cents"] = breakdown.line_total_cents
+        set_cart(session, cart)
+        return cart, True
+
+    return cart, False
+
+
+def add_addon_to_cart_item(
+    session: ConversationSession,
+    item_name: str,
+    addon: dict,
+) -> tuple[list[dict], bool]:
+    """
+    Add a specific paid add-on to a cart item (fuzzy match on item name).
+    Skips duplicates (by name). Reprices after addition.
+
+    addon must contain: {"add_on_id", "name", "price_cents", "quantity"}
+    Returns (updated_cart, was_found).
+    """
+    from shared.pricing.engine import calculate_line_item
+
+    cart = get_cart(session)
+    item_name_lower = item_name.lower().strip()
+    addon_name_lower = addon["name"].lower()
+
+    for item in cart:
+        cart_name_lower = item["name"].lower()
+        if item_name_lower not in cart_name_lower and cart_name_lower not in item_name_lower:
+            continue
+        current_addons = list(item.get("add_ons") or [])
+        if any(ao["name"].lower() == addon_name_lower for ao in current_addons):
+            return cart, True  # already present — no-op
+        current_addons.append(addon)
+        item["add_ons"] = current_addons
+        breakdown = calculate_line_item(
+            item.get("base_price_cents") or item["price_cents"],
+            item.get("selected_options") or [],
+            current_addons,
+            item["quantity"],
+        )
+        item["price_cents"] = breakdown.unit_price_cents
+        item["unit_price_cents"] = breakdown.unit_price_cents
+        item["add_on_total_cents"] = breakdown.add_on_total_cents
+        item["line_total_cents"] = breakdown.line_total_cents
+        set_cart(session, cart)
+        return cart, True
+
+    return cart, False
+
+
 def clear_cart(session: ConversationSession) -> None:
     """Clear cart, confirmed_cart, and all order-specific context so the next
     order starts completely fresh. Customer name/phone are kept to avoid

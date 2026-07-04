@@ -1,22 +1,32 @@
 {
   "id": "conv_043",
-  "title": "Confirmation negation — No then edit, then confirm",
+  "title": "Confirmation \u2014 Wait then add, then confirm",
   "category": "confirmation",
-  "tags": ["deterministic", "negation", "edit_after_confirm"],
-
+  "tags": [
+    "deterministic",
+    "negation",
+    "edit_after_confirm"
+  ],
   "turns": [
     {
       "message": "Can I get a Classic Smash Burger",
       "expect": {
         "state": "CONFIRMING_ORDER",
-        "cart": [{"name": "Classic Smash Burger", "quantity": 1}]
+        "cart": [
+          {
+            "name": "Classic Smash Burger",
+            "quantity": 1
+          }
+        ]
       }
     },
     {
-      "message": "No",
+      "message": "Wait",
       "expect": {
         "state": "BUILDING_CART",
-        "response_contains": ["change"]
+        "response_contains": [
+          "change"
+        ]
       }
     },
     {
@@ -24,33 +34,52 @@
       "expect": {
         "state": "CONFIRMING_ORDER",
         "cart": [
-          {"name": "Classic Smash Burger", "quantity": 1},
-          {"name": "Coca-Cola (330ml)", "quantity": 1}
+          {
+            "name": "Classic Smash Burger",
+            "quantity": 1
+          },
+          {
+            "name": "Coca-Cola (330ml)",
+            "quantity": 1
+          }
         ]
       }
     },
     {
       "message": "That's it",
-      "expect": {"state": "CHOOSING_ORDER_MODE"}
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
     },
     {
       "message": "Pickup",
-      "expect": {"state": "COLLECTING_DETAILS"}
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
     },
     {
       "message": "Phindi",
-      "expect": {"state": "COLLECTING_DETAILS"}
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
     },
     {
       "message": "0720000017",
-      "expect": {"state": "ORDER_PLACED"}
+      "expect": {
+        "state": "ORDER_PLACED"
+      }
     }
   ],
-
   "final_order": {
     "items": [
-      {"name": "Classic Smash Burger", "quantity": 1},
-      {"name": "Coca-Cola (330ml)", "quantity": 1}
+      {
+        "name": "Classic Smash Burger",
+        "quantity": 1
+      },
+      {
+        "name": "Coca-Cola (330ml)",
+        "quantity": 1
+      }
     ],
     "subtotal_cents": 9500,
     "total_cents": 9500,

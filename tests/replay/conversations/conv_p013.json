@@ -1,0 +1,52 @@
+{
+  "id": "conv_p013",
+  "title": "Modifier editing — Test 3: Plain burger then Add Extra Patty via DET",
+  "category": "pricing",
+  "tags": ["pricing", "add_on", "addon_add", "det", "modifier_editing"],
+
+  "notes": "Order plain Loaded Smash Burger via DET (R75). Then say 'Add extra patty' — DET_ADDON_ADD handler fires, adds Extra Patty (+R25) to the existing cart item without creating a duplicate. Final price R100. Parent item must not duplicate or disappear.",
+
+  "menu": ["Loaded Smash Burger", "Coca-Cola (330ml)"],
+
+  "turns": [
+    {
+      "message": "Can I get a Loaded Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Loaded Smash Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Add an extra patty",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Loaded Smash Burger", "quantity": 1}],
+        "response_contains": ["extra patty"]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Zanele",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0823456789",
+      "expect": {"state": "ORDER_PLACED", "cart": []}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Loaded Smash Burger", "quantity": 1}],
+    "subtotal_cents": 10000,
+    "total_cents": 10000,
+    "order_mode": "PICKUP",
+    "customer_name": "Zanele"
+  }
+}

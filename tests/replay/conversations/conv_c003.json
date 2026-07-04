@@ -1,0 +1,61 @@
+{
+  "id": "conv_c003",
+  "title": "Cancel regression — multi-item order cleared on 'Nah'",
+  "category": "cancel_restart",
+  "tags": ["deterministic", "cancel", "negate", "cart_clear", "multi_item"],
+
+  "notes": "Customer orders two items (CSB + Ice Coffee) then says 'Nah'. Both items must be cleared. Fresh order of a single Spicy Chicken Burger should contain only that item.",
+
+  "turns": [
+    {
+      "message": "Can I get a Classic Smash Burger and an Ice Coffee",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Classic Smash Burger", "quantity": 1},
+          {"name": "Ice Coffee", "quantity": 1}
+        ]
+      }
+    },
+    {
+      "message": "Nah",
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_contains": ["cancelled"]
+      }
+    },
+    {
+      "message": "Give me a Spicy Chicken Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Spicy Chicken Burger", "quantity": 1}],
+        "response_contains": ["spicy chicken burger"]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Zanele",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0829876543",
+      "expect": {"state": "ORDER_PLACED", "cart": []}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Spicy Chicken Burger", "quantity": 1}],
+    "subtotal_cents": 8000,
+    "total_cents": 8000,
+    "order_mode": "PICKUP",
+    "customer_name": "Zanele"
+  }
+}

@@ -1,0 +1,58 @@
+{
+  "id": "conv_c001",
+  "title": "Cancel regression — 'Actually no.' must clear cart before new order",
+  "category": "cancel_restart",
+  "tags": ["deterministic", "cancel", "negate", "cart_clear", "regression"],
+
+  "notes": "Exact reproduction of the live WhatsApp bug. Customer orders Classic Smash Burger, then says 'Actually no.' — the cart must be completely cleared before the Grilled Chicken Burger is ordered. Without the fix, both items appear in the cart (R160). With the fix, only Grilled Chicken Burger (R85).",
+
+  "turns": [
+    {
+      "message": "Can I get a Classic Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Actually no.",
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_contains": ["cancelled"]
+      }
+    },
+    {
+      "message": "Give me a Grilled Chicken Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Grilled Chicken Burger", "quantity": 1}],
+        "response_contains": ["grilled chicken burger"]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Mohammed",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0837866021",
+      "expect": {"state": "ORDER_PLACED", "cart": []}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Grilled Chicken Burger", "quantity": 1}],
+    "subtotal_cents": 8500,
+    "total_cents": 8500,
+    "order_mode": "PICKUP",
+    "customer_name": "Mohammed"
+  }
+}

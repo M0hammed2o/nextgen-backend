@@ -24,7 +24,11 @@
     {
       "message": "Nah",
       "expect": {
-        "state": "BUILDING_CART"
+        "state": "IDLE",
+        "cart": [],
+        "response_contains": [
+          "cancelled"
+        ]
       }
     },
     {

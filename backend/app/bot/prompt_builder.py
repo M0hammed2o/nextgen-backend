@@ -89,11 +89,30 @@ ACTION must be one of:
   special_instructions. NEVER use remove_item for ingredient changes.
   Examples: "burger without tomato" → add_ons=[], special_instructions="no tomato"
             "chips with extra salt"  → add_ons=[], special_instructions="extra salt"
-- "remove_item" — customer wants to remove an ENTIRE ITEM from the cart (e.g. "take off the burger",
-  "I don't want the chips anymore", "cancel the pizza"). items = [{{"name": "item to remove"}}]
-  NEVER use remove_item for ingredient modifications — "remove the tomato from my burger" means
-  special_instructions="no tomato" on an add_items action, NOT remove_item.
-- "replace_item" — customer wants to swap one item for another (e.g. "change my Coke to a Sprite", "replace chips with cheesy chips"). items = [{{"remove": "exact name to remove", "add": "exact name to add", "quantity": 1, "options": {{}}, "special_instructions": ""}}]
+- "remove_item" — customer wants to remove an entire item from the cart (the whole menu item, e.g.
+  "take off the burger", "I don't want the chips anymore", "cancel the pizza").
+  items = [{{"name": "item to remove"}}]
+  NEVER use remove_item when the customer only wants to remove an add-on or ingredient modifier.
+  "remove the extra cheese" or "remove the soy milk" → use replace_item, NOT remove_item.
+- "replace_item" — TWO uses:
+  1. Swap one item for another: "change my Coke to a Sprite", "replace chips with cheesy chips"
+  2. Modify add-ons or options on an existing cart item (remove/add/swap an add-on or milk choice)
+  items = [{{"remove": "exact item name", "add": "exact item name", "quantity": 1,
+             "options": {{}}, "add_ons": [<COMPLETE updated add-ons list>], "special_instructions": ""}}]
+  ADD-ON MODIFICATION RULES:
+  - Set "remove" and "add" to the SAME item name (the parent item stays in the cart).
+  - "add_ons" must contain the COMPLETE final list of add-ons AFTER the change (not just the delta).
+  - Always preserve any existing special_instructions that are not being changed.
+  - Look at the Current Cart section above to see what add-ons the item already has.
+  Examples (cart has: 1× Classic Smash Burger with ✦ Extra Cheese +R10):
+    "remove extra cheese"
+    → {{"remove":"Classic Smash Burger","add":"Classic Smash Burger","add_ons":[],"special_instructions":""}}
+    "replace extra cheese with extra patty"
+    → {{"remove":"Classic Smash Burger","add":"Classic Smash Burger","add_ons":[{{"name":"Extra Patty","quantity":1}}]}}
+    "change soy milk to oat milk" (cart has: 1× Latte with ✦ Soy Milk)
+    → {{"remove":"Latte","add":"Latte","options":{{"Milk":"Oat Milk"}},"add_ons":[]}}
+    "change oat milk back to full cream"
+    → {{"remove":"Latte","add":"Latte","options":{{"Milk":"Full Cream"}},"add_ons":[]}}
 - "recommend_items" — you are recommending a specific item the customer should try.
   items = [{{"name": "exact menu item name", "quantity": 1, "options": {{}}, "special_instructions": ""}}]
   Recommend ONE item at a time in your message. Do NOT use "X or Y" phrasing — if you want to offer
@@ -294,13 +313,23 @@ def _format_specials_for_prompt(specials: list[Special]) -> str:
 
 
 def _format_cart_for_prompt(cart: list[dict], currency: str) -> str:
-    """Format current cart for the prompt context."""
+    """
+    Format current cart for the prompt context.
+    Shows add-ons and free modifiers so the LLM knows exactly what's in the cart
+    and can correctly apply replace_item when modifying add-ons.
+    """
     if not cart:
         return ""
     lines = []
     for item in cart:
         price = format_currency(item["line_total_cents"], currency)
         lines.append(f"  {item['quantity']}x {item['name']} = {price}")
+        for ao in (item.get("add_ons") or []):
+            ao_qty = ao.get("quantity", 1)
+            qty_str = f" ×{ao_qty}" if ao_qty > 1 else ""
+            lines.append(f"      ✦ {ao['name']}{qty_str} (+{format_currency(ao['price_cents'] * ao_qty, currency)})")
+        if item.get("special_instructions"):
+            lines.append(f"      📝 {item['special_instructions']}")
     total = sum(i["line_total_cents"] for i in cart)
     lines.append(f"  Subtotal: {format_currency(total, currency)}")
     return "\n".join(lines)
@@ -363,10 +392,19 @@ def _format_state_rules(conversation_state: str) -> str:
         return (
             "The customer is currently reviewing their order (CONFIRMING_ORDER).\n"
             "- If they say YES / confirm → use \"confirm_order\"\n"
-            "- If they want to ADD more items → you MUST use \"add_items\". NEVER use \"chitchat\" for an add request.\n"
-            "- If they want to REMOVE an item → you MUST use \"remove_item\". NEVER use \"chitchat\" for a remove request.\n"
-            "- If they want to SWAP an item → you MUST use \"replace_item\".\n"
-            "- Never summarise the cart in a chitchat message — always use the correct action."
+            "- If they say NO / cancel / don't want this / actually no / never mind / start over\n"
+            "  → use \"cancel_order\". This clears the cart so the customer can start fresh.\n"
+            "- If they want to ADD a NEW menu item (e.g. \"also give me chips\", \"add a Coke\") → use \"add_items\".\n"
+            "- If they want to ADD a paid add-on to an EXISTING cart item (e.g. \"add extra patty\",\n"
+            "  \"extra cheese please\", \"add bacon\") → use \"replace_item\" with remove=add=the existing item name\n"
+            "  and add_ons containing the COMPLETE final list (existing add-ons + the new one).\n"
+            "  Example: cart has 1× Burger (no add-ons). Customer says \"add extra patty\".\n"
+            "  → {\"remove\":\"Loaded Smash Burger\",\"add\":\"Loaded Smash Burger\",\"add_ons\":[{\"name\":\"Extra Patty\",\"quantity\":1}]}\n"
+            "- If they want to REMOVE a whole menu item → use \"remove_item\".\n"
+            "  If they want to REMOVE a paid add-on → use \"replace_item\" (NEVER \"remove_item\" for add-ons).\n"
+            "- If they want to SWAP or CHANGE something → use \"replace_item\".\n"
+            "- NEVER use \"chitchat\" for add/remove/change/cancel requests — always use the correct action.\n"
+            "- Never summarise the cart in a chitchat message — the system builds all order summaries."
         )
     return ""
 

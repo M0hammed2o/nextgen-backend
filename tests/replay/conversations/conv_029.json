@@ -1,48 +1,74 @@
 {
   "id": "conv_029",
-  "title": "Two items same name accumulates quantity",
+  "title": "Two items same name accumulates quantity \u2014 Wait then add",
   "category": "basic_ordering",
-  "tags": ["deterministic", "quantity_accumulation"],
-
+  "tags": [
+    "deterministic",
+    "quantity_accumulation"
+  ],
   "turns": [
     {
       "message": "Can I get a Classic Smash Burger",
       "expect": {
         "state": "CONFIRMING_ORDER",
-        "cart": [{"name": "Classic Smash Burger", "quantity": 1}]
+        "cart": [
+          {
+            "name": "Classic Smash Burger",
+            "quantity": 1
+          }
+        ]
       }
     },
     {
-      "message": "No",
-      "expect": {"state": "BUILDING_CART"}
+      "message": "Wait",
+      "expect": {
+        "state": "BUILDING_CART"
+      }
     },
     {
       "message": "Add a Classic Smash Burger",
       "expect": {
         "state": "CONFIRMING_ORDER",
-        "cart": [{"name": "Classic Smash Burger", "quantity": 2}]
+        "cart": [
+          {
+            "name": "Classic Smash Burger",
+            "quantity": 2
+          }
+        ]
       }
     },
     {
       "message": "Yes",
-      "expect": {"state": "CHOOSING_ORDER_MODE"}
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
     },
     {
       "message": "Pickup",
-      "expect": {"state": "COLLECTING_DETAILS"}
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
     },
     {
       "message": "Thandi",
-      "expect": {"state": "COLLECTING_DETAILS"}
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
     },
     {
       "message": "0710000005",
-      "expect": {"state": "ORDER_PLACED"}
+      "expect": {
+        "state": "ORDER_PLACED"
+      }
     }
   ],
-
   "final_order": {
-    "items": [{"name": "Classic Smash Burger", "quantity": 2}],
+    "items": [
+      {
+        "name": "Classic Smash Burger",
+        "quantity": 2
+      }
+    ],
     "subtotal_cents": 15000,
     "total_cents": 15000,
     "order_mode": "PICKUP"

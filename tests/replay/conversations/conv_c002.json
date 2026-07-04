@@ -1,0 +1,57 @@
+{
+  "id": "conv_c002",
+  "title": "Cancel regression — bare 'No' must clear cart, not accumulate",
+  "category": "cancel_restart",
+  "tags": ["deterministic", "cancel", "negate", "cart_clear"],
+
+  "notes": "Customer orders Classic Smash Burger then says bare 'No'. Without the fix the cart stays and a second order of the same item produces 2x in the cart. With the fix, 'No' clears the cart and the re-order produces exactly 1x.",
+
+  "turns": [
+    {
+      "message": "Can I get a Classic Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "No",
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_contains": ["cancelled"]
+      }
+    },
+    {
+      "message": "Can I get a Classic Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Thabo",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0821234567",
+      "expect": {"state": "ORDER_PLACED", "cart": []}
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Classic Smash Burger", "quantity": 1}],
+    "subtotal_cents": 7500,
+    "total_cents": 7500,
+    "order_mode": "PICKUP",
+    "customer_name": "Thabo"
+  }
+}

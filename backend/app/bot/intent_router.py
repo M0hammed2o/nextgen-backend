@@ -228,12 +228,57 @@ def is_confirmation(text: str) -> bool:
 
 
 def is_negation(text: str) -> bool:
-    """Check if a message is a clear no/negation."""
+    """
+    Check if a message is a clear no/cancellation of the current order.
+
+    In CONFIRMING_ORDER this clears the cart and resets to IDLE so any
+    subsequent order starts completely fresh (no old items accumulate).
+
+    Catches bare negations ("no", "nah") and compound forms ("actually no",
+    "no thanks").  Intentionally EXCLUDES pause words ("wait", "not yet",
+    "hold on") — those are handled by is_pause() which keeps the cart.
+
+    Does NOT match messages with embedded ordering intent ("No, give me a
+    coke" → falls through to LLM which picks add_items or replace_item).
+    """
     negations = re.compile(
-        r"^(no|nah|nope|not\s+yet|not\s+now|wait|hold\s+on|actually|"
-        r"cancel\s+that|scratch\s+that|never\s+mind|nevermind)\s*[,!.]*$", re.I
+        r"^("
+        # Bare core negations
+        r"no|nah|nope|"
+        # Pause/hold signals (also negations for delivery fee flow)
+        r"not\s+yet|not\s+now|wait|hold\s+on|"
+        # "actually" alone OR compound forms
+        r"actually|actually\s+no|no\s+actually|"
+        # "no" + polite/SA trailing words
+        r"no\s+(thanks|thank\s+you|please|ta|man|bru|way|chance|more)|"
+        # "nah" + polite/SA trailing words
+        r"nah\s+(thanks|thank\s+you|please|man|bru)|"
+        # Explicit cancel phrases
+        r"cancel\s+that|scratch\s+that|never\s+mind|nevermind"
+        r")\s*[,!.?]*$",
+        re.I,
     )
     return bool(negations.match(text.strip()))
+
+
+def is_pause(text: str) -> bool:
+    """
+    Check if a message is a PAUSE signal — customer wants to reconsider or
+    make a small change without cancelling.
+
+    In CONFIRMING_ORDER the cart is kept and state goes to BUILDING_CART so
+    the customer can add/remove items before re-confirming.
+
+    Examples: "wait", "hold on", "not yet", "not now", "one sec"
+    """
+    pauses = re.compile(
+        r"^("
+        r"wait|hold\s+on|not\s+yet|not\s+now|"
+        r"one\s+(sec|second|mo|moment)|just\s+a\s+(sec|moment)|hang\s+on"
+        r")\s*[,!.?]*$",
+        re.I,
+    )
+    return bool(pauses.match(text.strip()))
 
 
 def is_recommendation_acceptance(text: str) -> bool:
