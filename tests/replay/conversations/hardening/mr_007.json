@@ -1,0 +1,96 @@
+{
+  "id": "mr_007",
+  "title": "Modifier replace \u2014 Remove extra cheese via DET Sub-case B2",
+  "category": "modifier_replace",
+  "tags": [
+    "det",
+    "addon_remove",
+    "cart_integrity",
+    "pricing"
+  ],
+  "notes": "LSB + Extra Cheese (R85). 'Remove the extra cheese' \u2014 DET Sub-case B2. Final: LSB only (R75). Burger MUST survive.",
+  "turns": [
+    {
+      "message": "Loaded Smash Burger with extra cheese",
+      "llm": {
+        "action": "add_items",
+        "message": "LSB with Extra Cheese R85 done!",
+        "items": [
+          {
+            "name": "Loaded Smash Burger",
+            "quantity": 1,
+            "options": {},
+            "add_ons": [
+              {
+                "name": "Extra Cheese",
+                "quantity": 1
+              }
+            ],
+            "special_instructions": ""
+          }
+        ]
+      },
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Loaded Smash Burger",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "Remove the extra cheese",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Loaded Smash Burger",
+            "quantity": 1
+          }
+        ],
+        "response_contains": [
+          "removed"
+        ]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Siphamandla",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0845678901",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Loaded Smash Burger",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 7500,
+    "total_cents": 7500,
+    "order_mode": "PICKUP",
+    "customer_name": "Siphamandla"
+  }
+}

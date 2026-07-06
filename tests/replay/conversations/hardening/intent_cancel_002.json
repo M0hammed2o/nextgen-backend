@@ -1,0 +1,35 @@
+{
+  "id": "ic_002",
+  "title": "ORDER_CANCEL \u2014 'Start over' clears cart",
+  "category": "intent_hardening",
+  "tags": [
+    "deterministic",
+    "order_cancel",
+    "cart_cleared"
+  ],
+  "notes": "'Start over' is an ORDER_CANCEL signal. Via: keyword. Cart must be completely cleared and state must be IDLE. Critical invariant: if the response says the order is cancelled, cart MUST be empty.",
+  "turns": [
+    {
+      "message": "Can I get a Classic Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Classic Smash Burger",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "Start over",
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_contains": [
+          "cancel"
+        ]
+      }
+    }
+  ]
+}

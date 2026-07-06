@@ -1,0 +1,78 @@
+{
+  "id": "mr_003",
+  "title": "Modifier replace \u2014 Upgrade burger (conversational item swap)",
+  "category": "modifier_replace",
+  "tags": [
+    "det",
+    "order_edit",
+    "item_swap",
+    "conversational"
+  ],
+  "notes": "CSB in cart. Customer says 'Actually make it a Double Smash Burger'. Pipeline triggers CART_CORRECTION (ORDER_EDIT) — clears cart and rebuilds via DET. Final: only DSB. No duplicate burger. No LLM needed.",
+  "turns": [
+    {
+      "message": "Can I get a Classic Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Classic Smash Burger",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "Actually make it a Double Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Double Smash Burger",
+            "quantity": 1
+          }
+        ],
+        "response_contains": [
+          "double smash burger"
+        ]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Kabelo",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0824567890",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Double Smash Burger",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 9500,
+    "total_cents": 9500,
+    "order_mode": "PICKUP",
+    "customer_name": "Kabelo"
+  }
+}

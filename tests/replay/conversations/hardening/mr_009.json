@@ -1,0 +1,81 @@
+{
+  "id": "mr_009",
+  "title": "Modifier replace \u2014 Remove Coke from cart, burger survives",
+  "category": "modifier_replace",
+  "tags": [
+    "det",
+    "item_remove",
+    "cart_integrity"
+  ],
+  "notes": "CSB + Coke. 'Remove the Coke' \u2014 DET Sub-case A2. CSB must remain. Exactly 1 item after removal.",
+  "turns": [
+    {
+      "message": "Can I get a Classic Smash Burger and a Coke",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Classic Smash Burger",
+            "quantity": 1
+          },
+          {
+            "name": "Coca-Cola (330ml)",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "Remove the Coke",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Classic Smash Burger",
+            "quantity": 1
+          }
+        ],
+        "response_contains": [
+          "removed"
+        ]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Thandeka",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0878901234",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Classic Smash Burger",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 7500,
+    "total_cents": 7500,
+    "order_mode": "PICKUP",
+    "customer_name": "Thandeka"
+  }
+}

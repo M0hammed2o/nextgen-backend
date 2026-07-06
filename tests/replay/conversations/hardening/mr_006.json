@@ -1,0 +1,78 @@
+{
+  "id": "mr_006",
+  "title": "Modifier replace \u2014 Add extra cheese via DET in CONFIRMING_ORDER",
+  "category": "modifier_replace",
+  "tags": [
+    "det",
+    "addon_add",
+    "cart_integrity",
+    "pricing"
+  ],
+  "notes": "Plain LSB (R75). 'Extra cheese please' in CONFIRMING_ORDER. DET_ADDON_ADD fires. Total R85.",
+  "turns": [
+    {
+      "message": "Can I get a Loaded Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Loaded Smash Burger",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "Extra cheese please",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Loaded Smash Burger",
+            "quantity": 1
+          }
+        ],
+        "response_contains": [
+          "extra cheese"
+        ]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Noxolo",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0856789012",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Loaded Smash Burger",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 8500,
+    "total_cents": 8500,
+    "order_mode": "PICKUP",
+    "customer_name": "Noxolo"
+  }
+}

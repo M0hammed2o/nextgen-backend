@@ -1,0 +1,101 @@
+{
+  "id": "mr_008",
+  "title": "Modifier replace \u2014 Remove one of two add-ons (other must survive)",
+  "category": "modifier_replace",
+  "tags": [
+    "det",
+    "addon_remove",
+    "multi_addon",
+    "cart_integrity",
+    "pricing"
+  ],
+  "notes": "LSB + Extra Cheese + Extra Patty (R110). Remove only Extra Cheese. Final: LSB + Extra Patty (R100). Patty MUST survive.",
+  "turns": [
+    {
+      "message": "Loaded Smash Burger with extra cheese and extra patty",
+      "llm": {
+        "action": "add_items",
+        "message": "LSB with Extra Cheese and Extra Patty R110 done!",
+        "items": [
+          {
+            "name": "Loaded Smash Burger",
+            "quantity": 1,
+            "options": {},
+            "add_ons": [
+              {
+                "name": "Extra Cheese",
+                "quantity": 1
+              },
+              {
+                "name": "Extra Patty",
+                "quantity": 1
+              }
+            ],
+            "special_instructions": ""
+          }
+        ]
+      },
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Loaded Smash Burger",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "Remove extra cheese",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Loaded Smash Burger",
+            "quantity": 1
+          }
+        ],
+        "response_contains": [
+          "removed"
+        ]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Andile",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0867890123",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Loaded Smash Burger",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 10000,
+    "total_cents": 10000,
+    "order_mode": "PICKUP",
+    "customer_name": "Andile"
+  }
+}

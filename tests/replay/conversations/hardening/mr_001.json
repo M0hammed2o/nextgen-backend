@@ -1,0 +1,104 @@
+{
+  "id": "mr_001",
+  "title": "Modifier replace \u2014 Change Sprite to Coke (item swap)",
+  "category": "modifier_replace",
+  "tags": [
+    "llm",
+    "replace_item",
+    "item_swap",
+    "cart_integrity"
+  ],
+  "notes": "CSB and Sprite in cart. Customer swaps Sprite for Coke. Cart must have CSB + Coke only.",
+  "turns": [
+    {
+      "message": "Can I get a Classic Smash Burger and a Sprite",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Classic Smash Burger",
+            "quantity": 1
+          },
+          {
+            "name": "Sprite (330ml)",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "Change the Sprite to a Coke",
+      "llm": {
+        "action": "replace_item",
+        "message": "Swapped Sprite for Coca-Cola done!",
+        "items": [
+          {
+            "remove": "Sprite (330ml)",
+            "add": "Coca-Cola (330ml)",
+            "quantity": 1,
+            "options": {},
+            "add_ons": [],
+            "special_instructions": ""
+          }
+        ]
+      },
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Classic Smash Burger",
+            "quantity": 1
+          },
+          {
+            "name": "Coca-Cola (330ml)",
+            "quantity": 1
+          }
+        ],
+        "response_contains": [
+          "coca-cola"
+        ]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Thabo",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0821234567",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Classic Smash Burger",
+        "quantity": 1
+      },
+      {
+        "name": "Coca-Cola (330ml)",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 9500,
+    "total_cents": 9500,
+    "order_mode": "PICKUP",
+    "customer_name": "Thabo"
+  }
+}

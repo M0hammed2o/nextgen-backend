@@ -1,0 +1,104 @@
+{
+  "id": "mr_002",
+  "title": "Modifier replace \u2014 Swap Chips for Onion Rings",
+  "category": "modifier_replace",
+  "tags": [
+    "llm",
+    "replace_item",
+    "item_swap",
+    "cart_integrity"
+  ],
+  "notes": "CSB + Chips. Customer swaps Chips for Onion Rings. Final: CSB + Onion Rings. Subtotal R75+R30=R105.",
+  "turns": [
+    {
+      "message": "Can I get a Classic Smash Burger and Chips",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Classic Smash Burger",
+            "quantity": 1
+          },
+          {
+            "name": "Chips",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "Swap the Chips for Onion Rings",
+      "llm": {
+        "action": "replace_item",
+        "message": "Swapped Chips for Onion Rings done!",
+        "items": [
+          {
+            "remove": "Chips",
+            "add": "Onion Rings",
+            "quantity": 1,
+            "options": {},
+            "add_ons": [],
+            "special_instructions": ""
+          }
+        ]
+      },
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Classic Smash Burger",
+            "quantity": 1
+          },
+          {
+            "name": "Onion Rings",
+            "quantity": 1
+          }
+        ],
+        "response_contains": [
+          "onion rings"
+        ]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Zanele",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0829876543",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Classic Smash Burger",
+        "quantity": 1
+      },
+      {
+        "name": "Onion Rings",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 10500,
+    "total_cents": 10500,
+    "order_mode": "PICKUP",
+    "customer_name": "Zanele"
+  }
+}

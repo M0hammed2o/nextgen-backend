@@ -1,0 +1,40 @@
+{
+  "id": "ie_006",
+  "title": "ORDER_EDIT \u2014 'No bru' keeps cart",
+  "category": "intent_hardening",
+  "tags": [
+    "deterministic",
+    "order_edit",
+    "cart_preserved"
+  ],
+  "notes": "'No bru' is an ORDER_EDIT signal \u2014 cart must be preserved and state goes to BUILDING_CART. SA slang for \"no thanks\". Customer then removes the Coke to verify the burger was preserved.",
+  "turns": [
+    {
+      "message": "Can I get a Classic Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Classic Smash Burger",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "No bru",
+      "expect": {
+        "state": "BUILDING_CART",
+        "cart": [
+          {
+            "name": "Classic Smash Burger",
+            "quantity": 1
+          }
+        ],
+        "response_contains": [
+          "change"
+        ]
+      }
+    }
+  ]
+}

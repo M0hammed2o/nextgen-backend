@@ -1,0 +1,35 @@
+{
+  "id": "ic_009",
+  "title": "ORDER_CANCEL \u2014 \"I don't want it anymore\" clears cart",
+  "category": "intent_hardening",
+  "tags": [
+    "deterministic",
+    "order_cancel",
+    "cart_cleared"
+  ],
+  "notes": "\"I don't want it anymore\" is an ORDER_CANCEL signal. Via: is_order_cancel. Cart must be completely cleared and state must be IDLE. Critical invariant: if the response says the order is cancelled, cart MUST be empty. (is_order_cancel path)",
+  "turns": [
+    {
+      "message": "Can I get a Classic Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Classic Smash Burger",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "I don't want it anymore",
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_contains": [
+          "cancel"
+        ]
+      }
+    }
+  ]
+}
