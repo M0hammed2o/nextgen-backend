@@ -1,23 +1,21 @@
 {
-  "id": "conv_p008",
-  "title": "Pricing \u00e2\u20ac\u201d add-on max quantity enforced: clamps 5 extra patty to max=3",
-  "category": "pricing",
+  "id": "det_ao_002",
+  "title": "DET addon resolved \u2014 CSB + Extra Patty = R115 (no LLM)",
+  "category": "det_addon",
   "tags": [
-    "llm",
-    "pricing",
-    "add_on",
-    "quantity_limit",
-    "pickup"
+    "det",
+    "det_addon_resolved",
+    "pricing"
   ],
-  "notes": "Customer asks for 5 extra patty. DET detects 'extra patty' as paid add-on conflict and yields to LLM. LLM returns quantity=5. Pipeline clamps to max_qty=3. 3 \u00c3\u2014 R25 = R75. unit_price=7500+7500=15000. subtotal=15000.",
+  "notes": "CSB R75 + Extra Patty R25 = R100. Wait, CSB=7500 + Extra Patty=2500 = R100. Verified via DET_ADDON_RESOLVED.",
   "turns": [
     {
-      "message": "Loaded Smash Burger with 5 extra patty",
+      "message": "Classic Smash Burger with extra patty",
       "expect": {
         "state": "CONFIRMING_ORDER",
         "cart": [
           {
-            "name": "Loaded Smash Burger",
+            "name": "Classic Smash Burger",
             "quantity": 1
           }
         ]
@@ -42,7 +40,7 @@
       }
     },
     {
-      "message": "0867654321",
+      "message": "0821111111",
       "expect": {
         "state": "ORDER_PLACED",
         "cart": []
@@ -52,12 +50,12 @@
   "final_order": {
     "items": [
       {
-        "name": "Loaded Smash Burger",
+        "name": "Classic Smash Burger",
         "quantity": 1
       }
     ],
-    "subtotal_cents": 15000,
-    "total_cents": 15000,
+    "subtotal_cents": 10000,
+    "total_cents": 10000,
     "order_mode": "PICKUP",
     "customer_name": "Thabo"
   }

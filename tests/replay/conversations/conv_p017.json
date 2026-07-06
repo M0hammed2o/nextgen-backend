@@ -1,62 +1,96 @@
 {
   "id": "conv_p017",
-  "title": "Modifier editing — Test 7: Burger → Extra Patty → Extra Cheese → Remove Patty",
+  "title": "Modifier editing \u00e2\u20ac\u201d Test 7: Burger \u00e2\u2020\u2019 Extra Patty \u00e2\u2020\u2019 Extra Cheese \u00e2\u2020\u2019 Remove Patty",
   "category": "pricing",
-  "tags": ["pricing", "add_on", "addon_remove", "det", "llm", "modifier_editing", "multi_step"],
-
+  "tags": [
+    "pricing",
+    "add_on",
+    "addon_remove",
+    "det",
+    "llm",
+    "modifier_editing",
+    "multi_step"
+  ],
   "notes": "Burger + Extra Patty (R100). Add Extra Cheese via DET (R110). Remove Extra Patty via DET (R85). Burger must remain. Cheese must survive patty removal.",
-
-  "menu": ["Loaded Smash Burger"],
-
+  "menu": [
+    "Loaded Smash Burger"
+  ],
   "turns": [
     {
       "message": "Loaded Smash Burger with extra patty",
-      "llm": {
-        "action": "add_items",
-        "message": "Loaded Smash Burger with Extra Patty — R100.00 ✅",
-        "items": [{"name": "Loaded Smash Burger", "quantity": 1, "options": {}, "add_ons": [{"name": "Extra Patty", "quantity": 1}], "special_instructions": ""}]
-      },
       "expect": {
         "state": "CONFIRMING_ORDER",
-        "cart": [{"name": "Loaded Smash Burger", "quantity": 1}]
+        "cart": [
+          {
+            "name": "Loaded Smash Burger",
+            "quantity": 1
+          }
+        ]
       }
     },
     {
       "message": "Add extra cheese",
       "expect": {
         "state": "CONFIRMING_ORDER",
-        "cart": [{"name": "Loaded Smash Burger", "quantity": 1}],
-        "response_contains": ["extra cheese"]
+        "cart": [
+          {
+            "name": "Loaded Smash Burger",
+            "quantity": 1
+          }
+        ],
+        "response_contains": [
+          "extra cheese"
+        ]
       }
     },
     {
       "message": "Remove extra patty",
       "expect": {
         "state": "CONFIRMING_ORDER",
-        "cart": [{"name": "Loaded Smash Burger", "quantity": 1}],
-        "response_contains": ["removed"]
+        "cart": [
+          {
+            "name": "Loaded Smash Burger",
+            "quantity": 1
+          }
+        ],
+        "response_contains": [
+          "removed"
+        ]
       }
     },
     {
       "message": "Yes",
-      "expect": {"state": "CHOOSING_ORDER_MODE"}
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
     },
     {
       "message": "Pickup",
-      "expect": {"state": "COLLECTING_DETAILS"}
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
     },
     {
       "message": "Noxolo",
-      "expect": {"state": "COLLECTING_DETAILS"}
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
     },
     {
       "message": "0856789012",
-      "expect": {"state": "ORDER_PLACED", "cart": []}
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
     }
   ],
-
   "final_order": {
-    "items": [{"name": "Loaded Smash Burger", "quantity": 1}],
+    "items": [
+      {
+        "name": "Loaded Smash Burger",
+        "quantity": 1
+      }
+    ],
     "subtotal_cents": 8500,
     "total_cents": 8500,
     "order_mode": "PICKUP",

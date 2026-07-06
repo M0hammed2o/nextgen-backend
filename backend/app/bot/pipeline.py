@@ -1060,6 +1060,117 @@ def _rescue_addons_from_instructions(
     return (cleaned if cleaned else None), rescued
 
 
+def _extract_addons_from_text(
+    text: str | None,
+    item,
+    add_ons_map: dict[str, list[dict]],
+) -> list[dict]:
+    """
+    Extract paid add-ons positively mentioned in text for an item.
+
+    Scans text against add_ons_map[item.id] and returns a resolved add-on dict
+    for each match (add_on_id, name, price_cents, quantity).  Handles:
+      - Direct substring match: "extra cheese" → Extra Cheese
+      - Quantity prefix: "2x extra patty" → Extra Patty qty=2 (clamped to max_qty)
+      - Plural stem: "extra patties" → Extra Patty (4-char stem match)
+      - Negation guard: skips add-ons preceded by without/no/remove/take off
+
+    Called by DET-native add-on resolution to avoid the LLM entirely for
+    pure add-on orders, eliminating the "Sorry, I didn't catch the items"
+    failure that occurred when the LLM returned chitchat instead of add_items.
+    """
+    import re as _re
+
+    if not text:
+        return []
+    item_id = str(getattr(item, "id", ""))
+    available = add_ons_map.get(item_id, [])
+    if not available:
+        return []
+
+    text_lower = text.lower()
+    text_words = text_lower.split()
+    resolved: list[dict] = []
+    seen_ids: set[str] = set()
+
+    # Negation prefixes — if one precedes the add-on name, skip it
+    _NEG_RE = _re.compile(
+        r"\b(?:without|no\s|remove|take\s+off|take\s+out|drop|delete)\s+(?:the\s+)?",
+        _re.I,
+    )
+
+    for ao in available:
+        ao_id = ao.get("add_on_id", "")
+        if ao_id in seen_ids:
+            continue
+        ao_name = ao["name"]
+        ao_name_lower = ao_name.lower()
+
+        # --- negation guard: skip if "without extra cheese" etc. ---
+        neg_match = _NEG_RE.search(text_lower)
+        if neg_match:
+            after_neg = text_lower[neg_match.end():]
+            if ao_name_lower in after_neg or after_neg[:len(ao_name_lower)] == ao_name_lower:
+                continue
+
+        # --- direct substring match ---
+        if ao_name_lower in text_lower:
+            qty = ao.get("default_qty", 1)
+            qty_m = _re.search(
+                r"(\d+)\s*x?\s*" + _re.escape(ao_name_lower), text_lower
+            )
+            if qty_m:
+                raw_qty = int(qty_m.group(1))
+                qty = max(ao.get("min_qty", 0), min(ao.get("max_qty", 10), raw_qty))
+            resolved.append({
+                "add_on_id": ao_id, "name": ao_name,
+                "price_cents": ao["price_cents"], "quantity": qty,
+            })
+            seen_ids.add(ao_id)
+            continue
+
+        # --- plural / stem match (4-char prefix): "patties" → "patty" ---
+        # ALL words of the add-on name must stem-match a word in text
+        # (conjunction, not disjunction) to avoid "extra" matching every
+        # add-on that starts with "extra" via the shared "extr" stem.
+        ao_words = [w for w in ao_name_lower.split() if len(w) >= 4]
+        if ao_words and all(
+            any(tw[:4] == aw[:4] for tw in text_words if len(tw) >= 4)
+            for aw in ao_words
+        ):
+            resolved.append({
+                "add_on_id": ao_id, "name": ao_name,
+                "price_cents": ao["price_cents"],
+                "quantity": ao.get("default_qty", 1),
+            })
+            seen_ids.add(ao_id)
+
+    return resolved
+
+
+def _filter_addon_names_from_text(
+    text: str | None,
+    resolved_addons: list[dict],
+) -> str | None:
+    """
+    Remove add-on name strings from text so they don't appear in
+    special_instructions alongside the resolved paid add-on entry.
+
+    E.g. modifier="extra cheese" with resolved Extra Cheese → None.
+         modifier="extra cheese no tomato"               → "no tomato".
+    """
+    if not text or not resolved_addons:
+        return text
+    import re as _re
+    cleaned = text
+    for ao in resolved_addons:
+        cleaned = _re.sub(_re.escape(ao["name"]), "", cleaned, flags=_re.I).strip()
+    # Strip leading connectors left after removal
+    cleaned = _re.sub(r"^\s*(?:and|with|also|plus|\+|,|;)\s*", "", cleaned, flags=_re.I)
+    cleaned = _re.sub(r"\s{2,}", " ", cleaned).strip(" ,;")
+    return cleaned if cleaned else None
+
+
 def _build_add_ons_map_from_items(items: list) -> dict[str, list[dict]]:
     """
     Build {menu_item_id: [add_on_dict, ...]} from the already-loaded menu items.
@@ -2281,29 +2392,97 @@ async def _handle_with_llm(
                 return (_build_option_question(_pend_item.name, _missing_groups),
                         False, None, None, None)
             # ── Phase 8: pricing conflict guard ──────────────────────────────
-            # Yield to LLM when:
-            # (a) The message suffix matches a paid add-on name (e.g. "extra patty")
-            # (b) The message selects a PRICED option (e.g. "oat milk" with +R10 delta)
-            # In both cases the LLM path applies the correct price via
-            # _resolve_option_prices / _resolve_add_ons.
-            _has_pricing_conflict = (
-                _det_has_add_on_conflict(
-                    [(it, qty, mod) for it, qty, mod in det_matches],
-                    " ".join(mod for _, _, mod in det_matches if mod),
-                    add_ons_map,
-                )
-                or any(
-                    _det_has_priced_option(it, norm_text)
-                    for it, _, _ in det_matches
-                )
+            # Two kinds of pricing conflict:
+            #   (a) Paid add-on name in the modifier ("extra patty", "extra cheese")
+            #   (b) Priced option selected ("oat milk" on Latte with +R10 delta)
+            #
+            # For (a) only: DET resolves the add-on directly from add_ons_map —
+            # no LLM call.  This eliminates the "Sorry, I didn't catch the items"
+            # failure that occurred when the real LLM returned chitchat instead of
+            # add_items for add-on orders.
+            #
+            # For (b) or mixed (a+b): still yield to LLM because priced options
+            # require the LLM to apply _resolve_option_prices.
+            _modifier_combined = " ".join(mod for _, _, mod in det_matches if mod)
+            _has_addon_conflict = _det_has_add_on_conflict(
+                [(it, qty, mod) for it, qty, mod in det_matches],
+                _modifier_combined,
+                add_ons_map,
             )
+            _has_priced_option = any(
+                _det_has_priced_option(it, norm_text)
+                for it, _, _ in det_matches
+            )
+            _has_pricing_conflict = _has_addon_conflict or _has_priced_option
+
             if _has_pricing_conflict:
-                logger.warning(
-                    "DET_PRICING_CONFLICT: message contains paid add-on or priced option, "
-                    "yielding to LLM for price resolution. session_id=%s", session.id,
-                )
-                # Fall through to LLM path (do NOT return here)
-                pass
+                if _has_addon_conflict and not _has_priced_option:
+                    # ── DET-native add-on resolution ─────────────────────────
+                    # Per-item search strategy:
+                    #  - Single item: use norm_text to capture quantity prefixes
+                    #    ("2 extra cheese") that _extract_items_from_message drops.
+                    #  - Multiple items: use each item's own modifier to prevent
+                    #    cross-contamination ("CSB no tomato + DSB extra cheese"
+                    #    must not add Extra Cheese to CSB).
+                    _multi_item = len(det_matches) > 1
+                    det_added: list[str] = []
+                    for _di, _dq, _dm in det_matches:
+                        _item_search = (_dm or norm_text) if _multi_item else norm_text
+                        _resolved_ao = _extract_addons_from_text(
+                            _item_search, _di, add_ons_map
+                        )
+                        # Remove add-on names from modifier so they don't also
+                        # appear as free special_instructions
+                        _clean_mod = _filter_addon_names_from_text(_dm, _resolved_ao)
+                        state_machine.add_to_cart(
+                            session,
+                            menu_item_id=str(_di.id),
+                            name=_di.name,
+                            price_cents=_di.price_cents,
+                            quantity=_dq,
+                            add_ons=_resolved_ao,
+                            special_instructions=_clean_mod or None,
+                        )
+                        _label = f"{_dq}x {_di.name}"
+                        if _resolved_ao:
+                            _label += " [" + ", ".join(
+                                f"+{a['name']}" for a in _resolved_ao
+                            ) + "]"
+                        elif _clean_mod:
+                            _label += f" ({_clean_mod})"
+                        det_added.append(_label)
+                    import copy as _copy
+                    _det_ao_cart = state_machine.get_cart(session)
+                    state_machine.set_context(
+                        session, "confirmed_cart", _copy.deepcopy(_det_ao_cart)
+                    )
+                    state_machine.transition_state(
+                        session, ConversationState.CONFIRMING_ORDER.value
+                    )
+                    logger.warning(
+                        "DET_ADDON_RESOLVED: added %d item(s) with priced add-on(s): %r, session_id=%s",
+                        len(det_added), det_added, session.id,
+                    )
+                    order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
+                    total = state_machine.cart_total_cents(session)
+                    summary = state_machine.cart_summary_text(session, business.currency)
+                    confirm_msg = responses.ask_confirmation_response(
+                        summary, total, 0, order_mode, business.currency
+                    )
+                    if order_mode == "DELIVERY":
+                        confirm_msg += "\n_Delivery fee will be confirmed by our team._"
+                    _parts = ["Added to your order: " + ", ".join(det_added) + " ✅"]
+                    _parts.append("\n" + confirm_msg)
+                    return ("\n".join(_parts), False, None, None, None)
+
+                else:
+                    # Has priced option (or mixed) → yield to LLM
+                    logger.warning(
+                        "DET_PRICING_CONFLICT: message contains priced option, "
+                        "yielding to LLM. session_id=%s", session.id,
+                    )
+                    # Fall through to LLM path (do NOT return here)
+                    pass
             else:
                 # ── All items ready — normal DET flow ────────────────────────
                 det_added: list[str] = []

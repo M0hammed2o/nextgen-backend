@@ -1,28 +1,24 @@
 {
-  "id": "conv_p002",
-  "title": "Pricing \u00e2\u20ac\u201d paid add-on: Loaded Smash Burger with Extra Patty (+R25)",
-  "category": "pricing",
+  "id": "det_ao_004",
+  "title": "DET addon resolved \u2014 CSB + 2x Extra Cheese = R95 (quantity, no LLM)",
+  "category": "det_addon",
   "tags": [
-    "llm",
+    "det",
+    "det_addon_resolved",
     "pricing",
-    "add_on",
-    "pickup"
+    "quantity"
   ],
-  "notes": "Customer orders Loaded Smash Burger with Extra Patty. LLM returns add_ons=[{name: Extra Patty, quantity: 1}]. Pipeline resolves price_cents=2500. unit_price=10000, subtotal=10000.",
+  "notes": "CSB R75 + 2x Extra Cheese (2x R10) = R95. DET parses quantity from message. max_qty=3 so qty=2 is within range.",
   "turns": [
     {
-      "message": "Loaded Smash Burger with extra patty please",
+      "message": "Can I get a Classic Smash Burger with 2 extra cheese",
       "expect": {
         "state": "CONFIRMING_ORDER",
         "cart": [
           {
-            "name": "Loaded Smash Burger",
+            "name": "Classic Smash Burger",
             "quantity": 1
           }
-        ],
-        "response_contains": [
-          "loaded smash burger",
-          "extra patty"
         ]
       }
     },
@@ -45,7 +41,7 @@
       }
     },
     {
-      "message": "0829876543",
+      "message": "0834567890",
       "expect": {
         "state": "ORDER_PLACED",
         "cart": []
@@ -55,12 +51,12 @@
   "final_order": {
     "items": [
       {
-        "name": "Loaded Smash Burger",
+        "name": "Classic Smash Burger",
         "quantity": 1
       }
     ],
-    "subtotal_cents": 10000,
-    "total_cents": 10000,
+    "subtotal_cents": 9500,
+    "total_cents": 9500,
     "order_mode": "PICKUP",
     "customer_name": "Sipho"
   }

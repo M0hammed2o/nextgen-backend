@@ -1,24 +1,20 @@
 {
-  "id": "conv_031",
-  "title": "Extra ingredient modifier \u00e2\u20ac\u201d with extra cheese",
-  "category": "modifiers",
+  "id": "det_ao_005",
+  "title": "DET addon resolved \u2014 CSB no tomato + Extra Cheese = R85 (mixed free+paid)",
+  "category": "det_addon",
   "tags": [
-    "deterministic",
-    "extra_ingredient",
-    "suffix_extraction"
+    "det",
+    "det_addon_resolved",
+    "pricing",
+    "mixed_modifier"
   ],
+  "notes": "CSB with free modifier 'no tomato' AND paid add-on Extra Cheese. DET adds Extra Cheese to add_ons (R10) and keeps 'no tomato' in special_instructions. Total R85.",
   "turns": [
     {
-      "message": "Can I get a Classic Smash Burger with extra cheese",
+      "message": "Classic Smash Burger no tomato with extra cheese",
       "expect": {
         "state": "CONFIRMING_ORDER",
         "cart": [
-          {
-            "name": "Classic Smash Burger",
-            "quantity": 1
-          }
-        ],
-        "confirmed_cart": [
           {
             "name": "Classic Smash Burger",
             "quantity": 1
@@ -39,15 +35,16 @@
       }
     },
     {
-      "message": "Precious",
+      "message": "Noxolo",
       "expect": {
         "state": "COLLECTING_DETAILS"
       }
     },
     {
-      "message": "0710000007",
+      "message": "0856789012",
       "expect": {
-        "state": "ORDER_PLACED"
+        "state": "ORDER_PLACED",
+        "cart": []
       }
     }
   ],
@@ -60,6 +57,7 @@
     ],
     "subtotal_cents": 8500,
     "total_cents": 8500,
-    "order_mode": "PICKUP"
+    "order_mode": "PICKUP",
+    "customer_name": "Noxolo"
   }
 }

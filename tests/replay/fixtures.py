@@ -213,12 +213,13 @@ _COFFEE_ADD_ONS = [
 #   conversation subtotals are unchanged.
 
 SA_MENU: list[FakeMenuItem] = [
-    # Burgers (existing — no add-ons, backward-compat with all existing modifier tests)
-    FakeMenuItem("Classic Smash Burger",   7500),
-    FakeMenuItem("Double Smash Burger",    9500),
-    FakeMenuItem("Spicy Chicken Burger",   8000),
-    FakeMenuItem("Grilled Chicken Burger", 8500),
-    # Phase 8: Loaded Smash Burger — has add-ons; dedicated for add-on pricing tests
+    # Burgers — all carry paid add-ons matching production DB configuration.
+    # Classic Smash Burger now has _BURGER_ADD_ONS so replay tests match the
+    # live menu where Extra Cheese (+R10) and Extra Patty (+R25) are linked.
+    FakeMenuItem("Classic Smash Burger",   7500, add_ons=_BURGER_ADD_ONS),
+    FakeMenuItem("Double Smash Burger",    9500, add_ons=_BURGER_ADD_ONS),
+    FakeMenuItem("Spicy Chicken Burger",   8000, add_ons=_BURGER_ADD_ONS),
+    FakeMenuItem("Grilled Chicken Burger", 8500, add_ons=_BURGER_ADD_ONS),
     FakeMenuItem("Loaded Smash Burger",    7500, add_ons=_BURGER_ADD_ONS),
     # Sides
     FakeMenuItem("Chips",                  3500),

@@ -14,24 +14,6 @@
   "turns": [
     {
       "message": "Loaded Smash Burger with extra cheese",
-      "llm": {
-        "action": "add_items",
-        "message": "LSB with Extra Cheese R85 done!",
-        "items": [
-          {
-            "name": "Loaded Smash Burger",
-            "quantity": 1,
-            "options": {},
-            "add_ons": [
-              {
-                "name": "Extra Cheese",
-                "quantity": 1
-              }
-            ],
-            "special_instructions": ""
-          }
-        ]
-      },
       "expect": {
         "state": "CONFIRMING_ORDER",
         "cart": [

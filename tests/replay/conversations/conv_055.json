@@ -1,40 +1,63 @@
 {
   "id": "conv_055",
-  "title": "SA slang — cheez normalised to cheese by normalizer",
+  "title": "SA slang \u00e2\u20ac\u201d cheez normalised to cheese by normalizer",
   "category": "sa_slang",
-  "tags": ["deterministic", "sa_slang", "normalizer", "modifier"],
-
+  "tags": [
+    "deterministic",
+    "sa_slang",
+    "normalizer",
+    "modifier"
+  ],
   "turns": [
     {
       "message": "Can I get a Classic Smash Burger with extra cheez",
       "expect": {
         "state": "CONFIRMING_ORDER",
-        "cart": [{"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "extra cheese"}],
-        "response_contains": ["classic smash burger"]
+        "cart": [
+          {
+            "name": "Classic Smash Burger",
+            "quantity": 1
+          }
+        ],
+        "response_contains": [
+          "classic smash burger"
+        ]
       }
     },
     {
       "message": "Yes",
-      "expect": {"state": "CHOOSING_ORDER_MODE"}
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
     },
     {
       "message": "Pickup",
-      "expect": {"state": "COLLECTING_DETAILS"}
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
     },
     {
       "message": "Wendy",
-      "expect": {"state": "COLLECTING_DETAILS"}
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
     },
     {
       "message": "0730000008",
-      "expect": {"state": "ORDER_PLACED"}
+      "expect": {
+        "state": "ORDER_PLACED"
+      }
     }
   ],
-
   "final_order": {
-    "items": [{"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "extra cheese"}],
-    "subtotal_cents": 7500,
-    "total_cents": 7500,
+    "items": [
+      {
+        "name": "Classic Smash Burger",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 8500,
+    "total_cents": 8500,
     "order_mode": "PICKUP"
   }
 }

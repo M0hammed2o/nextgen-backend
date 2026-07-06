@@ -1,48 +1,81 @@
 {
   "id": "conv_032",
-  "title": "Modifier update in CONFIRMING_ORDER — Add extra cheese to the burger",
+  "title": "Modifier update in CONFIRMING_ORDER \u00e2\u20ac\u201d Add extra cheese to the burger",
   "category": "modifiers",
-  "tags": ["deterministic", "modifier_update", "det_modifier_update"],
-
+  "tags": [
+    "deterministic",
+    "modifier_update",
+    "det_modifier_update"
+  ],
   "turns": [
     {
       "message": "Can I get a Classic Smash Burger",
       "expect": {
         "state": "CONFIRMING_ORDER",
-        "cart": [{"name": "Classic Smash Burger", "quantity": 1}]
+        "cart": [
+          {
+            "name": "Classic Smash Burger",
+            "quantity": 1
+          }
+        ]
       }
     },
     {
       "message": "Add extra cheese to the burger",
       "expect": {
         "state": "CONFIRMING_ORDER",
-        "cart": [{"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "extra cheese"}],
-        "confirmed_cart": [{"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "extra cheese"}],
-        "response_contains": ["extra cheese", "classic smash burger"]
+        "cart": [
+          {
+            "name": "Classic Smash Burger",
+            "quantity": 1
+          }
+        ],
+        "confirmed_cart": [
+          {
+            "name": "Classic Smash Burger",
+            "quantity": 1
+          }
+        ],
+        "response_contains": [
+          "extra cheese",
+          "classic smash burger"
+        ]
       }
     },
     {
       "message": "Yes",
-      "expect": {"state": "CHOOSING_ORDER_MODE"}
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
     },
     {
       "message": "Pickup",
-      "expect": {"state": "COLLECTING_DETAILS"}
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
     },
     {
       "message": "Mandla",
-      "expect": {"state": "COLLECTING_DETAILS"}
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
     },
     {
       "message": "0710000008",
-      "expect": {"state": "ORDER_PLACED"}
+      "expect": {
+        "state": "ORDER_PLACED"
+      }
     }
   ],
-
   "final_order": {
-    "items": [{"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "extra cheese"}],
-    "subtotal_cents": 7500,
-    "total_cents": 7500,
+    "items": [
+      {
+        "name": "Classic Smash Burger",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 8500,
+    "total_cents": 8500,
     "order_mode": "PICKUP"
   }
 }

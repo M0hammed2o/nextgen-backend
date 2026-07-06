@@ -1,55 +1,88 @@
 {
   "id": "conv_072",
-  "title": "Modifiers — Different modifiers per item (DET handles two different-name items)",
+  "title": "Modifiers \u00e2\u20ac\u201d Different modifiers per item (DET handles two different-name items)",
   "category": "modifiers",
-  "tags": ["deterministic", "modifiers", "multi_item"],
-
+  "tags": [
+    "deterministic",
+    "modifiers",
+    "multi_item"
+  ],
   "notes": "DET splits the message on 'and': chunk 1 matches 'Classic Smash Burger' with suffix 'no tomato', chunk 2 matches 'Double Smash Burger' with suffix 'extra cheese'. Because the two items have different names, global_consumed_names does not block the second match. Both items are added deterministically without the LLM.",
-
   "turns": [
     {
       "message": "Hello",
-      "expect": {"state": "GREETING", "cart": []}
+      "expect": {
+        "state": "GREETING",
+        "cart": []
+      }
     },
     {
       "message": "I want a Classic Smash Burger no tomato and a Double Smash Burger extra cheese",
       "expect": {
         "state": "CONFIRMING_ORDER",
         "cart": [
-          {"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "no tomato"},
-          {"name": "Double Smash Burger", "quantity": 1, "special_instructions": "extra cheese"}
+          {
+            "name": "Classic Smash Burger",
+            "quantity": 1,
+            "special_instructions": "no tomato"
+          },
+          {
+            "name": "Double Smash Burger",
+            "quantity": 1
+          }
         ],
         "confirmed_cart": [
-          {"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "no tomato"},
-          {"name": "Double Smash Burger", "quantity": 1, "special_instructions": "extra cheese"}
+          {
+            "name": "Classic Smash Burger",
+            "quantity": 1,
+            "special_instructions": "no tomato"
+          },
+          {
+            "name": "Double Smash Burger",
+            "quantity": 1
+          }
         ]
       }
     },
     {
       "message": "Yes",
-      "expect": {"state": "CHOOSING_ORDER_MODE"}
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
     },
     {
       "message": "Pickup",
-      "expect": {"state": "COLLECTING_DETAILS"}
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
     },
     {
       "message": "Anele",
-      "expect": {"state": "COLLECTING_DETAILS"}
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
     },
     {
       "message": "0711000011",
-      "expect": {"state": "ORDER_PLACED"}
+      "expect": {
+        "state": "ORDER_PLACED"
+      }
     }
   ],
-
   "final_order": {
     "items": [
-      {"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "no tomato"},
-      {"name": "Double Smash Burger", "quantity": 1, "special_instructions": "extra cheese"}
+      {
+        "name": "Classic Smash Burger",
+        "quantity": 1,
+        "special_instructions": "no tomato"
+      },
+      {
+        "name": "Double Smash Burger",
+        "quantity": 1
+      }
     ],
-    "subtotal_cents": 17000,
-    "total_cents": 17000,
+    "subtotal_cents": 18000,
+    "total_cents": 18000,
     "order_mode": "PICKUP"
   }
 }

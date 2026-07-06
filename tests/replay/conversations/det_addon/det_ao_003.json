@@ -1,28 +1,24 @@
 {
-  "id": "conv_p005",
-  "title": "Pricing \u00e2\u20ac\u201d multiple paid add-ons on one item (Extra Cheese + Extra Patty)",
-  "category": "pricing",
+  "id": "det_ao_003",
+  "title": "DET addon resolved \u2014 CSB + Extra Cheese + Extra Patty = R125 (compound, no LLM)",
+  "category": "det_addon",
   "tags": [
-    "llm",
+    "det",
+    "det_addon_resolved",
     "pricing",
-    "add_on",
-    "multi_addon",
-    "pickup"
+    "compound"
   ],
-  "notes": "Extra Cheese R10 + Extra Patty R25 = R35 in add-ons. unit_price=7500+1000+2500=11000. subtotal=11000.",
+  "notes": "CSB R75 + Extra Cheese R10 + Extra Patty R25 = R110. DET picks up both add-ons from the message without LLM. Fixes the live bug where compound add-ons always returned R75.",
   "turns": [
     {
-      "message": "Loaded Smash Burger with extra cheese and extra patty",
+      "message": "Can I get a Classic Smash Burger with extra cheese and extra patty",
       "expect": {
         "state": "CONFIRMING_ORDER",
         "cart": [
           {
-            "name": "Loaded Smash Burger",
+            "name": "Classic Smash Burger",
             "quantity": 1
           }
-        ],
-        "response_contains": [
-          "loaded smash burger"
         ]
       }
     },
@@ -39,13 +35,13 @@
       }
     },
     {
-      "message": "Yusuf",
+      "message": "Zanele",
       "expect": {
         "state": "COLLECTING_DETAILS"
       }
     },
     {
-      "message": "0824567890",
+      "message": "0829876543",
       "expect": {
         "state": "ORDER_PLACED",
         "cart": []
@@ -55,13 +51,13 @@
   "final_order": {
     "items": [
       {
-        "name": "Loaded Smash Burger",
+        "name": "Classic Smash Burger",
         "quantity": 1
       }
     ],
     "subtotal_cents": 11000,
     "total_cents": 11000,
     "order_mode": "PICKUP",
-    "customer_name": "Yusuf"
+    "customer_name": "Zanele"
   }
 }

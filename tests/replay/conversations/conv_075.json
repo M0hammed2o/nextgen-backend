@@ -1,40 +1,62 @@
 {
   "id": "conv_075",
-  "title": "Modifiers — Extra multiple ingredients in one message",
+  "title": "Modifiers \u00e2\u20ac\u201d Extra multiple ingredients in one message",
   "category": "modifiers",
-  "tags": ["deterministic", "modifiers", "extra_ingredients"],
-
+  "tags": [
+    "deterministic",
+    "modifiers",
+    "extra_ingredients"
+  ],
   "turns": [
     {
       "message": "Can I get a Double Smash Burger with extra cheese and extra sauce",
       "expect": {
         "state": "CONFIRMING_ORDER",
-        "cart": [{"name": "Double Smash Burger", "quantity": 1}],
-        "response_contains": ["double smash burger"]
+        "cart": [
+          {
+            "name": "Double Smash Burger",
+            "quantity": 1
+          }
+        ],
+        "response_contains": [
+          "double smash burger"
+        ]
       }
     },
     {
       "message": "Yes",
-      "expect": {"state": "CHOOSING_ORDER_MODE"}
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
     },
     {
       "message": "Pickup",
-      "expect": {"state": "COLLECTING_DETAILS"}
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
     },
     {
       "message": "Sibusiso",
-      "expect": {"state": "COLLECTING_DETAILS"}
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
     },
     {
       "message": "0711000014",
-      "expect": {"state": "ORDER_PLACED"}
+      "expect": {
+        "state": "ORDER_PLACED"
+      }
     }
   ],
-
   "final_order": {
-    "items": [{"name": "Double Smash Burger", "quantity": 1}],
-    "subtotal_cents": 9500,
-    "total_cents": 9500,
+    "items": [
+      {
+        "name": "Double Smash Burger",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 10500,
+    "total_cents": 10500,
     "order_mode": "PICKUP"
   }
 }
