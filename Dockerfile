@@ -20,3 +20,12 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
 EXPOSE 8000 8001
+
+# Copy and make the startup script executable
+COPY start.sh /app/start.sh
+RUN chmod +x /app/start.sh
+
+# Run migrations then start the server.
+# Render overrides CMD with its "Start Command" setting — update that to:
+#   ./start.sh
+CMD ["/app/start.sh"]
