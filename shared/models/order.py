@@ -78,6 +78,20 @@ class Order(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         DateTime(timezone=True), nullable=True
     )
 
+    # ── Payment ──────────────────────────────────────────────────────────
+    payment_method: Mapped[str | None] = mapped_column(
+        String(16), nullable=True,
+        comment="CASH or CARD — set when payment is recorded"
+    )
+    payment_reference: Mapped[str | None] = mapped_column(
+        String(255), nullable=True,
+        comment="Card/EFT transaction reference, printed receipt number, etc."
+    )
+    paid_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+        comment="UTC timestamp when payment_status was set to PAID"
+    )
+
     # ── Cancellation ─────────────────────────────────────────────────────
     cancelled_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     cancelled_by_user_id: Mapped[uuid.UUID | None] = mapped_column(

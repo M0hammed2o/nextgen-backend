@@ -41,6 +41,9 @@ class OrderResponse(BaseModel):
     order_number: str
     status: str
     payment_status: str
+    payment_method: str | None = None
+    payment_reference: str | None = None
+    paid_at: datetime | None = None
     order_mode: str
     source: str
     subtotal_cents: int
@@ -571,6 +574,14 @@ async def set_delivery_fee(
 
 class PaymentUpdateRequest(BaseModel):
     payment_status: str = Field(pattern=r"^(PENDING|PAID|CASH_ON_COLLECTION)$")
+    payment_method: str | None = Field(
+        default=None, pattern=r"^(CASH|CARD)$",
+        description="CASH or CARD — required when payment_status=PAID",
+    )
+    payment_reference: str | None = Field(
+        default=None, max_length=255,
+        description="Card/EFT transaction reference (required when payment_method=CARD)",
+    )
 
 
 @router.patch("/{order_id}/payment", response_model=OrderResponse)
@@ -581,8 +592,10 @@ async def update_payment_status(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Update payment status on an order.
-    Staff / Manager / Owner can mark PENDING → PAID or CASH_ON_COLLECTION.
+    Record payment on an order.
+
+    Staff / Manager / Owner set payment_status + optional method + reference.
+    paid_at is stamped automatically when payment_status == PAID.
     """
     result = await db.execute(
         select(Order).where(
@@ -595,6 +608,14 @@ async def update_payment_status(
         raise NotFoundError("Order", str(order_id))
 
     order.payment_status = body.payment_status
+    if body.payment_method is not None:
+        order.payment_method = body.payment_method
+    if body.payment_reference is not None:
+        order.payment_reference = body.payment_reference
+    if body.payment_status == "PAID" and order.paid_at is None:
+        from datetime import timezone
+        order.paid_at = __import__("datetime").datetime.now(timezone.utc)
+
     await db.commit()
     await db.refresh(order)
     return OrderResponse.model_validate(order)

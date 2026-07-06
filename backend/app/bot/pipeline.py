@@ -1007,6 +1007,59 @@ def _load_add_ons_map(items: list) -> dict[str, list[dict]]:
     return _build_add_ons_map_from_items(items)
 
 
+def _rescue_addons_from_instructions(
+    item,
+    special_instructions: str | None,
+    add_ons_map: dict[str, list[dict]],
+    existing_add_ons: list[dict],
+) -> tuple[str | None, list[dict]]:
+    """
+    Production-safety rescue: when the real LLM puts a paid add-on name inside
+    special_instructions instead of the add_ons list, detect and move it.
+
+    Returns (cleaned_instructions, rescued_add_ons).
+    - cleaned_instructions: original string with the matched add-on phrase removed
+      (None when the result would be empty/whitespace).
+    - rescued_add_ons: list of resolved add-on dicts to merge into res_add_ons.
+
+    Skips add-ons already present in existing_add_ons so re-running is idempotent.
+    Only fires when special_instructions is non-empty and the item has available add-ons.
+    """
+    import re as _re
+
+    if not special_instructions or not special_instructions.strip():
+        return special_instructions, []
+
+    item_id = str(getattr(item, "id", ""))
+    available = add_ons_map.get(item_id, [])
+    if not available:
+        return special_instructions, []
+
+    existing_names = {a["name"].lower() for a in existing_add_ons}
+    cleaned = special_instructions
+    rescued: list[dict] = []
+
+    for ao in available:
+        ao_name_lower = ao["name"].lower()
+        if ao_name_lower in existing_names:
+            continue
+        if ao_name_lower not in cleaned.lower():
+            continue
+        # Remove the matched add-on phrase (case-insensitive) from instructions
+        cleaned = _re.sub(_re.escape(ao["name"]), "", cleaned, flags=_re.I).strip()
+        cleaned = _re.sub(r"\s{2,}", " ", cleaned).strip(" ,;")
+        qty = ao.get("default_qty", 1)
+        rescued.append({
+            "add_on_id": ao["add_on_id"],
+            "name": ao["name"],
+            "price_cents": ao["price_cents"],
+            "quantity": qty,
+        })
+        existing_names.add(ao_name_lower)
+
+    return (cleaned if cleaned else None), rescued
+
+
 def _build_add_ons_map_from_items(items: list) -> dict[str, list[dict]]:
     """
     Build {menu_item_id: [add_on_dict, ...]} from the already-loaded menu items.
@@ -1636,6 +1689,89 @@ def _detect_addon_removal(
     # Also check the add_ons_map for available add-ons (even if not yet in cart)
     # to distinguish "remove extra cheese" targeting an available but missing add-on
     # from an ingredient-modifier request — in both cases we fall back to LLM.
+    return None
+
+
+def _detect_compound_addon_edit(
+    norm_text: str,
+    cart: list[dict],
+    add_ons_map: dict[str, list[dict]],
+) -> tuple[str, dict, dict] | None:
+    """
+    Detect compound "remove X and add Y" messages where BOTH X and Y are paid
+    add-ons for the same cart item.  Handles these deterministically so the
+    real LLM can never return remove_item (which would delete the parent item).
+
+    Examples:
+      "remove extra cheese and add extra patty"  → ("Extra Cheese", extra_patty_ao, burger_ci)
+      "swap the soy milk for oat milk"           → ("Soy Milk", oat_milk_ao, latte_ci)
+      "change Coke to Sprite"                    → None  (different menu items, not add-ons)
+
+    Returns (remove_addon_name, add_addon_dict, cart_item) or None.
+    The caller is responsible for calling remove_addon_from_cart_item +
+    add_addon_to_cart_item atomically.
+    """
+    import re as _re
+
+    if not cart or not add_ons_map:
+        return None
+
+    msg_lower = norm_text.strip().lower()
+
+    # Must contain a remove signal AND an add signal in the same message
+    _REMOVE_RE = _re.compile(
+        r"(?:remove|take\s+off|take\s+out|drop|delete|without|swap|change|replace)\s+"
+        r"(?:the\s+)?([\w]+(?:\s+[\w]+){0,3})",
+        _re.I,
+    )
+    _ADD_RE = _re.compile(
+        r"(?:and\s+(?:add|give|give\s+me|include|with|get)|"
+        r"(?:instead|for|with|to)\s+(?:the\s+)?)\s*([\w]+(?:\s+[\w]+){0,3})",
+        _re.I,
+    )
+
+    remove_match = _REMOVE_RE.search(msg_lower)
+    add_match = _ADD_RE.search(msg_lower)
+    if not remove_match or not add_match:
+        return None
+
+    remove_raw = _re.sub(r"\s+(?:from|on|in|for)\s+.*$", "", remove_match.group(1)).strip()
+    add_raw = _re.sub(r"\s+(?:from|on|in|for)\s+.*$", "", add_match.group(1)).strip()
+    if not remove_raw or not add_raw:
+        return None
+
+    # Both must resolve to paid add-ons on the same cart item
+    for cart_item in cart:
+        item_id = cart_item.get("menu_item_id", "")
+        available = add_ons_map.get(item_id, [])
+        if not available:
+            continue
+
+        avail_map = {a["name"].lower(): a for a in available}
+
+        # Find the remove target in the cart item's current add-ons
+        remove_ao_name: str | None = None
+        for ao in (cart_item.get("add_ons") or []):
+            n = ao["name"].lower()
+            if n in remove_raw or remove_raw in n:
+                remove_ao_name = ao["name"]
+                break
+        if not remove_ao_name:
+            continue
+
+        # Find the add target in available add-ons
+        add_ao: dict | None = None
+        for n, ao in avail_map.items():
+            if n in add_raw or add_raw in n:
+                add_ao = ao
+                break
+        if not add_ao:
+            continue
+
+        qty = add_ao.get("default_qty", 1)
+        add_ao_with_qty = {**add_ao, "quantity": qty}
+        return remove_ao_name, add_ao_with_qty, cart_item
+
     return None
 
 
@@ -2329,6 +2465,41 @@ async def _handle_with_llm(
 
         _current_cart = state_machine.get_cart(session)
 
+        # ── Sub-case B1: compound add-on edit ("remove X and add Y") ─────────────
+        # Both X and Y must be paid add-ons on the same cart item.
+        # Handled entirely by DET to prevent the real LLM from returning remove_item
+        # and accidentally deleting the parent item.
+        _compound_edit = _detect_compound_addon_edit(norm_text, _current_cart, add_ons_map)
+        if _compound_edit:
+            _ce_remove_name, _ce_add_ao, _ce_target = _compound_edit
+            _, _ce_removed = state_machine.remove_addon_from_cart_item(
+                session, _ce_target["name"], _ce_remove_name
+            )
+            _, _ce_added = state_machine.add_addon_to_cart_item(
+                session, _ce_target["name"], _ce_add_ao
+            )
+            if _ce_removed or _ce_added:
+                import copy as _copy
+                _ce_cart = state_machine.get_cart(session)
+                state_machine.set_context(session, "confirmed_cart", _copy.deepcopy(_ce_cart))
+                logger.warning(
+                    "DET_COMPOUND_ADDON_EDIT: removed %r, added %r on %r, session_id=%s",
+                    _ce_remove_name, _ce_add_ao["name"], _ce_target["name"], session.id,
+                )
+                order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
+                state_machine.transition_state(session, ConversationState.CONFIRMING_ORDER.value)
+                total = state_machine.cart_total_cents(session)
+                summary = state_machine.cart_summary_text(session, business.currency)
+                confirm_msg = responses.ask_confirmation_response(
+                    summary, total, 0, order_mode, business.currency
+                )
+                if order_mode == "DELIVERY":
+                    confirm_msg += "\n_Delivery fee will be confirmed by our team._"
+                return (
+                    f"Done ✅ Removed {_ce_remove_name}, added {_ce_add_ao['name']}.\n\n{confirm_msg}",
+                    False, None, None, None,
+                )
+
         # ── Sub-case B2: paid add-on removal (checked BEFORE ingredient modifier) ──
         # "Remove the extra cheese" when cart has Extra Cheese as a PAID add-on.
         # Must fire before Sub-case B so that "cheese" (an ingredient word) doesn't
@@ -2732,6 +2903,21 @@ async def _handle_with_llm(
                 # Phase 8: resolve priced options and paid add-ons
                 sel_opts = _resolve_option_prices(matched_item, pi.options)
                 res_add_ons = _resolve_add_ons(matched_item, pi.add_ons, add_ons_map)
+                # Production rescue: LLM sometimes puts a paid add-on name in
+                # special_instructions instead of the add_ons list. Detect and
+                # migrate so the correct price is always applied.
+                clean_instr, rescued = _rescue_addons_from_instructions(
+                    matched_item, pi.special_instructions, add_ons_map, res_add_ons
+                )
+                if rescued:
+                    res_add_ons = res_add_ons + rescued
+                    logger.warning(
+                        "ADDON_RESCUE: migrated %r from special_instructions to add_ons "
+                        "for %r, session_id=%s",
+                        [a["name"] for a in rescued], matched_item.name, session.id,
+                    )
+                else:
+                    clean_instr = pi.special_instructions
                 state_machine.add_to_cart(
                     session,
                     menu_item_id=str(matched_item.id),
@@ -2741,7 +2927,7 @@ async def _handle_with_llm(
                     selected_options=sel_opts,
                     add_ons=res_add_ons,
                     options=pi.options if pi.options else None,
-                    special_instructions=pi.special_instructions,
+                    special_instructions=clean_instr,
                 )
                 label = f"{safe_qty}x {matched_item.name}"
                 if sel_opts:
@@ -2854,13 +3040,26 @@ async def _handle_with_llm(
                 # as well as genuine item swaps with options.
                 sel_opts = _resolve_option_prices(new_item, pi.options)
                 res_add_ons = _resolve_add_ons(new_item, pi.add_ons, add_ons_map)
+                # Production rescue: same as add_items path — migrate stray add-ons.
+                clean_instr, rescued = _rescue_addons_from_instructions(
+                    new_item, pi.special_instructions, add_ons_map, res_add_ons
+                )
+                if rescued:
+                    res_add_ons = res_add_ons + rescued
+                    logger.warning(
+                        "ADDON_RESCUE (replace): migrated %r from special_instructions "
+                        "for %r, session_id=%s",
+                        [a["name"] for a in rescued], new_item.name, session.id,
+                    )
+                else:
+                    clean_instr = pi.special_instructions
                 state_machine.add_to_cart(
                     session, str(new_item.id), new_item.name,
                     new_item.price_cents, safe_qty,
                     selected_options=sel_opts,
                     add_ons=res_add_ons,
                     options=pi.options if pi.options else None,
-                    special_instructions=pi.special_instructions,
+                    special_instructions=clean_instr,
                 )
                 label = new_item.name
                 if sel_opts:

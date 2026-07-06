@@ -1,16 +1,16 @@
 {
   "id": "mr_004",
-  "title": "Modifier replace \u2014 Remove extra cheese and add extra patty (compound LLM)",
+  "title": "Modifier replace \u2014 Remove extra cheese and add extra patty (compound DET)",
   "category": "modifier_replace",
   "tags": [
-    "llm",
-    "replace_item",
+    "det",
+    "compound_addon_edit",
     "addon_swap",
     "compound",
     "cart_integrity",
     "pricing"
   ],
-  "notes": "LSB + Extra Cheese (R85). Compound: remove cheese + add patty. LLM replace_item. Final: LSB + Extra Patty (R100).",
+  "notes": "LSB + Extra Cheese (R85). Compound: remove cheese + add patty. Now handled by DET _detect_compound_addon_edit \u2014 no LLM needed. Final: LSB + Extra Patty (R100). This is the Bug 2 fix: DET prevents the real LLM from returning remove_item and deleting the parent burger.",
   "turns": [
     {
       "message": "Loaded Smash Burger with extra cheese",
@@ -44,25 +44,6 @@
     },
     {
       "message": "Remove extra cheese and add extra patty",
-      "llm": {
-        "action": "replace_item",
-        "message": "Done R100 now!",
-        "items": [
-          {
-            "remove": "Loaded Smash Burger",
-            "add": "Loaded Smash Burger",
-            "quantity": 1,
-            "options": {},
-            "add_ons": [
-              {
-                "name": "Extra Patty",
-                "quantity": 1
-              }
-            ],
-            "special_instructions": ""
-          }
-        ]
-      },
       "expect": {
         "state": "CONFIRMING_ORDER",
         "cart": [
