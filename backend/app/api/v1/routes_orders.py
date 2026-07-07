@@ -32,6 +32,8 @@ class OrderItemResponse(BaseModel):
     quantity: int
     line_total_cents: int
     options_snapshot: dict | None
+    add_ons_snapshot: list | None = None
+    selected_options_snapshot: list | None = None
     special_instructions: str | None
     model_config = {"from_attributes": True}
 

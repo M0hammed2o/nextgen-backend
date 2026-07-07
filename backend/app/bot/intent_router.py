@@ -82,9 +82,16 @@ _PATTERNS: list[tuple[re.Pattern, MessageIntent]] = [
     ), MessageIntent.ORDER_CANCEL),
 
     # Order start (explicit)
+    # "can i please get", "can i just get", "could i get", "may i get" are all
+    # valid ordering phrases. Allow up to 2 optional words between the verb pair
+    # so that polite fillers ("please", "just", "quickly") don't block matching.
     (re.compile(
-        r"\b(order|i.?d like|i want|can i get|give me|"
-        r"let me get|i.?ll have|place.*order)\b", re.I
+        r"\b(order|i.?d like|i want|"
+        r"can\s+i\s+(?:\w+\s+){0,2}(?:get|have|order)|"
+        r"could\s+i\s+(?:\w+\s+){0,2}(?:get|have|order)|"
+        r"may\s+i\s+(?:\w+\s+){0,2}(?:get|have|order)|"
+        r"i.?ll\s+(?:take|have|get)|"
+        r"give me|let me get|place.*order)\b", re.I
     ), MessageIntent.ORDER_START),
 
     # Order confirm (in context of cart)

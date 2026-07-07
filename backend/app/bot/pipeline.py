@@ -2176,6 +2176,12 @@ def _extract_items_from_message(
     wins over "Chips". Returns [] if nothing matched — caller falls back to LLM.
 
     Each element is (MenuItem, quantity, special_instructions | None).
+
+    Modifier continuation: when a chunk after the split contains no menu item
+    but does contain recognised modifier tokens ("extra patty", "no tomato"),
+    those tokens are appended to the previous match's modifier rather than
+    being dropped. This handles "burger with extra cheese and extra patty"
+    where the "and" split would otherwise discard "extra patty".
     """
     import re as _re
     active = [i for i in menu_items if i.is_active and not i.is_deleted]
@@ -2191,7 +2197,17 @@ def _extract_items_from_message(
     all_matched: list[tuple] = []
     consumed_names: set[str] = set()
     for chunk in chunks:
-        all_matched.extend(_extract_items_from_chunk(chunk, active_sorted, consumed_names))
+        chunk_matches = _extract_items_from_chunk(chunk, active_sorted, consumed_names)
+        if chunk_matches:
+            all_matched.extend(chunk_matches)
+        elif all_matched:
+            # No menu item in this chunk — check for modifier-only continuation.
+            # e.g. "... and extra patty" after an item already matched above.
+            continuation = _extract_modifier_from_suffix(chunk)
+            if continuation:
+                prev_item, prev_qty, prev_mod = all_matched[-1]
+                combined = f"{prev_mod}, {continuation}" if prev_mod else continuation
+                all_matched[-1] = (prev_item, prev_qty, combined)
 
     return all_matched
 
