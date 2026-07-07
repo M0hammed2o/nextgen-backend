@@ -45,6 +45,16 @@ class BusinessSettingsResponse(BaseModel):
     address: str | None
     phone: str | None
     menu_image_url: str | None
+    # Payment settings
+    payment_methods_enabled: list | None = None
+    online_payment_required: bool = False
+    payment_provider: str | None = None
+    payment_timeout_minutes: int = 30
+    eft_bank_name: str | None = None
+    eft_account_name: str | None = None
+    eft_account_number: str | None = None
+    eft_branch_code: str | None = None
+    eft_reference_prefix: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -65,6 +75,16 @@ class BusinessSettingsUpdate(BaseModel):
     address: str | None = None
     phone: str | None = None
     menu_image_url: str | None = None
+    # Payment settings
+    payment_methods_enabled: list | None = None
+    online_payment_required: bool | None = None
+    payment_provider: str | None = None
+    payment_timeout_minutes: int | None = Field(default=None, ge=1, le=1440)
+    eft_bank_name: str | None = None
+    eft_account_name: str | None = None
+    eft_account_number: str | None = None
+    eft_branch_code: str | None = None
+    eft_reference_prefix: str | None = None
 
 
 # ── Routes ───────────────────────────────────────────────────────────────────

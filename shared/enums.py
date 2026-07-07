@@ -75,9 +75,12 @@ class OrderSource(str, enum.Enum):
 
 
 class PaymentStatus(str, enum.Enum):
-    PENDING = "PENDING"
-    PAID = "PAID"
-    CASH_ON_COLLECTION = "CASH_ON_COLLECTION"
+    UNPAID = "UNPAID"            # online payment required, instructions not yet sent
+    PENDING = "PENDING"          # payment instructions sent / card at collection
+    PAID = "PAID"                # payment confirmed
+    FAILED = "FAILED"            # payment attempt failed
+    REFUNDED = "REFUNDED"        # payment refunded
+    CASH_ON_COLLECTION = "CASH_ON_COLLECTION"  # traditional cash flow
 
 
 # ── Messages ─────────────────────────────────────────────────────────────────

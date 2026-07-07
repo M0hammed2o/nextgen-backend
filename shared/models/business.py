@@ -108,6 +108,33 @@ class Business(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     address: Mapped[str | None] = mapped_column(Text, nullable=True)
     phone: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
+    # ── Payment Settings (Phase 9) ───────────────────────────────────────
+    payment_methods_enabled: Mapped[list | None] = mapped_column(
+        JSONB, nullable=True,
+        comment='["CASH", "DIRECT_EFT", "PAYMENT_LINK"] — methods the business accepts'
+    )
+    online_payment_required: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False,
+        comment="If true, order must be PAID before moving to IN_PROGRESS"
+    )
+    payment_provider: Mapped[str | None] = mapped_column(
+        String(32), nullable=True,
+        comment="Active payment link provider: YOCO | PAYFAST | STITCH"
+    )
+    payment_timeout_minutes: Mapped[int] = mapped_column(
+        Integer, default=30, nullable=False,
+        comment="Minutes before an UNPAID online-payment order is auto-cancelled"
+    )
+    # EFT banking details
+    eft_bank_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    eft_account_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    eft_account_number: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    eft_branch_code: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    eft_reference_prefix: Mapped[str | None] = mapped_column(
+        String(16), nullable=True,
+        comment="Prefix for payment references, e.g. 'BAR' → BAR-000123"
+    )
+
     # ── Relationships (lazy loaded by default) ───────────────────────────
     users = relationship("BusinessUser", back_populates="business", lazy="selectin")
     menu_categories = relationship("MenuCategory", back_populates="business", lazy="noload")

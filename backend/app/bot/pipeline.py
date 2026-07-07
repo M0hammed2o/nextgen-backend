@@ -3950,8 +3950,16 @@ async def _handle_waiting_delivery_fee(
     pending_order_id = state_machine.get_context(session, "pending_order_id")
 
     if intent_router.is_confirmation(msg_text):
-        # Fee approved — now ask how they'll pay before finalising.
         state_machine.set_context(session, "delivery_fee_status", "APPROVED")
+        # Skip asking cash/card when online payment is required — payment is
+        # handled out-of-band after staff accepts, not during the conversation.
+        if getattr(business, "online_payment_required", False):
+            logger.warning(
+                "DELIVERY_FEE_APPROVED: online_payment_required=True, skipping COLLECTING_PAYMENT, session_id=%s",
+                session.id,
+            )
+            return await _finalize_pending_delivery_order(db, business, customer, session)
+        # Standard flow: ask for payment method before finalising
         state_machine.transition_state(session, ConversationState.COLLECTING_PAYMENT.value)
         logger.warning("DELIVERY_FEE_APPROVED: moving to COLLECTING_PAYMENT, session_id=%s", session.id)
         return (
@@ -4063,8 +4071,12 @@ async def _finalize_pending_delivery_order(
 
     fee_cents = state_machine.get_context(session, "delivery_fee_cents", 0)
     pending_order_id = state_machine.get_context(session, "pending_order_id")
-    payment_method = state_machine.get_context(session, "payment_method", "CASH_ON_COLLECTION")
-    payment_status = "CASH_ON_COLLECTION" if payment_method == "CASH_ON_COLLECTION" else "PENDING"
+    if getattr(business, "online_payment_required", False):
+        payment_method = None
+        payment_status = "UNPAID"
+    else:
+        payment_method = state_machine.get_context(session, "payment_method", "CASH_ON_COLLECTION")
+        payment_status = "CASH_ON_COLLECTION" if payment_method == "CASH_ON_COLLECTION" else "PENDING"
 
     if pending_order_id:
         try:
@@ -4079,6 +4091,7 @@ async def _finalize_pending_delivery_order(
                     total_cents=_Order.subtotal_cents + fee_cents,
                     status="NEW",
                     payment_status=payment_status,
+                    payment_required=getattr(business, "online_payment_required", False),
                 )
                 .returning(_Order.order_number, _Order.subtotal_cents)
             )

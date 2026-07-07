@@ -41,6 +41,9 @@ logger = logging.getLogger("nextgen.worker")
 # How long a delivery order may sit in PENDING_DELIVERY_FEE before auto-cancel.
 DELIVERY_FEE_TIMEOUT_MINUTES = 45
 
+# Fallback payment timeout when business hasn't configured one.
+DEFAULT_PAYMENT_TIMEOUT_MINUTES = 30
+
 
 # ── Startup / Shutdown ────────────────────────────────────────────────────────
 
@@ -244,6 +247,110 @@ async def cancel_stale_delivery_fee_orders(ctx: dict) -> None:
             )
 
 
+# ── Cron: Payment timeout ────────────────────────────────────────────────────
+
+async def cancel_unpaid_orders(ctx: dict) -> None:
+    """
+    Cancel orders where payment was required but not received within the timeout.
+
+    Runs every 5 minutes. Checks orders with:
+      - payment_required = True
+      - payment_status in (UNPAID, PENDING)
+      - status not already terminal / cancelled
+      - created_at older than business.payment_timeout_minutes (default 30)
+
+    Each timed-out order is cancelled with reason "Payment timeout" and the
+    customer is notified via WhatsApp.
+    """
+    from sqlalchemy import and_, or_, outerjoin
+    from sqlalchemy.orm import aliased
+
+    notifications: list[tuple[str, str, str]] = []  # (phone_number_id, wa_id, order_number)
+
+    async with ctx["session_factory"]() as db:
+        try:
+            _Cust = aliased(Customer)
+            _Biz  = aliased(Business)
+
+            rows = await db.execute(
+                select(
+                    Order,
+                    _Cust.wa_id,
+                    _Biz.whatsapp_phone_number_id,
+                    _Biz.payment_timeout_minutes,
+                )
+                .select_from(
+                    outerjoin(Order, _Cust, and_(Order.customer_id == _Cust.id))
+                    .outerjoin(_Biz, Order.business_id == _Biz.id)
+                )
+                .where(
+                    Order.payment_required.is_(True),
+                    Order.payment_status.in_(["UNPAID", "PENDING"]),
+                    Order.status.not_in(["CANCELLED", "COLLECTED", "DELIVERED"]),
+                )
+            )
+            all_rows = rows.all()
+
+            if not all_rows:
+                return
+
+            now = datetime.now(timezone.utc)
+            timed_out = []
+            for order, wa_id, phone_number_id, timeout_minutes in all_rows:
+                timeout = timeout_minutes or DEFAULT_PAYMENT_TIMEOUT_MINUTES
+                cutoff = order.created_at + timedelta(minutes=timeout)
+                if now >= cutoff:
+                    timed_out.append((order, wa_id, phone_number_id, timeout))
+
+            if not timed_out:
+                return
+
+            logger.warning(
+                "Payment timeout: cancelling %d order(s).", len(timed_out)
+            )
+
+            for order, wa_id, phone_number_id, timeout in timed_out:
+                old_status = order.status
+                order.status = "CANCELLED"
+                order.payment_status = "FAILED"
+                order.cancelled_reason = f"Payment not received within {timeout} minutes"
+                db.add(OrderEvent(
+                    order_id=order.id,
+                    business_id=order.business_id,
+                    old_status=old_status,
+                    new_status="CANCELLED",
+                    reason="Automated timeout: payment not received",
+                ))
+                if wa_id and phone_number_id:
+                    notifications.append((phone_number_id, wa_id, order.order_number))
+
+            await db.commit()
+
+        except Exception:
+            await db.rollback()
+            logger.exception("Payment timeout job failed — rolled back.")
+            return
+
+    for phone_number_id, wa_id, order_number in notifications:
+        try:
+            from backend.app.payments.messages import build_payment_timeout_message
+
+            class _FakeOrder:
+                pass
+            fake = _FakeOrder()
+            fake.order_number = order_number
+            await send_notification_message(
+                phone_number_id=phone_number_id,
+                recipient_wa_id=wa_id,
+                text=build_payment_timeout_message(fake),
+            )
+            logger.info("Payment timeout notification sent: order=%s", order_number)
+        except Exception:
+            logger.exception(
+                "Failed to send payment timeout notification for order %s", order_number
+            )
+
+
 # ── Worker Settings ───────────────────────────────────────────────────────────
 
 _settings = get_settings()
@@ -280,6 +387,13 @@ class WorkerSettings:
             cancel_stale_delivery_fee_orders,
             minute={0, 10, 20, 30, 40, 50},
             second=0,
+            run_at_startup=True,
+        ),
+        # Cancel UNPAID online-payment orders past their timeout — every 5 minutes.
+        cron(
+            cancel_unpaid_orders,
+            minute={0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55},
+            second=30,
             run_at_startup=True,
         ),
     ]

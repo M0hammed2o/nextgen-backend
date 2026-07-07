@@ -81,11 +81,19 @@ async def create_order_from_cart(
     total = subtotal + delivery_fee
 
     # ── 3. Create order ──────────────────────────────────────────────────
+    # If the business requires online payment, snapshot that requirement on
+    # the order and set initial payment_status = UNPAID. This means the order
+    # will not be allowed to move to IN_PROGRESS until staff mark it PAID.
+    online_payment_required = bool(getattr(business, "online_payment_required", False))
+    initial_payment_status = "UNPAID" if online_payment_required else "PENDING"
+
     order = Order(
         business_id=business.id,
         customer_id=customer.id,
         order_number=order_number,
         status=initial_status,
+        payment_required=online_payment_required,
+        payment_status=initial_payment_status,
         order_mode=order_mode,
         source="WHATSAPP",
         subtotal_cents=subtotal,

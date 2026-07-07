@@ -45,6 +45,8 @@ class OrderResponse(BaseModel):
     payment_status: str
     payment_method: str | None = None
     payment_reference: str | None = None
+    payment_link_url: str | None = None
+    payment_required: bool = False
     paid_at: datetime | None = None
     order_mode: str
     source: str
@@ -323,6 +325,14 @@ async def update_order_status(
     if requested not in allowed:
         raise InvalidTransitionError(current.value, requested.value)
 
+    # ── Payment gate: block IN_PROGRESS if online payment required ───────
+    if requested == OrderStatus.IN_PROGRESS and order.payment_required:
+        if order.payment_status != "PAID":
+            raise InvalidTransitionError(
+                current.value, requested.value,
+                detail="Payment must be confirmed before the order can move to IN_PROGRESS."
+            )
+
     old_status = order.status
     order.status = requested.value
     now = datetime.now(timezone.utc)
@@ -340,6 +350,10 @@ async def update_order_status(
     elif requested == OrderStatus.CANCELLED:
         order.cancelled_reason = body.reason
         order.cancelled_by_user_id = user.user_id
+
+    # ── When accepted with online payment required → set PENDING ────────
+    if requested == OrderStatus.ACCEPTED and order.payment_required:
+        order.payment_status = "PENDING"
 
     # ── Create audit event ───────────────────────────────────────────────
     event = OrderEvent(
@@ -381,6 +395,7 @@ async def update_order_status(
         if order.customer_id:
             from shared.models.customer import Customer
             from backend.app.bot.whatsapp_sender import send_notification_message
+            from backend.app.payments.messages import build_payment_message
 
             cust_row = await db.execute(
                 select(Customer.wa_id).where(Customer.id == order.customer_id)
@@ -388,25 +403,35 @@ async def update_order_status(
             wa_id = cust_row.scalar_one_or_none()
 
             biz_row = await db.execute(
-                select(Business.whatsapp_phone_number_id).where(
-                    Business.id == order.business_id
-                )
+                select(Business).where(Business.id == order.business_id)
             )
-            phone_number_id = biz_row.scalar_one_or_none()
+            business_obj = biz_row.scalar_one_or_none()
+            phone_number_id = business_obj.whatsapp_phone_number_id if business_obj else None
 
             if wa_id and phone_number_id:
-                msg = _customer_status_message(
-                    status=requested.value,
-                    order_number=order.order_number,
-                    estimated_ready_minutes=body.estimated_ready_minutes,
-                    reason=body.reason,
-                )
-                if msg:
-                    await send_notification_message(
-                        phone_number_id=phone_number_id,
-                        recipient_wa_id=wa_id,
-                        text=msg,
+                # For online-payment-required orders accepted: send payment instructions
+                # instead of (or in addition to) the generic accepted message.
+                if requested == OrderStatus.ACCEPTED and order.payment_required and business_obj:
+                    payment_msg = build_payment_message(order, business_obj)
+                    if payment_msg:
+                        await send_notification_message(
+                            phone_number_id=phone_number_id,
+                            recipient_wa_id=wa_id,
+                            text=payment_msg,
+                        )
+                else:
+                    msg = _customer_status_message(
+                        status=requested.value,
+                        order_number=order.order_number,
+                        estimated_ready_minutes=body.estimated_ready_minutes,
+                        reason=body.reason,
                     )
+                    if msg:
+                        await send_notification_message(
+                            phone_number_id=phone_number_id,
+                            recipient_wa_id=wa_id,
+                            text=msg,
+                        )
     except Exception:
         import logging
         logging.getLogger("nextgen").warning(
@@ -575,14 +600,17 @@ async def set_delivery_fee(
 
 
 class PaymentUpdateRequest(BaseModel):
-    payment_status: str = Field(pattern=r"^(PENDING|PAID|CASH_ON_COLLECTION)$")
+    payment_status: str = Field(
+        pattern=r"^(UNPAID|PENDING|PAID|FAILED|REFUNDED|CASH_ON_COLLECTION)$"
+    )
     payment_method: str | None = Field(
-        default=None, pattern=r"^(CASH|CARD)$",
-        description="CASH or CARD — required when payment_status=PAID",
+        default=None,
+        pattern=r"^(CASH|CARD|PAY_ON_COLLECTION|DIRECT_EFT|PAYSHAP|YOCO|PAYFAST|STITCH)$",
+        description="Payment method used",
     )
     payment_reference: str | None = Field(
         default=None, max_length=255,
-        description="Card/EFT transaction reference (required when payment_method=CARD)",
+        description="Transaction reference, EFT pop number, etc.",
     )
 
 
@@ -609,15 +637,49 @@ async def update_payment_status(
     if not order:
         raise NotFoundError("Order", str(order_id))
 
+    was_unpaid = order.payment_status in ("UNPAID", "PENDING")
+    payment_required = order.payment_required
+
     order.payment_status = body.payment_status
     if body.payment_method is not None:
         order.payment_method = body.payment_method
     if body.payment_reference is not None:
         order.payment_reference = body.payment_reference
     if body.payment_status == "PAID" and order.paid_at is None:
-        from datetime import timezone
-        order.paid_at = __import__("datetime").datetime.now(timezone.utc)
+        order.paid_at = datetime.now(timezone.utc)
 
     await db.commit()
     await db.refresh(order)
+
+    # ── Send WhatsApp payment confirmation if online payment was required ─
+    if body.payment_status == "PAID" and was_unpaid and payment_required:
+        try:
+            from shared.models.customer import Customer
+            from backend.app.bot.whatsapp_sender import send_notification_message
+            from backend.app.payments.messages import build_payment_confirmed_message
+
+            cust_row = await db.execute(
+                select(Customer.wa_id).where(Customer.id == order.customer_id)
+            )
+            wa_id = cust_row.scalar_one_or_none()
+
+            biz_row = await db.execute(
+                select(Business.whatsapp_phone_number_id).where(
+                    Business.id == order.business_id
+                )
+            )
+            phone_number_id = biz_row.scalar_one_or_none()
+
+            if wa_id and phone_number_id:
+                await send_notification_message(
+                    phone_number_id=phone_number_id,
+                    recipient_wa_id=wa_id,
+                    text=build_payment_confirmed_message(order),
+                )
+        except Exception:
+            import logging
+            logging.getLogger("nextgen").warning(
+                "Failed to send payment confirmation WhatsApp for order %s", order.id
+            )
+
     return OrderResponse.model_validate(order)

@@ -306,12 +306,13 @@ class TestWorkerSettings:
         names = [f.__name__ for f in WorkerSettings.functions]
         assert "process_whatsapp_message" in names
 
-    def test_two_cron_jobs_registered(self):
-        """Both outbox and delivery fee cron jobs must be registered."""
-        assert len(WorkerSettings.cron_jobs) == 2
+    def test_three_cron_jobs_registered(self):
+        """Outbox, delivery fee, and payment timeout cron jobs must be registered."""
+        assert len(WorkerSettings.cron_jobs) == 3
         names = {c.name for c in WorkerSettings.cron_jobs}
         assert "cron:run_outbox_batch" in names
         assert "cron:cancel_stale_delivery_fee_orders" in names
+        assert "cron:cancel_unpaid_orders" in names
 
     def test_max_tries_is_positive(self):
         """max_tries must be > 0 so infrastructure failures can be retried."""

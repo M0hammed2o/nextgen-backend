@@ -85,10 +85,10 @@ class DailyLimitError(AppError):
 
 
 class InvalidTransitionError(AppError):
-    def __init__(self, current: str, requested: str):
+    def __init__(self, current: str, requested: str, detail: str | None = None):
         super().__init__(
             code="INVALID_STATUS_TRANSITION",
-            message=f"Cannot transition from {current} to {requested}",
+            message=detail or f"Cannot transition from {current} to {requested}",
             status_code=422,
             details={"current_status": current, "requested_status": requested},
         )
