@@ -12,6 +12,7 @@ from backend.app.payments.mock_provider import MockPaymentProvider
 from backend.app.payments.yoco import YocoProvider
 from backend.app.payments.payfast import PayFastProvider
 from backend.app.payments.stitch import StitchProvider
+from backend.app.payments.ikhoka import IKhokaProvider
 
 _PROVIDERS: dict[str, PaymentProvider] = {
     "DIRECT_EFT": DirectEFTProvider(),
@@ -19,6 +20,7 @@ _PROVIDERS: dict[str, PaymentProvider] = {
     "YOCO": YocoProvider(),
     "PAYFAST": PayFastProvider(),
     "STITCH": StitchProvider(),
+    "IKHOKA": IKhokaProvider(),
 }
 
 

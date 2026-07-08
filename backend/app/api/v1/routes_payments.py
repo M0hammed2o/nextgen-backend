@@ -198,6 +198,53 @@ async def payfast_webhook(
     return {"received": True}
 
 
+# ── iKhoka ───────────────────────────────────────────────────────────────────
+
+@router.post("/ikhoka/{business_id}", include_in_schema=False)
+async def ikhoka_webhook(
+    business_id: uuid.UUID = Path(...),
+    request: Request = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Receive iKhoka payment callback.
+
+    iKhoka calls the callbackUrl embedded in each payment link at creation time.
+    No separate dashboard webhook configuration is required.
+    The URL pattern is: https://<api-domain>/v1/payments/webhooks/ikhoka/<business_id>
+    """
+    raw_body = await request.body()
+    ik_sign = request.headers.get("ik-sign", "")
+
+    business = await _load_business(db, business_id)
+    if not business:
+        raise HTTPException(status_code=404, detail="Business not found")
+
+    from backend.app.payments.ikhoka import IKhokaProvider
+    # iKhoka uses the Application Secret (payment_api_secret) for webhook signing —
+    # the same secret used to sign outbound API requests.
+    app_secret = getattr(business, "payment_api_secret", None) or ""
+    callback_path = f"/v1/payments/webhooks/ikhoka/{business_id}"
+
+    if not IKhokaProvider.verify_signature(raw_body, ik_sign, app_secret, callback_path):
+        logger.warning("iKhoka webhook: invalid signature for business %s", business_id)
+        raise HTTPException(status_code=400, detail="Invalid signature")
+
+    import json
+    try:
+        payload = json.loads(raw_body)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    provider = IKhokaProvider()
+    result = await provider.handle_webhook(payload)
+
+    if result.get("paid") and result.get("order_id"):
+        await _mark_order_paid(db, result["order_id"], business_id, "iKhoka")
+
+    return {"received": True}
+
+
 # ── Stitch ────────────────────────────────────────────────────────────────────
 
 @router.post("/stitch/{business_id}", include_in_schema=False)
