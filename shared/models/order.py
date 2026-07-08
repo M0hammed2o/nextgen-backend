@@ -100,6 +100,9 @@ class Order(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         comment="UTC timestamp when payment_status was set to PAID"
     )
 
+    # ── Special Instructions ─────────────────────────────────────────────
+    special_instructions: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     # ── Cancellation ─────────────────────────────────────────────────────
     cancelled_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     cancelled_by_user_id: Mapped[uuid.UUID | None] = mapped_column(

@@ -409,6 +409,7 @@ def clear_cart(session: ConversationSession) -> None:
         "confirmed_cart", "order_mode", "pending_order_id",
         "delivery_fee_cents", "delivery_fee_status", "payment_method",
         "pending_options", "proposed_items", "recommended_items", "superseded_order_id",
+        "order_notes_asked", "order_notes",
     ):
         ctx.pop(key, None)
     session.context_json = ctx

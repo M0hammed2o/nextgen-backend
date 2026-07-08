@@ -62,6 +62,7 @@ class OrderResponse(BaseModel):
     accepted_at: datetime | None
     ready_at: datetime | None
     completed_at: datetime | None
+    special_instructions: str | None = None
     cancelled_reason: str | None
     items: list[OrderItemResponse] = []
     created_at: datetime

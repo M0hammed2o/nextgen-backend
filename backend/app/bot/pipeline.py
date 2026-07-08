@@ -3702,6 +3702,17 @@ async def _handle_order_confirmation(
         state_machine.transition_state(session, ConversationState.COLLECTING_DETAILS.value)
         return details_prompt, False, None, None, None
 
+    # ── Ask for order-level special instructions (once) ──────────────────
+    if not state_machine.get_context(session, "order_notes_asked"):
+        state_machine.set_context(session, "order_notes_asked", True)
+        state_machine.transition_state(session, ConversationState.COLLECTING_DETAILS.value)
+        return (
+            "Any special instructions for your order? "
+            "(e.g. _extra spicy_, _allergic to nuts_, _collect at 5 pm_)\n\n"
+            "Reply *skip* if none.",
+            False, None, None, None,
+        )
+
     # ── Delivery flow: park the order waiting for staff to set the fee ───
     if order_mode == "DELIVERY":
         delivery_address = state_machine.get_context(session, "delivery_address")
@@ -4244,6 +4255,16 @@ async def _handle_collecting_details(
         still_missing = _check_missing_details(business, session)
         if still_missing:
             return still_missing, False, None, None, None
+        return await _next_after_details(db, business, customer, session)
+
+    # ── Capture order-level special instructions ──────────────────────────
+    if state_machine.get_context(session, "order_notes_asked") and "order_notes" not in ctx:
+        note = text.strip()
+        state_machine.set_context(
+            session,
+            "order_notes",
+            note if note.lower() not in ("skip", "no", "none", "n/a", "nope", "-") else None,
+        )
         return await _next_after_details(db, business, customer, session)
 
     return await _next_after_details(db, business, customer, session)

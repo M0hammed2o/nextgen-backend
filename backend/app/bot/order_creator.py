@@ -104,6 +104,7 @@ async def create_order_from_cart(
         customer_name=ctx.get("customer_name") or customer.display_name,
         phone_number=ctx.get("phone_number") or customer.phone_number,
         delivery_address=ctx.get("delivery_address"),
+        special_instructions=ctx.get("order_notes") or None,
         confirmed_at=datetime.now(timezone.utc),
     )
     db.add(order)
