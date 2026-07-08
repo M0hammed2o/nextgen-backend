@@ -28,9 +28,11 @@ def upgrade() -> None:
             auth            VARCHAR(256) NOT NULL,
             created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             CONSTRAINT uq_push_subscription_endpoint UNIQUE (endpoint)
-        );
+        )
+    """)
+    op.execute("""
         CREATE INDEX IF NOT EXISTS ix_push_subscriptions_business_id
-            ON push_subscriptions (business_id);
+            ON push_subscriptions (business_id)
     """)
 
 
