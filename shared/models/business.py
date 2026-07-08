@@ -134,6 +134,22 @@ class Business(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         String(16), nullable=True,
         comment="Prefix for payment references, e.g. 'BAR' → BAR-000123"
     )
+    # Per-business payment provider credentials (Model B — each business owns their account)
+    # Yoco:    api_key=Secret Key,  api_secret=<unused>,    webhook_secret=Webhook Secret
+    # PayFast: api_key=Merchant Key, api_secret=Merchant ID, webhook_secret=Passphrase
+    # Stitch:  api_key=Client Secret, api_secret=Client ID,  webhook_secret=<unused (uses api_key)>
+    payment_api_key: Mapped[str | None] = mapped_column(
+        String(512), nullable=True,
+        comment="Primary provider credential — never returned in API responses"
+    )
+    payment_api_secret: Mapped[str | None] = mapped_column(
+        String(512), nullable=True,
+        comment="Secondary provider credential (PayFast merchant ID, Stitch client ID)"
+    )
+    payment_webhook_secret: Mapped[str | None] = mapped_column(
+        String(512), nullable=True,
+        comment="Webhook signing secret for verifying inbound payment webhooks"
+    )
 
     # ── Relationships (lazy loaded by default) ───────────────────────────
     users = relationship("BusinessUser", back_populates="business", lazy="selectin")

@@ -67,6 +67,14 @@ class Settings(BaseSettings):
     SUPABASE_SERVICE_KEY: str = ""
     SUPABASE_STORAGE_BUCKET: str = "nextgen-assets"
 
+    # ── Payment providers ─────────────────────────────────────────────────
+    # Public URL of this API — used by payment providers to POST webhooks back.
+    # Set to your Render service URL, e.g. https://nextgen-api.onrender.com
+    BACKEND_PUBLIC_URL: str = "https://nextgen-api.onrender.com"
+    # Where to redirect customers after a successful or cancelled payment.
+    PAYMENT_RETURN_URL: str = "https://nextgenintelligence.co.za/payment/success"
+    PAYMENT_CANCEL_URL: str = "https://nextgenintelligence.co.za/payment/cancelled"
+
     # ── Rate Limiting ────────────────────────────────────────────────────
     LOGIN_RATE_LIMIT_PER_MINUTE: int = 5
     ACCOUNT_LOCKOUT_ATTEMPTS: int = 5

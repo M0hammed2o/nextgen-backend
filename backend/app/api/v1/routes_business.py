@@ -55,8 +55,58 @@ class BusinessSettingsResponse(BaseModel):
     eft_account_number: str | None = None
     eft_branch_code: str | None = None
     eft_reference_prefix: str | None = None
+    # Credential hints — never return raw keys, only show last-4 masked
+    payment_api_key_hint: str | None = None
+    payment_api_secret_hint: str | None = None
+    payment_webhook_secret_configured: bool = False
 
-    model_config = {"from_attributes": True}
+    model_config = {"from_attributes": False}
+
+    @classmethod
+    def from_business(cls, b: "Business") -> "BusinessSettingsResponse":
+        def _hint(val: str | None) -> str | None:
+            if not val:
+                return None
+            return "****" + val[-4:] if len(val) >= 4 else "****"
+
+        return cls(
+            id=b.id,
+            name=b.name,
+            slug=b.slug,
+            business_code=b.business_code,
+            timezone=b.timezone,
+            business_hours=b.business_hours,
+            greeting_text=b.greeting_text,
+            fallback_text=b.fallback_text,
+            closed_text=b.closed_text,
+            order_in_only=b.order_in_only,
+            delivery_enabled=b.delivery_enabled,
+            delivery_fee_cents=b.delivery_fee_cents,
+            require_customer_name=b.require_customer_name,
+            require_phone_number=b.require_phone_number,
+            require_delivery_address=b.require_delivery_address,
+            currency=b.currency,
+            plan=b.plan,
+            billing_status=b.billing_status,
+            daily_message_limit=b.daily_message_limit,
+            daily_llm_call_limit=b.daily_llm_call_limit,
+            daily_order_limit=b.daily_order_limit,
+            address=b.address,
+            phone=b.phone,
+            menu_image_url=b.menu_image_url,
+            payment_methods_enabled=b.payment_methods_enabled,
+            online_payment_required=b.online_payment_required,
+            payment_provider=b.payment_provider,
+            payment_timeout_minutes=b.payment_timeout_minutes,
+            eft_bank_name=b.eft_bank_name,
+            eft_account_name=b.eft_account_name,
+            eft_account_number=b.eft_account_number,
+            eft_branch_code=b.eft_branch_code,
+            eft_reference_prefix=b.eft_reference_prefix,
+            payment_api_key_hint=_hint(b.payment_api_key),
+            payment_api_secret_hint=_hint(b.payment_api_secret),
+            payment_webhook_secret_configured=bool(b.payment_webhook_secret),
+        )
 
 
 class BusinessSettingsUpdate(BaseModel):
@@ -85,6 +135,10 @@ class BusinessSettingsUpdate(BaseModel):
     eft_account_number: str | None = None
     eft_branch_code: str | None = None
     eft_reference_prefix: str | None = None
+    # Provider credentials — accepted in PUT, never returned in GET
+    payment_api_key: str | None = None
+    payment_api_secret: str | None = None
+    payment_webhook_secret: str | None = None
 
 
 # ── Routes ───────────────────────────────────────────────────────────────────
@@ -101,7 +155,7 @@ async def get_business_settings(
     business = result.scalar_one_or_none()
     if not business:
         raise NotFoundError("Business")
-    return BusinessSettingsResponse.model_validate(business)
+    return BusinessSettingsResponse.from_business(business)
 
 
 @router.put("/settings", response_model=BusinessSettingsResponse)
@@ -118,10 +172,18 @@ async def update_business_settings(
     if not business:
         raise NotFoundError("Business")
 
+    # Exclude credential fields from the generic setattr loop —
+    # they are handled separately so empty strings clear the stored value.
+    _CREDENTIAL_FIELDS = {"payment_api_key", "payment_api_secret", "payment_webhook_secret"}
     update_data = body.model_dump(exclude_unset=True)
+
     for field, value in update_data.items():
-        setattr(business, field, value)
+        if field in _CREDENTIAL_FIELDS:
+            # Empty string → clear the credential; None (not set) → skip
+            setattr(business, field, value if value else None)
+        else:
+            setattr(business, field, value)
 
     await db.commit()
     await db.refresh(business)
-    return BusinessSettingsResponse.model_validate(business)
+    return BusinessSettingsResponse.from_business(business)

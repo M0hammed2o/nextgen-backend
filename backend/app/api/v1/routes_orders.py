@@ -369,6 +369,27 @@ async def update_order_status(
     await db.commit()
     await db.refresh(order)
 
+    # ── Payment link creation (ACCEPTED + payment_required + provider set) ─
+    if requested == OrderStatus.ACCEPTED and order.payment_required:
+        try:
+            from backend.app.payments.registry import get_provider
+            biz_result = await db.execute(select(Business).where(Business.id == order.business_id))
+            biz_for_payment = biz_result.scalar_one_or_none()
+            if biz_for_payment and biz_for_payment.payment_provider:
+                provider = get_provider(biz_for_payment.payment_provider)
+                if provider:
+                    link_url = await provider.create_payment_link(order, biz_for_payment)
+                    if link_url:
+                        order.payment_link_url = link_url
+                        await db.commit()
+                        await db.refresh(order)
+        except Exception:
+            import logging as _log
+            _log.getLogger("nextgen").warning(
+                "Payment link creation failed for order %s — continuing without link",
+                order.order_number,
+            )
+
     # ── Publish SSE event (fire and forget) ──────────────────────────────
     try:
         from backend.app.db.session import get_redis
