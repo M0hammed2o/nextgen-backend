@@ -1,6 +1,6 @@
 """Payment provider credentials per business (Model B)
 
-Revision ID: 0009_payment_provider_credentials
+Revision ID: 0009_payment_creds
 Revises: 0008_payment_settings
 Create Date: 2026-07-07
 
@@ -13,13 +13,14 @@ Field mapping per provider:
   Yoco:    payment_api_key=Secret Key,  payment_api_secret=<unused>,    payment_webhook_secret=Webhook Secret
   PayFast: payment_api_key=Merchant Key, payment_api_secret=Merchant ID, payment_webhook_secret=Passphrase
   Stitch:  payment_api_key=Client Secret, payment_api_secret=Client ID,  payment_webhook_secret=<unused>
+  iKhoka:  payment_api_key=Application ID, payment_api_secret=Application Secret, payment_webhook_secret=<unused>
 
 All columns use IF NOT EXISTS — safe to re-run.
 """
 from alembic import op
 
 
-revision = "0009_payment_provider_credentials"
+revision = "0009_payment_creds"
 down_revision = "0008_payment_settings"
 branch_labels = None
 depends_on = None
