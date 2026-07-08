@@ -325,3 +325,193 @@ def test_payment_required_snapshot_safe_for_legacy_business():
     business = LegacyBusiness()
     online_payment_required = bool(getattr(business, "online_payment_required", False))
     assert online_payment_required is False
+
+
+# ── iKhoka provider ───────────────────────────────────────────────────────────
+
+from backend.app.payments.ikhoka import IKhokaProvider, _sign
+
+
+class FakeIKhokaBusiness(FakeBusiness):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.payment_api_key = kwargs.get("payment_api_key", "TEST_APP_ID")
+        self.payment_api_secret = kwargs.get("payment_api_secret", "TEST_APP_SECRET")
+
+
+def test_ikhoka_sign_is_deterministic():
+    """Same inputs always produce the same HMAC-SHA256 hex digest."""
+    sig1 = _sign("/public-api/v1/api/payment", '{"amount":10000}', "mysecret")
+    sig2 = _sign("/public-api/v1/api/payment", '{"amount":10000}', "mysecret")
+    assert sig1 == sig2
+    assert len(sig1) == 64  # SHA-256 hex = 64 chars
+
+
+def test_ikhoka_sign_different_secret_gives_different_sig():
+    body = '{"amount":10000}'
+    path = "/public-api/v1/api/payment"
+    assert _sign(path, body, "secret_a") != _sign(path, body, "secret_b")
+
+
+def test_ikhoka_sign_escapes_quotes_in_payload():
+    """The payload sent to HMAC must have double-quotes escaped as backslash-quote."""
+    import hashlib
+    import hmac as hmac_mod
+
+    path = "/test/path"
+    compact_body = '{"key":"value"}'
+    app_secret = "secret"
+
+    # manually build the expected payload: path + body with " → \"
+    escaped = compact_body.replace('"', '\\"')
+    expected_payload = (path + escaped).encode("utf-8")
+    expected_sig = hmac_mod.new(
+        app_secret.encode("utf-8"), expected_payload, hashlib.sha256
+    ).hexdigest()
+
+    assert _sign(path, compact_body, app_secret) == expected_sig
+
+
+def test_ikhoka_verify_signature_round_trip():
+    """Sign a payload then verify it — the two functions must agree."""
+    import json
+    webhook_body = {
+        "paylinkID": "abc123",
+        "status": "SUCCESS",
+        "externalTransactionID": str(uuid.uuid4()),
+        "responseCode": "00",
+    }
+    raw_body = json.dumps(webhook_body, separators=(",", ":")).encode("utf-8")
+    compact = json.dumps(webhook_body, separators=(",", ":"))
+    callback_path = "/v1/payments/webhooks/ikhoka/some-business-id"
+    app_secret = "my_app_secret"
+
+    valid_sig = _sign(callback_path, compact, app_secret)
+
+    assert IKhokaProvider.verify_signature(raw_body, valid_sig, app_secret, callback_path) is True
+
+
+def test_ikhoka_verify_signature_wrong_secret_fails():
+    import json
+    webhook_body = {"paylinkID": "x", "status": "SUCCESS", "externalTransactionID": "y", "responseCode": "00"}
+    raw_body = json.dumps(webhook_body, separators=(",", ":")).encode("utf-8")
+    compact = json.dumps(webhook_body, separators=(",", ":"))
+    callback_path = "/v1/payments/webhooks/ikhoka/biz-id"
+
+    valid_sig = _sign(callback_path, compact, "correct_secret")
+
+    assert IKhokaProvider.verify_signature(raw_body, valid_sig, "wrong_secret", callback_path) is False
+
+
+def test_ikhoka_verify_signature_empty_sig_fails():
+    raw_body = b'{"status":"SUCCESS"}'
+    assert IKhokaProvider.verify_signature(raw_body, "", "secret", "/path") is False
+
+
+def test_ikhoka_verify_signature_empty_secret_fails():
+    raw_body = b'{"status":"SUCCESS"}'
+    assert IKhokaProvider.verify_signature(raw_body, "somesig", "", "/path") is False
+
+
+def test_ikhoka_handle_webhook_success():
+    provider = IKhokaProvider()
+    order_id = str(uuid.uuid4())
+
+    import asyncio
+    result = asyncio.get_event_loop().run_until_complete(
+        provider.handle_webhook({
+            "paylinkID": "2zh1zj6y8xpb0g3",
+            "status": "SUCCESS",
+            "externalTransactionID": order_id,
+            "responseCode": "00",
+        })
+    )
+    assert result["paid"] is True
+    assert result["order_id"] == order_id
+
+
+def test_ikhoka_handle_webhook_failure_status():
+    provider = IKhokaProvider()
+    import asyncio
+    result = asyncio.get_event_loop().run_until_complete(
+        provider.handle_webhook({
+            "paylinkID": "abc",
+            "status": "FAILURE",
+            "externalTransactionID": str(uuid.uuid4()),
+            "responseCode": "05",
+        })
+    )
+    assert result["paid"] is False
+
+
+def test_ikhoka_handle_webhook_bad_response_code():
+    """SUCCESS status with non-00 response code should NOT be treated as paid."""
+    provider = IKhokaProvider()
+    import asyncio
+    result = asyncio.get_event_loop().run_until_complete(
+        provider.handle_webhook({
+            "paylinkID": "abc",
+            "status": "SUCCESS",
+            "externalTransactionID": str(uuid.uuid4()),
+            "responseCode": "05",
+        })
+    )
+    assert result["paid"] is False
+
+
+def test_ikhoka_create_payment_link_missing_credentials_returns_none():
+    import asyncio
+    provider = IKhokaProvider()
+    order = FakeOrder(order_number="BO-000001", total_cents=9000)
+    business = FakeIKhokaBusiness(payment_api_key=None, payment_api_secret=None)
+    result = asyncio.get_event_loop().run_until_complete(
+        provider.create_payment_link(order, business)
+    )
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_ikhoka_create_payment_link_returns_paylink_url():
+    """create_payment_link returns the paylinkUrl from a successful API response."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    provider = IKhokaProvider()
+    order = FakeOrder(order_number="BO-000001", total_cents=15000)
+    business = FakeIKhokaBusiness()
+
+    mock_response = MagicMock()
+    mock_response.json.return_value = {
+        "responseCode": "00",
+        "paylinkUrl": "https://securepay.ikhokha.red/test123abc",
+        "paylinkID": "test123abc",
+        "externalTransactionID": str(order.id),
+    }
+    mock_response.raise_for_status = MagicMock()
+
+    mock_client = MagicMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.post = AsyncMock(return_value=mock_response)
+
+    fake_settings = MagicMock()
+    fake_settings.BACKEND_PUBLIC_URL = "https://nextgen-api.onrender.com"
+    fake_settings.PAYMENT_RETURN_URL = "https://nextgenintelligence.co.za/payment/success"
+    fake_settings.PAYMENT_CANCEL_URL = "https://nextgenintelligence.co.za/payment/cancelled"
+
+    with patch("backend.app.payments.ikhoka.httpx.AsyncClient", return_value=mock_client), \
+         patch("backend.app.core.config.get_settings", return_value=fake_settings):
+        url = await provider.create_payment_link(order, business)
+
+    assert url == "https://securepay.ikhokha.red/test123abc"
+
+
+def test_ikhoka_registry_lookup():
+    from backend.app.payments.registry import get_provider
+    provider = get_provider("IKHOKA")
+    assert provider is not None
+    assert isinstance(provider, IKhokaProvider)
+
+
+def test_ikhoka_registry_lookup_case_insensitive():
+    from backend.app.payments.registry import get_provider
+    assert get_provider("ikhoka") is not None
