@@ -515,3 +515,110 @@ def test_ikhoka_registry_lookup():
 def test_ikhoka_registry_lookup_case_insensitive():
     from backend.app.payments.registry import get_provider
     assert get_provider("ikhoka") is not None
+
+
+# ── Push notification service ─────────────────────────────────────────────────
+
+
+def test_push_service_skips_when_vapid_not_configured():
+    """send_order_alert returns immediately when VAPID keys are not set."""
+    import asyncio
+    from unittest.mock import MagicMock, patch
+
+    fake_settings = MagicMock()
+    fake_settings.VAPID_PRIVATE_KEY = ""
+    fake_settings.VAPID_PUBLIC_KEY = ""
+
+    with patch("backend.app.core.config.get_settings", return_value=fake_settings):
+        from backend.app.push_service import send_order_alert
+        # Must complete without error and without calling DB
+        asyncio.get_event_loop().run_until_complete(
+            send_order_alert(uuid.uuid4(), "BO-000001", "PICKUP")
+        )
+
+
+def test_push_service_skips_when_key_not_valid_base64():
+    """send_order_alert logs a warning and returns when VAPID key is not base64."""
+    import asyncio
+    from unittest.mock import MagicMock, patch
+
+    fake_settings = MagicMock()
+    fake_settings.VAPID_PRIVATE_KEY = "not-valid-base64!!!"
+    fake_settings.VAPID_PUBLIC_KEY = "somekey"
+
+    with patch("backend.app.core.config.get_settings", return_value=fake_settings):
+        from backend.app.push_service import send_order_alert
+        asyncio.get_event_loop().run_until_complete(
+            send_order_alert(uuid.uuid4(), "BO-000001", "DELIVERY")
+        )
+
+
+@pytest.mark.asyncio
+async def test_push_service_sends_to_all_subscribers():
+    """_send_to_business calls _send_one for each subscription in the business."""
+    import base64
+    from unittest.mock import AsyncMock, MagicMock, call, patch
+
+    from backend.app.push_service import _send_to_business
+
+    fake_sub_1 = MagicMock(endpoint="https://push.example.com/sub1", p256dh="key1", auth="auth1", business_id=uuid.uuid4())
+    fake_sub_2 = MagicMock(endpoint="https://push.example.com/sub2", p256dh="key2", auth="auth2", business_id=fake_sub_1.business_id)
+
+    mock_scalars = MagicMock()
+    mock_scalars.all.return_value = [fake_sub_1, fake_sub_2]
+    mock_result = MagicMock()
+    mock_result.scalars.return_value = mock_scalars
+
+    mock_db = AsyncMock()
+    mock_db.execute = AsyncMock(return_value=mock_result)
+
+    calls_made: list = []
+
+    async def fake_to_thread(fn, *args, **kwargs):
+        calls_made.append(args)
+
+    with patch("asyncio.to_thread", side_effect=fake_to_thread):
+        await _send_to_business(mock_db, fake_sub_1.business_id, '{"title":"New"}', "pem", {"sub": "mailto:x@y.com"})
+
+    assert len(calls_made) == 2
+    endpoints = [c[0] for c in calls_made]
+    assert "https://push.example.com/sub1" in endpoints
+    assert "https://push.example.com/sub2" in endpoints
+
+
+@pytest.mark.asyncio
+async def test_push_service_removes_expired_subscriptions():
+    """_send_to_business deletes subscriptions that return 404/410."""
+    import asyncio as aio
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from backend.app.push_service import _send_to_business
+
+    fake_sub = MagicMock(
+        endpoint="https://push.example.com/dead",
+        p256dh="key",
+        auth="auth",
+        business_id=uuid.uuid4(),
+    )
+
+    mock_scalars = MagicMock()
+    mock_scalars.all.return_value = [fake_sub]
+    mock_result = MagicMock()
+    mock_result.scalars.return_value = mock_scalars
+
+    mock_db = AsyncMock()
+    mock_db.execute = AsyncMock(return_value=mock_result)
+    mock_db.commit = AsyncMock()
+
+    # Simulate a 410 Gone response from the push service
+    expired_error = Exception("Gone")
+    expired_error.response = MagicMock(status_code=410)
+
+    async def raise_expired(fn, *args, **kwargs):
+        raise expired_error
+
+    with patch("asyncio.to_thread", side_effect=raise_expired):
+        await _send_to_business(mock_db, fake_sub.business_id, '{"title":"New"}', "pem", {"sub": "mailto:x@y.com"})
+
+    # Commit must have been called to persist the deletion
+    mock_db.commit.assert_called_once()

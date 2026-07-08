@@ -75,6 +75,17 @@ class Settings(BaseSettings):
     PAYMENT_RETURN_URL: str = "https://nextgenintelligence.co.za/payment/success"
     PAYMENT_CANCEL_URL: str = "https://nextgenintelligence.co.za/payment/cancelled"
 
+    # ── Web Push (VAPID) ──────────────────────────────────────────────────
+    # Generate keys once with:
+    #   python -c "from py_vapid import Vapid; import base64; v=Vapid(); v.generate_keys();
+    #     print('VAPID_PRIVATE_KEY=' + base64.b64encode(v.private_pem()).decode());
+    #     print('VAPID_PUBLIC_KEY=' + v.public_key.serialize().decode())"
+    # Store VAPID_PRIVATE_KEY as the base64-encoded PEM string.
+    # Store VAPID_PUBLIC_KEY as the raw base64url string (sent to browsers as applicationServerKey).
+    VAPID_PRIVATE_KEY: str = ""
+    VAPID_PUBLIC_KEY: str = ""
+    VAPID_CONTACT_EMAIL: str = "mailto:admin@nextgenintelligence.co.za"
+
     # ── Rate Limiting ────────────────────────────────────────────────────
     LOGIN_RATE_LIMIT_PER_MINUTE: int = 5
     ACCOUNT_LOCKOUT_ATTEMPTS: int = 5

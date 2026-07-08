@@ -3,6 +3,7 @@ Order Creator — transactionally creates orders from confirmed carts.
 Increments order number sequence, creates order + items, publishes to Redis.
 """
 
+import asyncio
 import json
 import logging
 import uuid
@@ -169,6 +170,19 @@ async def create_order_from_cart(
         )
     except Exception:
         logger.warning("Failed to publish SSE event for new order %s", order_number)
+
+    # ── 7. Push notifications (fire and forget) ──────────────────────────
+    try:
+        from backend.app.push_service import send_order_alert
+        asyncio.create_task(
+            send_order_alert(
+                business_id=business.id,
+                order_number=order_number,
+                order_mode=order_mode,
+            )
+        )
+    except Exception:
+        pass  # Never let push failures affect order creation
 
     logger.info(
         "Order created: %s for business %s, total %d cents, %d items",

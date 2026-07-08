@@ -13,6 +13,7 @@ from shared.models.customer import ConversationSession, Customer
 from shared.models.menu import MenuAddOn, MenuCategory, MenuItem
 from shared.models.message import Message
 from shared.models.order import Order, OrderEvent, OrderItem
+from shared.models.push_subscription import PushSubscription
 from shared.models.specials import Special
 from shared.models.user import AdminRefreshToken, BusinessUser, RefreshToken
 
@@ -35,6 +36,7 @@ __all__ = [
     "Order",
     "OrderEvent",
     "OrderItem",
+    "PushSubscription",
     "RefreshToken",
     "Special",
 ]
