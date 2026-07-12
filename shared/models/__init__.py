@@ -5,6 +5,7 @@ All SQLAlchemy models — import here so Alembic autogenerate discovers them.
 from shared.models.base import Base
 
 from shared.models.admin import AdminUser
+from shared.models.ai_emails import AiEmailImportBatch, AiEmailLead
 from shared.models.analytics import DailyUsage
 from shared.models.asset import Asset
 from shared.models.audit import AuditEvent, MessageOutbox
@@ -21,6 +22,8 @@ __all__ = [
     "Base",
     "AdminUser",
     "AdminRefreshToken",
+    "AiEmailImportBatch",
+    "AiEmailLead",
     "Asset",
     "AuditEvent",
     "Business",
