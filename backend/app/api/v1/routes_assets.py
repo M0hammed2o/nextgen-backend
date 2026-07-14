@@ -41,7 +41,7 @@ MAX_FILE_SIZE_MB = 5
 
 class UploadUrlRequest(BaseModel):
     kind: str = Field(
-        description="MENU_ITEM_IMAGE | BUSINESS_LOGO | SPECIAL_IMAGE"
+        description="MENU_ITEM_IMAGE | BUSINESS_LOGO | SPECIAL_IMAGE | BUSINESS_MENU_IMAGE"
     )
     entity_id: uuid.UUID | None = None
     content_type: str = Field(
@@ -55,6 +55,13 @@ class UploadUrlResponse(BaseModel):
     upload_url: str
     storage_path: str
     asset_id: uuid.UUID
+    # Permanent public URL — only resolves if the bucket/path is set to
+    # public read in Supabase. Callers that need indefinitely-valid URLs
+    # (e.g. a business's menu image, read by the WhatsApp bot with no
+    # per-request auth) should store this instead of a signed URL, which
+    # expires. Entities that must stay private should keep using
+    # /{asset_id}/signed-url instead of this field.
+    public_url: str
 
 
 class SignedUrlResponse(BaseModel):
@@ -205,10 +212,16 @@ async def get_upload_url(
             f"{settings.SUPABASE_STORAGE_BUCKET}/{storage_path}"
         )
 
+    public_url = (
+        f"{settings.SUPABASE_URL}/storage/v1/object/public/"
+        f"{settings.SUPABASE_STORAGE_BUCKET}/{storage_path}"
+    )
+
     return UploadUrlResponse(
         upload_url=upload_url,
         storage_path=storage_path,
         asset_id=asset_id,
+        public_url=public_url,
     )
 
 
