@@ -266,3 +266,47 @@ async def deactivate_staff(
         .values(revoked_at=datetime.now(timezone.utc))
     )
     await db.commit()
+
+
+@router.delete("/{staff_id}/permanent", status_code=204)
+async def delete_staff_permanently(
+    staff_id: uuid.UUID,
+    user: AuthUser = Depends(require_owner_or_manager),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Permanently delete a staff/manager record — irreversible, unlike the
+    soft-deactivate above. OWNER only, and only once the account is already
+    inactive (deactivate first) — a two-step gate against deleting someone
+    still on shift by mistake.
+
+    Safe to hard-delete: refresh_tokens and push_subscriptions cascade on
+    delete; order history (Order.cancelled_by_user_id,
+    OrderEvent.changed_by_user_id) intentionally has no FK to business_users,
+    so past orders simply keep the (now orphaned) id.
+    """
+    if user.role != "OWNER":
+        raise AppError("INSUFFICIENT_ROLE", "Only the owner can permanently delete staff", 403)
+
+    result = await db.execute(
+        select(BusinessUser).where(
+            BusinessUser.id == staff_id,
+            BusinessUser.business_id == user.business_id,
+        )
+    )
+    staff = result.scalar_one_or_none()
+    if not staff:
+        raise NotFoundError("Staff", str(staff_id))
+
+    if staff.id == user.user_id:
+        raise AppError("SELF_DELETION", "Cannot delete your own account", 422)
+
+    if staff.is_active:
+        raise AppError(
+            "STILL_ACTIVE",
+            "Deactivate this staff member before permanently deleting them",
+            422,
+        )
+
+    await db.delete(staff)
+    await db.commit()
