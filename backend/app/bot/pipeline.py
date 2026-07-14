@@ -3904,6 +3904,7 @@ async def _handle_recommendation_acceptance(
 
     added: list[str] = []
     unmatched: list[str] = []
+    needs_opts: list[tuple] = []
 
     for rec in recommended_items:
         name = rec.get("name", "")
@@ -3918,6 +3919,13 @@ async def _handle_recommendation_acceptance(
                 matched = sorted(candidates, reverse=True)[0][1]
 
         if matched:
+            # A recommended item can have required option groups (e.g. size)
+            # that the recommendation itself never specified — must ask before
+            # adding, same as the deterministic ORDER_START/ORDER_ADD path does.
+            missing = _get_missing_required_groups(matched, rec.get("special_instructions"))
+            if missing:
+                needs_opts.append((matched, rec))
+                continue
             safe_qty = max(1, min(int(rec.get("quantity") or 1), 20))
             state_machine.add_to_cart(
                 session,
@@ -3939,6 +3947,35 @@ async def _handle_recommendation_acceptance(
                 "REC_ACCEPT_UNMATCHED: %r not found in menu, session_id=%s",
                 name, session.id,
             )
+
+    if needs_opts:
+        # Ask about the first item's missing required group. Any other
+        # recommended items already added above stay in the cart; the pending
+        # one is asked about before anything is locked/confirmed.
+        _pend_item, _pend_rec = needs_opts[0]
+        _pend_qty = max(1, min(int(_pend_rec.get("quantity") or 1), 20))
+        _missing_groups = _get_missing_required_groups(_pend_item, _pend_rec.get("special_instructions"))
+        state_machine.set_context(session, "pending_options", [{
+            "name": _pend_item.name,
+            "quantity": _pend_qty,
+            "special_instructions": _pend_rec.get("special_instructions"),
+            "menu_item_id": str(_pend_item.id),
+            "options_json": getattr(_pend_item, "options_json", None) or {},
+        }])
+        # recommended_items is done with — the pending item takes over from here.
+        state_machine.set_context(session, "recommended_items", None)
+        state_machine.transition_state(session, ConversationState.CHOOSING_OPTIONS.value)
+        logger.warning(
+            "REC_ACCEPT_OPTIONS_REQUIRED: item=%r, missing=%r, session_id=%s",
+            _pend_item.name, [g["name"] for g in _missing_groups], session.id,
+        )
+        prefix = ""
+        if added:
+            prefix = "Added to your order: " + ", ".join(added) + " ✅\n\n"
+        return (
+            prefix + _build_option_question(_pend_item.name, _missing_groups),
+            False, None, None, None,
+        )
 
     # Clear the stored recommendation regardless of outcome
     state_machine.set_context(session, "recommended_items", None)
