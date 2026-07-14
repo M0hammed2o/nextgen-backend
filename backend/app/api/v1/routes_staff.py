@@ -21,12 +21,21 @@ from shared.models.user import BusinessUser, RefreshToken
 router = APIRouter(prefix="/business/staff", tags=["staff"])
 
 
+def _generate_pin() -> str:
+    """4 digits — matches the staff till's fixed 4-digit PinKeypad UI."""
+    return f"{secrets.randbelow(10000):04d}"
+
+
 # ── Schemas ──────────────────────────────────────────────────────────────────
 
 class StaffCreate(BaseModel):
-    """Create a staff member (PIN-based) or manager (email+password)."""
+    """
+    Create a staff member (PIN-based) or manager (email+password).
+    pin is optional for STAFF — a 4-digit PIN is auto-generated when omitted
+    and returned once via StaffResponse.initial_pin.
+    """
     staff_name: str = Field(max_length=255)
-    pin: str | None = Field(default=None, min_length=4, max_length=8, pattern=r"^\d{4,8}$")
+    pin: str | None = Field(default=None, min_length=4, max_length=4, pattern=r"^\d{4}$")
     role: str = Field(default="STAFF", pattern=r"^(STAFF|MANAGER)$")
     email: EmailStr | None = None
     password: str | None = Field(default=None, min_length=8, max_length=128)
@@ -38,7 +47,9 @@ class StaffUpdate(BaseModel):
 
 
 class PinRotation(BaseModel):
-    new_pin: str = Field(min_length=4, max_length=8, pattern=r"^\d{4,8}$")
+    # Exactly 4 digits — matches the staff till's PinKeypad, which is a
+    # fixed 4-digit UI. A longer PIN can never be entered on the till.
+    new_pin: str = Field(min_length=4, max_length=4, pattern=r"^\d{4}$")
 
 
 class StaffResponse(BaseModel):
@@ -49,6 +60,9 @@ class StaffResponse(BaseModel):
     is_active: bool
     last_login_at: datetime | None
     created_at: datetime
+    # Populated only by POST /business/staff when a PIN was auto-generated —
+    # shown once, never returned by GET/PUT.
+    initial_pin: str | None = None
     model_config = {"from_attributes": True}
 
 
@@ -83,7 +97,9 @@ async def create_staff(
     """
     Create a new staff or manager user.
 
-    STAFF role: requires pin (4-8 digits). Authenticates via POST /auth/pin.
+    STAFF role: pin is optional — a 4-digit PIN is auto-generated when
+    omitted and returned once via the response's initial_pin field.
+    Authenticates via POST /auth/pin.
     MANAGER role: requires email + password. Authenticates via POST /auth/login.
     """
     # Only OWNER can create MANAGER
@@ -91,6 +107,7 @@ async def create_staff(
         raise AppError("INSUFFICIENT_ROLE", "Only the owner can create managers", 403)
 
     # Validate required fields based on role
+    generated_pin: str | None = None
     if body.role == "MANAGER":
         if not body.email:
             raise AppError("MISSING_EMAIL", "Email is required for managers", 422)
@@ -98,7 +115,7 @@ async def create_staff(
             raise AppError("MISSING_PASSWORD", "Password is required for managers", 422)
     else:  # STAFF
         if not body.pin:
-            raise AppError("MISSING_PIN", "PIN is required for staff members", 422)
+            generated_pin = _generate_pin()
 
     # Check email uniqueness if provided
     if body.email:
@@ -109,19 +126,23 @@ async def create_staff(
         if existing.scalar_one_or_none():
             raise DuplicateError("User", "email")
 
+    pin_to_store = body.pin or generated_pin
     staff = BusinessUser(
         business_id=user.business_id,
         role=body.role,
         staff_name=body.staff_name,
         email=body.email.lower().strip() if body.email else None,
         password_hash=hash_password(body.password) if body.password else None,
-        pin_hash=hash_pin(body.pin) if body.pin else None,
-        pin_updated_at=datetime.now(timezone.utc) if body.pin else None,
+        pin_hash=hash_pin(pin_to_store) if pin_to_store else None,
+        pin_updated_at=datetime.now(timezone.utc) if pin_to_store else None,
         is_active=True,
     )
     db.add(staff)
     await db.commit()
     await db.refresh(staff)
+
+    # Transient attribute — not a mapped column, never persisted.
+    staff.initial_pin = generated_pin
     return StaffResponse.model_validate(staff)
 
 
@@ -189,8 +210,9 @@ async def auto_rotate_pin(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Auto-generate a new random 6-digit PIN, hash it, and return plaintext once.
-    This is the recommended way to rotate PINs.
+    Auto-generate a new random 4-digit PIN, hash it, and return plaintext once.
+    This is the recommended way to rotate PINs. 4 digits matches the staff
+    till's fixed-length PinKeypad — anything longer can't be entered there.
     """
     result = await db.execute(
         select(BusinessUser).where(
@@ -202,8 +224,7 @@ async def auto_rotate_pin(
     if not staff:
         raise NotFoundError("Staff", str(staff_id))
 
-    # Generate random 6-digit PIN
-    new_pin = f"{secrets.randbelow(1000000):06d}"
+    new_pin = _generate_pin()
 
     staff.pin_hash = hash_pin(new_pin)
     staff.pin_updated_at = datetime.now(timezone.utc)

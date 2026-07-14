@@ -370,6 +370,102 @@ async def create_business_owner(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# NEW: Feature 3 — List and reset password for existing owner/manager logins
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class BusinessUserSummary(BaseModel):
+    id: uuid.UUID
+    email: str | None
+    staff_name: str | None
+    role: str
+    is_active: bool
+    last_login_at: datetime | None
+    created_at: datetime
+    model_config = {"from_attributes": True}
+
+
+class ResetPasswordResponse(BaseModel):
+    id: uuid.UUID
+    email: str | None
+    # Shown once, in this response only.
+    temporary_password: str
+    model_config = {"from_attributes": True}
+
+
+@router.get(
+    "/{business_id}/users",
+    response_model=list[BusinessUserSummary],
+    summary="List owner/manager logins for a business",
+)
+async def list_business_users(
+    business_id: uuid.UUID,
+    user: AuthUser = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    biz = await db.get(Business, business_id)
+    if not biz:
+        raise NotFoundError("Business", str(business_id))
+
+    result = await db.execute(
+        select(BusinessUser)
+        .where(
+            BusinessUser.business_id == business_id,
+            BusinessUser.role.in_(["OWNER", "MANAGER"]),
+        )
+        .order_by(BusinessUser.staff_name, BusinessUser.email)
+    )
+    return [BusinessUserSummary.model_validate(u) for u in result.scalars().all()]
+
+
+@router.post(
+    "/{business_id}/users/{user_id}/reset-password",
+    response_model=ResetPasswordResponse,
+    summary="Reset an owner/manager's password (generates a new temporary password)",
+)
+async def reset_business_user_password(
+    business_id: uuid.UUID,
+    user_id: uuid.UUID,
+    user: AuthUser = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Generate a new temporary password for an existing OWNER/MANAGER login,
+    force a reset via must_change_password (same flow as account creation),
+    and revoke their live sessions — same pattern as staff deactivation.
+    """
+    from sqlalchemy import update as sa_update
+    from shared.models.user import RefreshToken
+
+    result = await db.execute(
+        select(BusinessUser).where(
+            BusinessUser.id == user_id,
+            BusinessUser.business_id == business_id,
+            BusinessUser.role.in_(["OWNER", "MANAGER"]),
+        )
+    )
+    target = result.scalar_one_or_none()
+    if not target:
+        raise NotFoundError("User", str(user_id))
+
+    temp_password = generate_temp_password()
+    target.password_hash = hash_password(temp_password)
+    target.must_change_password = True
+    target.failed_login_attempts = 0
+    target.locked_until = None
+
+    await db.execute(
+        sa_update(RefreshToken)
+        .where(RefreshToken.user_id == target.id, RefreshToken.revoked_at.is_(None))
+        .values(revoked_at=datetime.now(timezone.utc))
+    )
+    await db.commit()
+    await db.refresh(target)
+
+    target.temporary_password = temp_password
+    return ResetPasswordResponse.model_validate(target)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # NEW: Feature 2 — WhatsApp test message send
 # ═══════════════════════════════════════════════════════════════════════════════
 
