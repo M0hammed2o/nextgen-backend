@@ -21,6 +21,7 @@ from fastapi import APIRouter, HTTPException, Path, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.app.core.crypto import decrypt_credential
 from backend.app.db.session import get_db
 from fastapi import Depends
 from shared.models.business import Business
@@ -133,7 +134,7 @@ async def yoco_webhook(
         raise HTTPException(status_code=404, detail="Business not found")
 
     from backend.app.payments.yoco import YocoProvider
-    webhook_secret = getattr(business, "payment_webhook_secret", None) or ""
+    webhook_secret = decrypt_credential(getattr(business, "payment_webhook_secret", None)) or ""
     if not YocoProvider.verify_signature(raw_body, sig, webhook_secret):
         logger.warning("Yoco webhook: invalid signature for business %s", business_id)
         raise HTTPException(status_code=400, detail="Invalid signature")
@@ -181,7 +182,7 @@ async def payfast_webhook(
         raise HTTPException(status_code=404, detail="Business not found")
 
     from backend.app.payments.payfast import PayFastProvider
-    passphrase = getattr(business, "payment_webhook_secret", None)
+    passphrase = decrypt_credential(getattr(business, "payment_webhook_secret", None))
     # verify_signature pops "signature" from params dict
     params_copy = dict(params)
     if not PayFastProvider.verify_signature(params_copy, passphrase):
@@ -223,7 +224,7 @@ async def ikhoka_webhook(
     from backend.app.payments.ikhoka import IKhokaProvider
     # iKhoka uses the Application Secret (payment_api_secret) for webhook signing —
     # the same secret used to sign outbound API requests.
-    app_secret = getattr(business, "payment_api_secret", None) or ""
+    app_secret = decrypt_credential(getattr(business, "payment_api_secret", None)) or ""
     callback_path = f"/v1/payments/webhooks/ikhoka/{business_id}"
 
     if not IKhokaProvider.verify_signature(raw_body, ik_sign, app_secret, callback_path):
@@ -268,7 +269,7 @@ async def stitch_webhook(
 
     from backend.app.payments.stitch import StitchProvider
     # Stitch signs with client_secret (same as payment_api_key)
-    client_secret = getattr(business, "payment_api_key", None) or ""
+    client_secret = decrypt_credential(getattr(business, "payment_api_key", None)) or ""
     if not StitchProvider.verify_signature(raw_body, sig, client_secret):
         logger.warning("Stitch webhook: invalid signature for business %s", business_id)
         raise HTTPException(status_code=400, detail="Invalid signature")

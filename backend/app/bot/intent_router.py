@@ -398,11 +398,15 @@ def is_cart_correction(text: str) -> bool:
       "No, just one of each"
       "Actually I want only one of each"
       "Make it just one of each"
+      "No i want a single Classic Smash Burger and 2 ice coffee"  — DIFFERENT
+        per-item quantities, not "one of each": customer is restating counts
+        for items already in the cart, not adding more on top.
 
     These should NOT match (simple add-ons or removals):
       "Add an ice coffee"
       "Remove the tomato"
       "I want to add wings"
+      "No tomato please"
     """
     pattern = re.compile(
         r"("
@@ -422,6 +426,15 @@ def is_cart_correction(text: str) -> bool:
         # "Actually I only want..." is already covered by the (actually|no) branch above;
         # this covers "Actually make it..." without a following want/just/only phrase
         r"|actually\s+make\s+it"
+        # "No I want <qty> <item> and <qty> <item>..." / "No give me <qty> ..." —
+        # customer restates the FULL order with specific, possibly-different
+        # per-item quantities (not the uniform "one of each" case above).
+        # Excludes "no ... i want TO ADD ..." which signals a plain addition,
+        # not a restatement. Requires a quantity word directly after
+        # want/give-me (optionally through "just"/"only") so bare "no thanks" /
+        # "no tomato please" never match.
+        r"|\bno[,.]?\s+(i\s+)?(want|give\s+me)\s+(just\s+|only\s+)?(?!to\s+add\b)"
+        r"(a\s+single|a\b|an\b|one|two|three|four|five|six|\d+)"
         r")",
         re.I,
     )

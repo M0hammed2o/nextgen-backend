@@ -175,6 +175,16 @@ def closed_response(business: Business) -> str:
     )
 
 
+def busy_response(business: Business) -> str:
+    """Response when staff have paused WhatsApp ordering (too busy)."""
+    if business.busy_text:
+        return business.busy_text
+    return (
+        f"Sorry, *{business.name}* is currently too busy to take WhatsApp orders. 🙏\n\n"
+        "Please place your order in store, or try again shortly."
+    )
+
+
 def fallback_response(business: Business) -> str:
     """Response when we can't understand the message."""
     if business.fallback_text:

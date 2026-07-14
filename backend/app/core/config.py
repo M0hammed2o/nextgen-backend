@@ -40,9 +40,23 @@ class Settings(BaseSettings):
 
     # ── JWT ───────────────────────────────────────────────────────────────
     JWT_SECRET_KEY: str = "CHANGE-ME-IN-PRODUCTION"
+    # Separate signing secret for admin-plane (SUPER_ADMIN) tokens.
+    # MUST differ from JWT_SECRET_KEY in production — a leak of the business
+    # API secret must not allow forging admin tokens.
+    JWT_ADMIN_SECRET_KEY: str = "CHANGE-ME-IN-PRODUCTION"
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    # STAFF tokens expire faster: a deactivated till user must lose access
+    # within minutes, not half an hour.
+    STAFF_ACCESS_TOKEN_EXPIRE_MINUTES: int = 10
     REFRESH_TOKEN_EXPIRE_DAYS: int = 30
+
+    # ── Credential encryption (payment provider keys at rest) ────────────
+    # Fernet key — generate with:
+    #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    # Empty = credentials stored as-is (development only; production startup
+    # validation requires this to be set).
+    CREDENTIALS_ENCRYPTION_KEY: str = ""
 
     # ── Meta / WhatsApp (Model 1: single WABA, platform token) ───────────
     META_API_BASE_URL: str = "https://graph.facebook.com"
@@ -87,7 +101,10 @@ class Settings(BaseSettings):
     VAPID_CONTACT_EMAIL: str = "mailto:admin@nextgenintelligence.co.za"
 
     # ── Rate Limiting ────────────────────────────────────────────────────
+    RATE_LIMIT_ENABLED: bool = True
     LOGIN_RATE_LIMIT_PER_MINUTE: int = 5
+    PIN_RATE_LIMIT_PER_MINUTE: int = 10
+    REFRESH_RATE_LIMIT_PER_MINUTE: int = 30
     ACCOUNT_LOCKOUT_ATTEMPTS: int = 5
     ACCOUNT_LOCKOUT_MINUTES: int = 30
     CUSTOMER_MESSAGE_RATE_PER_MINUTE: int = 10

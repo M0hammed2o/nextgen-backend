@@ -53,8 +53,9 @@ class IKhokaProvider(PaymentProvider):
 
     async def create_payment_link(self, order, business) -> str | None:
         """POST to iKhoka payment API and return the hosted paylinkUrl."""
-        app_id = getattr(business, "payment_api_key", None)
-        app_secret = getattr(business, "payment_api_secret", None)
+        from backend.app.core.crypto import decrypt_credential
+        app_id = decrypt_credential(getattr(business, "payment_api_key", None))
+        app_secret = decrypt_credential(getattr(business, "payment_api_secret", None))
         if not app_id or not app_secret:
             logger.warning(
                 "iKhoka: missing credentials for business %s", getattr(business, "id", "?")

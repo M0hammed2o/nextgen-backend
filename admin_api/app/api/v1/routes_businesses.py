@@ -19,7 +19,7 @@ from backend.app.core.security import hash_password
 from backend.app.db.session import get_db
 from shared.models.business import Business
 from shared.models.user import BusinessUser
-from shared.utils import generate_business_code
+from shared.utils import generate_business_code, generate_temp_password
 
 logger = logging.getLogger("nextgen.admin")
 router = APIRouter(prefix="/admin/businesses", tags=["admin-businesses"])
@@ -36,9 +36,11 @@ class BusinessCreate(BaseModel):
     daily_message_limit: int = 800
     daily_llm_call_limit: int = 400
     daily_order_limit: int = 200
-    # Optional: create owner user in the same transaction
+    # Optional: create owner user in the same transaction.
+    # No password field — the system always generates a temporary password
+    # (see owner_temporary_password on BusinessAdminResponse) and the owner
+    # must set a real one via POST /auth/set-password before they can log in.
     owner_email: EmailStr | None = None
-    owner_password: str | None = Field(default=None, min_length=8, max_length=128)
     owner_full_name: str | None = Field(default=None, max_length=255)
 
 
@@ -82,13 +84,20 @@ class BusinessAdminResponse(BaseModel):
     daily_order_limit: int
     last_webhook_received_at: datetime | None
     created_at: datetime
+    # Populated only by POST /admin/businesses when owner_email was provided —
+    # shown once, never returned by GET/PATCH.
+    owner_temporary_password: str | None = None
     model_config = {"from_attributes": True}
 
 
 class OwnerCreateRequest(BaseModel):
-    """Create an owner/manager login for a business."""
+    """
+    Create an owner/manager login for a business.
+    No password field — the system always generates a temporary password
+    (returned once as OwnerResponse.temporary_password) and the owner must
+    set a real one via POST /auth/set-password before they can log in.
+    """
     email: EmailStr
-    password: str = Field(min_length=8, max_length=128)
     full_name: str = Field(max_length=255)
     role: str = Field(default="OWNER", pattern=r"^(OWNER|MANAGER)$")
 
@@ -101,6 +110,9 @@ class OwnerResponse(BaseModel):
     business_id: uuid.UUID
     is_active: bool
     created_at: datetime
+    # Shown ONCE, in this creation response only — never persisted in plaintext,
+    # never returned by any other endpoint.
+    temporary_password: str
     model_config = {"from_attributes": True}
 
 
@@ -181,13 +193,6 @@ async def create_business(
         if email_check.scalar_one_or_none():
             raise DuplicateError("User", "email")
 
-        if not body.owner_password:
-            raise AppError(
-                "MISSING_PASSWORD",
-                "owner_password is required when owner_email is provided",
-                422,
-            )
-
     # Generate unique business code
     for _ in range(10):
         code = generate_business_code()
@@ -200,26 +205,33 @@ async def create_business(
         raise AppError("CODE_GENERATION_FAILED", "Could not generate unique business code", 500)
 
     # Create business
-    biz_data = body.model_dump(exclude={"owner_email", "owner_password", "owner_full_name", "slug"})
+    biz_data = body.model_dump(exclude={"owner_email", "owner_full_name", "slug"})
     biz = Business(business_code=code, slug=body_slug, **biz_data)
     db.add(biz)
     await db.flush()  # Get biz.id before creating user
 
-    # Optionally create owner user in same transaction
-    if body.owner_email and body.owner_password:
+    # Optionally create owner user in same transaction, with a generated
+    # temporary password — same policy as POST /admin/businesses/{id}/owner.
+    owner_temp_password: str | None = None
+    if body.owner_email:
+        owner_temp_password = generate_temp_password()
         owner = BusinessUser(
             business_id=biz.id,
             role="OWNER",
             email=body.owner_email.lower().strip(),
-            password_hash=hash_password(body.owner_password),
+            password_hash=hash_password(owner_temp_password),
             staff_name=body.owner_full_name,
             is_active=True,
+            must_change_password=True,
         )
         db.add(owner)
 
     await db.commit()
     await db.refresh(biz)
-    return BusinessAdminResponse.model_validate(biz)
+
+    response = BusinessAdminResponse.model_validate(biz)
+    response.owner_temporary_password = owner_temp_password
+    return response
 
 
 @router.get("/{business_id}", response_model=BusinessAdminResponse)
@@ -338,18 +350,22 @@ async def create_business_owner(
     if existing.scalar_one_or_none():
         raise DuplicateError("User", "email")
 
+    temp_password = generate_temp_password()
     owner = BusinessUser(
         business_id=business_id,
         role=body.role,
         email=email_lower,
-        password_hash=hash_password(body.password),
+        password_hash=hash_password(temp_password),
         staff_name=body.full_name,
         is_active=True,
+        must_change_password=True,
     )
     db.add(owner)
     await db.commit()
     await db.refresh(owner)
 
+    # Transient attribute — not a mapped column, never persisted.
+    owner.temporary_password = temp_password
     return OwnerResponse.model_validate(owner)
 
 

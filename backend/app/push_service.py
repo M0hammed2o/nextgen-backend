@@ -66,18 +66,76 @@ async def send_order_alert(
         await _send_to_business(db, business_id, payload, pem_str, vapid_claims)
 
 
+async def send_whatsapp_status_alert(
+    business_id: uuid.UUID,
+    paused: bool,
+    staff_name: str | None,
+) -> None:
+    """
+    Background task: notify OWNER/MANAGER subscriptions when staff pause or
+    resume WhatsApp ordering. Unlike send_order_alert (all staff), this only
+    targets OWNER/MANAGER — a busy-toggle event is an owner-facing concern.
+    Opens its own DB session, independent of the toggle endpoint's transaction.
+    """
+    from backend.app.core.config import get_settings
+    settings = get_settings()
+    if not settings.VAPID_PRIVATE_KEY or not settings.VAPID_PUBLIC_KEY:
+        return
+
+    try:
+        pem_str = base64.b64decode(settings.VAPID_PRIVATE_KEY).decode("ascii")
+    except Exception:
+        logger.warning("VAPID_PRIVATE_KEY is not valid base64 — push skipped")
+        return
+
+    from backend.app.db.session import async_session_factory
+
+    if paused:
+        by = f" by {staff_name}" if staff_name else ""
+        payload = json.dumps({
+            "title": "WhatsApp ordering paused",
+            "body": f"Paused{by} — customers are seeing your busy message.",
+            "url": "/",
+        })
+    else:
+        payload = json.dumps({
+            "title": "WhatsApp ordering resumed",
+            "body": "Customers can place orders again.",
+            "url": "/",
+        })
+    vapid_claims = {"sub": settings.VAPID_CONTACT_EMAIL}
+
+    async with async_session_factory() as db:
+        await _send_to_business(
+            db, business_id, payload, pem_str, vapid_claims,
+            roles=("OWNER", "MANAGER"),
+        )
+
+
 async def _send_to_business(
     db: AsyncSession,
     business_id: uuid.UUID,
     payload: str,
     pem_str: str,
     vapid_claims: dict,
+    roles: tuple[str, ...] | None = None,
 ) -> None:
     from shared.models.push_subscription import PushSubscription
 
-    result = await db.execute(
-        select(PushSubscription).where(PushSubscription.business_id == business_id)
-    )
+    if roles:
+        from shared.models.user import BusinessUser
+        result = await db.execute(
+            select(PushSubscription)
+            .join(BusinessUser, BusinessUser.id == PushSubscription.user_id)
+            .where(
+                PushSubscription.business_id == business_id,
+                BusinessUser.role.in_(roles),
+            )
+        )
+    else:
+        result = await db.execute(
+            select(PushSubscription).where(PushSubscription.business_id == business_id)
+        )
     subscriptions = result.scalars().all()
     if not subscriptions:
         return

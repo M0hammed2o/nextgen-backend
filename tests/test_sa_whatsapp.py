@@ -649,3 +649,39 @@ class TestCartCorrectionNonRegression:
         assert not is_cart_correction(normalize(text)), (
             f"Should NOT be cart correction: {text!r}"
         )
+
+
+class TestCartCorrectionPerItemQuantities:
+    """
+    Regression test for a reported bug: a customer restating their order with
+    DIFFERENT per-item quantities (not the uniform "one of each" case) was
+    misread as an addition, e.g. cart at 2x Burger + 2x Coffee, customer says
+    "No i want a single Classic Smash Burger and 2 ice coffee" (meaning:
+    replace with 1 burger + 2 coffees total) — the bot instead added on top,
+    producing 3x Burger + 4x Coffee.
+    """
+
+    @pytest.mark.parametrize("text", [
+        "No i want a single Classic Smash Burger and 2 ice coffee",
+        "No I want a Classic Smash Burger and 2 ice coffee",
+        "No, I want 1 burger and 2 coffees",
+        "No I want just a burger and two coffees",
+        "no give me a single burger and 2 coffees",
+    ])
+    def test_restated_order_with_per_item_quantities_is_correction(self, text):
+        assert is_cart_correction(normalize(text)), (
+            f"Expected cart correction for: {text!r}"
+        )
+
+    @pytest.mark.parametrize("text", [
+        # "to add" signals a plain addition, not a full restatement
+        "No, I want to add wings",
+        "No, I want to add a Coke",
+        # no want/give-me directly after "no" — must not match
+        "no tomato please",
+        "No, that's not right",
+    ])
+    def test_similar_but_non_correction_messages_do_not_match(self, text):
+        assert not is_cart_correction(normalize(text)), (
+            f"Should NOT be cart correction: {text!r}"
+        )

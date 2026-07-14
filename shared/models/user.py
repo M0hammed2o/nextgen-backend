@@ -34,6 +34,11 @@ class BusinessUser(Base, UUIDPrimaryKeyMixin, TimestampMixin):
 
     # ── Status & Security ────────────────────────────────────────────────
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    must_change_password: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False,
+        comment="Set when admin generates a temp password — blocks normal "
+                 "login until POST /auth/set-password succeeds"
+    )
     failed_login_attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     locked_until: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True

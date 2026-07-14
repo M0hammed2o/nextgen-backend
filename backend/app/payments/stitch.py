@@ -131,8 +131,9 @@ class StitchProvider(PaymentProvider):
         browser, select their bank, and authorise the payment — funds land
         directly in the business's linked bank account.
         """
-        client_secret = getattr(business, "payment_api_key", None)
-        client_id = getattr(business, "payment_api_secret", None)
+        from backend.app.core.crypto import decrypt_credential
+        client_secret = decrypt_credential(getattr(business, "payment_api_key", None))
+        client_id = decrypt_credential(getattr(business, "payment_api_secret", None))
         if not client_secret or not client_id:
             logger.warning(
                 "Stitch: missing client_id or client_secret for business %s",

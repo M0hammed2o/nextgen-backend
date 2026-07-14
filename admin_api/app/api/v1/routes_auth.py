@@ -9,6 +9,7 @@ from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.app.core.ratelimit import limiter
 from backend.app.core.security import (
     create_admin_access_token,
     hash_refresh_token,
@@ -40,6 +41,7 @@ from backend.app.db.session import get_db
 
 
 @router.post("/login", response_model=AdminTokenResponse)
+@limiter.limit("5/minute")
 async def admin_login(
     body: AdminLoginRequest,
     request: Request,

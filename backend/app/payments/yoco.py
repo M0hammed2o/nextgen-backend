@@ -37,7 +37,8 @@ class YocoProvider(PaymentProvider):
 
     async def create_payment_link(self, order, business) -> str | None:
         """Call Yoco Checkouts API and return the hosted payment URL."""
-        api_key = getattr(business, "payment_api_key", None)
+        from backend.app.core.crypto import decrypt_credential
+        api_key = decrypt_credential(getattr(business, "payment_api_key", None))
         if not api_key:
             logger.warning("Yoco: no api_key configured for business %s", getattr(business, "id", "?"))
             return None

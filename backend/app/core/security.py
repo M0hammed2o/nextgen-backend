@@ -53,16 +53,19 @@ def create_access_token(
     business_id: uuid.UUID | None,
     role: str,
     extra_claims: dict | None = None,
+    expires_minutes: int | None = None,
 ) -> str:
     """
     Create a JWT access token.
-    
+
     Claims:
         sub: user_id (str)
         bid: business_id (str or null)
         role: user role
         exp: expiration
         iat: issued at
+
+    expires_minutes overrides the default TTL (used for short-lived STAFF tokens).
     """
     now = datetime.now(timezone.utc)
     payload = {
@@ -70,7 +73,7 @@ def create_access_token(
         "bid": str(business_id) if business_id else None,
         "role": role,
         "iat": now,
-        "exp": now + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES),
+        "exp": now + timedelta(minutes=expires_minutes or settings.ACCESS_TOKEN_EXPIRE_MINUTES),
         "type": "access",
     }
     if extra_claims:
@@ -79,7 +82,11 @@ def create_access_token(
 
 
 def create_admin_access_token(admin_user_id: uuid.UUID, role: str = "SUPER_ADMIN") -> str:
-    """Create a JWT access token for admin users (no business_id)."""
+    """
+    Create a JWT access token for admin users (no business_id).
+    Signed with JWT_ADMIN_SECRET_KEY — the admin plane is cryptographically
+    separate from the business plane.
+    """
     now = datetime.now(timezone.utc)
     payload = {
         "sub": str(admin_user_id),
@@ -89,19 +96,39 @@ def create_admin_access_token(admin_user_id: uuid.UUID, role: str = "SUPER_ADMIN
         "exp": now + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES),
         "type": "admin_access",
     }
-    return jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+    return jwt.encode(payload, settings.JWT_ADMIN_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
 
 
 def decode_access_token(token: str) -> dict:
     """
-    Decode and validate a JWT access token.
-    Raises jwt.ExpiredSignatureError or jwt.InvalidTokenError on failure.
+    Decode and validate a business-plane JWT access token.
+    Raises jwt.ExpiredSignatureError or jwt.InvalidTokenError on failure —
+    including admin-plane tokens, which are signed with a different secret
+    and carry type="admin_access".
     """
-    return jwt.decode(
+    payload = jwt.decode(
         token,
         settings.JWT_SECRET_KEY,
         algorithms=[settings.JWT_ALGORITHM],
     )
+    if payload.get("type", "access") != "access":
+        raise jwt.InvalidTokenError("Not a business-plane access token")
+    return payload
+
+
+def decode_admin_token(token: str) -> dict:
+    """
+    Decode and validate an admin-plane JWT (type="admin_access").
+    Raises jwt.ExpiredSignatureError or jwt.InvalidTokenError on failure.
+    """
+    payload = jwt.decode(
+        token,
+        settings.JWT_ADMIN_SECRET_KEY,
+        algorithms=[settings.JWT_ALGORITHM],
+    )
+    if payload.get("type") != "admin_access":
+        raise jwt.InvalidTokenError("Not an admin-plane access token")
+    return payload
 
 
 # ── Meta Webhook Signature Verification ──────────────────────────────────────

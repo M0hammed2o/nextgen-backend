@@ -13,6 +13,7 @@ from backend.app.core.config import get_settings
 from backend.app.core.errors import AppError, NotFoundError
 from backend.app.core.security import (
     create_access_token,
+    hash_password,
     hash_refresh_token,
     verify_password,
     verify_pin,
@@ -53,6 +54,9 @@ class AuthService:
 
         if not user.password_hash or not verify_password(password, user.password_hash):
             await self._record_failed_login(user)
+            # Commit explicitly — get_db never commits, so without this the
+            # failed-attempt counter is lost when the 401 propagates.
+            await self.db.commit()
             raise AppError("INVALID_CREDENTIALS", "Invalid email or password", 401)
 
         if not user.is_active:
@@ -67,24 +71,78 @@ class AuthService:
         user.locked_until = None
         user.last_login_at = datetime.now(timezone.utc)
 
-        # Create tokens
-        access_token = create_access_token(user.id, user.business_id, user.role)
-        refresh_raw = generate_refresh_token()
-        await self._store_refresh_token(user.id, refresh_raw, ip_address)
+        if user.must_change_password:
+            # They proved they know the (temporary) password — bookkeeping
+            # above stands — but no tokens until they set a real one via
+            # POST /auth/set-password.
+            await self.db.commit()
+            raise AppError(
+                "PASSWORD_CHANGE_REQUIRED",
+                "You must set a new password before continuing",
+                403,
+            )
 
+        access_token, refresh_raw = await self._issue_tokens(user, ip_address)
         await self.db.commit()
         return user, business, access_token, refresh_raw
 
-    # ── Business Code + PIN Login (STAFF) ────────────────────────────────
+    # ── Forced Password Reset (OWNER / MANAGER) ──────────────────────────
 
-    async def login_pin(
-        self, business_code: str, pin: str, ip_address: str | None = None
+    async def set_password(
+        self, email: str, current_password: str, new_password: str, ip_address: str | None = None
     ) -> tuple[BusinessUser, Business, str, str]:
         """
-        Authenticate staff via business_code + PIN.
-        Returns (user, business, access_token, refresh_token_raw).
+        Complete a forced password reset: re-verify the current (temporary)
+        password, set a real one, clear must_change_password, and issue
+        tokens (auto-login). Returns (user, business, access_token, refresh_token_raw).
         """
-        # Find business by code
+        stmt = select(BusinessUser).where(BusinessUser.email == email.lower().strip())
+        result = await self.db.execute(stmt)
+        user = result.scalar_one_or_none()
+
+        if not user:
+            raise AppError("INVALID_CREDENTIALS", "Invalid email or password", 401)
+
+        self._check_lockout(user)
+
+        if not user.password_hash or not verify_password(current_password, user.password_hash):
+            await self._record_failed_login(user)
+            await self.db.commit()
+            raise AppError("INVALID_CREDENTIALS", "Invalid email or password", 401)
+
+        if not user.is_active:
+            raise AppError("ACCOUNT_DISABLED", "This account has been disabled", 403)
+
+        if new_password == current_password:
+            raise AppError(
+                "SAME_PASSWORD",
+                "New password must be different from the current password",
+                422,
+            )
+
+        business = await self._load_business(user.business_id)
+        self._check_business_active(business)
+
+        user.password_hash = hash_password(new_password)
+        user.must_change_password = False
+        user.failed_login_attempts = 0
+        user.locked_until = None
+        user.last_login_at = datetime.now(timezone.utc)
+
+        access_token, refresh_raw = await self._issue_tokens(user, ip_address)
+        await self.db.commit()
+        return user, business, access_token, refresh_raw
+
+    # ── Business Code + Staff + PIN Login (STAFF) ────────────────────────
+
+    async def get_staff_directory(
+        self, business_code: str
+    ) -> tuple[Business, list[BusinessUser]]:
+        """
+        Return the active, PIN-enabled staff for the login screen's
+        pick-your-name step. Raises the same generic 401 as login for an
+        unknown code so business codes cannot be probed apart from PINs.
+        """
         stmt = select(Business).where(Business.business_code == business_code.upper())
         result = await self.db.execute(stmt)
         business = result.scalar_one_or_none()
@@ -94,43 +152,80 @@ class AuthService:
 
         self._check_business_active(business)
 
-        # Find matching staff user by trying each staff PIN
         stmt = (
             select(BusinessUser)
             .where(
                 BusinessUser.business_id == business.id,
                 BusinessUser.role == "STAFF",
                 BusinessUser.is_active == True,
+                BusinessUser.pin_hash.is_not(None),
             )
+            .order_by(BusinessUser.staff_name)
         )
         result = await self.db.execute(stmt)
-        staff_users = result.scalars().all()
+        return business, list(result.scalars().all())
 
-        matched_user = None
-        for staff in staff_users:
-            self._check_lockout(staff)
-            if staff.pin_hash and verify_pin(pin, staff.pin_hash):
-                matched_user = staff
-                break
+    async def login_pin(
+        self,
+        business_code: str,
+        staff_id: uuid.UUID,
+        pin: str,
+        ip_address: str | None = None,
+    ) -> tuple[BusinessUser, Business, str, str]:
+        """
+        Authenticate one specific staff member via business_code + staff_id + PIN.
 
-        if not matched_user:
-            # Increment failed attempts for all checked staff (prevents PIN enumeration)
-            for staff in staff_users:
-                if staff.pin_hash:
-                    await self._record_failed_login(staff)
+        The staff member picks their name on the login screen, so exactly one
+        bcrypt hash is verified and lockout applies to that user only — a
+        wrong PIN can never lock out the rest of the till staff, and two
+        staff sharing a PIN can never be misattributed.
+        """
+        stmt = select(Business).where(Business.business_code == business_code.upper())
+        result = await self.db.execute(stmt)
+        business = result.scalar_one_or_none()
+
+        if not business:
+            raise AppError("INVALID_CREDENTIALS", "Invalid business code or PIN", 401)
+
+        self._check_business_active(business)
+
+        stmt = select(BusinessUser).where(
+            BusinessUser.id == staff_id,
+            BusinessUser.business_id == business.id,
+            BusinessUser.role == "STAFF",
+            BusinessUser.is_active == True,
+        )
+        result = await self.db.execute(stmt)
+        user = result.scalar_one_or_none()
+
+        if not user or not user.pin_hash:
+            raise AppError("INVALID_CREDENTIALS", "Invalid business code or PIN", 401)
+
+        self._check_lockout(user)
+
+        if not verify_pin(pin, user.pin_hash):
+            await self._record_failed_login(user)
+            # Commit explicitly — get_db never commits, so without this the
+            # failed-attempt counter is lost when the 401 propagates.
+            await self.db.commit()
             raise AppError("INVALID_CREDENTIALS", "Invalid business code or PIN", 401)
 
         # Success
-        matched_user.failed_login_attempts = 0
-        matched_user.locked_until = None
-        matched_user.last_login_at = datetime.now(timezone.utc)
+        user.failed_login_attempts = 0
+        user.locked_until = None
+        user.last_login_at = datetime.now(timezone.utc)
 
-        access_token = create_access_token(matched_user.id, business.id, matched_user.role)
+        access_token = create_access_token(
+            user.id,
+            business.id,
+            user.role,
+            expires_minutes=settings.STAFF_ACCESS_TOKEN_EXPIRE_MINUTES,
+        )
         refresh_raw = generate_refresh_token()
-        await self._store_refresh_token(matched_user.id, refresh_raw, ip_address)
+        await self._store_refresh_token(user.id, refresh_raw, ip_address)
 
         await self.db.commit()
-        return matched_user, business, access_token, refresh_raw
+        return user, business, access_token, refresh_raw
 
     # ── Token Refresh (rotation) ─────────────────────────────────────────
 
@@ -170,8 +265,15 @@ class AuthService:
         # Revoke old token
         stored.revoked_at = datetime.now(timezone.utc)
 
-        # Issue new pair
-        access_token = create_access_token(user.id, user.business_id, user.role)
+        # Issue new pair (STAFF keeps the short-lived access token on refresh)
+        access_token = create_access_token(
+            user.id,
+            user.business_id,
+            user.role,
+            expires_minutes=(
+                settings.STAFF_ACCESS_TOKEN_EXPIRE_MINUTES if user.role == "STAFF" else None
+            ),
+        )
         new_refresh_raw = generate_refresh_token()
         await self._store_refresh_token(user.id, new_refresh_raw, ip_address)
 
@@ -241,6 +343,15 @@ class AuthService:
                 minutes=settings.ACCOUNT_LOCKOUT_MINUTES
             )
         await self.db.flush()
+
+    async def _issue_tokens(
+        self, user: BusinessUser, ip_address: str | None
+    ) -> tuple[str, str]:
+        """Create an access + refresh token pair for an OWNER/MANAGER user."""
+        access_token = create_access_token(user.id, user.business_id, user.role)
+        refresh_raw = generate_refresh_token()
+        await self._store_refresh_token(user.id, refresh_raw, ip_address)
+        return access_token, refresh_raw
 
     async def _store_refresh_token(
         self, user_id: uuid.UUID, raw_token: str, ip_address: str | None

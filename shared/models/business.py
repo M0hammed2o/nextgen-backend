@@ -43,10 +43,27 @@ class Business(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     )
     is_whatsapp_enabled: Mapped[bool] = mapped_column(
         Boolean, default=True, nullable=False,
-        comment="Toggle WhatsApp bot on/off without removing phone_number_id"
+        comment="Platform-admin kill switch. Toggle WhatsApp bot on/off without "
+                 "removing phone_number_id. Authoritative over whatsapp_paused — "
+                 "if False, WhatsApp stays off regardless of the staff pause flag."
     )
     last_webhook_received_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
+    )
+
+    # ── Staff busy/pause toggle (distinct from is_whatsapp_enabled) ──────
+    whatsapp_paused: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False,
+        comment="Staff-facing 'too busy' pause — blocks new inbound orders "
+                 "with busy_text until a staff member resumes"
+    )
+    whatsapp_paused_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    whatsapp_paused_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True,
+        comment="business_users.id of the staff member who paused — not FK-enforced, "
+                 "same pattern as Order.cancelled_by_user_id"
     )
 
     # ── Timezone & Hours ─────────────────────────────────────────────────
@@ -62,6 +79,10 @@ class Business(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     greeting_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     fallback_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     closed_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    busy_text: Mapped[str | None] = mapped_column(
+        Text, nullable=True,
+        comment="Shown to customers while whatsapp_paused is true"
+    )
 
     # ── Order Config ─────────────────────────────────────────────────────
     order_in_only: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)

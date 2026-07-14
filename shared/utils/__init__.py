@@ -36,3 +36,14 @@ def format_order_number(sequence: int, prefix: str = "BO") -> str:
 def generate_refresh_token() -> str:
     """Generate a cryptographically secure refresh token string."""
     return secrets.token_urlsafe(48)
+
+
+def generate_temp_password(length: int = 10) -> str:
+    """
+    Generate a temporary password for a newly-created OWNER/MANAGER login.
+    Excludes visually ambiguous characters (0/O, 1/l/I) since an admin often
+    relays this by phone or WhatsApp — the owner must be able to retype it
+    correctly on their first login.
+    """
+    alphabet = "ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789"
+    return "".join(secrets.choice(alphabet) for _ in range(length))

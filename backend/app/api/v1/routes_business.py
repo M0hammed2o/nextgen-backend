@@ -4,16 +4,19 @@ Only accessible by OWNER or MANAGER.
 """
 
 import uuid
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.app.core.crypto import decrypt_credential, encrypt_credential
 from backend.app.core.errors import NotFoundError
-from backend.app.core.rbac import AuthUser, require_owner_or_manager
+from backend.app.core.rbac import AuthUser, require_owner_or_manager, require_staff_or_above
 from backend.app.db.session import get_db
 from shared.models.business import Business
+from shared.models.user import BusinessUser
 
 router = APIRouter(prefix="/business", tags=["business"])
 
@@ -30,6 +33,7 @@ class BusinessSettingsResponse(BaseModel):
     greeting_text: str | None
     fallback_text: str | None
     closed_text: str | None
+    busy_text: str | None
     order_in_only: bool
     delivery_enabled: bool
     delivery_fee_cents: int
@@ -79,6 +83,7 @@ class BusinessSettingsResponse(BaseModel):
             greeting_text=b.greeting_text,
             fallback_text=b.fallback_text,
             closed_text=b.closed_text,
+            busy_text=b.busy_text,
             order_in_only=b.order_in_only,
             delivery_enabled=b.delivery_enabled,
             delivery_fee_cents=b.delivery_fee_cents,
@@ -103,8 +108,8 @@ class BusinessSettingsResponse(BaseModel):
             eft_account_number=b.eft_account_number,
             eft_branch_code=b.eft_branch_code,
             eft_reference_prefix=b.eft_reference_prefix,
-            payment_api_key_hint=_hint(b.payment_api_key),
-            payment_api_secret_hint=_hint(b.payment_api_secret),
+            payment_api_key_hint=_hint(decrypt_credential(b.payment_api_key)),
+            payment_api_secret_hint=_hint(decrypt_credential(b.payment_api_secret)),
             payment_webhook_secret_configured=bool(b.payment_webhook_secret),
         )
 
@@ -116,6 +121,7 @@ class BusinessSettingsUpdate(BaseModel):
     greeting_text: str | None = None
     fallback_text: str | None = None
     closed_text: str | None = None
+    busy_text: str | None = None
     order_in_only: bool | None = None
     delivery_enabled: bool | None = None
     delivery_fee_cents: int | None = Field(default=None, ge=0)
@@ -179,11 +185,133 @@ async def update_business_settings(
 
     for field, value in update_data.items():
         if field in _CREDENTIAL_FIELDS:
-            # Empty string → clear the credential; None (not set) → skip
-            setattr(business, field, value if value else None)
+            # Empty string → clear the credential; None (not set) → skip.
+            # Credentials are encrypted at rest (Fernet, enc1: prefix).
+            setattr(business, field, encrypt_credential(value) if value else None)
         else:
             setattr(business, field, value)
 
     await db.commit()
     await db.refresh(business)
     return BusinessSettingsResponse.from_business(business)
+
+
+# ── WhatsApp pause/busy toggle ────────────────────────────────────────────────
+# Staff-facing "too busy" pause — distinct from the platform-admin
+# is_whatsapp_enabled kill switch. Any STAFF/MANAGER/OWNER can toggle it.
+
+class WhatsAppStatusResponse(BaseModel):
+    paused: bool
+    paused_at: datetime | None = None
+    paused_by_name: str | None = None
+    busy_text: str | None = None
+
+
+async def _load_business_for_toggle(db: AsyncSession, user: AuthUser) -> Business:
+    result = await db.execute(select(Business).where(Business.id == user.business_id))
+    business = result.scalar_one_or_none()
+    if not business:
+        raise NotFoundError("Business")
+    return business
+
+
+async def _paused_by_name(db: AsyncSession, business: Business) -> str | None:
+    if not business.whatsapp_paused or not business.whatsapp_paused_by_user_id:
+        return None
+    result = await db.execute(
+        select(BusinessUser.staff_name).where(BusinessUser.id == business.whatsapp_paused_by_user_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def _publish_whatsapp_status(business_id: uuid.UUID, event_type: str, paused_by_name: str | None) -> None:
+    """Fire-and-forget SSE publish on the same channel used for order events."""
+    try:
+        import json
+
+        from backend.app.db.session import get_redis
+        redis = await get_redis()
+        await redis.publish(
+            f"orders:{business_id}",
+            json.dumps({
+                "type": event_type,
+                "paused_by_name": paused_by_name,
+                "at": datetime.now(timezone.utc).isoformat(),
+            }),
+        )
+    except Exception:
+        pass
+
+
+@router.get("/whatsapp/status", response_model=WhatsAppStatusResponse)
+async def get_whatsapp_status(
+    user: AuthUser = Depends(require_staff_or_above),
+    db: AsyncSession = Depends(get_db),
+):
+    """Current pause state — used by the staff Profile screen and the manager banner."""
+    business = await _load_business_for_toggle(db, user)
+    return WhatsAppStatusResponse(
+        paused=business.whatsapp_paused,
+        paused_at=business.whatsapp_paused_at,
+        paused_by_name=await _paused_by_name(db, business),
+        busy_text=business.busy_text,
+    )
+
+
+@router.post("/whatsapp/pause", response_model=WhatsAppStatusResponse)
+async def pause_whatsapp(
+    user: AuthUser = Depends(require_staff_or_above),
+    db: AsyncSession = Depends(get_db),
+):
+    """Pause incoming WhatsApp orders — customers get busy_text until resumed."""
+    business = await _load_business_for_toggle(db, user)
+    business.whatsapp_paused = True
+    business.whatsapp_paused_at = datetime.now(timezone.utc)
+    business.whatsapp_paused_by_user_id = user.user_id
+    await db.commit()
+    await db.refresh(business)
+
+    staff_name = await _paused_by_name(db, business)
+
+    await _publish_whatsapp_status(business.id, "whatsapp_paused", staff_name)
+    try:
+        from backend.app.push_service import send_whatsapp_status_alert
+        import asyncio
+        asyncio.create_task(
+            send_whatsapp_status_alert(business_id=business.id, paused=True, staff_name=staff_name)
+        )
+    except Exception:
+        pass
+
+    return WhatsAppStatusResponse(
+        paused=True,
+        paused_at=business.whatsapp_paused_at,
+        paused_by_name=staff_name,
+        busy_text=business.busy_text,
+    )
+
+
+@router.post("/whatsapp/resume", response_model=WhatsAppStatusResponse)
+async def resume_whatsapp(
+    user: AuthUser = Depends(require_staff_or_above),
+    db: AsyncSession = Depends(get_db),
+):
+    """Resume WhatsApp ordering."""
+    business = await _load_business_for_toggle(db, user)
+    business.whatsapp_paused = False
+    business.whatsapp_paused_at = None
+    business.whatsapp_paused_by_user_id = None
+    await db.commit()
+    await db.refresh(business)
+
+    await _publish_whatsapp_status(business.id, "whatsapp_resumed", None)
+    try:
+        from backend.app.push_service import send_whatsapp_status_alert
+        import asyncio
+        asyncio.create_task(
+            send_whatsapp_status_alert(business_id=business.id, paused=False, staff_name=None)
+        )
+    except Exception:
+        pass
+
+    return WhatsAppStatusResponse(paused=False, paused_at=None, paused_by_name=None, busy_text=business.busy_text)

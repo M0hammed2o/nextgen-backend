@@ -42,6 +42,12 @@ def _validate_production_secrets() -> None:
     errors: list[str] = []
     if settings.JWT_SECRET_KEY == _PLACEHOLDER_JWT:
         errors.append("JWT_SECRET_KEY is set to the default placeholder — all JWTs are forgeable")
+    if settings.JWT_ADMIN_SECRET_KEY == _PLACEHOLDER_JWT:
+        errors.append("JWT_ADMIN_SECRET_KEY is set to the default placeholder — admin JWTs are forgeable")
+    if settings.JWT_ADMIN_SECRET_KEY == settings.JWT_SECRET_KEY:
+        errors.append("JWT_ADMIN_SECRET_KEY must differ from JWT_SECRET_KEY — planes must not share a signing key")
+    if not settings.CREDENTIALS_ENCRYPTION_KEY:
+        errors.append("CREDENTIALS_ENCRYPTION_KEY is not set — payment credentials would be stored in plaintext")
     if settings.META_APP_SECRET in _PLACEHOLDER_META:
         errors.append("META_APP_SECRET is set to a placeholder — webhook signatures cannot be verified")
     if settings.META_VERIFY_TOKEN in _PLACEHOLDER_META:
@@ -107,6 +113,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── Rate Limiting (slowapi — decorators live on the auth routes) ─────────────
+
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+
+from backend.app.core.ratelimit import limiter
+
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # ── Error Handlers ───────────────────────────────────────────────────────────
 

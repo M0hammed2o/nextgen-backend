@@ -17,8 +17,12 @@ from dataclasses import dataclass
 import jwt
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.app.core.security import decode_access_token
+from backend.app.core.security import decode_access_token, decode_admin_token
+from backend.app.db.session import get_db
+from shared.models.user import BusinessUser
 
 bearer_scheme = HTTPBearer(auto_error=False)
 
@@ -35,10 +39,19 @@ class AuthUser:
 async def get_current_user(
     request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    db: AsyncSession = Depends(get_db),
 ) -> AuthUser:
     """
     Extract and validate JWT from Authorization header.
     Returns AuthUser with user_id, business_id, and role.
+
+    Business-plane tokens are tried first. Admin-plane tokens (signed with
+    JWT_ADMIN_SECRET_KEY) are accepted as a fallback, but only for
+    SUPER_ADMIN — the two planes are otherwise cryptographically separate.
+
+    Business users are also checked against their live is_active flag so a
+    deactivated staff member loses access on their next request, not when
+    their token expires.
     """
     if not credentials:
         raise HTTPException(
@@ -46,26 +59,51 @@ async def get_current_user(
             detail={"code": "MISSING_TOKEN", "message": "Authorization header required"},
         )
 
+    _expired = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail={"code": "TOKEN_EXPIRED", "message": "Access token has expired"},
+    )
+    _invalid = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail={"code": "INVALID_TOKEN", "message": "Invalid access token"},
+    )
+
     try:
         payload = decode_access_token(credentials.credentials)
     except jwt.ExpiredSignatureError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={"code": "TOKEN_EXPIRED", "message": "Access token has expired"},
-        )
+        raise _expired
     except jwt.InvalidTokenError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={"code": "INVALID_TOKEN", "message": "Invalid access token"},
-        )
+        # Not a business-plane token — try the admin plane (SUPER_ADMIN only).
+        try:
+            payload = decode_admin_token(credentials.credentials)
+        except jwt.ExpiredSignatureError:
+            raise _expired
+        except jwt.InvalidTokenError:
+            raise _invalid
+        if payload.get("role") != "SUPER_ADMIN":
+            raise _invalid
 
     bid_str = payload.get("bid")
-    return AuthUser(
+    user = AuthUser(
         user_id=uuid.UUID(payload["sub"]),
         business_id=uuid.UUID(bid_str) if bid_str else None,
         role=payload["role"],
         token_type=payload.get("type", "access"),
     )
+
+    # Instant cutoff for deactivated business users — one indexed-PK lookup.
+    # Admin-plane tokens are validated against admin_users at login/refresh.
+    if user.token_type == "access":
+        result = await db.execute(
+            select(BusinessUser.is_active).where(BusinessUser.id == user.user_id)
+        )
+        if not result.scalar_one_or_none():
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={"code": "ACCOUNT_DISABLED", "message": "This account has been disabled"},
+            )
+
+    return user
 
 
 def require_role(allowed_roles: list[str]):

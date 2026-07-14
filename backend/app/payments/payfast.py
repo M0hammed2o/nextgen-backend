@@ -58,8 +58,9 @@ class PayFastProvider(PaymentProvider):
         and send it to the customer. They click it, pay on PayFast's hosted
         page, and PayFast POSTs the result to our notify_url.
         """
-        merchant_key = getattr(business, "payment_api_key", None)
-        merchant_id = getattr(business, "payment_api_secret", None)
+        from backend.app.core.crypto import decrypt_credential
+        merchant_key = decrypt_credential(getattr(business, "payment_api_key", None))
+        merchant_id = decrypt_credential(getattr(business, "payment_api_secret", None))
         if not merchant_key or not merchant_id:
             logger.warning(
                 "PayFast: missing merchant_id or merchant_key for business %s",
@@ -67,7 +68,7 @@ class PayFastProvider(PaymentProvider):
             )
             return None
 
-        passphrase = getattr(business, "payment_webhook_secret", None)
+        passphrase = decrypt_credential(getattr(business, "payment_webhook_secret", None))
 
         from backend.app.core.config import get_settings
         cfg = get_settings()

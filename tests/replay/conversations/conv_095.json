@@ -4,7 +4,7 @@
   "category": "recovery",
   "tags": ["deterministic", "recovery", "cancel", "collecting_details"],
 
-  "notes": "Customer reaches COLLECTING_DETAILS for name, then cancels instead of providing their name. ORDER_CANCEL resets to IDLE.",
+  "notes": "Customer reaches COLLECTING_DETAILS for name, then cancels instead of providing their name. ORDER_CANCEL resets to IDLE. No Order row exists yet at this point, so cancellation is self-service (no phone call needed).",
 
   "turns": [
     {
@@ -29,7 +29,7 @@
       "message": "Cancel",
       "expect": {
         "state": "IDLE",
-        "response_contains": ["call", "store"]
+        "response_contains": ["cancelled"]
       }
     }
   ]

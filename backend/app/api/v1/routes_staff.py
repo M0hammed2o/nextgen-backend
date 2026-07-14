@@ -9,14 +9,14 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.errors import AppError, DuplicateError, NotFoundError
 from backend.app.core.rbac import AuthUser, require_owner_or_manager
 from backend.app.core.security import hash_password, hash_pin
 from backend.app.db.session import get_db
-from shared.models.user import BusinessUser
+from shared.models.user import BusinessUser, RefreshToken
 
 router = APIRouter(prefix="/business/staff", tags=["staff"])
 
@@ -236,4 +236,12 @@ async def deactivate_staff(
         raise AppError("SELF_DEACTIVATION", "Cannot deactivate your own account", 422)
 
     staff.is_active = False
+
+    # Kill their sessions immediately: revoke all live refresh tokens.
+    # Their access token dies on next request via the rbac is_active check.
+    await db.execute(
+        update(RefreshToken)
+        .where(RefreshToken.user_id == staff.id, RefreshToken.revoked_at.is_(None))
+        .values(revoked_at=datetime.now(timezone.utc))
+    )
     await db.commit()

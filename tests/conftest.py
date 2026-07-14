@@ -25,8 +25,10 @@ if PROJECT_ROOT not in sys.path:
 os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost/nextgen")
 os.environ.setdefault("REDIS_URL", "redis://localhost:6379/0")
 os.environ.setdefault("JWT_SECRET_KEY", "test-secret-key-for-unit-tests")
+os.environ.setdefault("JWT_ADMIN_SECRET_KEY", "test-admin-secret-key-for-unit-tests")
 os.environ.setdefault("META_VERIFY_TOKEN", "test-verify-token")
 os.environ.setdefault("WHATSAPP_DEFAULT_ACCESS_TOKEN", "test-token")
+os.environ.setdefault("RATE_LIMIT_ENABLED", "false")
 
 
 # ── Silence flag_modified globally so unit tests don't need a real SA session ─

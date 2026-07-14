@@ -287,6 +287,41 @@ async def _process(
         )
         return
 
+    # ── 10c. Busy gate — staff-paused WhatsApp ordering ───────────────────
+    # Same pattern as the closed gate above, but keyed on the pause TIMESTAMP
+    # (not a calendar day) since a business can pause/resume/pause again in
+    # one day and each new pause cycle should re-notify the same customer.
+    if getattr(business, "whatsapp_paused", False):
+        paused_at = business.whatsapp_paused_at
+        paused_key = paused_at.isoformat() if paused_at else "unknown"
+        busy_sent_for = state_machine.get_context(session, "busy_msg_sent_for")
+        if busy_sent_for == paused_key:
+            logger.info(
+                "PIPELINE_BUSY_SILENT: already notified for this pause cycle, skipping. "
+                "session_id=%s", session.id,
+            )
+            await usage_tracker.increment_usage(
+                db, business.id, business.timezone, inbound_messages=1
+            )
+            return
+        state_machine.set_context(session, "busy_msg_sent_for", paused_key)
+        await _send_response(
+            db=db,
+            business=business,
+            customer=customer,
+            wa_id=wa_id,
+            text=responses.busy_response(business),
+            intent="BUSY",
+        )
+        await usage_tracker.increment_usage(
+            db, business.id, business.timezone, inbound_messages=1, outbound_messages=1
+        )
+        logger.warning(
+            "PIPELINE_BUSY_GATE: sent busy message to customer_id=%s, session_id=%s",
+            customer.id, session.id,
+        )
+        return
+
     # ── 11. Process based on intent + state ──────────────────────────────
     logger.warning(
         "PIPELINE_HANDLE_START: business_id=%s, wa_id=%s, intent=%s, session_state=%s, msg_text=%r",
@@ -575,11 +610,34 @@ async def _handle_message(
         )
 
     if intent == MessageIntent.ORDER_CANCEL:
-        logger.warning("HANDLE_BRANCH: ORDER_CANCEL → redirecting to phone")
+        # Only a REAL placed order (state == ORDER_PLACED, i.e. order_creator.py
+        # already created an Order row that staff/kitchen may have seen) needs
+        # a phone call to unwind. Before that point this is just a draft cart
+        # in conversation context — the bot can cancel it itself, no call needed.
+        last_order = None
+        if current_state == ConversationState.ORDER_PLACED.value:
+            last_order = await _get_last_order(db, business.id, customer.id)
+
+        if last_order and last_order.status not in ("CANCELLED", "COLLECTED", "DELIVERED"):
+            logger.warning(
+                "HANDLE_BRANCH: ORDER_CANCEL → redirecting to phone (real order %s, status=%s)",
+                last_order.order_number, last_order.status,
+            )
+            state_machine.clear_cart(session)
+            state_machine.transition_state(session, ConversationState.IDLE.value)
+            return (
+                "To cancel your order, please call the store directly and we'll sort it out for you right away! 📞",
+                False,
+                None,
+                None,
+                None,
+            )
+
+        logger.warning("HANDLE_BRANCH: ORDER_CANCEL → self-service (no order placed yet)")
         state_machine.clear_cart(session)
         state_machine.transition_state(session, ConversationState.IDLE.value)
         return (
-            "To cancel your order, please call the store directly and we'll sort it out for you right away! 📞",
+            "No problem! Order cancelled. 🗑️ What would you like to order instead?",
             False,
             None,
             None,

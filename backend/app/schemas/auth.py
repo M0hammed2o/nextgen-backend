@@ -17,9 +17,39 @@ class EmailLoginRequest(BaseModel):
 
 
 class PinLoginRequest(BaseModel):
-    """Staff login with business_code + PIN."""
+    """Staff login with business_code + staff identity + PIN."""
     business_code: str = Field(min_length=6, max_length=6, pattern=r"^[A-Z0-9]{6}$")
+    staff_id: uuid.UUID = Field(description="Selected staff member (from /auth/pin/staff)")
     pin: str = Field(min_length=4, max_length=8, pattern=r"^\d{4,8}$")
+
+
+class StaffDirectoryRequest(BaseModel):
+    """Look up the staff name list for the PIN login screen."""
+    business_code: str = Field(min_length=6, max_length=6, pattern=r"^[A-Z0-9]{6}$")
+
+
+class StaffDirectoryEntry(BaseModel):
+    """One selectable staff member on the PIN login screen."""
+    id: uuid.UUID
+    staff_name: str
+
+
+class StaffDirectoryResponse(BaseModel):
+    business_name: str
+    staff: list[StaffDirectoryEntry]
+
+
+class SetPasswordRequest(BaseModel):
+    """
+    Complete a forced password reset (OWNER/MANAGER only). current_password
+    is the temporary password the admin generated — re-verified here as the
+    same trust boundary /auth/login already uses, rather than issuing a
+    separate reset token. Confirming new_password twice is a client-side-only
+    concern; the server only needs the single final value.
+    """
+    email: EmailStr
+    current_password: str
+    new_password: str = Field(min_length=8, max_length=128)
 
 
 class RefreshRequest(BaseModel):
