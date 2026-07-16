@@ -83,8 +83,14 @@ class Settings(BaseSettings):
 
     # ── Payment providers ─────────────────────────────────────────────────
     # Public URL of this API — used by payment providers to POST webhooks back.
-    # Set to your Render service URL, e.g. https://nextgen-api.onrender.com
-    BACKEND_PUBLIC_URL: str = "https://nextgen-api.onrender.com"
+    # Must be the live, reachable API host. The old default here
+    # (nextgen-api.onrender.com) went dead at some point and was never
+    # updated — iKhoka/PayFast kept getting told to call back to a 503,
+    # so a real customer payment succeeded on the provider's side but never
+    # reached this backend to mark the order paid. Confirm this still
+    # resolves (`curl <value>/health` should return 200) if it's ever
+    # overridden via env var.
+    BACKEND_PUBLIC_URL: str = "https://api.nextgenintelligence.co.za"
     # Where to redirect customers after a successful or cancelled payment.
     PAYMENT_RETURN_URL: str = "https://nextgenintelligence.co.za/payment/success"
     PAYMENT_CANCEL_URL: str = "https://nextgenintelligence.co.za/payment/cancelled"
