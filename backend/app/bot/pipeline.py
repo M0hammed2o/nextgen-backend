@@ -537,20 +537,32 @@ async def _handle_message(
                 for ext in (".jpg", ".jpeg", ".png", ".webp", ".gif")
             )
         )
+        cart = state_machine.get_cart(session)
+        _has_active_order = current_state in _order_active_states and bool(cart)
+
         if menu_image_url and _direct_image:
+            caption = (
+                "Here's our menu 👇\n\nYour order is still saved 🛒 — tell me what "
+                'you\'d like to add, or say "done" to confirm.'
+                if _has_active_order
+                else "Here's our menu 👇\n\nLet me know what you'd like to order! 😊"
+            )
             try:
                 await whatsapp_sender.send_image_message(
                     phone_number_id=business.whatsapp_phone_number_id,
                     recipient_wa_id=customer.wa_id,
                     image_url=menu_image_url,
-                    caption="Here's our menu 👇",
+                    caption=caption,
                 )
+                # Image + caption covers everything — no separate text menu needed.
+                return "", False, None, None, None
             except Exception:
                 logger.exception(
                     "PIPELINE_IMAGE_SEND_FAIL: failed to send menu image, "
                     "falling back to text menu. business_id=%s",
                     business.id,
                 )
+                # Falls through to the text menu below.
         elif menu_image_url:
             logger.warning(
                 "PIPELINE_IMAGE_SKIP: not a direct image URL, including as link. url=%s",
@@ -558,8 +570,7 @@ async def _handle_message(
             )
 
         text = responses.menu_response(categories, items, business.currency)
-        cart = state_machine.get_cart(session)
-        if current_state in _order_active_states and cart:
+        if _has_active_order:
             text = (
                 "Here's the full menu! Your current order is still saved 🛒\n\n"
                 + text
