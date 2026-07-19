@@ -28,6 +28,30 @@ logger = logging.getLogger("nextgen")
 
 # ── Lifespan ─────────────────────────────────────────────────────────────────
 
+def _looks_like_placeholder(value: str) -> bool:
+    """
+    Broader placeholder detection than an exact-string match.
+
+    A real incident showed the gap in exact matching: JWT_SECRET_KEY was set
+    to "CHANGE-ME-generate-a-strong-random-string" in production — clearly a
+    never-rotated placeholder, but not equal to the one literal string this
+    check used to look for ("CHANGE-ME-IN-PRODUCTION"), so it silently passed.
+    Catch anything placeholder-shaped by substring/length instead of relying
+    on one exact value.
+    """
+    if not value:
+        return True
+    lowered = value.lower()
+    if any(marker in lowered for marker in ("change-me", "change_me", "your-", "your_", "example", "replace-me")):
+        return True
+    # A real secrets.token_urlsafe(64)/Fernet key is comfortably over 32 chars;
+    # anything shorter is suspicious for a value that's supposed to be a
+    # high-entropy signing key.
+    if len(value) < 32:
+        return True
+    return False
+
+
 def _validate_production_secrets() -> None:
     """
     Crash immediately if placeholder secrets are present in production.
@@ -36,14 +60,13 @@ def _validate_production_secrets() -> None:
     if settings.ENVIRONMENT != "production":
         return
 
-    _PLACEHOLDER_JWT = "CHANGE-ME-IN-PRODUCTION"
     _PLACEHOLDER_META = {"CHANGE-ME", "", "your-app-secret", "your-webhook-verify-token"}
 
     errors: list[str] = []
-    if settings.JWT_SECRET_KEY == _PLACEHOLDER_JWT:
-        errors.append("JWT_SECRET_KEY is set to the default placeholder — all JWTs are forgeable")
-    if settings.JWT_ADMIN_SECRET_KEY == _PLACEHOLDER_JWT:
-        errors.append("JWT_ADMIN_SECRET_KEY is set to the default placeholder — admin JWTs are forgeable")
+    if _looks_like_placeholder(settings.JWT_SECRET_KEY):
+        errors.append("JWT_SECRET_KEY looks like a placeholder — all JWTs are forgeable")
+    if _looks_like_placeholder(settings.JWT_ADMIN_SECRET_KEY):
+        errors.append("JWT_ADMIN_SECRET_KEY looks like a placeholder — admin JWTs are forgeable")
     if settings.JWT_ADMIN_SECRET_KEY == settings.JWT_SECRET_KEY:
         errors.append("JWT_ADMIN_SECRET_KEY must differ from JWT_SECRET_KEY — planes must not share a signing key")
     if not settings.CREDENTIALS_ENCRYPTION_KEY:
@@ -59,6 +82,19 @@ def _validate_production_secrets() -> None:
         msg = "FATAL: Production deployment with unconfigured secrets:\n" + "\n".join(f"  • {e}" for e in errors)
         logger.critical(msg)
         raise RuntimeError(msg)
+
+    # Stripe billing isn't in use yet (iKhoka is the active payment provider),
+    # so this is a warning, not a startup-blocking error — see KNOWN_BUGS.md
+    # BUG-0001. Promote this to the `errors` list above once Stripe billing
+    # actually goes live, so an unset/placeholder webhook secret can never
+    # silently ship again.
+    if _looks_like_placeholder(settings.STRIPE_WEBHOOK_SECRET):
+        logger.warning(
+            "STRIPE_WEBHOOK_SECRET looks unset or placeholder — the Stripe "
+            "billing webhook currently accepts unverified requests. Not "
+            "fatal yet because Stripe billing isn't in use, but must be "
+            "fixed before it is (see KNOWN_BUGS.md BUG-0001)."
+        )
 
 
 @asynccontextmanager
