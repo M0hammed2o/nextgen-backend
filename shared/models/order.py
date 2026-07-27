@@ -99,6 +99,18 @@ class Order(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         DateTime(timezone=True), nullable=True,
         comment="UTC timestamp when payment_status was set to PAID"
     )
+    refund_reference: Mapped[str | None] = mapped_column(
+        String(255), nullable=True,
+        comment="Provider's own refund transaction id, distinct from payment_reference (the original charge)"
+    )
+    refund_amount_cents: Mapped[int | None] = mapped_column(
+        Integer, nullable=True,
+        comment="Amount actually refunded — may be less than total_cents for a partial refund"
+    )
+    refunded_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+        comment="UTC timestamp when the refund was recorded"
+    )
 
     # ── Special Instructions ─────────────────────────────────────────────
     special_instructions: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -107,6 +119,16 @@ class Order(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     cancelled_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     cancelled_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True
+    )
+
+    # ── POS discount / tax (Phase 1) ─────────────────────────────────────
+    discount_cents: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    tax_cents: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    discount_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    discount_approved_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True,
+        comment="business_users.id who approved a staff discount above the "
+                 "configured limit — not FK-enforced, same pattern as cancelled_by_user_id"
     )
 
     # ── Relationships ────────────────────────────────────────────────────

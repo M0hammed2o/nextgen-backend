@@ -78,23 +78,22 @@ def _validate_production_secrets() -> None:
     if not settings.WHATSAPP_DEFAULT_ACCESS_TOKEN or settings.WHATSAPP_DEFAULT_ACCESS_TOKEN == "CHANGE-ME":
         errors.append("WHATSAPP_DEFAULT_ACCESS_TOKEN is not configured — cannot send WhatsApp messages")
 
+    # Stripe billing (self-service subscription checkout/portal, shipped
+    # 2026-07-21) is now commercially live, so an unverified webhook is a
+    # real production risk — a forged event could flip any tenant's
+    # billing_status/is_active. This was a non-fatal warning while Stripe
+    # billing was dormant (see KNOWN_BUGS.md BUG-0001); now that it's live,
+    # it's promoted to the same hard-fail treatment as every other secret.
+    if _looks_like_placeholder(settings.STRIPE_WEBHOOK_SECRET):
+        errors.append(
+            "STRIPE_WEBHOOK_SECRET looks unset or placeholder — the Stripe "
+            "billing webhook would accept unverified requests"
+        )
+
     if errors:
         msg = "FATAL: Production deployment with unconfigured secrets:\n" + "\n".join(f"  • {e}" for e in errors)
         logger.critical(msg)
         raise RuntimeError(msg)
-
-    # Stripe billing isn't in use yet (iKhoka is the active payment provider),
-    # so this is a warning, not a startup-blocking error — see KNOWN_BUGS.md
-    # BUG-0001. Promote this to the `errors` list above once Stripe billing
-    # actually goes live, so an unset/placeholder webhook secret can never
-    # silently ship again.
-    if _looks_like_placeholder(settings.STRIPE_WEBHOOK_SECRET):
-        logger.warning(
-            "STRIPE_WEBHOOK_SECRET looks unset or placeholder — the Stripe "
-            "billing webhook currently accepts unverified requests. Not "
-            "fatal yet because Stripe billing isn't in use, but must be "
-            "fixed before it is (see KNOWN_BUGS.md BUG-0001)."
-        )
 
 
 @asynccontextmanager
@@ -142,13 +141,26 @@ app = FastAPI(
 
 app.add_middleware(RequestLoggingMiddleware)
 app.add_middleware(CorrelationIDMiddleware)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.ALLOWED_ORIGINS.split(","),
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# In development, ALSO allow any localhost port via regex. A static
+# ALLOWED_ORIGINS list can never fully cover local frontend dev servers,
+# whose Vite dev server silently falls back to the next free port whenever
+# something else on the machine is already using its configured one (see
+# KNOWN_BUGS.md BUG-0025/RELEASE_CHECKLIST.md) -- the Manager Dashboard
+# landed on :8082 during local user-acceptance testing, which the static
+# ALLOWED_ORIGINS list (added for BUG-0023) never anticipated, and the
+# browser's login request failed with a generic "Failed to fetch" (a CORS
+# rejection, not a real login/network failure) until this was added. Only
+# takes effect when ENVIRONMENT=development -- production keeps the exact
+# static allowlist, no regex fallback.
+_cors_kwargs = {
+    "allow_origins": settings.ALLOWED_ORIGINS.split(","),
+    "allow_credentials": True,
+    "allow_methods": ["*"],
+    "allow_headers": ["*"],
+}
+if settings.ENVIRONMENT == "development":
+    _cors_kwargs["allow_origin_regex"] = r"http://localhost:\d+"
+app.add_middleware(CORSMiddleware, **_cors_kwargs)
 
 # ── Rate Limiting (slowapi — decorators live on the auth routes) ─────────────
 
@@ -171,6 +183,9 @@ from backend.app.api.v1.routes_webhook import router as webhook_router
 from backend.app.api.v1.routes_business import router as business_router
 from backend.app.api.v1.routes_menu import router as menu_router
 from backend.app.api.v1.routes_orders import router as orders_router
+from backend.app.api.v1.routes_pos import router as pos_router
+from backend.app.api.v1.routes_billing import router as billing_settings_router
+from backend.app.api.v1.routes_loyalty import router as loyalty_router
 from backend.app.api.v1.routes_specials import router as specials_router
 from backend.app.api.v1.routes_analytics import router as analytics_router
 from backend.app.api.v1.routes_assets import router as assets_router
@@ -188,6 +203,9 @@ app.include_router(webhook_router, prefix=PREFIX)
 app.include_router(business_router, prefix=PREFIX)
 app.include_router(menu_router, prefix=PREFIX)
 app.include_router(orders_router, prefix=PREFIX)
+app.include_router(pos_router, prefix=PREFIX)
+app.include_router(billing_settings_router, prefix=PREFIX)
+app.include_router(loyalty_router, prefix=PREFIX)
 app.include_router(specials_router, prefix=PREFIX)
 app.include_router(analytics_router, prefix=PREFIX)
 app.include_router(assets_router, prefix=PREFIX)

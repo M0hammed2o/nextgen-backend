@@ -91,16 +91,40 @@ async def get_current_user(
         token_type=payload.get("type", "access"),
     )
 
-    # Instant cutoff for deactivated business users — one indexed-PK lookup.
-    # Admin-plane tokens are validated against admin_users at login/refresh.
+    # Instant cutoff for deactivated business users AND suspended businesses —
+    # one indexed join, no extra round-trip. Business suspension was
+    # previously only checked at login (auth_service.py's _check_business_active)
+    # — a business suspended mid-session (e.g. subscription lapses) could
+    # keep using an already-issued access token until it naturally expired.
+    # This closes that gap for every request, not just login, matching the
+    # per-user "instant cutoff" this comment already described.
     if user.token_type == "access":
+        from shared.models.business import Business
         result = await db.execute(
-            select(BusinessUser.is_active).where(BusinessUser.id == user.user_id)
+            select(BusinessUser.is_active, Business.is_active, Business.suspended_reason)
+            .join(Business, Business.id == BusinessUser.business_id)
+            .where(BusinessUser.id == user.user_id)
         )
-        if not result.scalar_one_or_none():
+        row = result.one_or_none()
+        if not row:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail={"code": "ACCOUNT_DISABLED", "message": "This account has been disabled"},
+            )
+        user_active, business_active, suspended_reason = row
+        if not user_active:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={"code": "ACCOUNT_DISABLED", "message": "This account has been disabled"},
+            )
+        if not business_active:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "code": "BUSINESS_SUSPENDED",
+                    "message": "This business account has been suspended.",
+                    "details": {"reason": suspended_reason} if suspended_reason else None,
+                },
             )
 
     return user

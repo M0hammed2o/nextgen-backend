@@ -351,6 +351,41 @@ async def cancel_unpaid_orders(ctx: dict) -> None:
             )
 
 
+# ── Cron: Billing grace-period suspension ────────────────────────────────────
+
+async def suspend_past_due_businesses(ctx: dict) -> None:
+    """
+    Suspend any business whose billing grace period has elapsed.
+
+    Runs hourly. "Retry. Notify. Grace period. Suspend account." — retry and
+    notify are the billing provider's own webhook-driven responsibility
+    (Stripe/PayFast retry failed invoices automatically and email the
+    customer); this job owns the one part that's ours to enforce: suspending
+    access once the grace period given in backend/app/billing/lifecycle.py
+    has actually elapsed. Never deletes any data — only flips is_active/
+    billing_status, same fields the admin suite's manual suspend already uses.
+    """
+    from backend.app.billing.lifecycle import is_past_grace_period, suspend_for_nonpayment
+
+    async with ctx["session_factory"]() as db:
+        try:
+            result = await db.execute(
+                select(Business).where(Business.billing_status == "PAST_DUE", Business.is_active.is_(True))
+            )
+            past_due = result.scalars().all()
+            suspended = 0
+            for business in past_due:
+                if is_past_grace_period(business):
+                    suspend_for_nonpayment(business)
+                    suspended += 1
+            if suspended:
+                await db.commit()
+                logger.warning("Billing grace-period sweep: suspended %d business(es).", suspended)
+        except Exception:
+            await db.rollback()
+            logger.exception("Billing grace-period suspension job failed — rolled back.")
+
+
 # ── Worker Settings ───────────────────────────────────────────────────────────
 
 _settings = get_settings()
@@ -394,6 +429,13 @@ class WorkerSettings:
             cancel_unpaid_orders,
             minute={0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55},
             second=30,
+            run_at_startup=True,
+        ),
+        # Suspend businesses whose billing grace period has elapsed — hourly.
+        cron(
+            suspend_past_due_businesses,
+            minute=0,
+            second=0,
             run_at_startup=True,
         ),
     ]

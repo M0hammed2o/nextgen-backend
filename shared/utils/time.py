@@ -61,3 +61,26 @@ def today_date_for_business(tz_name: str):
     """Get today's date in the business's timezone (for daily_usage keying)."""
     now_local = to_business_tz(utc_now(), tz_name)
     return now_local.date()
+
+
+def local_midnight_to_utc(local_date, tz_name: str) -> datetime:
+    """
+    Convert a business-local calendar date's midnight into a real UTC
+    instant, for comparing against UTC-stored timestamps (e.g.
+    `Order.created_at >= local_midnight_to_utc(today, tz_name)`).
+
+    BUG-0032: a previous version of this logic (duplicated inline in
+    `routes_analytics.py`) built `datetime(y, m, d, tzinfo=timezone.utc)`
+    directly from the local date's own year/month/day -- correct only for
+    UTC-offset-zero timezones. For any positive-offset timezone (e.g. the
+    platform default "Africa/Johannesburg", UTC+2), that shifted the real
+    cutoff 2 hours LATER than true local midnight, silently excluding
+    every order placed in the first 2 hours of each local day from
+    "today"'s analytics. Construct midnight IN the business's own
+    timezone first, then convert -- not the other way around.
+    """
+    local_midnight = datetime(
+        local_date.year, local_date.month, local_date.day,
+        tzinfo=zoneinfo.ZoneInfo(tz_name),
+    )
+    return local_midnight.astimezone(timezone.utc)

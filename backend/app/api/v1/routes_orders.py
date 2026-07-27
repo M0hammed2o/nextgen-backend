@@ -11,11 +11,13 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select, func, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.app.core.errors import InvalidTransitionError, NotFoundError
+from backend.app.core.errors import AppError, InvalidTransitionError, NotFoundError
 from backend.app.core.pagination import CursorParams, PaginatedResponse, PaginationMeta, encode_cursor
 from backend.app.core.rbac import AuthUser, require_owner_or_manager, require_staff_or_above
 from backend.app.db.session import get_db
-from shared.enums import ORDER_STATUS_TRANSITIONS, OrderStatus
+from shared.enums import ORDER_STATUS_TRANSITIONS, AuditScope, OrderSource, OrderStatus
+from backend.app.payments.registry import get_provider
+from shared.models.audit import AuditEvent
 from shared.models.business import Business
 from shared.models.order import Order, OrderEvent, OrderItem
 from shared.utils import format_order_number
@@ -52,8 +54,14 @@ class OrderResponse(BaseModel):
     source: str
     subtotal_cents: int
     delivery_fee_cents: int
+    discount_cents: int = 0
+    tax_cents: int = 0
+    discount_reason: str | None = None
     total_cents: int
     currency: str
+    refund_reference: str | None = None
+    refund_amount_cents: int | None = None
+    refunded_at: datetime | None = None
     customer_name: str | None
     phone_number: str | None
     delivery_address: str | None
@@ -94,6 +102,12 @@ class OrderItemCreate(BaseModel):
     special_instructions: str | None = None
 
 
+# Sources this dashboard endpoint may be asked to record an order under.
+# Deliberately excludes OrderSource.POS — POS orders are always priced and
+# created via POST /business/pos/orders, never claimed here.
+_MANUAL_ORDER_SOURCES = (OrderSource.MANUAL, OrderSource.ADMIN, OrderSource.WHATSAPP)
+
+
 class OrderCreate(BaseModel):
     """Create an order from the dashboard (manual order)."""
     customer_name: str | None = Field(default=None, max_length=255)
@@ -102,7 +116,10 @@ class OrderCreate(BaseModel):
     items: list[OrderItemCreate] = Field(min_length=1)
     notes: str | None = None
     order_mode: str = Field(default="PICKUP", pattern=r"^(PICKUP|DELIVERY|DINE_IN)$")
-    source: str = Field(default="MANUAL", pattern=r"^(MANUAL|ADMIN|WHATSAPP)$")
+    source: str = Field(
+        default=OrderSource.MANUAL.value,
+        pattern=r"^(" + "|".join(s.value for s in _MANUAL_ORDER_SOURCES) + r")$",
+    )
 
 
 # ── Routes ───────────────────────────────────────────────────────────────────
@@ -196,6 +213,19 @@ async def create_order(
 
     await db.commit()
     await db.refresh(order)
+
+    # Record usage (fire and forget) — feeds the monthly order-quota/pack
+    # tracking (backend/app/billing/usage.py). Every order-creation path
+    # (WhatsApp, manual, POS) must call this — previously only the bot did.
+    try:
+        from backend.app.bot.usage_tracker import increment_usage
+        await increment_usage(
+            db, user.business_id, "Africa/Johannesburg",
+            orders_created=1, revenue_cents=order.total_cents,
+        )
+    except Exception:
+        import logging
+        logging.getLogger("nextgen").warning("Failed to record usage for manual order %s", order.id)
 
     # Publish SSE (fire and forget)
     try:
@@ -661,6 +691,7 @@ async def update_payment_status(
 
     was_unpaid = order.payment_status in ("UNPAID", "PENDING")
     payment_required = order.payment_required
+    old_payment_status = order.payment_status
 
     order.payment_status = body.payment_status
     if body.payment_method is not None:
@@ -670,8 +701,30 @@ async def update_payment_status(
     if body.payment_status == "PAID" and order.paid_at is None:
         order.paid_at = datetime.now(timezone.utc)
 
+    # Refunds have no dedicated OrderEvent trail today (see PROJECT.md/Phase 1
+    # POS discovery) — record it in the shared business-scope audit log.
+    if body.payment_status == "REFUNDED" and old_payment_status != "REFUNDED":
+        db.add(AuditEvent(
+            scope=AuditScope.BUSINESS.value,
+            business_id=user.business_id,
+            actor_user_id=user.user_id,
+            action="order.payment.refunded",
+            target_type="order",
+            target_id=order.id,
+            diff_json={
+                "old_payment_status": old_payment_status,
+                "new_payment_status": body.payment_status,
+                "payment_reference": body.payment_reference,
+            },
+        ))
+
     await db.commit()
     await db.refresh(order)
+
+    # ── Award loyalty points if this business has loyalty enabled ────────
+    if body.payment_status == "PAID" and was_unpaid:
+        from backend.app.loyalty.engine import award_loyalty_points_if_enabled
+        await award_loyalty_points_if_enabled(db, user.business_id, order)
 
     # ── Send WhatsApp payment confirmation if online payment was required ─
     if body.payment_status == "PAID" and was_unpaid and payment_required:
@@ -705,3 +758,107 @@ async def update_payment_status(
             )
 
     return OrderResponse.model_validate(order)
+
+
+# ── Refund (Payment Provider Framework) ──────────────────────────────────────
+
+class RefundRequest(BaseModel):
+    amount_cents: int | None = Field(default=None, ge=1, description="Defaults to a full refund of total_cents")
+    reason: str | None = Field(default=None, max_length=255)
+
+
+class RefundResponse(BaseModel):
+    success: bool
+    status: str
+    provider_reference: str | None = None
+    error: str | None = None
+    order: OrderResponse
+
+
+@router.post("/{order_id}/refund", response_model=RefundResponse)
+async def refund_order_payment(
+    order_id: uuid.UUID,
+    body: RefundRequest,
+    user: AuthUser = Depends(require_owner_or_manager),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Refund a paid order through its business's configured payment provider
+    (the Payment Provider Framework, `backend/app/payments/base.py`) — the
+    route never contains provider-specific logic, it only asks the provider
+    to "process this refund."
+
+    OWNER/MANAGER only, same as the discount-limit gate on POS orders —
+    refunds are a financial action a cashier shouldn't authorize solo.
+
+    A MANUAL_REQUIRED or FAILED result does NOT change payment_status —
+    only a provider-confirmed COMPLETED refund does. For MANUAL_REQUIRED
+    providers (Direct EFT, Stitch), staff still use the existing
+    `PATCH /{order_id}/payment` endpoint to mark REFUNDED once they've
+    completed the manual transfer themselves.
+    """
+    result = await db.execute(
+        select(Order).where(Order.id == order_id, Order.business_id == user.business_id)
+    )
+    order = result.scalar_one_or_none()
+    if not order:
+        raise NotFoundError("Order", str(order_id))
+
+    if order.payment_status != "PAID":
+        raise AppError(
+            "ORDER_NOT_PAID",
+            f"Cannot refund an order with payment_status={order.payment_status!r} — only PAID orders can be refunded",
+            422,
+        )
+
+    amount_cents = body.amount_cents or order.total_cents
+    if amount_cents > order.total_cents:
+        raise AppError("REFUND_EXCEEDS_TOTAL", "Refund amount cannot exceed the order total", 422)
+
+    biz_result = await db.execute(select(Business).where(Business.id == user.business_id))
+    business = biz_result.scalar_one_or_none()
+    if not business:
+        raise NotFoundError("Business")
+
+    provider = get_provider(business.payment_provider)
+    if not provider:
+        raise AppError(
+            "NO_PAYMENT_PROVIDER",
+            "This business has no payment provider configured — cannot process a refund",
+            422,
+        )
+
+    refund_result = await provider.refund_payment(order, business, amount_cents)
+
+    if refund_result.success and refund_result.status == "COMPLETED":
+        order.payment_status = "REFUNDED"
+        order.refund_reference = refund_result.provider_reference
+        order.refund_amount_cents = amount_cents
+        order.refunded_at = datetime.now(timezone.utc)
+
+    db.add(AuditEvent(
+        scope=AuditScope.BUSINESS.value,
+        business_id=user.business_id,
+        actor_user_id=user.user_id,
+        action="order.payment.refund_attempted",
+        target_type="order",
+        target_id=order.id,
+        diff_json={
+            "amount_cents": amount_cents,
+            "reason": body.reason,
+            "provider": business.payment_provider,
+            "result_status": refund_result.status,
+            "success": refund_result.success,
+        },
+    ))
+
+    await db.commit()
+    await db.refresh(order)
+
+    return RefundResponse(
+        success=refund_result.success,
+        status=refund_result.status,
+        provider_reference=refund_result.provider_reference,
+        error=refund_result.error,
+        order=OrderResponse.model_validate(order),
+    )

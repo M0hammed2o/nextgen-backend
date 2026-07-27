@@ -15,10 +15,17 @@ from backend.app.core.crypto import decrypt_credential, encrypt_credential
 from backend.app.core.errors import NotFoundError
 from backend.app.core.rbac import AuthUser, require_owner_or_manager, require_staff_or_above
 from backend.app.db.session import get_db
+from backend.app.payments.registry import get_provider
 from shared.models.business import Business
 from shared.models.user import BusinessUser
 
 router = APIRouter(prefix="/business", tags=["business"])
+
+# Every provider name the registry actually knows how to serve — kept as the
+# single source of truth for the `payment_provider` field's allowed values,
+# so this constraint and the registry can never silently drift apart
+# (BUG-0006: this field previously had no validation at all).
+_VALID_PAYMENT_PROVIDERS = r"^(DIRECT_EFT|MOCK|YOCO|PAYFAST|STITCH|IKHOKA)$"
 
 
 # ── Schemas ──────────────────────────────────────────────────────────────────
@@ -46,6 +53,12 @@ class BusinessSettingsResponse(BaseModel):
     daily_message_limit: int
     daily_llm_call_limit: int
     daily_order_limit: int
+    # Monthly order quota (NextGen Restaurant plan) — distinct from the
+    # daily_order_limit runaway-cost guard above.
+    monthly_order_quota: int = 1500
+    order_pack_credits: int = 0
+    monthly_orders_used: int = 0
+    monthly_orders_remaining: int = 1500
     address: str | None
     phone: str | None
     menu_image_url: str | None
@@ -96,6 +109,8 @@ class BusinessSettingsResponse(BaseModel):
             daily_message_limit=b.daily_message_limit,
             daily_llm_call_limit=b.daily_llm_call_limit,
             daily_order_limit=b.daily_order_limit,
+            monthly_order_quota=b.monthly_order_quota,
+            order_pack_credits=b.order_pack_credits,
             address=b.address,
             phone=b.phone,
             menu_image_url=b.menu_image_url,
@@ -134,7 +149,7 @@ class BusinessSettingsUpdate(BaseModel):
     # Payment settings
     payment_methods_enabled: list | None = None
     online_payment_required: bool | None = None
-    payment_provider: str | None = None
+    payment_provider: str | None = Field(default=None, pattern=_VALID_PAYMENT_PROVIDERS)
     payment_timeout_minutes: int | None = Field(default=None, ge=1, le=1440)
     eft_bank_name: str | None = None
     eft_account_name: str | None = None
@@ -161,7 +176,14 @@ async def get_business_settings(
     business = result.scalar_one_or_none()
     if not business:
         raise NotFoundError("Business")
-    return BusinessSettingsResponse.from_business(business)
+
+    from backend.app.billing.usage import get_order_quota_status
+    quota = await get_order_quota_status(db, business)
+
+    response = BusinessSettingsResponse.from_business(business)
+    response.monthly_orders_used = quota.used
+    response.monthly_orders_remaining = quota.remaining
+    return response
 
 
 @router.put("/settings", response_model=BusinessSettingsResponse)
@@ -194,6 +216,50 @@ async def update_business_settings(
     await db.commit()
     await db.refresh(business)
     return BusinessSettingsResponse.from_business(business)
+
+
+# ── Payment provider health check ────────────────────────────────────────────
+
+class PaymentHealthResponse(BaseModel):
+    healthy: bool
+    provider: str
+    checked_at: datetime
+    detail: str | None = None
+
+
+@router.get("/payments/health", response_model=PaymentHealthResponse)
+async def get_payment_provider_health(
+    user: AuthUser = Depends(require_owner_or_manager),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Readiness check for this business's configured payment provider — part
+    of the Payment Provider Framework (see `backend/app/payments/base.py`).
+    A configuration check (credentials present/well-formed), not a live API
+    ping — see `PaymentProvider.check_health`'s docstring for why.
+    """
+    result = await db.execute(select(Business).where(Business.id == user.business_id))
+    business = result.scalar_one_or_none()
+    if not business:
+        raise NotFoundError("Business")
+
+    if not business.payment_provider:
+        return PaymentHealthResponse(
+            healthy=False, provider="NONE", checked_at=datetime.now(timezone.utc),
+            detail="No payment provider configured for this business",
+        )
+
+    provider = get_provider(business.payment_provider)
+    if not provider:
+        return PaymentHealthResponse(
+            healthy=False, provider=business.payment_provider, checked_at=datetime.now(timezone.utc),
+            detail="Configured provider name is not a recognized provider",
+        )
+
+    status = await provider.check_health(business)
+    return PaymentHealthResponse(
+        healthy=status.healthy, provider=status.provider, checked_at=status.checked_at, detail=status.detail,
+    )
 
 
 # ── WhatsApp pause/busy toggle ────────────────────────────────────────────────

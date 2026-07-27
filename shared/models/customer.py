@@ -5,7 +5,7 @@ Customers (WhatsApp contacts) and conversation sessions.
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -23,9 +23,11 @@ class Customer(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         UUID(as_uuid=True), ForeignKey("businesses.id", ondelete="CASCADE"),
         nullable=False, index=True,
     )
-    wa_id: Mapped[str] = mapped_column(
-        String(64), nullable=False,
-        comment="WhatsApp user identifier (phone number format)"
+    wa_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True,
+        comment="WhatsApp user identifier (phone number format). Nullable since "
+                 "2026-07-24 (migration 0019) — a POS-originated customer enrolled "
+                 "for loyalty may have no WhatsApp identity, only a phone_number."
     )
     display_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     phone_number: Mapped[str | None] = mapped_column(String(32), nullable=True)
@@ -34,6 +36,20 @@ class Customer(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     language: Mapped[str | None] = mapped_column(String(10), nullable=True)
     last_message_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
+    )
+
+    # ── Loyalty (added 2026-07-24, see backend/app/loyalty/*) ────────────
+    loyalty_points_balance: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False,
+        comment="Current redeemable point balance — 0 for every customer unless the business enables loyalty"
+    )
+    loyalty_tier: Mapped[str] = mapped_column(
+        String(16), default="BRONZE", nullable=False,
+        comment="BRONZE / SILVER / GOLD, computed from loyalty_points_balance against LoyaltyProgram thresholds"
+    )
+    loyalty_points_expire_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+        comment="When the current balance expires (simple rolling expiry, not per-transaction FIFO — see DECISIONS.md)"
     )
 
 

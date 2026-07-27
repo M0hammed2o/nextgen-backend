@@ -106,11 +106,13 @@ def test_missing_whatsapp_token_caught(settings):
         main_module._validate_production_secrets()
 
 
-def test_placeholder_stripe_secret_is_a_warning_not_a_crash(settings, caplog):
+def test_placeholder_stripe_secret_is_caught(settings):
     """
-    Stripe billing isn't live yet (iKhoka is the active payment provider) —
-    an unconfigured STRIPE_WEBHOOK_SECRET must not block startup, only warn.
+    Stripe self-service subscription billing went live 2026-07-21 — an
+    unconfigured STRIPE_WEBHOOK_SECRET is now a hard production failure,
+    same as every other secret (previously a non-fatal warning while
+    Stripe billing was dormant; see KNOWN_BUGS.md BUG-0001).
     """
     settings.STRIPE_WEBHOOK_SECRET = "whsec_your_webhook_signing_secret"
-    main_module._validate_production_secrets()  # must not raise
-    assert any("STRIPE_WEBHOOK_SECRET" in r.message for r in caplog.records)
+    with pytest.raises(RuntimeError, match="STRIPE_WEBHOOK_SECRET"):
+        main_module._validate_production_secrets()

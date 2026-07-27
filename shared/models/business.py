@@ -8,7 +8,7 @@ Model 1: whatsapp_access_token_encrypted REMOVED.
 """
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import Boolean, DateTime, Integer, String, Text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
@@ -109,11 +109,35 @@ class Business(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     stripe_subscription_id: Mapped[str | None] = mapped_column(
         String(255), unique=True, nullable=True
     )
+    # PayFast recurring-billing token — the PayFast-provider equivalent of
+    # stripe_subscription_id, populated once the owner completes a PayFast
+    # subscription checkout (backend/app/billing/payfast_billing.py).
+    payfast_subscription_token: Mapped[str | None] = mapped_column(
+        String(255), unique=True, nullable=True
+    )
 
     # ── Limits (enforced server-side) ────────────────────────────────────
     daily_message_limit: Mapped[int] = mapped_column(Integer, default=800, nullable=False)
     daily_llm_call_limit: Mapped[int] = mapped_column(Integer, default=400, nullable=False)
     daily_order_limit: Mapped[int] = mapped_column(Integer, default=200, nullable=False)
+
+    # ── Monthly order quota / packs (NextGen Restaurant plan, added 2026-07-24) ─
+    # "1,500 Included Customer Orders per Month" — a *billing-period* quota,
+    # distinct from daily_order_limit above (a same-day abuse/runaway-cost
+    # guard). Usage is computed from the existing DailyUsage.orders_created
+    # signal (see backend/app/billing/usage.py), not a separately-maintained
+    # counter, so it can never drift from what actually happened.
+    monthly_order_quota: Mapped[int] = mapped_column(Integer, default=1500, nullable=False)
+    order_pack_credits: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False,
+        comment="Extra orders purchased on top of monthly_order_quota via an Order Pack add-on"
+    )
+    billing_period_started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        comment="Reset to now() when a subscription invoice is paid (stripe_webhooks.py) — "
+                 "defines the window monthly_order_quota/order_pack_credits apply to"
+    )
 
     # ── Order Numbering ──────────────────────────────────────────────────
     order_number_sequence: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
@@ -145,6 +169,12 @@ class Business(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     payment_timeout_minutes: Mapped[int] = mapped_column(
         Integer, default=30, nullable=False,
         comment="Minutes before an UNPAID online-payment order is auto-cancelled"
+    )
+    # ── POS discount limit (Phase 1) ─────────────────────────────────────
+    max_staff_discount_cents: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False,
+        comment="Max discount a STAFF/MANAGER can apply on a POS order without "
+                 "owner sign-off; 0 = no staff discretion. OWNER is never limited."
     )
     # EFT banking details
     eft_bank_name: Mapped[str | None] = mapped_column(String(255), nullable=True)

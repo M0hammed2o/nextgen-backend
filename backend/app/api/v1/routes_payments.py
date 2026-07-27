@@ -39,11 +39,17 @@ async def _mark_order_paid(
     order_id_str: str,
     business_id: uuid.UUID,
     provider_name: str,
+    provider_reference: str | None = None,
 ) -> None:
     """
     Mark an order PAID and send WhatsApp confirmation.
 
-    Called by all three provider webhook handlers after signature verification.
+    Called by all four provider webhook handlers after signature verification.
+    provider_reference (the provider's own charge/transaction id, e.g. Yoco's
+    "chr_xxx" or iKhoka's paylinkID) is persisted on Order.payment_reference
+    so a later refund_payment() call has something real to target — without
+    this, a refund could only ever act on our own order UUID, which none of
+    these providers' refund APIs accept.
     """
     try:
         parsed_id = uuid.UUID(str(order_id_str))
@@ -65,6 +71,8 @@ async def _mark_order_paid(
 
     was_unpaid = order.payment_status in ("UNPAID", "PENDING")
     order.payment_status = "PAID"
+    if provider_reference and not order.payment_reference:
+        order.payment_reference = provider_reference
 
     from datetime import datetime, timezone
     order.paid_at = datetime.now(timezone.utc)
@@ -80,6 +88,10 @@ async def _mark_order_paid(
     await db.refresh(order)
 
     logger.info("%s webhook: order %s marked PAID", provider_name, order.order_number)
+
+    # Award loyalty points if this business has loyalty enabled
+    from backend.app.loyalty.engine import award_loyalty_points_if_enabled
+    await award_loyalty_points_if_enabled(db, business_id, order)
 
     # Fire-and-forget WhatsApp notification
     if was_unpaid and order.payment_required and order.customer_id:
@@ -149,7 +161,7 @@ async def yoco_webhook(
     result = await provider.handle_webhook(payload)
 
     if result.get("paid") and result.get("order_id"):
-        await _mark_order_paid(db, result["order_id"], business_id, "Yoco")
+        await _mark_order_paid(db, result["order_id"], business_id, "Yoco", result.get("reference"))
 
     return {"received": True}
 
@@ -193,7 +205,7 @@ async def payfast_webhook(
     result = await provider.handle_webhook(params)
 
     if result.get("paid") and result.get("order_id"):
-        await _mark_order_paid(db, result["order_id"], business_id, "PayFast")
+        await _mark_order_paid(db, result["order_id"], business_id, "PayFast", result.get("reference"))
 
     # PayFast expects a 200 OK with no body
     return {"received": True}
@@ -241,7 +253,7 @@ async def ikhoka_webhook(
     result = await provider.handle_webhook(payload)
 
     if result.get("paid") and result.get("order_id"):
-        await _mark_order_paid(db, result["order_id"], business_id, "iKhoka")
+        await _mark_order_paid(db, result["order_id"], business_id, "iKhoka", result.get("reference"))
 
     return {"received": True}
 
@@ -284,6 +296,6 @@ async def stitch_webhook(
     result = await provider.handle_webhook(payload)
 
     if result.get("paid") and result.get("order_id"):
-        await _mark_order_paid(db, result["order_id"], business_id, "Stitch")
+        await _mark_order_paid(db, result["order_id"], business_id, "Stitch", result.get("reference"))
 
     return {"received": True}

@@ -5,32 +5,40 @@ All SQLAlchemy models — import here so Alembic autogenerate discovers them.
 from shared.models.base import Base
 
 from shared.models.admin import AdminUser
-from shared.models.ai_emails import AiEmailImportBatch, AiEmailLead
+from shared.models.ai_emails import AiEmailCaseStudy, AiEmailImportBatch, AiEmailLead
 from shared.models.analytics import DailyUsage
 from shared.models.asset import Asset
 from shared.models.audit import AuditEvent, MessageOutbox
+from shared.models.billing_invoice import BillingInvoice
 from shared.models.business import Business
 from shared.models.customer import ConversationSession, Customer
+from shared.models.loyalty import LoyaltyProgram, LoyaltyReward, LoyaltyTransaction
 from shared.models.menu import MenuAddOn, MenuCategory, MenuItem
 from shared.models.message import Message
 from shared.models.order import Order, OrderEvent, OrderItem
 from shared.models.push_subscription import PushSubscription
 from shared.models.specials import Special
+from shared.models.till import TillSession
 from shared.models.user import AdminRefreshToken, BusinessUser, RefreshToken
 
 __all__ = [
     "Base",
     "AdminUser",
     "AdminRefreshToken",
+    "AiEmailCaseStudy",
     "AiEmailImportBatch",
     "AiEmailLead",
     "Asset",
     "AuditEvent",
+    "BillingInvoice",
     "Business",
     "BusinessUser",
     "ConversationSession",
     "Customer",
     "DailyUsage",
+    "LoyaltyProgram",
+    "LoyaltyReward",
+    "LoyaltyTransaction",
     "MenuAddOn",
     "MenuCategory",
     "MenuItem",
@@ -42,4 +50,5 @@ __all__ = [
     "PushSubscription",
     "RefreshToken",
     "Special",
+    "TillSession",
 ]

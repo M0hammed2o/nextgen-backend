@@ -12,7 +12,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.errors import NotFoundError
-from backend.app.core.rbac import AuthUser, require_owner_or_manager
+from backend.app.core.rbac import AuthUser, require_owner_or_manager, require_staff_or_above
 from backend.app.db.session import get_db
 from shared.models.menu import MenuAddOn, MenuCategory, MenuItem, menu_item_add_ons
 
@@ -163,7 +163,9 @@ class ItemResponse(BaseModel):
 
 @router.get("/categories", response_model=list[CategoryResponse])
 async def list_categories(
-    user: AuthUser = Depends(require_owner_or_manager),
+    # Staff need read access to build a POS cart (routes_pos.py) — only the
+    # mutating routes below stay owner/manager-only.
+    user: AuthUser = Depends(require_staff_or_above),
     db: AsyncSession = Depends(get_db),
 ):
     result = await db.execute(
@@ -264,7 +266,8 @@ async def delete_category(
 async def list_items(
     category_id: uuid.UUID | None = None,
     include_inactive: bool = False,
-    user: AuthUser = Depends(require_owner_or_manager),
+    # Staff need read access to build a POS cart (routes_pos.py).
+    user: AuthUser = Depends(require_staff_or_above),
     db: AsyncSession = Depends(get_db),
 ):
     query = (
@@ -391,7 +394,8 @@ class AddOnUpdate(BaseModel):
 
 @router.get("/add-ons", response_model=list[AddOnResponse])
 async def list_add_ons(
-    user: AuthUser = Depends(require_owner_or_manager),
+    # Staff need read access to build a POS cart (routes_pos.py).
+    user: AuthUser = Depends(require_staff_or_above),
     db: AsyncSession = Depends(get_db),
 ):
     result = await db.execute(

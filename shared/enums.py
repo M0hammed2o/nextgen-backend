@@ -72,6 +72,7 @@ class OrderSource(str, enum.Enum):
     WHATSAPP = "WHATSAPP"
     MANUAL = "MANUAL"
     ADMIN = "ADMIN"
+    POS = "POS"
 
 
 class PaymentStatus(str, enum.Enum):

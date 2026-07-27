@@ -24,12 +24,15 @@ import hashlib
 import logging
 import urllib.parse
 
-from backend.app.payments.base import PaymentProvider
+import httpx
+
+from backend.app.payments.base import PaymentProvider, ProviderHealthStatus, RefundResult
 
 logger = logging.getLogger("nextgen.payments.payfast")
 
 _LIVE_URL = "https://www.payfast.co.za/eng/process"
 _SANDBOX_URL = "https://sandbox.payfast.co.za/eng/process"
+_REFUND_API_URL = "https://api.payfast.co.za/orders/{payment_id}/refund"
 
 
 def _build_signature(params: dict, passphrase: str | None) -> str:
@@ -107,7 +110,67 @@ class PayFastProvider(PaymentProvider):
         order_id = payload.get("m_payment_id", "")
         payment_status = payload.get("payment_status", "")
         paid = payment_status == "COMPLETE"
-        return {"paid": paid, "order_id": order_id}
+        # pf_payment_id is PayFast's own transaction id — captured so a later
+        # refund can target the real provider transaction.
+        reference = payload.get("pf_payment_id")
+        return {"paid": paid, "order_id": order_id, "reference": reference}
+
+    async def refund_payment(self, order, business, amount_cents: int) -> RefundResult:
+        """
+        Refund a PayFast payment by its pf_payment_id.
+
+        UNVERIFIED against live credentials or a sandbox account. PayFast's
+        refund API (api.payfast.co.za) uses a different auth scheme (an API
+        key/passphrase-derived token, not the ITN form-signature used
+        elsewhere in this file) that this session had no live account to
+        confirm against — implemented as a best-effort call using the
+        merchant_id/passphrase already configured, but PayFast refunds
+        typically also require the merchant's refund permission to be
+        enabled by PayFast support first. Confirm both the auth scheme and
+        that refunds are enabled on the account before relying on this in
+        production; it fails safely (RefundResult(success=False)) on any
+        error rather than falsely marking an order refunded.
+        """
+        from backend.app.core.crypto import decrypt_credential
+        merchant_id = decrypt_credential(getattr(business, "payment_api_secret", None))
+        passphrase = decrypt_credential(getattr(business, "payment_webhook_secret", None))
+        if not merchant_id:
+            return RefundResult(success=False, status="FAILED", error="PayFast merchant_id not configured")
+
+        reference = getattr(order, "payment_reference", None)
+        if not reference:
+            return RefundResult(
+                success=False, status="FAILED",
+                error="No PayFast pf_payment_id stored on this order — cannot target a refund",
+            )
+
+        params = {"merchant-id": merchant_id, "amount": amount_cents}
+        signature = _build_signature(params, passphrase)
+
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    _REFUND_API_URL.format(payment_id=reference),
+                    json=params,
+                    headers={"merchant-id": merchant_id, "signature": signature, "Content-Type": "application/json"},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                return RefundResult(success=True, status="COMPLETED", provider_reference=data.get("id", reference))
+        except httpx.HTTPStatusError as exc:
+            logger.error("PayFast refund %s error for order %s: %s", exc.response.status_code, order.order_number, exc.response.text)
+            return RefundResult(success=False, status="FAILED", error=f"PayFast API error: {exc.response.status_code}")
+        except Exception as exc:
+            logger.exception("PayFast refund_payment failed for order %s", order.order_number)
+            return RefundResult(success=False, status="FAILED", error=str(exc))
+
+    async def check_health(self, business) -> ProviderHealthStatus:
+        from backend.app.core.crypto import decrypt_credential
+        merchant_key = decrypt_credential(getattr(business, "payment_api_key", None))
+        merchant_id = decrypt_credential(getattr(business, "payment_api_secret", None))
+        if not merchant_key or not merchant_id:
+            return ProviderHealthStatus.now(healthy=False, provider="PAYFAST", detail="Merchant ID/Key not configured")
+        return ProviderHealthStatus.now(healthy=True, provider="PAYFAST", detail="Credentials configured (live connectivity not checked)")
 
     @staticmethod
     def verify_signature(params: dict, passphrase: str | None) -> bool:

@@ -66,9 +66,35 @@ class Settings(BaseSettings):
     WHATSAPP_DEFAULT_ACCESS_TOKEN: str = "CHANGE-ME"
     WHATSAPP_WEBHOOK_PATH: str = "/v1/webhook/meta"
 
-    # ── Stripe ───────────────────────────────────────────────────────────
+    # ── SaaS billing provider selection ──────────────────────────────────
+    # Which BillingProvider (backend/app/billing/provider_base.py) actively
+    # handles NextGen's own subscription billing of tenants. Stripe remains
+    # fully implemented and is the default; PayFast is implemented but
+    # unverified against live credentials (see KNOWN_BUGS.md). Switching is
+    # a config change, never a code change — see backend/app/billing/registry.py.
+    BILLING_PROVIDER: str = "STRIPE"  # STRIPE | PAYFAST
+
+    # NextGen's OWN PayFast merchant account for SaaS billing — distinct
+    # from Business.payment_api_key/etc., which are each *tenant's own*
+    # PayFast credentials for their customers' payments.
+    PAYFAST_BILLING_MERCHANT_ID: str = ""
+    PAYFAST_BILLING_MERCHANT_KEY: str = ""
+    PAYFAST_BILLING_PASSPHRASE: str = ""
+
+    # ── Stripe (NextGen's own SaaS subscription billing of tenants —
+    #    distinct from the customer-facing payment providers below, which
+    #    are how a tenant's own customers pay the tenant) ─────────────────
     STRIPE_SECRET_KEY: str = ""
     STRIPE_WEBHOOK_SECRET: str = ""
+    # One Stripe recurring Price ID per self-service plan tier. ENTERPRISE
+    # is deliberately excluded — per PRODUCT_ROADMAP.md's packaging section,
+    # Enterprise is sales-assisted/custom-contract, never self-service Checkout.
+    STRIPE_PRICE_ID_STARTER: str = ""
+    STRIPE_PRICE_ID_GROWTH: str = ""
+    # Where Stripe Checkout/Billing Portal send the owner back to afterward.
+    BILLING_SUCCESS_URL: str = "https://app.nextgenintelligence.co.za/settings/billing?checkout=success"
+    BILLING_CANCEL_URL: str = "https://app.nextgenintelligence.co.za/settings/billing?checkout=cancelled"
+    BILLING_PORTAL_RETURN_URL: str = "https://app.nextgenintelligence.co.za/settings/billing"
 
     # ── LLM ──────────────────────────────────────────────────────────────
     OPENAI_API_KEY: str = ""

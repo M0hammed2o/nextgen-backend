@@ -34,7 +34,7 @@ from datetime import datetime, timezone
 
 import httpx
 
-from backend.app.payments.base import PaymentProvider
+from backend.app.payments.base import PaymentProvider, ProviderHealthStatus, RefundResult
 
 logger = logging.getLogger("nextgen.payments.stitch")
 
@@ -247,7 +247,41 @@ class StitchProvider(PaymentProvider):
             event_type == "payment_initiation_request.complete"
             and status_type == "Completed"
         )
-        return {"paid": paid, "order_id": order_id}
+        # The payment initiation request's own id ("pir_xxx") — captured for
+        # completeness, though see refund_payment: it can't actually be used
+        # to reverse an instant bank-to-bank payment via this API.
+        reference = data.get("id")
+        return {"paid": paid, "order_id": order_id, "reference": reference}
+
+    async def refund_payment(self, order, business, amount_cents: int) -> RefundResult:
+        """
+        Stitch "Pay by Bank" is an instant bank-to-bank transfer, not a card
+        charge — there is no reversal/refund endpoint for an already-completed
+        bank transfer on the payment-initiation API this integration uses
+        (that would require a separate *payouts* capability, sending a new
+        payment from the business back to the customer, which isn't part of
+        this integration). This is a genuine architectural limit, not a
+        credentials gap — MANUAL_REQUIRED is the structurally correct answer
+        for this provider, not a placeholder.
+        """
+        return RefundResult(
+            success=False,
+            status="MANUAL_REQUIRED",
+            error="Stitch instant EFT payments can't be reversed via API — refund the customer via a manual bank transfer.",
+        )
+
+    async def check_health(self, business) -> ProviderHealthStatus:
+        from backend.app.core.crypto import decrypt_credential
+        client_secret = decrypt_credential(getattr(business, "payment_api_key", None))
+        client_id = decrypt_credential(getattr(business, "payment_api_secret", None))
+        if not client_secret or not client_id:
+            return ProviderHealthStatus.now(healthy=False, provider="STITCH", detail="Client ID/Secret not configured")
+        if not getattr(business, "eft_account_number", None):
+            return ProviderHealthStatus.now(
+                healthy=False, provider="STITCH",
+                detail="No eft_account_number configured — Stitch needs a linked beneficiary bank account",
+            )
+        return ProviderHealthStatus.now(healthy=True, provider="STITCH", detail="Credentials configured (live connectivity not checked)")
 
     @staticmethod
     def verify_signature(raw_body: bytes, signature_header: str, client_secret: str) -> bool:

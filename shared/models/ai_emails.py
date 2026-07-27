@@ -1,15 +1,20 @@
 """
-AI Email Outreach — lead + import batch models.
+AI Email Outreach — lead, import batch, and case-study profile models.
 
 Super-admin-only lead-generation/outreach module (see "AI emails/" docs at the
-repo root). Leads are external prospects (gyms/sports facilities) sourced from
-spreadsheet imports — unrelated to the `businesses` table (the platform's
-paying WhatsApp-bot tenants). No relationship() to AdminUser is declared here,
-matching how shared/models/audit.py::AuditEvent keeps its actor FK as a bare
-column rather than an ORM relationship.
+repo root) for NextGen Intelligence's custom-software sales campaign — NOT a
+feature of, or variant of, the WhatsApp ordering product also hosted in this
+repo. Leads are external sales prospects (gyms/sports facilities) sourced from
+spreadsheet imports. This module has zero foreign keys, joins, or code
+dependency on `businesses` or any of its related tables — that must never
+change. No relationship() to AdminUser is declared here, matching how
+shared/models/audit.py::AuditEvent keeps its actor FK as a bare column rather
+than an ORM relationship.
 
-Phase 1 only: import batches + leads. No campaigns/generated-emails/sent-emails/
-replies/followups/gmail-connections tables yet — those come in later phases.
+Phase 1 (+ case-study profile, added ahead of Phase 2 as compliance/data
+infrastructure): import batches, leads, case studies. No campaigns/generated-
+emails/sent-emails/replies/followups/gmail-connections tables yet — those come
+in later phases.
 """
 
 import uuid
@@ -116,6 +121,13 @@ class AiEmailLead(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         ARRAY(String), default=list, nullable=False
     )
     do_not_contact: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    phone_outreach_completed: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False,
+        comment="Manual tick for leads without an email — worked by phone/WhatsApp instead"
+    )
+    phone_outreach_completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     unsubscribed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -130,3 +142,53 @@ class AiEmailLead(Base, UUIDPrimaryKeyMixin, TimestampMixin):
 
     def __repr__(self) -> str:
         return f"<AiEmailLead {self.business_name} ({self.lead_status})>"
+
+
+class AiEmailCaseStudy(Base, UUIDPrimaryKeyMixin, TimestampMixin):
+    """
+    Structured, approved facts for one case-study reference project (e.g.
+    Muscle Factory), used by the Phase 2 email generator instead of embedding
+    facts only in prompt text. The generator must never state a fact that
+    isn't present here, must refuse to use a case study whose
+    approved_for_marketing is false, and must not name the client unless
+    client_permission_status = 'granted'.
+    """
+    __tablename__ = "ai_email_case_studies"
+
+    case_study_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    client_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    industry: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    approved_for_marketing: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False,
+        comment="NextGen's internal editorial approval of this content for outbound use"
+    )
+    confirmed_deployed_features: Mapped[list] = mapped_column(
+        JSONB, default=list, nullable=False,
+        comment="Facts that may be stated as already built — list of strings"
+    )
+    optional_or_proposed_features: Mapped[list] = mapped_column(
+        JSONB, default=list, nullable=False,
+        comment="Facts that must only be phrased as can-be-added/configured — list of strings"
+    )
+    approved_credibility_statement: Mapped[str | None] = mapped_column(
+        Text, nullable=True,
+        comment="Vetted paragraph the generator may paraphrase — never invent beyond this"
+    )
+    approved_screenshots: Mapped[list] = mapped_column(
+        JSONB, default=list, nullable=False,
+        comment="[{label, url, redacted}] — empty until screenshots exist and are cleared"
+    )
+    screenshot_redaction_status: Mapped[str] = mapped_column(
+        String(16), default="not_applicable", nullable=False,
+        comment="not_applicable / pending / completed"
+    )
+    client_permission_status: Mapped[str] = mapped_column(
+        String(16), default="not_requested", nullable=False,
+        comment="not_requested / requested / granted / denied — whether the CLIENT consented "
+                "to being named/referenced with third parties; separate from approved_for_marketing"
+    )
+    last_reviewed_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+
+    def __repr__(self) -> str:
+        return f"<AiEmailCaseStudy {self.case_study_name} (approved={self.approved_for_marketing})>"

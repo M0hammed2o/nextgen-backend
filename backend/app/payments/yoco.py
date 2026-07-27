@@ -26,11 +26,12 @@ import logging
 
 import httpx
 
-from backend.app.payments.base import PaymentProvider
+from backend.app.payments.base import PaymentProvider, ProviderHealthStatus, RefundResult
 
 logger = logging.getLogger("nextgen.payments.yoco")
 
 _CHECKOUT_URL = "https://payments.yoco.com/api/checkouts"
+_PAYMENTS_URL = "https://payments.yoco.com/api/payments"
 
 
 class YocoProvider(PaymentProvider):
@@ -108,7 +109,63 @@ class YocoProvider(PaymentProvider):
         order_id = metadata.get("orderId")
 
         paid = event_type in ("checkout.completed", "payment.succeeded") and status == "successful"
-        return {"paid": paid, "order_id": order_id}
+        # "id" here is Yoco's own charge/payment id (e.g. "chr_xxx") — captured
+        # so a later refund can reference the actual provider transaction,
+        # not just our own order UUID.
+        reference = inner.get("id")
+        return {"paid": paid, "order_id": order_id, "reference": reference}
+
+    async def refund_payment(self, order, business, amount_cents: int) -> RefundResult:
+        """
+        Refund a Yoco payment by its charge/payment id.
+
+        UNVERIFIED against live credentials or a sandbox account — this
+        session had no Yoco API access to confirm the exact refund endpoint
+        path/response shape. Implemented against Yoco's documented REST
+        conventions (same Bearer-token auth as create_payment_link, refund
+        endpoint under /api/payments/{id}/refund). Confirm against Yoco's
+        current API reference (https://developer.yoco.com) before enabling
+        real refunds in production — until then this fails safely (caught
+        exception → RefundResult(success=False)), it will not silently
+        corrupt `Order.payment_status`.
+        """
+        from backend.app.core.crypto import decrypt_credential
+        api_key = decrypt_credential(getattr(business, "payment_api_key", None))
+        if not api_key:
+            return RefundResult(success=False, status="FAILED", error="No Yoco api_key configured")
+
+        reference = getattr(order, "payment_reference", None)
+        if not reference:
+            return RefundResult(
+                success=False, status="FAILED",
+                error="No Yoco charge reference stored on this order — cannot target a refund",
+            )
+
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    f"{_PAYMENTS_URL}/{reference}/refund",
+                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                    json={"amount": amount_cents},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                return RefundResult(success=True, status="COMPLETED", provider_reference=data.get("id", reference))
+        except httpx.HTTPStatusError as exc:
+            logger.error("Yoco refund %s error for order %s: %s", exc.response.status_code, order.order_number, exc.response.text)
+            return RefundResult(success=False, status="FAILED", error=f"Yoco API error: {exc.response.status_code}")
+        except Exception as exc:
+            logger.exception("Yoco refund_payment failed for order %s", order.order_number)
+            return RefundResult(success=False, status="FAILED", error=str(exc))
+
+    async def check_health(self, business) -> ProviderHealthStatus:
+        from backend.app.core.crypto import decrypt_credential
+        api_key = decrypt_credential(getattr(business, "payment_api_key", None))
+        if not api_key:
+            return ProviderHealthStatus.now(healthy=False, provider="YOCO", detail="No api_key configured")
+        if not api_key.startswith(("sk_live_", "sk_test_")):
+            return ProviderHealthStatus.now(healthy=False, provider="YOCO", detail="api_key doesn't look like a Yoco secret key")
+        return ProviderHealthStatus.now(healthy=True, provider="YOCO", detail="Credentials configured (live connectivity not checked)")
 
     @staticmethod
     def verify_signature(raw_body: bytes, signature_header: str, webhook_secret: str) -> bool:

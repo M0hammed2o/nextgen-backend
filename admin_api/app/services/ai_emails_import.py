@@ -196,9 +196,25 @@ def is_status_like_verify_value(value: str | None) -> bool:
     return "verify" in v or "research" in v
 
 
+def is_existing_client_hint(value: str | None) -> bool:
+    """
+    True for spreadsheet status text like "Existing client" — e.g. the
+    Muscle Factory reference business itself may appear in a prospect
+    spreadsheet (already a customer, sourced as a research reference, or
+    imported alongside other leads). Such rows must never receive a sales
+    pitch and are force-flagged do_not_contact at import time, not just
+    display time.
+    """
+    if not value:
+        return False
+    return "existing client" in value.strip().lower()
+
+
 def compute_initial_lead_status(outreach_hint: str | None, email: str | None) -> str:
     if outreach_hint:
         v = outreach_hint.strip().lower()
+        if is_existing_client_hint(outreach_hint):
+            return "do_not_contact"
         if "research" in v:
             return "requires_research"
         if "verify" in v:
@@ -253,9 +269,14 @@ def build_row_preview(raw_row: dict, mapping: dict[str, str | None], row_number:
 
     outreach_hint = get("outreach_status_hint")
     lead_status = compute_initial_lead_status(outreach_hint, email)
+    is_existing_client = bool(outreach_hint) and is_existing_client_hint(outreach_hint)
+    if is_existing_client:
+        warnings.append(
+            f"outreach_status_hint: '{outreach_hint}' — flagged do_not_contact (existing client, never send a sales pitch)"
+        )
 
     research_notes = get("research_notes")
-    if outreach_hint and is_status_like_verify_value(outreach_hint):
+    if outreach_hint and (is_status_like_verify_value(outreach_hint) or is_existing_client):
         note = f"Imported outreach status: {outreach_hint}"
         research_notes = f"{research_notes}\n{note}" if research_notes else note
 
@@ -273,6 +294,7 @@ def build_row_preview(raw_row: dict, mapping: dict[str, str | None], row_number:
         "preferred_contact_method": preferred_contact_method,
         "verification_status": verification_status,
         "lead_status": lead_status,
+        "do_not_contact": is_existing_client,
         "research_notes": research_notes,
         "last_contacted_date": _parse_loose_date(get("last_contacted_date")).isoformat()
             if _parse_loose_date(get("last_contacted_date")) else None,
@@ -428,6 +450,10 @@ async def apply_confirm(
                     value = data.get(field)
                     if value:
                         setattr(lead, field, value)
+                if data.get("do_not_contact"):
+                    # Only ever flips true — re-importing never silently clears an
+                    # existing do_not_contact flag a human may have set for other reasons.
+                    lead.do_not_contact = True
                 lead.import_batch_id = batch.id
                 updated_count += 1
                 continue
@@ -448,6 +474,7 @@ async def apply_confirm(
             preferred_contact_method=data.get("preferred_contact_method", "unknown"),
             verification_status=data.get("verification_status", "unverified"),
             lead_status=data.get("lead_status", "new"),
+            do_not_contact=data.get("do_not_contact", False),
             research_notes=data.get("research_notes"),
             import_batch_id=batch.id,
         )

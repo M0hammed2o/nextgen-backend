@@ -29,12 +29,14 @@ import logging
 
 import httpx
 
-from backend.app.payments.base import PaymentProvider
+from backend.app.payments.base import PaymentProvider, ProviderHealthStatus, RefundResult
 
 logger = logging.getLogger("nextgen.payments.ikhoka")
 
 _API_URL = "https://api.ikhokha.com/public-api/v1/api/payment"
 _API_PATH = "/public-api/v1/api/payment"
+_REFUND_API_URL = "https://api.ikhokha.com/public-api/v1/api/payment/refund"
+_REFUND_API_PATH = "/public-api/v1/api/payment/refund"
 
 
 def _sign(path: str, compact_body: str, app_secret: str) -> str:
@@ -145,7 +147,71 @@ class IKhokaProvider(PaymentProvider):
         response_code = payload.get("responseCode", "")
         order_id = payload.get("externalTransactionID")
         paid = status == "SUCCESS" and response_code == "00"
-        return {"paid": paid, "order_id": order_id}
+        # paylinkID is iKhoka's own transaction reference — captured so a
+        # later refund can target the real provider transaction.
+        reference = payload.get("paylinkID")
+        return {"paid": paid, "order_id": order_id, "reference": reference}
+
+    async def refund_payment(self, order, business, amount_cents: int) -> RefundResult:
+        """
+        Refund an iKhoka payment by its paylinkID.
+
+        UNVERIFIED against live credentials or a sandbox account — this
+        session had no iKhoka API access to confirm the exact refund
+        endpoint/response shape. Implemented reusing the same IK-APPID/IK-SIGN
+        request-signing scheme already established in create_payment_link
+        (iKhoka's entire public API uses this one signing convention), against
+        a plausible /payment/refund path. Confirm against iKhoka's current
+        Payment API reference before enabling real refunds in production —
+        this fails safely on any error, never marking an order refunded
+        without provider confirmation.
+        """
+        from backend.app.core.crypto import decrypt_credential
+        app_id = decrypt_credential(getattr(business, "payment_api_key", None))
+        app_secret = decrypt_credential(getattr(business, "payment_api_secret", None))
+        if not app_id or not app_secret:
+            return RefundResult(success=False, status="FAILED", error="iKhoka credentials not configured")
+
+        reference = getattr(order, "payment_reference", None)
+        if not reference:
+            return RefundResult(
+                success=False, status="FAILED",
+                error="No iKhoka paylinkID stored on this order — cannot target a refund",
+            )
+
+        body = {
+            "entityID": app_id,
+            "paylinkID": reference,
+            "amount": amount_cents,
+            "externalTransactionID": str(order.id),
+        }
+        body_str = json.dumps(body, separators=(",", ":"))
+        signature = _sign(_REFUND_API_PATH, body_str, app_secret)
+
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    _REFUND_API_URL,
+                    content=body_str.encode("utf-8"),
+                    headers={"Content-Type": "application/json", "IK-APPID": app_id, "IK-SIGN": signature},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                return RefundResult(success=True, status="COMPLETED", provider_reference=data.get("refundID", reference))
+        except httpx.HTTPStatusError as exc:
+            logger.error("iKhoka refund %s error for order %s: %s", exc.response.status_code, order.order_number, exc.response.text)
+            return RefundResult(success=False, status="FAILED", error=f"iKhoka API error: {exc.response.status_code}")
+        except Exception as exc:
+            logger.exception("iKhoka refund_payment failed for order %s", order.order_number)
+            return RefundResult(success=False, status="FAILED", error=str(exc))
+
+    async def check_health(self, business) -> ProviderHealthStatus:
+        from backend.app.core.crypto import decrypt_credential
+        app_id = decrypt_credential(getattr(business, "payment_api_key", None))
+        app_secret = decrypt_credential(getattr(business, "payment_api_secret", None))
+        if not app_id or not app_secret:
+            return ProviderHealthStatus.now(healthy=False, provider="IKHOKA", detail="Application ID/Secret not configured")
+        return ProviderHealthStatus.now(healthy=True, provider="IKHOKA", detail="Credentials configured (live connectivity not checked)")
 
     @staticmethod
     def verify_signature(

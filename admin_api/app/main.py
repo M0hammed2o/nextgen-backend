@@ -70,13 +70,18 @@ app = FastAPI(
 
 app.add_middleware(RequestLoggingMiddleware)
 app.add_middleware(CorrelationIDMiddleware)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.ALLOWED_ORIGINS.split(","),
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# See backend/app/main.py's matching comment: a static ALLOWED_ORIGINS list
+# can't cover Vite's automatic port-fallback for local frontend dev servers.
+# Development-only; production keeps the static allowlist only.
+_cors_kwargs = {
+    "allow_origins": settings.ALLOWED_ORIGINS.split(","),
+    "allow_credentials": True,
+    "allow_methods": ["*"],
+    "allow_headers": ["*"],
+}
+if settings.ENVIRONMENT == "development":
+    _cors_kwargs["allow_origin_regex"] = r"http://localhost:\d+"
+app.add_middleware(CORSMiddleware, **_cors_kwargs)
 
 register_error_handlers(app)
 

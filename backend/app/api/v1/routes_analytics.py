@@ -19,7 +19,7 @@ from backend.app.core.rbac import AuthUser, require_owner_or_manager
 from backend.app.db.session import get_db
 from shared.models.analytics import DailyUsage
 from shared.models.order import Order, OrderItem
-from shared.utils.time import today_date_for_business
+from shared.utils.time import local_midnight_to_utc, today_date_for_business
 
 router = APIRouter(prefix="/business/analytics", tags=["analytics"])
 
@@ -75,7 +75,11 @@ async def get_summary(
     else:
         start_date = today - timedelta(days=29)
 
-    cutoff_dt = datetime(start_date.year, start_date.month, start_date.day, tzinfo=tz.utc)
+    # BUG-0032: local midnight of start_date, converted to a real UTC
+    # instant -- see local_midnight_to_utc()'s docstring for why the
+    # naive "tag the local date's y/m/d with UTC tzinfo" approach this
+    # replaced was wrong for any non-zero-offset business timezone.
+    cutoff_dt = local_midnight_to_utc(start_date, tz_name)
 
     order_stats = await db.execute(
         select(
@@ -197,7 +201,7 @@ async def get_daily_breakdown(
     biz = await db.get(Business, user.business_id)
     tz_name = biz.timezone if biz else "Africa/Johannesburg"
     start_date = today_date_for_business(tz_name) - timedelta(days=days - 1)
-    cutoff_dt = datetime(start_date.year, start_date.month, start_date.day, tzinfo=tz.utc)
+    cutoff_dt = local_midnight_to_utc(start_date, tz_name)
 
     order_day_expr = cast(Order.created_at, Date)
 

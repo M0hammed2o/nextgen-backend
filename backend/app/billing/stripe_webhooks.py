@@ -70,6 +70,63 @@ async def stripe_webhook(
     return {"status": "ok"}
 
 
+@router.post("/webhooks/payfast", status_code=200, include_in_schema=False)
+async def payfast_billing_webhook(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Receive PayFast ITN for NextGen's OWN SaaS-billing merchant account
+    (PayFastBillingProvider) — distinct from
+    `routes_payments.py::payfast_webhook`, which is per-*tenant* PayFast
+    (each business's own customer payments). Verifies with the platform's
+    own PAYFAST_BILLING_PASSPHRASE, never a tenant's payment_webhook_secret.
+    """
+    raw_body = await request.body()
+    import urllib.parse
+    try:
+        params = dict(urllib.parse.parse_qsl(raw_body.decode("utf-8")))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid form data")
+
+    from backend.app.payments.payfast import PayFastProvider
+    params_copy = dict(params)
+    if not PayFastProvider.verify_signature(params_copy, settings.PAYFAST_BILLING_PASSPHRASE):
+        logger.warning("PayFast billing ITN: invalid signature")
+        raise HTTPException(status_code=400, detail="Invalid signature")
+
+    business_id = params.get("m_payment_id")
+    if not business_id:
+        return {"received": True}
+
+    result = await db.execute(select(Business).where(Business.id == business_id))
+    biz = result.scalar_one_or_none()
+    if not biz:
+        logger.warning("PayFast billing ITN: unknown business %s", business_id)
+        return {"received": True}
+
+    payment_status = params.get("payment_status", "")
+    token = params.get("token")
+    if token:
+        biz.payfast_subscription_token = token
+
+    amount_cents = None
+    if params.get("amount_gross"):
+        try:
+            amount_cents = round(float(params["amount_gross"]) * 100)
+        except ValueError:
+            amount_cents = None
+
+    from backend.app.billing.lifecycle import mark_invoice_paid, mark_payment_failed
+    if payment_status == "COMPLETE":
+        mark_invoice_paid(biz, db=db, amount_cents=amount_cents, provider="PAYFAST", provider_reference=params.get("pf_payment_id"))
+    elif payment_status in ("FAILED", "CANCELLED"):
+        mark_payment_failed(biz, db=db, amount_cents=amount_cents, provider="PAYFAST", provider_reference=params.get("pf_payment_id"))
+
+    await db.commit()
+    return {"received": True}
+
+
 async def _find_business_by_stripe(
     db: AsyncSession, customer_id: str | None = None, subscription_id: str | None = None
 ) -> Business | None:
@@ -129,12 +186,12 @@ async def _handle_invoice_paid(db: AsyncSession, data: dict) -> None:
     if not biz:
         return
 
-    if biz.billing_status == "PAST_DUE":
-        biz.billing_status = "ACTIVE"
-        biz.is_active = True
-        biz.suspended_reason = None
-        await db.commit()
-        logger.info("Business %s reactivated after payment", biz.id)
+    from backend.app.billing.lifecycle import mark_invoice_paid
+    mark_invoice_paid(
+        biz, db=db, amount_cents=data.get("amount_paid"),
+        provider="STRIPE", provider_reference=data.get("id"),
+    )
+    await db.commit()
 
 
 async def _handle_payment_failed(db: AsyncSession, data: dict) -> None:
@@ -142,9 +199,12 @@ async def _handle_payment_failed(db: AsyncSession, data: dict) -> None:
     if not biz:
         return
 
-    biz.billing_status = "PAST_DUE"
+    from backend.app.billing.lifecycle import mark_payment_failed
+    mark_payment_failed(
+        biz, db=db, amount_cents=data.get("amount_due"),
+        provider="STRIPE", provider_reference=data.get("id"),
+    )
     await db.commit()
-    logger.info("Business %s marked as PAST_DUE after payment failure", biz.id)
 
 
 async def _handle_subscription_deleted(db: AsyncSession, data: dict) -> None:

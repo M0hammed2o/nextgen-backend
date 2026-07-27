@@ -11,12 +11,15 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.errors import AppError, DuplicateError, NotFoundError
 from backend.app.core.rbac import AuthUser, require_super_admin
 from backend.app.core.security import hash_password
 from backend.app.db.session import get_db
+from shared.enums import AuditScope
+from shared.models.audit import AuditEvent
 from shared.models.business import Business
 from shared.models.user import BusinessUser
 from shared.utils import generate_business_code, generate_temp_password
@@ -82,6 +85,10 @@ class BusinessAdminResponse(BaseModel):
     daily_message_limit: int
     daily_llm_call_limit: int
     daily_order_limit: int
+    monthly_order_quota: int = 1500
+    order_pack_credits: int = 0
+    monthly_orders_used: int = 0
+    monthly_orders_remaining: int = 1500
     last_webhook_received_at: datetime | None
     created_at: datetime
     # Populated only by POST /admin/businesses when owner_email was provided —
@@ -226,6 +233,15 @@ async def create_business(
         )
         db.add(owner)
 
+    db.add(AuditEvent(
+        scope=AuditScope.PLATFORM.value,
+        business_id=biz.id,
+        actor_user_id=user.user_id,
+        action="admin.business.created",
+        target_type="business",
+        target_id=biz.id,
+        diff_json={"name": biz.name, "plan": biz.plan, "owner_email_provided": bool(body.owner_email)},
+    ))
     await db.commit()
     await db.refresh(biz)
 
@@ -243,7 +259,59 @@ async def get_business(
     biz = await db.get(Business, business_id)
     if not biz:
         raise NotFoundError("Business", str(business_id))
-    return BusinessAdminResponse.model_validate(biz)
+
+    from backend.app.billing.usage import get_order_quota_status
+    quota = await get_order_quota_status(db, biz)
+
+    response = BusinessAdminResponse.model_validate(biz)
+    response.monthly_orders_used = quota.used
+    response.monthly_orders_remaining = quota.remaining
+    return response
+
+
+class OrderPackGrant(BaseModel):
+    pack_size: int = Field(ge=1, description="e.g. 500/1000/2500/5000, but not restricted to those exact values")
+
+
+@router.post("/{business_id}/order-pack", response_model=BusinessAdminResponse)
+async def grant_order_pack(
+    business_id: uuid.UUID,
+    body: OrderPackGrant,
+    user: AuthUser = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Grant additional order-pack credits for the current billing period.
+
+    Admin-operated for now, not customer self-service — the order-pack
+    purchase flow isn't wired to any payment provider yet (NextGen's own
+    SaaS-billing provider is itself unresolved, see DECISIONS.md
+    DECISION-0014), so this is the honest interim: a super admin action,
+    same pattern as the existing manual plan/billing-field editor.
+    """
+    biz = await db.get(Business, business_id)
+    if not biz:
+        raise NotFoundError("Business", str(business_id))
+
+    biz.order_pack_credits += body.pack_size
+    db.add(AuditEvent(
+        scope=AuditScope.PLATFORM.value,
+        business_id=biz.id,
+        actor_user_id=user.user_id,
+        action="admin.business.order_pack_granted",
+        target_type="business",
+        target_id=biz.id,
+        diff_json={"pack_size": body.pack_size, "new_total_credits": biz.order_pack_credits},
+    ))
+    await db.commit()
+    await db.refresh(biz)
+
+    from backend.app.billing.usage import get_order_quota_status
+    quota = await get_order_quota_status(db, biz)
+    response = BusinessAdminResponse.model_validate(biz)
+    response.monthly_orders_used = quota.used
+    response.monthly_orders_remaining = quota.remaining
+    return response
 
 
 @router.patch("/{business_id}", response_model=BusinessAdminResponse)
@@ -257,9 +325,30 @@ async def update_business(
     if not biz:
         raise NotFoundError("Business", str(business_id))
 
-    for field, value in body.model_dump(exclude_unset=True).items():
+    changes = body.model_dump(exclude_unset=True)
+    for field, value in changes.items():
         setattr(biz, field, value)
-    await db.commit()
+    db.add(AuditEvent(
+        scope=AuditScope.PLATFORM.value,
+        business_id=biz.id,
+        actor_user_id=user.user_id,
+        action="admin.business.updated",
+        target_type="business",
+        target_id=biz.id,
+        diff_json=changes,
+    ))
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        # whatsapp_phone_number_id/stripe_customer_id/stripe_subscription_id
+        # are UNIQUE-but-nullable columns -- setting one to a value another
+        # business already has (including two businesses both set to the
+        # same non-null "") previously crashed this endpoint with an
+        # unhandled 500 and no JSON error body. Found via the admin-portal
+        # browser test against real (pre-existing, unrelated) dev data, not
+        # by guessing. Roll back and return a normal, actionable 409 instead.
+        await db.rollback()
+        raise DuplicateError("business field", "value you entered") from exc
     await db.refresh(biz)
     return BusinessAdminResponse.model_validate(biz)
 
@@ -277,6 +366,15 @@ async def suspend_business(
 
     biz.is_active = False
     biz.suspended_reason = body.reason
+    db.add(AuditEvent(
+        scope=AuditScope.PLATFORM.value,
+        business_id=biz.id,
+        actor_user_id=user.user_id,
+        action="admin.business.suspended",
+        target_type="business",
+        target_id=biz.id,
+        diff_json={"reason": body.reason},
+    ))
     await db.commit()
     await db.refresh(biz)
     return BusinessAdminResponse.model_validate(biz)
@@ -292,8 +390,18 @@ async def unsuspend_business(
     if not biz:
         raise NotFoundError("Business", str(business_id))
 
+    previous_reason = biz.suspended_reason
     biz.is_active = True
     biz.suspended_reason = None
+    db.add(AuditEvent(
+        scope=AuditScope.PLATFORM.value,
+        business_id=biz.id,
+        actor_user_id=user.user_id,
+        action="admin.business.unsuspended",
+        target_type="business",
+        target_id=biz.id,
+        diff_json={"previous_suspended_reason": previous_reason},
+    ))
     await db.commit()
     await db.refresh(biz)
     return BusinessAdminResponse.model_validate(biz)
@@ -310,8 +418,18 @@ async def set_business_limits(
     if not biz:
         raise NotFoundError("Business", str(business_id))
 
-    for field, value in body.model_dump(exclude_unset=True).items():
+    changes = body.model_dump(exclude_unset=True)
+    for field, value in changes.items():
         setattr(biz, field, value)
+    db.add(AuditEvent(
+        scope=AuditScope.PLATFORM.value,
+        business_id=biz.id,
+        actor_user_id=user.user_id,
+        action="admin.business.limits_updated",
+        target_type="business",
+        target_id=biz.id,
+        diff_json=changes,
+    ))
     await db.commit()
     await db.refresh(biz)
     return BusinessAdminResponse.model_validate(biz)
@@ -361,6 +479,17 @@ async def create_business_owner(
         must_change_password=True,
     )
     db.add(owner)
+    await db.flush()
+    db.add(AuditEvent(
+        scope=AuditScope.PLATFORM.value,
+        business_id=business_id,
+        actor_user_id=user.user_id,
+        action="admin.business.owner_created",
+        target_type="business_user",
+        target_id=owner.id,
+        # Never log the temporary password itself — only metadata.
+        diff_json={"email": email_lower, "role": body.role},
+    ))
     await db.commit()
     await db.refresh(owner)
 
@@ -458,6 +587,16 @@ async def reset_business_user_password(
         .where(RefreshToken.user_id == target.id, RefreshToken.revoked_at.is_(None))
         .values(revoked_at=datetime.now(timezone.utc))
     )
+    db.add(AuditEvent(
+        scope=AuditScope.PLATFORM.value,
+        business_id=business_id,
+        actor_user_id=user.user_id,
+        action="admin.business.user_password_reset",
+        target_type="business_user",
+        target_id=target.id,
+        # Never log the temporary password itself — only metadata.
+        diff_json={"email": target.email},
+    ))
     await db.commit()
     await db.refresh(target)
 

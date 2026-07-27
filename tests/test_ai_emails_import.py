@@ -18,6 +18,7 @@ from admin_api.app.services.ai_emails_import import (
     build_row_preview,
     compute_initial_lead_status,
     find_duplicates,
+    is_existing_client_hint,
     is_status_like_verify_value,
     normalize_sa_phone,
     parse_spreadsheet,
@@ -100,6 +101,32 @@ class TestVerifyStatusDetection:
         for hint in ["Verify", "Research", "Verify email", "Verify phone"]:
             status = compute_initial_lead_status(hint, "a@b.com")
             assert status in ("requires_research", "requires_verification")
+
+
+class TestExistingClientDetection:
+    """
+    Found via the real Durban/PMB spreadsheet: the Muscle Factory reference
+    business itself appears in the prospect list marked "Existing client" —
+    it must never be treated as a sendable lead.
+    """
+
+    def test_existing_client_detected(self):
+        assert is_existing_client_hint("Existing client") is True
+
+    def test_case_insensitive(self):
+        assert is_existing_client_hint("EXISTING CLIENT") is True
+
+    def test_not_confused_with_other_statuses(self):
+        for value in ["Verify", "Research", "Not contacted", "Call", "Call / WhatsApp"]:
+            assert is_existing_client_hint(value) is False
+
+    def test_existing_client_forces_do_not_contact_status(self):
+        assert compute_initial_lead_status("Existing client", "a@b.com") == "do_not_contact"
+
+    def test_existing_client_overrides_research_style_wording(self):
+        # Even if a hint were oddly worded, "existing client" must win over any
+        # research/verify substring match — it's checked first in the function.
+        assert compute_initial_lead_status("Existing client - needs research", None) == "do_not_contact"
 
 
 # ── suggest_column_mapping ────────────────────────────────────────────────────
@@ -211,6 +238,27 @@ class TestBuildRowPreview:
         assert row["status"] == "valid"
         assert row["data"]["email"] == "info@test.co.za"
         assert row["data"]["phone"] == "+27831234567"
+
+    def test_existing_client_row_flagged_do_not_contact(self):
+        mapping = {"business_name": "Business Name", "outreach_status_hint": "Outreach Status"}
+        row = build_row_preview(
+            {"Business Name": "Club Fitness Gym / Muscle Factory", "Outreach Status": "Existing client"},
+            mapping,
+            row_number=2,
+        )
+        assert row["status"] == "valid"
+        assert row["data"]["do_not_contact"] is True
+        assert row["data"]["lead_status"] == "do_not_contact"
+        assert any("do_not_contact" in w for w in row["warnings"])
+
+    def test_ordinary_row_not_flagged_do_not_contact(self):
+        mapping = {"business_name": "Business Name", "outreach_status_hint": "Outreach Status"}
+        row = build_row_preview(
+            {"Business Name": "Some Gym", "Outreach Status": "Not contacted"},
+            mapping,
+            row_number=2,
+        )
+        assert row["data"]["do_not_contact"] is False
 
     def test_unparseable_phone_is_warning_not_error(self):
         mapping = {"business_name": "Business Name", "phone": "Phone"}
