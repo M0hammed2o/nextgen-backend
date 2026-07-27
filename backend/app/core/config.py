@@ -74,6 +74,17 @@ class Settings(BaseSettings):
     # a config change, never a code change — see backend/app/billing/registry.py.
     BILLING_PROVIDER: str = "STRIPE"  # STRIPE | PAYFAST
 
+    # Set false to defer NextGen's own SaaS subscription billing entirely
+    # (e.g. while a chosen provider's real merchant credentials aren't
+    # configured yet) without weakening any OTHER production secret check.
+    # Only skips the BILLING_PROVIDER-specific secret requirement in
+    # _validate_production_secrets() — every other guard (JWT, credentials
+    # encryption, Meta/WhatsApp) still applies in full. The billing routes
+    # themselves (checkout/portal/cancel) are unaffected by this flag and
+    # will simply error if invoked without real provider credentials, which
+    # is the correct, honest behaviour while billing is deliberately deferred.
+    BILLING_ENABLED: bool = True
+
     # NextGen's OWN PayFast merchant account for SaaS billing — distinct
     # from Business.payment_api_key/etc., which are each *tenant's own*
     # PayFast credentials for their customers' payments.

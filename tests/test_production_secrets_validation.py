@@ -33,6 +33,7 @@ def settings():
         "WHATSAPP_DEFAULT_ACCESS_TOKEN": s.WHATSAPP_DEFAULT_ACCESS_TOKEN,
         "STRIPE_WEBHOOK_SECRET": s.STRIPE_WEBHOOK_SECRET,
         "BILLING_PROVIDER": s.BILLING_PROVIDER,
+        "BILLING_ENABLED": s.BILLING_ENABLED,
         "PAYFAST_BILLING_MERCHANT_ID": s.PAYFAST_BILLING_MERCHANT_ID,
         "PAYFAST_BILLING_MERCHANT_KEY": s.PAYFAST_BILLING_MERCHANT_KEY,
         "PAYFAST_BILLING_PASSPHRASE": s.PAYFAST_BILLING_PASSPHRASE,
@@ -47,6 +48,7 @@ def settings():
     s.WHATSAPP_DEFAULT_ACCESS_TOKEN = "a" * 64
     s.STRIPE_WEBHOOK_SECRET = "whsec_" + "a" * 32
     s.BILLING_PROVIDER = "STRIPE"
+    s.BILLING_ENABLED = True
     s.PAYFAST_BILLING_MERCHANT_ID = "10000100"
     s.PAYFAST_BILLING_MERCHANT_KEY = "46f0cd694581a"
     s.PAYFAST_BILLING_PASSPHRASE = _valid_secret("d4")
@@ -155,3 +157,26 @@ def test_payfast_missing_merchant_credentials_caught_when_active(settings):
 def test_valid_payfast_production_config_passes(settings):
     settings.BILLING_PROVIDER = "PAYFAST"
     main_module._validate_production_secrets()  # must not raise
+
+
+def test_billing_disabled_skips_all_billing_secret_checks(settings):
+    """
+    BILLING_ENABLED=false lets an owner defer NextGen's own SaaS billing
+    entirely (e.g. before real PayFast merchant credentials are ready)
+    without weakening any other production secret check.
+    """
+    settings.BILLING_ENABLED = False
+    settings.BILLING_PROVIDER = "PAYFAST"
+    settings.PAYFAST_BILLING_MERCHANT_ID = ""
+    settings.PAYFAST_BILLING_MERCHANT_KEY = ""
+    settings.PAYFAST_BILLING_PASSPHRASE = ""
+    settings.STRIPE_WEBHOOK_SECRET = ""
+    main_module._validate_production_secrets()  # must not raise
+
+
+def test_billing_disabled_still_enforces_every_other_secret(settings):
+    """The escape hatch must be billing-specific, not a blanket bypass."""
+    settings.BILLING_ENABLED = False
+    settings.JWT_SECRET_KEY = "CHANGE-ME-IN-PRODUCTION"
+    with pytest.raises(RuntimeError, match="JWT_SECRET_KEY"):
+        main_module._validate_production_secrets()
