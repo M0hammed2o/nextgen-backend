@@ -78,17 +78,33 @@ def _validate_production_secrets() -> None:
     if not settings.WHATSAPP_DEFAULT_ACCESS_TOKEN or settings.WHATSAPP_DEFAULT_ACCESS_TOKEN == "CHANGE-ME":
         errors.append("WHATSAPP_DEFAULT_ACCESS_TOKEN is not configured — cannot send WhatsApp messages")
 
-    # Stripe billing (self-service subscription checkout/portal, shipped
-    # 2026-07-21) is now commercially live, so an unverified webhook is a
-    # real production risk — a forged event could flip any tenant's
-    # billing_status/is_active. This was a non-fatal warning while Stripe
-    # billing was dormant (see KNOWN_BUGS.md BUG-0001); now that it's live,
-    # it's promoted to the same hard-fail treatment as every other secret.
-    if _looks_like_placeholder(settings.STRIPE_WEBHOOK_SECRET):
-        errors.append(
-            "STRIPE_WEBHOOK_SECRET looks unset or placeholder — the Stripe "
-            "billing webhook would accept unverified requests"
-        )
+    # NextGen's own SaaS billing provider (BILLING_PROVIDER: STRIPE | PAYFAST,
+    # see backend/app/billing/registry.py / DECISION-0017) is a config choice,
+    # not a code choice — so this check must only demand secrets for whichever
+    # provider is actually active. Originally this unconditionally required
+    # STRIPE_WEBHOOK_SECRET even when BILLING_PROVIDER=PAYFAST (found
+    # 2026-07-27 when a Render deploy correctly refused to boot over a
+    # missing Stripe secret while PayFast was the intended provider) — an
+    # unverified webhook is the same real risk on either provider: a forged
+    # event could flip any tenant's billing_status/is_active.
+    if settings.BILLING_PROVIDER.upper() == "PAYFAST":
+        if not settings.PAYFAST_BILLING_MERCHANT_ID or not settings.PAYFAST_BILLING_MERCHANT_KEY:
+            errors.append(
+                "BILLING_PROVIDER=PAYFAST but PAYFAST_BILLING_MERCHANT_ID/"
+                "PAYFAST_BILLING_MERCHANT_KEY are not set — cannot create "
+                "checkout sessions"
+            )
+        if _looks_like_placeholder(settings.PAYFAST_BILLING_PASSPHRASE):
+            errors.append(
+                "PAYFAST_BILLING_PASSPHRASE looks unset or placeholder — the "
+                "PayFast billing webhook (ITN) would accept unverified requests"
+            )
+    else:
+        if _looks_like_placeholder(settings.STRIPE_WEBHOOK_SECRET):
+            errors.append(
+                "STRIPE_WEBHOOK_SECRET looks unset or placeholder — the Stripe "
+                "billing webhook would accept unverified requests"
+            )
 
     if errors:
         msg = "FATAL: Production deployment with unconfigured secrets:\n" + "\n".join(f"  • {e}" for e in errors)

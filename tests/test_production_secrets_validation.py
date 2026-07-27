@@ -32,6 +32,10 @@ def settings():
         "META_VERIFY_TOKEN": s.META_VERIFY_TOKEN,
         "WHATSAPP_DEFAULT_ACCESS_TOKEN": s.WHATSAPP_DEFAULT_ACCESS_TOKEN,
         "STRIPE_WEBHOOK_SECRET": s.STRIPE_WEBHOOK_SECRET,
+        "BILLING_PROVIDER": s.BILLING_PROVIDER,
+        "PAYFAST_BILLING_MERCHANT_ID": s.PAYFAST_BILLING_MERCHANT_ID,
+        "PAYFAST_BILLING_MERCHANT_KEY": s.PAYFAST_BILLING_MERCHANT_KEY,
+        "PAYFAST_BILLING_PASSPHRASE": s.PAYFAST_BILLING_PASSPHRASE,
     }
     # Start every test from a fully-valid baseline, then break one field at a time.
     s.ENVIRONMENT = "production"
@@ -42,6 +46,10 @@ def settings():
     s.META_VERIFY_TOKEN = "a" * 32
     s.WHATSAPP_DEFAULT_ACCESS_TOKEN = "a" * 64
     s.STRIPE_WEBHOOK_SECRET = "whsec_" + "a" * 32
+    s.BILLING_PROVIDER = "STRIPE"
+    s.PAYFAST_BILLING_MERCHANT_ID = "10000100"
+    s.PAYFAST_BILLING_MERCHANT_KEY = "46f0cd694581a"
+    s.PAYFAST_BILLING_PASSPHRASE = _valid_secret("d4")
     yield s
     for key, value in original.items():
         setattr(s, key, value)
@@ -116,3 +124,34 @@ def test_placeholder_stripe_secret_is_caught(settings):
     settings.STRIPE_WEBHOOK_SECRET = "whsec_your_webhook_signing_secret"
     with pytest.raises(RuntimeError, match="STRIPE_WEBHOOK_SECRET"):
         main_module._validate_production_secrets()
+
+
+def test_stripe_placeholder_ignored_when_payfast_is_the_active_provider(settings):
+    """
+    BUG (found 2026-07-27 via a real Render deploy failure): this check used
+    to demand a real STRIPE_WEBHOOK_SECRET unconditionally, even when
+    BILLING_PROVIDER=PAYFAST and Stripe isn't in use at all. Switching
+    providers must not require configuring the OTHER provider's secrets.
+    """
+    settings.BILLING_PROVIDER = "PAYFAST"
+    settings.STRIPE_WEBHOOK_SECRET = "whsec_your_webhook_signing_secret"  # deliberately a placeholder
+    main_module._validate_production_secrets()  # must not raise
+
+
+def test_payfast_placeholder_passphrase_is_caught_when_active(settings):
+    settings.BILLING_PROVIDER = "PAYFAST"
+    settings.PAYFAST_BILLING_PASSPHRASE = "your-passphrase-here"
+    with pytest.raises(RuntimeError, match="PAYFAST_BILLING_PASSPHRASE"):
+        main_module._validate_production_secrets()
+
+
+def test_payfast_missing_merchant_credentials_caught_when_active(settings):
+    settings.BILLING_PROVIDER = "PAYFAST"
+    settings.PAYFAST_BILLING_MERCHANT_ID = ""
+    with pytest.raises(RuntimeError, match="PAYFAST_BILLING_MERCHANT_ID"):
+        main_module._validate_production_secrets()
+
+
+def test_valid_payfast_production_config_passes(settings):
+    settings.BILLING_PROVIDER = "PAYFAST"
+    main_module._validate_production_secrets()  # must not raise
