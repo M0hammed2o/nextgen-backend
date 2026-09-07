@@ -36,12 +36,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.app.core.errors import AppError, NotFoundError
 from backend.app.core.rbac import AuthUser, require_owner_or_manager
 from backend.app.db.session import get_db
+from backend.app.inventory.ledger import build_movement
 from backend.app.inventory.units import (
     UnitError,
     cost_per_canonical_micro_cents,
     to_milli,
 )
-from shared.enums import CanonicalUnit
+from shared.enums import CanonicalUnit, StockMovementType
 from shared.models.business import Business
 from shared.models.inventory import Ingredient
 from shared.models.menu import MenuCategory, MenuItem
@@ -530,12 +531,32 @@ def _parse_ingredients(rows: list[dict]) -> ParseResult:
         if not unit_label and canonical == "UNIT" and unit_raw not in ("UNIT", "UNITS", ""):
             unit_label = unit_raw.lower().rstrip("s") or None
 
+        # Opening stock. Advertised in the template, so it has to actually do
+        # something — a column that silently does nothing would leave a
+        # restaurant wondering why their stock is zero after an import.
+        opening_milli = None
+        raw_opening = (row.get("opening_quantity") or "").strip()
+        if raw_opening:
+            try:
+                opening_milli = to_milli(
+                    raw_opening, unit_raw or "UNIT", canonical=CanonicalUnit(canonical)
+                )
+            except (UnitError, ValueError) as exc:
+                result.errors.append(RowError(index, f"opening_quantity: {exc}"))
+                continue
+            if opening_milli < 0:
+                result.errors.append(
+                    RowError(index, "opening_quantity cannot be negative")
+                )
+                continue
+
         result.rows.append({
             "name": name,
             "canonical_unit": canonical,
             "count_method": count_method,
             "unit_label": unit_label,
             "category": (row.get("category") or "").strip() or None,
+            "_opening_milli": opening_milli,
             "sku": (row.get("sku") or "").strip() or None,
             "purchase_unit_name": f"{pack_size} {pack_unit.lower()}" if pack_size != "1" else None,
             "purchase_pack_milli": pack_milli,
@@ -588,6 +609,7 @@ async def preview_ingredients(
         "errors": [{"row": e.row, "message": e.message} for e in parsed.errors],
         "would_create": [r["name"] for r in parsed.rows if r["name"].casefold() not in existing],
         "would_skip_existing": [r["name"] for r in parsed.rows if r["name"].casefold() in existing],
+        "with_opening_stock": sum(1 for r in parsed.rows if r.get("_opening_milli")),
         "preview": parsed.rows[:20],
     }
 
@@ -628,16 +650,42 @@ async def commit_ingredients(
     }
 
     created = 0
+    opening_posted = 0
     skipped = []
     for row in parsed.rows:
         if row["name"].casefold() in existing:
             skipped.append(row["name"])
             continue
-        db.add(Ingredient(business_id=user.business_id, **row))
+
+        fields = {k: v for k, v in row.items() if not k.startswith("_")}
+        ingredient = Ingredient(business_id=user.business_id, **fields)
+        db.add(ingredient)
         created += 1
 
+        opening = row.get("_opening_milli")
+        if opening:
+            await db.flush()  # need the ingredient id for the movement
+            db.add(
+                build_movement(
+                    business_id=user.business_id,
+                    ingredient_id=ingredient.id,
+                    quantity_milli=opening,
+                    movement_type=StockMovementType.OPENING_BALANCE.value,
+                    unit_cost_micro_cents=int(
+                        ingredient.cost_per_canonical_micro_cents or 0
+                    ),
+                    created_by_user_id=user.user_id,
+                    notes="Opening stock from spreadsheet import",
+                )
+            )
+            opening_posted += 1
+
     await db.commit()
-    return {"created": created, "skipped_existing": skipped}
+    return {
+        "created": created,
+        "opening_balances_posted": opening_posted,
+        "skipped_existing": skipped,
+    }
 
 
 # ── Recipes ──────────────────────────────────────────────────────────────────

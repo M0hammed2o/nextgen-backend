@@ -105,6 +105,57 @@ class TestIngredientImport:
         result = _parse_ingredients(rows({"name": "", "unit": "kg"}))
         assert result.errors[0].row == 2
 
+    def test_opening_quantity_converts(self):
+        """
+        The template advertises this column, so it has to actually work — a
+        column that silently does nothing would leave a restaurant wondering
+        why their stock reads zero right after an import.
+        """
+        result = _parse_ingredients(rows(
+            {"name": "Cheese Portion", "unit": "portion", "pack_size": "1",
+             "pack_unit": "portion", "opening_quantity": "100"},
+            {"name": "Flour", "unit": "kg", "pack_size": "1", "pack_unit": "KG",
+             "opening_quantity": "5"},
+        ))
+        assert result.errors == []
+        assert result.rows[0]["_opening_milli"] == to_milli(100, "portion")
+        assert result.rows[1]["_opening_milli"] == to_milli(5, "kg")
+
+    def test_opening_quantity_is_optional(self):
+        result = _parse_ingredients(rows(
+            {"name": "Cheese", "unit": "kg", "pack_size": "1", "pack_unit": "KG"}
+        ))
+        assert result.errors == []
+        assert result.rows[0]["_opening_milli"] is None
+
+    def test_negative_opening_quantity_is_rejected(self):
+        result = _parse_ingredients(rows(
+            {"name": "Cheese", "unit": "kg", "pack_size": "1", "pack_unit": "KG",
+             "opening_quantity": "-3"}
+        ))
+        assert result.rows == []
+        assert "cannot be negative" in result.errors[0].message
+
+    def test_unit_label_defaults_to_the_countable_word_used(self):
+        """A sheet saying 'portion' should read as portions on screen without
+        needing a separate unit_label column."""
+        result = _parse_ingredients(rows(
+            {"name": "Cheese Portion", "unit": "portion", "pack_size": "1",
+             "pack_unit": "portion"},
+            {"name": "Pizza Box", "unit": "box", "pack_size": "1", "pack_unit": "box"},
+        ))
+        assert result.errors == []
+        assert result.rows[0]["unit_label"] == "portion"
+        assert result.rows[1]["unit_label"] == "box"
+        assert result.rows[0]["canonical_unit"] == "UNIT"
+
+    def test_explicit_unit_label_wins(self):
+        result = _parse_ingredients(rows(
+            {"name": "Dough", "unit": "portion", "unit_label": "ball",
+             "pack_size": "1", "pack_unit": "portion"}
+        ))
+        assert result.rows[0]["unit_label"] == "ball"
+
     def test_par_level_converts(self):
         result = _parse_ingredients(rows(
             {"name": "Cheese", "unit": "kg", "pack_size": "2", "pack_unit": "KG",

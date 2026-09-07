@@ -85,13 +85,13 @@ Drinks,Coca-Cola 330ml,,22.00,
 """
 
 INGREDIENT_CSV = """name,unit,unit_label,category,pack_size,pack_unit,pack_cost,opening_quantity
-Small Dough Ball,portion,portion,Dough,1,portion,4.50,
-Large Dough Ball,portion,portion,Dough,1,portion,6.50,
-Tomato Sauce Portion,portion,portion,Sauces,1,portion,3.20,
-Cheese Portion,portion,portion,Dairy,1,portion,15.00,
-Flour,g,,Dry Goods,1,kg,18.00,
-Small Pizza Box,box,box,Packaging,1,box,2.80,
-Large Pizza Box,box,box,Packaging,1,box,4.10,
+Small Dough Ball,portion,portion,Dough,1,portion,4.50,50
+Large Dough Ball,portion,portion,Dough,1,portion,6.50,100
+Tomato Sauce Portion,portion,portion,Sauces,1,portion,3.20,100
+Cheese Portion,portion,portion,Dairy,1,portion,15.00,100
+Flour,g,,Dry Goods,1,kg,18.00,5000
+Small Pizza Box,box,box,Packaging,1,box,2.80,50
+Large Pizza Box,box,box,Packaging,1,box,4.10,100
 """
 
 RECIPE_CSV = """menu_item,ingredient,quantity,unit,option_id
@@ -211,10 +211,15 @@ async def main():
         check("R15/portion -> unit cost",
               cheese_row["cost_per_canonical_micro_cents"] == 1_500_000_000)
 
+        check("opening stock detected in the sheet", iprev["with_opening_stock"] == 7,
+              str(iprev.get("with_opening_stock")))
+
         icommit = await routes_import.commit_ingredients(
             file=FakeUpload("ing.csv", INGREDIENT_CSV), mapping=None, user=owner, db=db
         )
         check("ingredients committed", icommit["created"] == 7, str(icommit))
+        check("opening stock posted straight from the sheet",
+              icommit["opening_balances_posted"] == 7, str(icommit))
 
         # ── 5. Owner imports recipes ──────────────────────────────────────
         print("\n== RECIPE IMPORT (size-scoped) ==")
@@ -252,23 +257,6 @@ async def main():
                 await db.execute(select(Ingredient).where(Ingredient.business_id == BIZ))
             ).scalars().all()
         }
-        t0 = datetime.now(timezone.utc) - timedelta(hours=5)
-        for name, qty, unit in [
-            ("Large Dough Ball", 100, "portion"),
-            ("Cheese Portion", 100, "portion"),
-            ("Tomato Sauce Portion", 100, "portion"),
-            ("Large Pizza Box", 100, "box"),
-            ("Flour", 5, "kg"),
-        ]:
-            ing = ingredients[name]
-            db.add(build_movement(
-                business_id=BIZ, ingredient_id=ing.id,
-                quantity_milli=to_milli(qty, unit),
-                movement_type=StockMovementType.OPENING_BALANCE.value,
-                unit_cost_micro_cents=ing.cost_per_canonical_micro_cents,
-                occurred_at=t0,
-            ))
-        await db.commit()
 
         live = await routes_setup.get_live_stock(attention_only=False, user=owner, db=db)
         rows = {r.name: r for r in live.rows}
