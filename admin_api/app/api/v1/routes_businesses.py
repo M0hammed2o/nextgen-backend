@@ -57,6 +57,15 @@ class BusinessUpdate(BaseModel):
     stripe_subscription_id: str | None = None
     billing_status: str | None = None
 
+    # ── Per-tenant module switches (Ciao Pizza P0) ───────────────────────
+    # These belong on the ADMIN plane, not the business plane: which modules
+    # a restaurant has bought is a platform/commercial decision, not
+    # something a tenant toggles for itself. This is what lets NextGen sell
+    # POS+Inventory to Ciao Pizza with WhatsApp off, while another tenant
+    # keeps WhatsApp on — without either affecting the other.
+    is_whatsapp_enabled: bool | None = None
+    inventory_enabled: bool | None = None
+
 
 class LimitsUpdate(BaseModel):
     daily_message_limit: int | None = Field(default=None, ge=0)

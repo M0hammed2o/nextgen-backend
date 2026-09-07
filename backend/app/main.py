@@ -207,6 +207,7 @@ from backend.app.api.v1.routes_business import router as business_router
 from backend.app.api.v1.routes_menu import router as menu_router
 from backend.app.api.v1.routes_orders import router as orders_router
 from backend.app.api.v1.routes_pos import router as pos_router
+from backend.app.api.v1.routes_import import router as import_router
 from backend.app.api.v1.routes_inventory import router as inventory_router
 from backend.app.api.v1.routes_recipes import router as recipes_router
 from backend.app.api.v1.routes_receipts import router as receipts_router
@@ -236,6 +237,7 @@ app.include_router(pos_router, prefix=PREFIX)
 # gated per tenant by Business.inventory_enabled, so registering them
 # does not change behaviour for tenants without the module.
 app.include_router(inventory_router, prefix=PREFIX)
+app.include_router(import_router, prefix=PREFIX)
 app.include_router(recipes_router, prefix=PREFIX)
 app.include_router(wastage_router, prefix=PREFIX)
 app.include_router(stocktake_router, prefix=PREFIX)

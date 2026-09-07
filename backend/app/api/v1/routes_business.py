@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -71,6 +71,18 @@ class BusinessSettingsResponse(BaseModel):
     eft_account_name: str | None = None
     eft_account_number: str | None = None
     eft_branch_code: str | None = None
+    # VAT / receipt / inventory (Ciao Pizza P0)
+    vat_registered: bool = False
+    vat_number: str | None = None
+    vat_rate_basis_points: int = 0
+    vat_inclusive_pricing: bool = True
+    receipt_paper_width_mm: int = 80
+    receipt_auto_print: bool = True
+    receipt_copies: int = 1
+    print_kitchen_receipt: bool = False
+    receipt_config_json: dict | None = None
+    inventory_enabled: bool = False
+    wastage_approval_threshold_cents: int = 0
     eft_reference_prefix: str | None = None
     # Credential hints — never return raw keys, only show last-4 masked
     payment_api_key_hint: str | None = None
@@ -111,6 +123,17 @@ class BusinessSettingsResponse(BaseModel):
             delivery_enabled=b.delivery_enabled,
             delivery_fee_cents=b.delivery_fee_cents,
             require_customer_name=b.require_customer_name,
+            vat_registered=b.vat_registered,
+            vat_number=b.vat_number,
+            vat_rate_basis_points=b.vat_rate_basis_points,
+            vat_inclusive_pricing=b.vat_inclusive_pricing,
+            receipt_paper_width_mm=b.receipt_paper_width_mm,
+            receipt_auto_print=b.receipt_auto_print,
+            receipt_copies=b.receipt_copies,
+            print_kitchen_receipt=b.print_kitchen_receipt,
+            receipt_config_json=b.receipt_config_json,
+            inventory_enabled=b.inventory_enabled,
+            wastage_approval_threshold_cents=b.wastage_approval_threshold_cents,
             require_phone_number=b.require_phone_number,
             require_delivery_address=b.require_delivery_address,
             currency=b.currency,
@@ -187,6 +210,28 @@ class BusinessSettingsUpdate(BaseModel):
     pos_direct_eft_enabled: bool | None = None
     pos_other_payment_enabled: bool | None = None
     pos_table_number_required: bool | None = None
+    # VAT / receipt config (Ciao Pizza P0). inventory_enabled is deliberately
+    # NOT settable here — enabling a paid module is a platform decision, made
+    # through the admin plane, not something a tenant switches on themselves.
+    vat_registered: bool | None = None
+    vat_number: str | None = Field(default=None, max_length=32)
+    vat_rate_basis_points: int | None = Field(default=None, ge=0, le=10000)
+    vat_inclusive_pricing: bool | None = None
+    receipt_paper_width_mm: int | None = Field(default=None)
+    receipt_auto_print: bool | None = None
+    receipt_copies: int | None = Field(default=None, ge=1, le=5)
+    print_kitchen_receipt: bool | None = None
+    receipt_config_json: dict | None = None
+    wastage_approval_threshold_cents: int | None = Field(default=None, ge=0)
+
+    @field_validator("receipt_paper_width_mm")
+    @classmethod
+    def _supported_paper_width(cls, v: int | None) -> int | None:
+        # A thermal roll is physically 58 or 80 mm; anything else would print
+        # off the edge of the paper.
+        if v is not None and v not in (58, 80):
+            raise ValueError("receipt_paper_width_mm must be 58 or 80")
+        return v
 
 
 # ── Routes ───────────────────────────────────────────────────────────────────
