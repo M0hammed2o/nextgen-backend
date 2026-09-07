@@ -98,11 +98,19 @@ def two_column(left: str, right: str, columns: int) -> str:
 
     If the pair cannot fit, the LEFT side is truncated — never the right.
     An amount is the one thing on a receipt that must never be clipped.
+
+    The result is always exactly `columns` wide. Reserving the separator
+    space BEFORE truncating matters: computing it afterwards produced a
+    line one character too long, which on a 32-column roll wraps onto a
+    second line and makes the slip look broken.
     """
     right = right or ""
-    available = max(0, columns - len(right))
-    left = (left or "")[:available]
-    return left + " " * max(1 if left else 0, columns - len(left) - len(right)) + right
+    left = left or ""
+    separator = 1 if left else 0
+    available = max(0, columns - len(right) - separator)
+    left = left[:available]
+    gap = max(0, columns - len(left) - len(right))
+    return left + " " * gap + right
 
 
 def centre(text: str, columns: int) -> str:
