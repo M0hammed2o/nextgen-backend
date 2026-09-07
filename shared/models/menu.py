@@ -151,6 +151,12 @@ class MenuItem(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     image_asset_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True
     )
+    requires_preparation: Mapped[bool] = mapped_column(
+        Boolean, default=True, nullable=False,
+        comment="False = grab-and-go (drinks, packaged snacks) — a POS sale "
+                 "containing only such items skips the kitchen ticket entirely "
+                 "and completes immediately. True = needs kitchen preparation."
+    )
 
     # ── Relationships ────────────────────────────────────────────────────
     business = relationship("Business", back_populates="menu_items")

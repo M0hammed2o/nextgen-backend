@@ -42,7 +42,7 @@ class FakeDB:
 
 
 def make_menu_item(business_id, price_cents=5000, options_json=None, add_ons=None,
-                    is_active=True, is_deleted=False):
+                    is_active=True, is_deleted=False, requires_preparation=True):
     return types.SimpleNamespace(
         id=uuid.uuid4(),
         business_id=business_id,
@@ -52,6 +52,7 @@ def make_menu_item(business_id, price_cents=5000, options_json=None, add_ons=Non
         is_active=is_active,
         is_deleted=is_deleted,
         add_ons=add_ons or [],
+        requires_preparation=requires_preparation,
     )
 
 
@@ -214,3 +215,75 @@ async def test_inactive_menu_item_is_rejected():
             [POSItemInput(menu_item_id=item.id, quantity=1)],
         )
     assert exc.value.code == "MENU_ITEM_INACTIVE"
+
+
+# ── Removable ingredients (restaurant POS redesign, 2026-07-28) ─────────────
+# Modelled as a plain, zero-priced, business-configured list living inside
+# options_json — never a hardcoded ingredient name anywhere in this codebase.
+
+def item_with_removable_ingredients(business_id):
+    return make_menu_item(business_id, options_json={
+        "option_groups": [],
+        "removable_ingredients": [
+            {"id": "tomato", "name": "Tomato"},
+            {"id": "onion", "name": "Onion"},
+        ],
+    })
+
+
+async def test_removed_ingredients_resolve_to_snapshot():
+    business_id = uuid.uuid4()
+    item = item_with_removable_ingredients(business_id)
+    db = FakeDB([FakeResult([item])])
+
+    resolved = await resolve_pos_items(
+        db, business_id,
+        [POSItemInput(menu_item_id=item.id, quantity=1, removed_ingredient_ids=["tomato"])],
+    )
+
+    assert resolved[0].removed_ingredients_snapshot == [{"id": "tomato", "name": "Tomato"}]
+
+
+async def test_unknown_removed_ingredient_id_is_rejected():
+    business_id = uuid.uuid4()
+    item = item_with_removable_ingredients(business_id)
+    db = FakeDB([FakeResult([item])])
+
+    with pytest.raises(AppError) as exc:
+        await resolve_pos_items(
+            db, business_id,
+            [POSItemInput(menu_item_id=item.id, quantity=1, removed_ingredient_ids=["lettuce"])],
+        )
+    assert exc.value.code == "INVALID_REMOVED_INGREDIENT"
+
+
+async def test_no_removed_ingredients_requested_is_a_no_op():
+    business_id = uuid.uuid4()
+    item = item_with_removable_ingredients(business_id)
+    db = FakeDB([FakeResult([item])])
+
+    resolved = await resolve_pos_items(
+        db, business_id,
+        [POSItemInput(menu_item_id=item.id, quantity=1)],
+    )
+    assert resolved[0].removed_ingredients_snapshot == []
+
+
+# ── requires_preparation passthrough (grab-and-go routing) ──────────────────
+
+async def test_resolved_item_carries_requires_preparation_true():
+    business_id = uuid.uuid4()
+    item = make_menu_item(business_id, requires_preparation=True)
+    db = FakeDB([FakeResult([item])])
+
+    resolved = await resolve_pos_items(db, business_id, [POSItemInput(menu_item_id=item.id, quantity=1)])
+    assert resolved[0].requires_preparation is True
+
+
+async def test_resolved_item_carries_requires_preparation_false_for_grab_and_go():
+    business_id = uuid.uuid4()
+    item = make_menu_item(business_id, requires_preparation=False)
+    db = FakeDB([FakeResult([item])])
+
+    resolved = await resolve_pos_items(db, business_id, [POSItemInput(menu_item_id=item.id, quantity=1)])
+    assert resolved[0].requires_preparation is False

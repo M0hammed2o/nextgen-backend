@@ -157,6 +157,20 @@ def _get_storage_client() -> SupabaseStorageClient:
     return SupabaseStorageClient()
 
 
+def asset_public_url(storage_path: str) -> str:
+    """
+    The public (unsigned) URL for an object in the Supabase Storage bucket.
+    Shared so every caller that resolves an Asset to a displayable URL
+    (this module's own upload-url response, and routes_menu.py's
+    image_asset_id -> image_url resolution) builds it identically instead
+    of duplicating the same string format.
+    """
+    return (
+        f"{settings.SUPABASE_URL}/storage/v1/object/public/"
+        f"{settings.SUPABASE_STORAGE_BUCKET}/{storage_path}"
+    )
+
+
 # ── Routes ───────────────────────────────────────────────────────────────────
 
 @router.post("/upload-url", response_model=UploadUrlResponse)
@@ -212,10 +226,7 @@ async def get_upload_url(
             f"{settings.SUPABASE_STORAGE_BUCKET}/{storage_path}"
         )
 
-    public_url = (
-        f"{settings.SUPABASE_URL}/storage/v1/object/public/"
-        f"{settings.SUPABASE_STORAGE_BUCKET}/{storage_path}"
-    )
+    public_url = asset_public_url(storage_path)
 
     return UploadUrlResponse(
         upload_url=upload_url,

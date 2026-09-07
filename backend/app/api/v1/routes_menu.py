@@ -11,10 +11,35 @@ from pydantic import BaseModel, Field, ValidationError, model_validator
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.app.core.errors import NotFoundError
+from backend.app.api.v1.routes_assets import asset_public_url
+from backend.app.core.errors import AppError, NotFoundError
 from backend.app.core.rbac import AuthUser, require_owner_or_manager, require_staff_or_above
 from backend.app.db.session import get_db
+from shared.models.asset import Asset
 from shared.models.menu import MenuAddOn, MenuCategory, MenuItem, menu_item_add_ons
+
+
+async def _resolve_item_image(db: AsyncSession, business_id: uuid.UUID, image_asset_id) -> tuple[str | None, "Asset | None"]:
+    """
+    Look up the Asset for a submitted image_asset_id and resolve it to a
+    displayable URL. Every write path that accepts image_asset_id (create,
+    update) must go through this — MenuItem.image_url is a separate stored
+    column, never automatically derived from image_asset_id by the ORM, and
+    was previously never set at all (found 2026-07-27: an owner could
+    "successfully" attach an image_asset_id and never see it render
+    anywhere, since ItemResponse.image_url stayed null forever).
+
+    Tenant-scoped: an asset_id belonging to another business must not
+    resolve here, even if the ID is guessed/known. Returns the Asset row
+    too so the caller can backfill Asset.entity_id once the MenuItem's own
+    id is known (not knowable yet on create, hence returned rather than set here).
+    """
+    if image_asset_id is None:
+        return None, None
+    asset = await db.get(Asset, image_asset_id)
+    if not asset or asset.business_id != business_id:
+        raise AppError("NOT_FOUND", "Asset not found", 404)
+    return asset_public_url(asset.storage_path), asset
 
 router = APIRouter(prefix="/business/menu", tags=["menu"])
 
@@ -85,8 +110,22 @@ class OptionGroupSchema(BaseModel):
         return self
 
 
+class RemovableIngredientSchema(BaseModel):
+    """
+    A single zero-priced, checkbox-style removable ingredient (e.g. "No
+    tomato"). Deliberately separate from OptionGroupSchema — removals never
+    change price and are never mutually exclusive, so modelling them as a
+    plain list here is simpler than forcing them through the priced,
+    single/limited-select option-group shape. Never hardcoded per-business;
+    each business configures its own list per item.
+    """
+    id: str = Field(min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=128)
+
+
 class MenuItemOptionsSchema(BaseModel):
-    option_groups: list[OptionGroupSchema] = Field(min_length=1)
+    option_groups: list[OptionGroupSchema] = Field(default_factory=list)
+    removable_ingredients: list[RemovableIngredientSchema] = Field(default_factory=list)
 
 
 def _validate_options_json(options_json: dict | None) -> None:
@@ -109,6 +148,7 @@ class ItemCreate(BaseModel):
     options_json: dict | None = None
     sort_order: int = 0
     image_asset_id: uuid.UUID | None = None
+    requires_preparation: bool = True
 
     @model_validator(mode="after")
     def validate_options(self) -> "ItemCreate":
@@ -125,6 +165,7 @@ class ItemUpdate(BaseModel):
     is_active: bool | None = None
     sort_order: int | None = None
     image_asset_id: uuid.UUID | None = None
+    requires_preparation: bool | None = None
 
     @model_validator(mode="after")
     def validate_options(self) -> "ItemUpdate":
@@ -156,6 +197,7 @@ class ItemResponse(BaseModel):
     is_active: bool
     sort_order: int
     image_url: str | None
+    requires_preparation: bool = True
     model_config = {"from_attributes": True}
 
 
@@ -293,6 +335,8 @@ async def create_item(
     user: AuthUser = Depends(require_owner_or_manager),
     db: AsyncSession = Depends(get_db),
 ):
+    image_url, asset = await _resolve_item_image(db, user.business_id, body.image_asset_id)
+
     item = MenuItem(
         business_id=user.business_id,
         currency=( # Inherit from business
@@ -301,6 +345,7 @@ async def create_item(
             )
         ).scalar() or "ZAR",
         **body.model_dump(),
+        image_url=image_url,
     )
     # Actually get currency from business
     from shared.models.business import Business
@@ -308,6 +353,9 @@ async def create_item(
     item.currency = biz.currency if biz else "ZAR"
 
     db.add(item)
+    await db.flush()  # assigns item.id before the asset backfill below
+    if asset is not None:
+        asset.entity_id = item.id
     await db.commit()
     await db.refresh(item)
     return ItemResponse.model_validate(item)
@@ -331,8 +379,19 @@ async def update_item(
     if not item:
         raise NotFoundError("MenuItem", str(item_id))
 
-    for field, value in body.model_dump(exclude_unset=True).items():
+    update_fields = body.model_dump(exclude_unset=True)
+    asset = None
+    if "image_asset_id" in update_fields:
+        image_url, asset = await _resolve_item_image(
+            db, user.business_id, update_fields["image_asset_id"]
+        )
+        update_fields["image_url"] = image_url
+
+    for field, value in update_fields.items():
         setattr(item, field, value)
+
+    if asset is not None:
+        asset.entity_id = item.id
 
     await db.commit()
     await db.refresh(item)

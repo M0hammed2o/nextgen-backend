@@ -26,6 +26,15 @@ def test_expected_cash_is_opening_float_plus_cash_sales():
     assert compute_expected_cash_cents(opening_float_cents=1000, cash_sales_cents=5000) == 6000
 
 
+def test_expected_cash_subtracts_cash_refunds():
+    assert compute_expected_cash_cents(opening_float_cents=1000, cash_sales_cents=5000, cash_refunds_cents=2000) == 4000
+
+
+def test_expected_cash_defaults_refunds_to_zero():
+    assert compute_expected_cash_cents(opening_float_cents=1000, cash_sales_cents=5000) == \
+        compute_expected_cash_cents(opening_float_cents=1000, cash_sales_cents=5000, cash_refunds_cents=0)
+
+
 def test_variance_positive_when_over():
     assert compute_variance_cents(expected_cash_cents=6000, counted_cash_cents=6200) == 200
 
@@ -188,7 +197,8 @@ async def test_close_till_computes_variance_and_writes_audit_event():
     session = make_session(user.business_id, opening_float_cents=10000)
     db = FakeDB([
         FakeResult(scalar=session),           # TillSession lookup
-        FakeResult(items=[5000, 3000]),       # Order.total_cents for CASH-paid orders since open
+        FakeResult(items=[5000, 3000]),       # Order.total_cents for CASH-paid orders in this session
+        FakeResult(items=[]),                 # Order.refund_amount_cents for CASH refunds/voids in this session
     ])
 
     result = await close_till(
@@ -197,10 +207,12 @@ async def test_close_till_computes_variance_and_writes_audit_event():
         user=user, db=db,
     )
 
-    # expected = 10000 (float) + 8000 (cash sales) = 18000; counted 18500 -> +500 over
+    # expected = 10000 (float) + 8000 (cash sales) - 0 (refunds) = 18000; counted 18500 -> +500 over
     assert result.expected_cash_cents == 18000
     assert result.variance_cents == 500
     assert result.status == "CLOSED"
+    assert result.cash_sales_cents == 8000
+    assert result.cash_refunds_cents == 0
 
     audit_events = [o for o in db.added if isinstance(o, AuditEvent)]
     assert len(audit_events) == 1
@@ -209,22 +221,22 @@ async def test_close_till_computes_variance_and_writes_audit_event():
     assert audit_events[0].diff_json["variance_cents"] == 500
 
 
-async def test_close_till_cash_query_excludes_refunded_orders():
+async def test_close_till_cash_query_still_filters_by_payment_status():
     """
-    Regression test (bug found via real-DB integration testing, 2026-07-24):
-    the cash-sales query must exclude REFUNDED orders — a cash sale that was
-    later refunded is no longer cash sitting in the drawer, so counting its
-    total_cents toward `expected_cash_cents` would produce a false shortfall
-    at close. This mocked test can't fake a real WHERE-clause bug (the fake
-    DB just returns whatever items it's told to), so it asserts the actual
-    compiled SQL includes a payment_status filter, closing the gap where the
-    same bug could otherwise silently regress unnoticed by mocked tests alone.
+    The cash-sales query filters `payment_status IN (PAID, REFUNDED,
+    PARTIALLY_REFUNDED, VOIDED)` — deliberately including refunded/voided
+    orders too (2026-07-28 fix: see test_close_till_same_session_refund_is_not_double_counted
+    for why excluding them here would double-reverse the same refund). This
+    just confirms the query still filters on payment_status at all — e.g.
+    never counting a still-PENDING/UNPAID cash order that hasn't actually
+    been paid yet.
     """
     user = make_user(role="OWNER")
     session = make_session(user.business_id, opening_float_cents=10000)
     db = FakeDB([
         FakeResult(scalar=session),
         FakeResult(items=[5000]),
+        FakeResult(items=[]),
     ])
 
     await close_till(
@@ -236,3 +248,137 @@ async def test_close_till_cash_query_excludes_refunded_orders():
     cash_query = db.executed_statements[1]
     compiled = str(cash_query.compile(compile_kwargs={"literal_binds": True}))
     assert "payment_status" in compiled
+
+
+async def test_close_till_cash_refund_reduces_expected_cash():
+    """Restaurant POS redesign: a cash refund given back during this session
+    must reduce expected_cash_cents — the drawer is genuinely lighter by that
+    amount, not still holding the original sale's cash."""
+    user = make_user(role="OWNER")
+    session = make_session(user.business_id, opening_float_cents=10000)
+    db = FakeDB([
+        FakeResult(scalar=session),
+        FakeResult(items=[5000]),      # one CASH sale of R50
+        FakeResult(items=[2000]),      # one CASH refund of R20 in the same session
+    ])
+
+    result = await close_till(
+        session_id=session.id,
+        body=TillCloseRequest(counted_cash_cents=13000),
+        user=user, db=db,
+    )
+
+    # expected = 10000 (float) + 5000 (sales) - 2000 (refund) = 13000 -> exact
+    assert result.expected_cash_cents == 13000
+    assert result.variance_cents == 0
+    assert result.cash_sales_cents == 5000
+    assert result.cash_refunds_cents == 2000
+
+
+async def test_close_till_cash_sales_query_links_via_till_session_id():
+    """
+    The cash-sales query filters on Order.till_session_id (set at POS
+    checkout) instead of the old opened_at/paid_at timestamp-window
+    heuristic — confirms the compiled query actually references the new
+    column, closing the risk of silently reverting to the fragile heuristic.
+    """
+    user = make_user(role="OWNER")
+    session = make_session(user.business_id, opening_float_cents=10000)
+    db = FakeDB([
+        FakeResult(scalar=session),
+        FakeResult(items=[]),
+        FakeResult(items=[]),
+    ])
+
+    await close_till(
+        session_id=session.id,
+        body=TillCloseRequest(counted_cash_cents=10000),
+        user=user, db=db,
+    )
+
+    cash_query = db.executed_statements[1]
+    assert "till_session_id" in str(cash_query.compile(compile_kwargs={"literal_binds": True}))
+
+
+async def test_close_till_refund_query_uses_refunded_at_not_till_session_id():
+    """
+    Regression test for a real double-counting bug found via a live-Postgres
+    integration test (2026-07-28): filtering refunds by the ORIGINAL sale's
+    till_session_id double-subtracts a same-session refund, since the
+    cash-sales query already excludes that order once its payment_status
+    moves off PAID. Refunds must instead be scoped by refunded_at falling
+    within the currently-closing session's open window.
+    """
+    user = make_user(role="OWNER")
+    session = make_session(user.business_id, opening_float_cents=10000)
+    db = FakeDB([
+        FakeResult(scalar=session),
+        FakeResult(items=[]),
+        FakeResult(items=[]),
+    ])
+
+    await close_till(
+        session_id=session.id,
+        body=TillCloseRequest(counted_cash_cents=10000),
+        user=user, db=db,
+    )
+
+    refund_query = db.executed_statements[2]
+    compiled = str(refund_query.compile(compile_kwargs={"literal_binds": True}))
+    assert "refunded_at" in compiled
+    assert "till_session_id" not in compiled
+
+
+async def test_close_till_same_session_refund_is_not_double_counted():
+    """
+    Regression test for a real bug found via a live-Postgres integration
+    test (2026-07-28): an R80 cash sale refunded in full in the SAME
+    session it was sold in must net to zero effect on the drawer (the R80
+    went in, then came back out) — R10000 float stays R10000. An earlier,
+    buggy version of this fix excluded refunded orders from cash_sales
+    entirely (double-reversing the refund: -R80 sales exclusion AND -R80
+    refund subtraction = -R160 total, instead of the correct 0).
+    """
+    user = make_user(role="OWNER")
+    session = make_session(user.business_id, opening_float_cents=10000)
+    db = FakeDB([
+        FakeResult(scalar=session),
+        FakeResult(items=[8000]),    # order B's original sale still counted (payment_status filter now includes REFUNDED)
+        FakeResult(items=[8000]),    # order B's refund_amount_cents, scoped by refunded_at
+    ])
+
+    result = await close_till(
+        session_id=session.id,
+        body=TillCloseRequest(counted_cash_cents=10000),
+        user=user, db=db,
+    )
+
+    # expected = 10000 (float) + 8000 (sale, still counted) - 8000 (refund) = 10000 -> net zero effect
+    assert result.expected_cash_cents == 10000
+    assert result.variance_cents == 0
+
+
+async def test_close_till_two_cash_sales_one_refunded_nets_correctly():
+    """
+    Order A (R80 cash, never refunded) + Order B (R80 cash, refunded in
+    full) in the same session -> expected = float + both sales - B's
+    refund = float + 8000 (A's net contribution), matching real physical
+    drawer counting.
+    """
+    user = make_user(role="OWNER")
+    session = make_session(user.business_id, opening_float_cents=10000)
+    db = FakeDB([
+        FakeResult(scalar=session),
+        FakeResult(items=[8000, 8000]),  # A (kept) + B (later refunded) — both counted as sales
+        FakeResult(items=[8000]),        # B's refund
+    ])
+
+    result = await close_till(
+        session_id=session.id,
+        body=TillCloseRequest(counted_cash_cents=18000),
+        user=user, db=db,
+    )
+
+    # expected = 10000 + 16000 (A+B sales) - 8000 (B refund) = 18000
+    assert result.expected_cash_cents == 18000
+    assert result.variance_cents == 0

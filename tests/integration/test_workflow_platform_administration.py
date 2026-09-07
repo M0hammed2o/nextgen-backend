@@ -50,9 +50,9 @@ from admin_api.app.api.v1.routes_businesses import (
 from admin_api.app.api.v1.routes_usage import get_audit_log, get_usage
 from backend.app.api.v1.routes_business import BusinessSettingsUpdate, update_business_settings
 from backend.app.api.v1.routes_menu import CategoryCreate, ItemCreate, create_category, create_item
-from backend.app.api.v1.routes_orders import PaymentUpdateRequest
-from backend.app.api.v1.routes_orders import update_payment_status as patch_payment
-from backend.app.api.v1.routes_pos import POSOrderCreateRequest, POSOrderItemRequest, create_pos_order
+from backend.app.api.v1.routes_pos import (
+    POSOrderCreateRequest, POSOrderItemRequest, TillOpenRequest, create_pos_order, open_till,
+)
 from backend.app.billing.lifecycle import GRACE_PERIOD_DAYS, is_past_grace_period, suspend_for_nonpayment
 from backend.app.core.errors import NotFoundError
 from backend.app.core.rbac import AuthUser, get_current_user, require_super_admin
@@ -195,17 +195,16 @@ async def test_platform_administration_workflow(db):
         item = await create_item(
             body=ItemCreate(category_id=category.id, name="Soda", price_cents=2500), user=owner_auth, db=db,
         )
+        await open_till(body=TillOpenRequest(opening_float_cents=0), user=owner_auth, db=db)
         order = await create_pos_order(
             body=POSOrderCreateRequest(
                 items=[POSOrderItemRequest(menu_item_id=item.id, quantity=1)],
                 order_mode="PICKUP", customer_phone="0821112222",
+                payment_method="CASH", cash_tendered_cents=2500,
             ),
             user=owner_auth, db=db,
         )
-        await patch_payment(
-            order_id=order.id, body=PaymentUpdateRequest(payment_status="PAID", payment_method="CASH"),
-            user=owner_auth, db=db,
-        )
+        assert order.payment_status == "PAID"
 
         # ── Billing / usage reporting ──────────────────────────────────────
         usage_rows = await get_usage(

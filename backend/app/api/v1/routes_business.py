@@ -76,6 +76,16 @@ class BusinessSettingsResponse(BaseModel):
     payment_api_key_hint: str | None = None
     payment_api_secret_hint: str | None = None
     payment_webhook_secret_configured: bool = False
+    # POS till payment settings — distinct from payment_methods_enabled
+    # above, which governs the WhatsApp/online-order flow.
+    pos_cash_enabled: bool = True
+    pos_card_enabled: bool = True
+    pos_payfast_enabled: bool = False
+    pos_yoco_enabled: bool = False
+    pos_ikhoka_enabled: bool = False
+    pos_direct_eft_enabled: bool = False
+    pos_other_payment_enabled: bool = False
+    pos_table_number_required: bool = False
 
     model_config = {"from_attributes": False}
 
@@ -126,6 +136,14 @@ class BusinessSettingsResponse(BaseModel):
             payment_api_key_hint=_hint(decrypt_credential(b.payment_api_key)),
             payment_api_secret_hint=_hint(decrypt_credential(b.payment_api_secret)),
             payment_webhook_secret_configured=bool(b.payment_webhook_secret),
+            pos_cash_enabled=b.pos_cash_enabled,
+            pos_card_enabled=b.pos_card_enabled,
+            pos_payfast_enabled=b.pos_payfast_enabled,
+            pos_yoco_enabled=b.pos_yoco_enabled,
+            pos_ikhoka_enabled=b.pos_ikhoka_enabled,
+            pos_direct_eft_enabled=b.pos_direct_eft_enabled,
+            pos_other_payment_enabled=b.pos_other_payment_enabled,
+            pos_table_number_required=b.pos_table_number_required,
         )
 
 
@@ -160,6 +178,15 @@ class BusinessSettingsUpdate(BaseModel):
     payment_api_key: str | None = None
     payment_api_secret: str | None = None
     payment_webhook_secret: str | None = None
+    # POS till payment settings
+    pos_cash_enabled: bool | None = None
+    pos_card_enabled: bool | None = None
+    pos_payfast_enabled: bool | None = None
+    pos_yoco_enabled: bool | None = None
+    pos_ikhoka_enabled: bool | None = None
+    pos_direct_eft_enabled: bool | None = None
+    pos_other_payment_enabled: bool | None = None
+    pos_table_number_required: bool | None = None
 
 
 # ── Routes ───────────────────────────────────────────────────────────────────

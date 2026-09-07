@@ -42,21 +42,19 @@ from backend.app.api.v1.routes_loyalty import (
 )
 from backend.app.api.v1.routes_menu import CategoryCreate, ItemCreate, create_category, create_item
 from backend.app.api.v1.routes_orders import (
-    PaymentUpdateRequest,
-    RefundRequest,
     StatusUpdateRequest,
-    refund_order_payment,
     update_order_status,
 )
-from backend.app.api.v1.routes_orders import update_payment_status as patch_payment
 from backend.app.api.v1.routes_pos import (
     POSOrderCreateRequest,
     POSOrderItemRequest,
+    POSRefundRequest,
     TillCloseRequest,
     TillOpenRequest,
     close_till,
     create_pos_order,
     open_till,
+    refund_pos_order,
 )
 from backend.app.api.v1.routes_staff import StaffCreate, create_staff
 from backend.app.api.v1.routes_analytics import get_summary
@@ -99,26 +97,27 @@ async def test_daily_operations_workflow(db, test_business: Business):
     till = await open_till(body=TillOpenRequest(opening_float_cents=10000), user=staff_user, db=db)
     assert till.status == "OPEN"
 
-    # ── Order A: walk-in, paid cash, walked through the kitchen workflow ──
+    # ── Order A: walk-in, paid cash AT CHECKOUT (POS redesign, 2026-07-28) ──
+    # then walked through the kitchen workflow. Burger defaults to
+    # requires_preparation=True, so the order starts at ACCEPTED (not NEW) —
+    # ringing it up already is the acceptance, per KNOWN_BUGS.md BUG-0035.
     order_a = await create_pos_order(
         body=POSOrderCreateRequest(
             items=[POSOrderItemRequest(menu_item_id=item.id, quantity=1)],
             order_mode="PICKUP",
             customer_name="Regular Customer",
             customer_phone="0827654321",
+            payment_method="CASH",
+            cash_tendered_cents=8000,
         ),
         user=staff_user, db=db,
     )
     assert order_a.total_cents == 8000
-
-    order_a = await patch_payment(
-        order_id=order_a.id,
-        body=PaymentUpdateRequest(payment_status="PAID", payment_method="CASH"),
-        user=staff_user, db=db,
-    )
     assert order_a.payment_status == "PAID"
+    assert order_a.status == "ACCEPTED"
+    assert order_a.change_due_cents == 0
 
-    for next_status in ("ACCEPTED", "IN_PROGRESS", "READY", "COLLECTED"):
+    for next_status in ("IN_PROGRESS", "READY", "COLLECTED"):
         order_a = await update_order_status(
             order_id=order_a.id, body=StatusUpdateRequest(status=next_status), user=staff_user, db=db,
         )
@@ -129,31 +128,30 @@ async def test_daily_operations_workflow(db, test_business: Business):
     await db.refresh(customer)
     assert customer.loyalty_points_balance == 80  # 8000 cents -> 80 Rand -> 80 points at 1/Rand
 
-    # ── Order B: same customer, paid cash, then REFUNDED (still in the ──
-    # same till session) — this is the exact scenario that exposed the
-    # cash-up reconciliation bug (routes_pos.py's close_till previously
-    # didn't exclude refunded cash orders from expected_cash_cents).
+    # ── Order B: same customer, paid cash AT CHECKOUT, then REFUNDED via the
+    # new till-native POS refund endpoint (still in the same till session) —
+    # this is the exact scenario that exposed the cash-up reconciliation bug
+    # (routes_pos.py's close_till previously didn't exclude refunded cash
+    # orders from expected_cash_cents, and the old provider-based refund
+    # endpoint had no way to reverse a till sale with no online provider).
     order_b = await create_pos_order(
         body=POSOrderCreateRequest(
             items=[POSOrderItemRequest(menu_item_id=item.id, quantity=1)],
             order_mode="PICKUP",
             customer_name="Regular Customer",
             customer_phone="0827654321",
+            payment_method="CASH",
+            cash_tendered_cents=8000,
         ),
         user=staff_user, db=db,
     )
-    order_b = await patch_payment(
-        order_id=order_b.id,
-        body=PaymentUpdateRequest(payment_status="PAID", payment_method="CASH"),
-        user=staff_user, db=db,
-    )
+    assert order_b.payment_status == "PAID"
 
-    refund_response = await refund_order_payment(
-        order_id=order_b.id, body=RefundRequest(reason="Customer changed their mind"),
+    refund_response = await refund_pos_order(
+        order_id=order_b.id, body=POSRefundRequest(reason="Customer changed their mind"),
         user=owner, db=db,
     )
-    assert refund_response.success is True
-    assert refund_response.order.payment_status == "REFUNDED"
+    assert refund_response.payment_status == "REFUNDED"
 
     # ── Loyalty redemption ────────────────────────────────────────────────
     await db.refresh(customer)

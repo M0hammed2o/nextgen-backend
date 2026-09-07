@@ -33,10 +33,11 @@ from sqlalchemy import select
 from backend.app.api.v1.routes_analytics import get_summary
 from backend.app.api.v1.routes_business import BusinessSettingsUpdate, update_business_settings
 from backend.app.api.v1.routes_menu import CategoryCreate, ItemCreate, create_category, create_item
-from backend.app.api.v1.routes_orders import PaymentUpdateRequest, StatusUpdateRequest
-from backend.app.api.v1.routes_orders import update_payment_status as patch_payment
+from backend.app.api.v1.routes_orders import StatusUpdateRequest
 from backend.app.api.v1.routes_orders import update_order_status
-from backend.app.api.v1.routes_pos import POSOrderCreateRequest, POSOrderItemRequest, create_pos_order
+from backend.app.api.v1.routes_pos import (
+    POSOrderCreateRequest, POSOrderItemRequest, TillOpenRequest, create_pos_order, open_till,
+)
 from backend.app.api.v1.routes_staff import StaffCreate, create_staff
 from backend.app.api.v1.routes_loyalty import LoyaltyProgramUpdate, update_loyalty_program
 from backend.app.billing.stripe_webhooks import _handle_invoice_paid
@@ -116,6 +117,9 @@ async def test_full_workflow_signup_to_active_subscription(db, test_business: Bu
     staff_user = _staff(test_business.id, staff_response.id)
 
     # ── Step: Place first order (POS, walk-in customer by phone) ────────
+    # POS checkout now pays at the till atomically (BUG-0035, 2026-07-28) —
+    # requires an open till session, and the order is created already PAID.
+    await open_till(body=TillOpenRequest(opening_float_cents=0), user=staff_user, db=db)
     order = await create_pos_order(
         body=POSOrderCreateRequest(
             items=[POSOrderItemRequest(
@@ -125,6 +129,8 @@ async def test_full_workflow_signup_to_active_subscription(db, test_business: Bu
             order_mode="PICKUP",
             customer_name="Walk-in Test Customer",
             customer_phone="0821234567",
+            payment_method="CASH",
+            cash_tendered_cents=13000,
         ),
         user=staff_user, db=db,
     )
@@ -132,21 +138,18 @@ async def test_full_workflow_signup_to_active_subscription(db, test_business: Bu
     assert order.subtotal_cents == 13000
     assert order.source == "POS"
     assert order.total_cents == 13000
+    assert order.payment_status == "PAID"
+    # This item's options_json carries no requires_preparation override, so
+    # it defaults True -> the order starts at ACCEPTED, not NEW (ringing it
+    # up at the till already is the acceptance).
+    assert order.status == "ACCEPTED"
 
     # Confirm a Customer was created and linked (loyalty walk-in identity).
     cust_result = await db.execute(select(Customer).where(Customer.phone_number == "0821234567"))
     customer = cust_result.scalar_one()
-    assert customer.loyalty_points_balance == 0  # not yet paid
 
-    # ── Step: Process payment ────────────────────────────────────────────
-    paid_order = await patch_payment(
-        order_id=order.id,
-        body=PaymentUpdateRequest(payment_status="PAID", payment_method="CASH"),
-        user=staff_user, db=db,
-    )
-    assert paid_order.payment_status == "PAID"
-
-    # ── Step: Loyalty points awarded ─────────────────────────────────────
+    # ── Step: Loyalty points awarded (at checkout, not at a later payment
+    # step — the order was already PAID at creation) ────────────────────
     await db.refresh(customer)
     # 130 Rand spent * 1 point/Rand + 10 flat per order = 140
     assert customer.loyalty_points_balance == 140
@@ -155,12 +158,8 @@ async def test_full_workflow_signup_to_active_subscription(db, test_business: Bu
 
     # ── Step: Kitchen/counter fulfils the order ──────────────────────────
     # Revenue is recognised on fulfilment (status COLLECTED/DELIVERED), not
-    # on payment alone — see routes_analytics.py's revenue_cents CASE. A POS
-    # walk-in sale still walks the same canonical order-status state machine
-    # as a WhatsApp order (NEW -> ACCEPTED -> IN_PROGRESS -> READY ->
-    # COLLECTED); there is deliberately no separate "instant complete" path,
-    # so a real cashier taps through these same statuses on the till.
-    for next_status in ("ACCEPTED", "IN_PROGRESS", "READY", "COLLECTED"):
+    # on payment alone — see routes_analytics.py's revenue_cents CASE.
+    for next_status in ("IN_PROGRESS", "READY", "COLLECTED"):
         order = await update_order_status(
             order_id=order.id,
             body=StatusUpdateRequest(status=next_status),

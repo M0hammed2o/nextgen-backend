@@ -34,6 +34,7 @@ class POSItemInput:
     quantity: int
     selected_option_ids: dict = field(default_factory=dict)  # {group_id: option_id}
     add_on_selections: list = field(default_factory=list)    # list[POSAddOnSelection]
+    removed_ingredient_ids: list = field(default_factory=list)  # list[str]
     special_instructions: str | None = None
 
 
@@ -44,7 +45,9 @@ class ResolvedPOSItem:
     breakdown: LineItemBreakdown
     selected_options_snapshot: list
     add_ons_snapshot: list
+    removed_ingredients_snapshot: list
     special_instructions: str | None
+    requires_preparation: bool
 
 
 def _resolve_selected_options(menu_item: MenuItem, selected_option_ids: dict) -> list[SelectedOption]:
@@ -93,6 +96,34 @@ def _resolve_selected_options(menu_item: MenuItem, selected_option_ids: dict) ->
             price_delta_cents=int(match.get("price_delta_cents", 0)),
         ))
 
+    return resolved
+
+
+def _resolve_removed_ingredients(menu_item: MenuItem, removed_ingredient_ids: list) -> list[dict]:
+    """
+    Removable ingredients are a plain, zero-priced, business-configured list
+    living alongside option_groups in MenuItem.options_json — not a new
+    priced-modifier concept, since "no tomato" never changes the price.
+    Resolves and validates requested ids against the item's own configured
+    list (never a hardcoded ingredient name anywhere in this codebase).
+    """
+    if not removed_ingredient_ids:
+        return []
+    available = {
+        i["id"]: i["name"]
+        for i in (menu_item.options_json or {}).get("removable_ingredients", [])
+    }
+    resolved = []
+    for ing_id in removed_ingredient_ids:
+        name = available.get(ing_id)
+        if not name:
+            raise AppError(
+                "INVALID_REMOVED_INGREDIENT",
+                f"'{ing_id}' is not a removable ingredient on {menu_item.name}",
+                422,
+                details={"ingredient_id": ing_id, "menu_item_id": str(menu_item.id)},
+            )
+        resolved.append({"id": ing_id, "name": name})
     return resolved
 
 
@@ -191,6 +222,7 @@ async def resolve_pos_items(
 
         selected_options = _resolve_selected_options(menu_item, item.selected_option_ids)
         selected_add_ons = await _resolve_add_ons(db, business_id, menu_item, item.add_on_selections)
+        removed_ingredients = _resolve_removed_ingredients(menu_item, item.removed_ingredient_ids)
 
         breakdown = calculate_line_item(
             base_price_cents=menu_item.price_cents,
@@ -222,7 +254,9 @@ async def resolve_pos_items(
                 }
                 for a in selected_add_ons
             ],
+            removed_ingredients_snapshot=removed_ingredients,
             special_instructions=item.special_instructions,
+            requires_preparation=menu_item.requires_preparation,
         ))
 
     return resolved_items

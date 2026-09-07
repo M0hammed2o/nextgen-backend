@@ -54,9 +54,10 @@ from backend.app.api.v1.routes_menu import (
     update_category,
     update_item,
 )
-from backend.app.api.v1.routes_orders import PaymentUpdateRequest, StatusUpdateRequest, update_order_status
-from backend.app.api.v1.routes_orders import update_payment_status as patch_payment
-from backend.app.api.v1.routes_pos import POSOrderCreateRequest, POSOrderItemRequest, create_pos_order
+from backend.app.api.v1.routes_orders import StatusUpdateRequest, update_order_status
+from backend.app.api.v1.routes_pos import (
+    POSOrderCreateRequest, POSOrderItemRequest, TillOpenRequest, create_pos_order, open_till,
+)
 from backend.app.api.v1.routes_specials import SpecialCreate, SpecialUpdate, create_special, delete_special, update_special
 from backend.app.api.v1.routes_staff import PinRotation, StaffCreate, StaffUpdate, auto_rotate_pin, create_staff, rotate_pin, update_staff
 from backend.app.api.v1.routes_analytics import get_summary
@@ -171,18 +172,20 @@ async def test_owner_administration_workflow(db, test_business: Business):
     assert reward.points_cost == 40
 
     staff_user = AuthUser(user_id=staff_response.id, business_id=test_business.id, role="STAFF", token_type="access")
+    await open_till(body=TillOpenRequest(opening_float_cents=0), user=staff_user, db=db)
+    # POS checkout now pays at the till (BUG-0035) — the Steak item defaults
+    # to requires_preparation=True, so the order starts at ACCEPTED, not NEW.
     order = await create_pos_order(
         body=POSOrderCreateRequest(
             items=[POSOrderItemRequest(menu_item_id=item.id, quantity=1, selected_option_ids={"doneness": "medium"})],
             order_mode="PICKUP", customer_name="Regular", customer_phone="0839998888",
+            payment_method="CASH", cash_tendered_cents=16000,
         ),
         user=staff_user, db=db,
     )
-    await patch_payment(
-        order_id=order.id, body=PaymentUpdateRequest(payment_status="PAID", payment_method="CASH"),
-        user=staff_user, db=db,
-    )
-    for next_status in ("ACCEPTED", "IN_PROGRESS", "READY", "COLLECTED"):
+    assert order.payment_status == "PAID"
+    assert order.status == "ACCEPTED"
+    for next_status in ("IN_PROGRESS", "READY", "COLLECTED"):
         await update_order_status(order_id=order.id, body=StatusUpdateRequest(status=next_status), user=staff_user, db=db)
 
     cust_result = await db.execute(select(Customer).where(Customer.phone_number == "0839998888"))

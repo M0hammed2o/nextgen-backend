@@ -131,6 +131,33 @@ class Order(Base, UUIDPrimaryKeyMixin, TimestampMixin):
                  "configured limit — not FK-enforced, same pattern as cancelled_by_user_id"
     )
 
+    # ── POS checkout (Phase 2 — atomic pay-at-till) ──────────────────────
+    table_number: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, comment="DINE_IN order_mode only"
+    )
+    cash_tendered_cents: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, comment="CASH payment_method only"
+    )
+    change_due_cents: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, comment="cash_tendered_cents - total_cents"
+    )
+    till_session_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("till_sessions.id", ondelete="SET NULL"),
+        nullable=True, index=True,
+        comment="Which till session rang this sale up — POS orders only"
+    )
+    idempotency_key: Mapped[str | None] = mapped_column(
+        String(128), nullable=True,
+        comment="Client-generated key; a retry with the same key returns the "
+                 "original order instead of creating a duplicate sale (unique "
+                 "per business_id, partial index — see migration 0023)"
+    )
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True,
+        comment="Cashier who rang up a POS sale — not FK-enforced, same "
+                 "pattern as cancelled_by_user_id"
+    )
+
     # ── Relationships ────────────────────────────────────────────────────
     items = relationship("OrderItem", back_populates="order", lazy="selectin")
     events = relationship("OrderEvent", back_populates="order", lazy="noload")
@@ -191,6 +218,11 @@ class OrderItem(Base, UUIDPrimaryKeyMixin):
     add_ons_snapshot: Mapped[list | None] = mapped_column(
         JSONB, nullable=True,
         comment="[{add_on_id, name, price_cents, quantity}]"
+    )
+    removed_ingredients_snapshot: Mapped[list | None] = mapped_column(
+        JSONB, nullable=True,
+        comment="[{id, name}] — resolved from MenuItem.options_json.removable_ingredients "
+                 "at order time, immutable like the other snapshot columns"
     )
     special_instructions: Mapped[str | None] = mapped_column(Text, nullable=True)
 

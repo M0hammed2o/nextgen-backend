@@ -36,6 +36,7 @@ class OrderItemResponse(BaseModel):
     options_snapshot: dict | None
     add_ons_snapshot: list | None = None
     selected_options_snapshot: list | None = None
+    removed_ingredients_snapshot: list | None = None
     special_instructions: str | None
     model_config = {"from_attributes": True}
 
@@ -51,7 +52,12 @@ class OrderResponse(BaseModel):
     payment_required: bool = False
     paid_at: datetime | None = None
     order_mode: str
+    table_number: str | None = None
     source: str
+    cash_tendered_cents: int | None = None
+    change_due_cents: int | None = None
+    till_session_id: uuid.UUID | None = None
+    created_by_user_id: uuid.UUID | None = None
     subtotal_cents: int
     delivery_fee_cents: int
     discount_cents: int = 0
