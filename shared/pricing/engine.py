@@ -97,3 +97,75 @@ def calculate_line_item(
         quantity=quantity,
         line_total_cents=unit_price * quantity,
     )
+
+
+# ── VAT / tax ────────────────────────────────────────────────────────────────
+#
+# Added for the Ciao Pizza P0 (2026-09-07). Before this, routes_pos.py wrote
+# a hardcoded tax_cents=0 with the comment "No tax-rate configuration exists
+# yet", which meant a VAT-registered tenant's till slip was not a valid South
+# African tax invoice.
+#
+# The rate is an integer in BASIS POINTS (15% = 1500) so no float ever
+# touches a tax figure. Rounding is half-up, applied exactly once, at the
+# end — never per line item, which would let rounding error accumulate
+# across a large order.
+
+
+def calculate_vat_cents(
+    amount_cents: int,
+    vat_rate_basis_points: int,
+    vat_inclusive: bool = True,
+) -> int:
+    """
+    VAT contained in (inclusive) or due on (exclusive) `amount_cents`.
+
+    Inclusive — the South African norm, where menu prices already include
+    VAT — back-calculates the tax out of the gross amount:
+
+        vat = amount * rate / (10000 + rate)
+        R115 at 15% -> 1500 cents of VAT, gross stays R115
+
+    Exclusive adds it on top:
+
+        vat = amount * rate / 10000
+        R100 at 15% -> 1500 cents of VAT, gross becomes R115
+
+    Returns 0 for a zero/negative rate or a non-positive amount.
+    """
+    from decimal import Decimal, ROUND_HALF_UP
+
+    rate = int(vat_rate_basis_points or 0)
+    if rate <= 0 or amount_cents <= 0:
+        return 0
+
+    gross = Decimal(int(amount_cents))
+    if vat_inclusive:
+        exact = gross * Decimal(rate) / (Decimal(10_000) + Decimal(rate))
+    else:
+        exact = gross * Decimal(rate) / Decimal(10_000)
+
+    return int(exact.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def apply_vat_to_total(
+    net_total_cents: int,
+    vat_rate_basis_points: int,
+    vat_inclusive: bool = True,
+) -> tuple[int, int]:
+    """
+    Resolve an order total and its VAT component together.
+
+    Returns ``(total_cents, vat_cents)``:
+
+      * inclusive — the total is unchanged and VAT is the portion inside it,
+        so switching VAT on never silently reprices a tenant's whole menu.
+      * exclusive — VAT is added on top and the total grows.
+
+    This asymmetry is the entire reason the two modes exist, and it is why
+    the caller must use the returned total rather than recomputing one.
+    """
+    vat_cents = calculate_vat_cents(net_total_cents, vat_rate_basis_points, vat_inclusive)
+    if vat_inclusive:
+        return net_total_cents, vat_cents
+    return net_total_cents + vat_cents, vat_cents
