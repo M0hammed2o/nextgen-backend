@@ -146,6 +146,33 @@ class Order(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         nullable=True, index=True,
         comment="Which till session rang this sale up — POS orders only"
     )
+    # ── External marketplace channel (Uber Eats / Mr D / generic) ────────
+    # An imported sale is a real Order, so it resolves the same recipes and
+    # posts to the same ledger as a till sale. These columns carry only what
+    # a till sale has no equivalent of.
+    external_order_id: Mapped[str | None] = mapped_column(
+        String(128), nullable=True,
+        comment="The platform's own order id. Together with business_id and "
+                "source this is the duplicate-upload guard (partial unique index)."
+    )
+    external_batch_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True,
+        comment="external_import_batches.id — which uploaded file created this"
+    )
+    external_placed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+        comment="When the customer actually ordered, per the platform. Stock "
+                "movements use THIS, not the import time, so a file uploaded "
+                "the next morning still consumes against the right day."
+    )
+    external_imported_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+        comment="When we imported it — kept separate from external_placed_at"
+    )
+    external_status: Mapped[str | None] = mapped_column(
+        String(48), nullable=True, comment="Raw status text from the platform's report"
+    )
+
     idempotency_key: Mapped[str | None] = mapped_column(
         String(128), nullable=True,
         comment="Client-generated key; a retry with the same key returns the "

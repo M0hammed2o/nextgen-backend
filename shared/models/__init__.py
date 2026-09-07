@@ -12,6 +12,7 @@ from shared.models.audit import AuditEvent, MessageOutbox
 from shared.models.billing_invoice import BillingInvoice
 from shared.models.business import Business
 from shared.models.customer import ConversationSession, Customer
+from shared.models.external_orders import ExternalImportBatch, ExternalProductMapping
 from shared.models.inventory import (
     GoodsReceipt,
     GoodsReceiptLine,
@@ -46,6 +47,8 @@ __all__ = [
     "ConversationSession",
     "Customer",
     "DailyUsage",
+    "ExternalImportBatch",
+    "ExternalProductMapping",
     "GoodsReceipt",
     "GoodsReceiptLine",
     "Ingredient",

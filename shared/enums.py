@@ -73,10 +73,88 @@ class OrderMode(str, enum.Enum):
 
 
 class OrderSource(str, enum.Enum):
+    """
+    Where an order came from.
+
+    POS/WHATSAPP/MANUAL/ADMIN are all *in-store* channels: the restaurant
+    took the order and the money itself. The external values below are
+    marketplace channels where the platform already collected payment from
+    the customer, and the order reaches us through a daily report rather
+    than through a till.
+
+    Deliberately ONE enum rather than a parallel "channel" concept: an
+    external sale is a real Order, so it resolves the same recipes, posts to
+    the same stock ledger, and appears in the same reporting. Splitting it
+    would mean two inventory systems that could disagree.
+    """
     WHATSAPP = "WHATSAPP"
     MANUAL = "MANUAL"
     ADMIN = "ADMIN"
     POS = "POS"
+    # Marketplace channels - paid on the platform, imported from a report.
+    UBER_EATS = "UBER_EATS"
+    MR_D = "MR_D"
+    OTHER_EXTERNAL = "OTHER_EXTERNAL"
+
+
+#: Sources whose money the restaurant never handles, so they must never
+#: reach till cash-up. Used by backend/app/pos/till.py.
+EXTERNAL_ORDER_SOURCES: frozenset[str] = frozenset({
+    OrderSource.UBER_EATS.value,
+    OrderSource.MR_D.value,
+    OrderSource.OTHER_EXTERNAL.value,
+})
+
+#: Everything the restaurant sold and collected for itself.
+IN_STORE_ORDER_SOURCES: frozenset[str] = frozenset({
+    OrderSource.POS.value,
+    OrderSource.WHATSAPP.value,
+    OrderSource.MANUAL.value,
+    OrderSource.ADMIN.value,
+})
+
+
+class ExternalPlatform(str, enum.Enum):
+    """
+    A delivery marketplace we can import a daily report from.
+
+    Kept separate from OrderSource so an import adapter, a saved product
+    mapping and a batch can all name a platform without implying that every
+    OrderSource value is importable.
+    """
+    UBER_EATS = "UBER_EATS"
+    MR_D = "MR_D"
+    GENERIC = "GENERIC"
+
+
+#: Which OrderSource an imported platform's orders are recorded as.
+PLATFORM_TO_ORDER_SOURCE: dict[str, str] = {
+    ExternalPlatform.UBER_EATS.value: OrderSource.UBER_EATS.value,
+    ExternalPlatform.MR_D.value: OrderSource.MR_D.value,
+    ExternalPlatform.GENERIC.value: OrderSource.OTHER_EXTERNAL.value,
+}
+
+
+class ExternalImportStatus(str, enum.Enum):
+    """
+    PREVIEW    - parsed and validated, nothing written
+    COMPLETED  - orders created and stock posted
+    BLOCKED    - unresolved items or a closed-period conflict stopped it
+    FAILED     - the file could not be processed
+    """
+    PREVIEW = "PREVIEW"
+    COMPLETED = "COMPLETED"
+    BLOCKED = "BLOCKED"
+    FAILED = "FAILED"
+
+
+class ExternalMappingKind(str, enum.Enum):
+    """
+    ITEM     - an external product name -> a NextGen menu item (+ size option)
+    MODIFIER - an external modifier -> an add-on, an option, or a removal
+    """
+    ITEM = "ITEM"
+    MODIFIER = "MODIFIER"
 
 
 class PaymentStatus(str, enum.Enum):
