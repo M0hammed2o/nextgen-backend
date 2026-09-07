@@ -79,6 +79,7 @@ class RecipeItemResponse(BaseModel):
     ingredient_id: uuid.UUID
     ingredient_name: str
     canonical_unit: str
+    unit_label: str | None = None
     quantity_milli: int
     quantity_display: str
     option_group_id: str | None
@@ -112,6 +113,7 @@ def _build_response(recipe: Recipe, ingredients: dict[uuid.UUID, Ingredient]) ->
     for line in sorted(recipe.items or [], key=lambda x: (x.sort_order or 0)):
         ingredient = ingredients.get(line.ingredient_id)
         unit = ingredient.canonical_unit if ingredient else CanonicalUnit.UNIT.value
+        label = ingredient.unit_label if ingredient else None
         cost = value_cents(
             int(line.quantity_milli),
             int(ingredient.cost_per_canonical_micro_cents or 0) if ingredient else 0,
@@ -127,8 +129,11 @@ def _build_response(recipe: Recipe, ingredients: dict[uuid.UUID, Ingredient]) ->
                 ingredient_id=line.ingredient_id,
                 ingredient_name=ingredient.name if ingredient else "(deleted ingredient)",
                 canonical_unit=unit,
+                unit_label=label,
                 quantity_milli=int(line.quantity_milli),
-                quantity_display=format_quantity(int(line.quantity_milli), CanonicalUnit(unit)),
+                quantity_display=format_quantity(
+                    int(line.quantity_milli), CanonicalUnit(unit), label
+                ),
                 option_group_id=line.option_group_id,
                 option_id=line.option_id,
                 removable_ref_id=line.removable_ref_id,

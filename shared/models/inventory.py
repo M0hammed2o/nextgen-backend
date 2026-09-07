@@ -90,6 +90,23 @@ class Ingredient(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         nullable=False,
         comment="UNIT_COUNT / WEIGHT / VOLUME - how staff are told to count it",
     )
+    unit_label: Mapped[str | None] = mapped_column(
+        String(32),
+        nullable=True,
+        comment=(
+            "The noun staff actually say for a COUNTABLE ingredient - "
+            "'portion', 'box', 'sachet', 'ball'. Display only; the ledger "
+            "still counts canonical units. A prepacked franchise counts "
+            "portions, not grams, and a stock screen that says a bare '72' "
+            "instead of '72 portions' is one nobody keeps up to date. "
+            "Ignored for mass/volume, which already have real units."
+        ),
+    )
+    category: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+        comment="Free-text grouping for the ingredient list, e.g. 'Dairy', 'Packaging'",
+    )
 
     # -- Purchasing ---------------------------------------------------------
     purchase_unit_name: Mapped[str | None] = mapped_column(

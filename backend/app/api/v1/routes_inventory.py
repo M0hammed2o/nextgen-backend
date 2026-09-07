@@ -99,6 +99,12 @@ class IngredientCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     canonical_unit: str = Field(pattern="^(GRAM|MILLILITRE|UNIT)$")
     count_method: str = Field(default="UNIT_COUNT", pattern="^(UNIT_COUNT|WEIGHT|VOLUME)$")
+    unit_label: str | None = Field(
+        default=None, max_length=32,
+        description="The noun staff say for a countable ingredient - "
+                    "'portion', 'box', 'sachet'. Ignored for weight/volume.",
+    )
+    category: str | None = Field(default=None, max_length=64)
     sku: str | None = Field(default=None, max_length=64)
     purchase_unit_name: str | None = Field(default=None, max_length=64)
     purchase_pack_quantity: str = Field(
@@ -120,6 +126,8 @@ class IngredientCreateRequest(BaseModel):
 class IngredientUpdateRequest(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=255)
     count_method: str | None = Field(default=None, pattern="^(UNIT_COUNT|WEIGHT|VOLUME)$")
+    unit_label: str | None = Field(default=None, max_length=32)
+    category: str | None = Field(default=None, max_length=64)
     sku: str | None = Field(default=None, max_length=64)
     purchase_unit_name: str | None = Field(default=None, max_length=64)
     purchase_pack_quantity: str | None = None
@@ -137,6 +145,8 @@ class IngredientResponse(BaseModel):
     sku: str | None
     canonical_unit: str
     count_method: str
+    unit_label: str | None = None
+    category: str | None = None
     purchase_unit_name: str | None
     purchase_pack_milli: int
     cost_per_pack_cents: int | None
@@ -192,6 +202,8 @@ class StockLevelResponse(BaseModel):
     name: str
     canonical_unit: str
     count_method: str
+    unit_label: str | None = None
+    category: str | None = None
     on_hand_milli: int
     on_hand_display: str
     par_level_milli: int | None
@@ -217,6 +229,8 @@ def _ingredient_response(ingredient: Ingredient, on_hand: int) -> IngredientResp
         sku=ingredient.sku,
         canonical_unit=ingredient.canonical_unit,
         count_method=ingredient.count_method,
+        unit_label=ingredient.unit_label,
+        category=ingredient.category,
         purchase_unit_name=ingredient.purchase_unit_name,
         purchase_pack_milli=int(ingredient.purchase_pack_milli or 0),
         cost_per_pack_cents=ingredient.cost_per_pack_cents,
@@ -225,7 +239,9 @@ def _ingredient_response(ingredient: Ingredient, on_hand: int) -> IngredientResp
         is_active=ingredient.is_active,
         notes=ingredient.notes,
         on_hand_milli=on_hand,
-        on_hand_display=format_quantity(on_hand, CanonicalUnit(ingredient.canonical_unit)),
+        on_hand_display=format_quantity(
+            on_hand, CanonicalUnit(ingredient.canonical_unit), ingredient.unit_label
+        ),
         below_par=par is not None and on_hand < par,
     )
 
@@ -296,6 +312,8 @@ async def create_ingredient(
         sku=body.sku,
         canonical_unit=body.canonical_unit,
         count_method=body.count_method,
+        unit_label=(body.unit_label or "").strip() or None,
+        category=(body.category or "").strip() or None,
         purchase_unit_name=body.purchase_unit_name,
         purchase_pack_milli=pack_milli,
         cost_per_pack_cents=body.cost_per_pack_cents,
@@ -335,7 +353,8 @@ async def update_ingredient(
     if not ingredient:
         raise NotFoundError("Ingredient", str(ingredient_id))
 
-    for simple in ("name", "sku", "count_method", "purchase_unit_name", "is_active", "notes"):
+    for simple in ("name", "sku", "count_method", "unit_label", "category",
+                   "purchase_unit_name", "is_active", "notes"):
         value = getattr(body, simple, None)
         if value is not None:
             setattr(ingredient, simple, value)
@@ -446,9 +465,11 @@ async def get_stock_levels(
                 name=ingredient.name,
                 canonical_unit=ingredient.canonical_unit,
                 count_method=ingredient.count_method,
+                unit_label=ingredient.unit_label,
+                category=ingredient.category,
                 on_hand_milli=quantity,
                 on_hand_display=format_quantity(
-                    quantity, CanonicalUnit(ingredient.canonical_unit)
+                    quantity, CanonicalUnit(ingredient.canonical_unit), ingredient.unit_label
                 ),
                 par_level_milli=ingredient.par_level_milli,
                 below_par=below,
@@ -749,5 +770,7 @@ async def create_adjustment(
     return {
         "ingredient_id": str(ingredient.id),
         "quantity_milli": quantity_milli,
-        "display": format_quantity(quantity_milli, CanonicalUnit(ingredient.canonical_unit)),
+        "display": format_quantity(
+            quantity_milli, CanonicalUnit(ingredient.canonical_unit), ingredient.unit_label
+        ),
     }

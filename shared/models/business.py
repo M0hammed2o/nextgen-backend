@@ -230,6 +230,12 @@ class Business(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         comment="Tenant receipt template config — trading/franchise name, branch, "
                 "address, phone, footer, QR, header lines. See backend/app/receipts/."
     )
+    menu_reference_asset_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True,
+        comment="Photo/scan/PDF of the client's EXISTING menu, kept as an "
+                "onboarding reference for assisted import. Never shown to a "
+                "customer — the live menu is always the structured records."
+    )
     receipt_reference_asset_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True,
         comment="Photo/scan/PDF of the client's CURRENT till slip, kept as an "

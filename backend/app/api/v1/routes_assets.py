@@ -34,6 +34,12 @@ settings = get_settings()
 ALLOWED_CONTENT_TYPES = {
     "image/png", "image/jpeg", "image/webp", "image/gif",
 }
+# Onboarding REFERENCE documents only — a photo/scan/PDF of the restaurant's
+# existing menu or till slip, uploaded so we can reproduce a layout they
+# already have. Never rendered to a customer and never printed: the live menu
+# and the printed receipt are always the structured records.
+REFERENCE_CONTENT_TYPES = ALLOWED_CONTENT_TYPES | {"application/pdf"}
+REFERENCE_KINDS = {"MENU_REFERENCE", "RECEIPT_REFERENCE"}
 MAX_FILE_SIZE_MB = 5
 
 
@@ -41,12 +47,16 @@ MAX_FILE_SIZE_MB = 5
 
 class UploadUrlRequest(BaseModel):
     kind: str = Field(
-        description="MENU_ITEM_IMAGE | BUSINESS_LOGO | SPECIAL_IMAGE | BUSINESS_MENU_IMAGE"
+        description="MENU_ITEM_IMAGE | BUSINESS_LOGO | SPECIAL_IMAGE | "
+                    "BUSINESS_MENU_IMAGE | MENU_REFERENCE | RECEIPT_REFERENCE"
     )
     entity_id: uuid.UUID | None = None
     content_type: str = Field(
         default="image/png",
-        pattern=r"^image/(png|jpeg|webp|gif)$",
+        # PDF is admitted here but only actually accepted for the reference
+        # kinds — enforced below, so a PDF can never be attached to a menu
+        # item or logo where a renderer expects an image.
+        pattern=r"^(image/(png|jpeg|webp|gif)|application/pdf)$",
     )
     original_filename: str | None = None
 
@@ -188,15 +198,17 @@ async def get_upload_url(
     3. Frontend attaches asset_id to the entity via PUT endpoint
        (e.g. PUT /v1/business/menu/items/{id} with image_asset_id)
     """
-    if body.content_type not in ALLOWED_CONTENT_TYPES:
+    is_reference = body.kind.upper() in REFERENCE_KINDS
+    permitted = REFERENCE_CONTENT_TYPES if is_reference else ALLOWED_CONTENT_TYPES
+    if body.content_type not in permitted:
         raise AppError(
             "INVALID_CONTENT_TYPE",
-            f"Allowed types: {', '.join(ALLOWED_CONTENT_TYPES)}",
+            f"Allowed types: {', '.join(sorted(permitted))}",
             status_code=422,
         )
 
     # Build storage path: {business_id}/{kind}/{asset_id}.{ext}
-    ext = body.content_type.split("/")[-1]
+    ext = "pdf" if body.content_type == "application/pdf" else body.content_type.split("/")[-1]
     if ext == "jpeg":
         ext = "jpg"
     asset_id = uuid.uuid4()

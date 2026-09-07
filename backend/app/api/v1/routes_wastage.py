@@ -212,7 +212,7 @@ async def record_wastage(
         ingredient_name=ingredient.name,
         quantity_milli=quantity_milli,
         quantity_display=format_quantity(
-            quantity_milli, CanonicalUnit(ingredient.canonical_unit)
+            quantity_milli, CanonicalUnit(ingredient.canonical_unit), ingredient.unit_label
         ),
         reason=entry.reason,
         note=entry.note,
@@ -249,7 +249,8 @@ async def list_wastage(
             ingredient_name=ingredient.name,
             quantity_milli=int(entry.quantity_milli),
             quantity_display=format_quantity(
-                int(entry.quantity_milli), CanonicalUnit(ingredient.canonical_unit)
+                int(entry.quantity_milli), CanonicalUnit(ingredient.canonical_unit),
+                ingredient.unit_label
             ),
             reason=entry.reason,
             note=entry.note,
@@ -299,7 +300,8 @@ async def approve_wastage(
         ingredient_name=ingredient.name,
         quantity_milli=int(entry.quantity_milli),
         quantity_display=format_quantity(
-            int(entry.quantity_milli), CanonicalUnit(ingredient.canonical_unit)
+            int(entry.quantity_milli), CanonicalUnit(ingredient.canonical_unit),
+            ingredient.unit_label
         ),
         reason=entry.reason,
         note=entry.note,

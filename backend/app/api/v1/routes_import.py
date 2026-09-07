@@ -25,10 +25,11 @@ import mechanism; openpyxl is already a dependency of this repo.
 
 import io
 import csv
+import json
 import uuid
 from dataclasses import dataclass, field
 
-from fastapi import APIRouter, Depends, File, UploadFile
+from fastapi import APIRouter, Depends, File, Form, UploadFile
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -43,7 +44,7 @@ from backend.app.inventory.units import (
 from shared.enums import CanonicalUnit
 from shared.models.business import Business
 from shared.models.inventory import Ingredient
-from shared.models.menu import MenuItem
+from shared.models.menu import MenuCategory, MenuItem
 from shared.models.recipe import Recipe, RecipeItem
 
 router = APIRouter(prefix="/business/import", tags=["import"])
@@ -128,10 +129,330 @@ async def _read_rows(upload: UploadFile) -> list[dict]:
     return rows
 
 
+def apply_mapping(rows: list[dict], mapping: dict | None) -> list[dict]:
+    """
+    Rename a spreadsheet's own column headings to the ones the parsers expect.
+
+    A restaurant's sheet says "Product", "Selling Price", "Item Description".
+    Rather than forcing them to rewrite the file, the UI shows the detected
+    headings, the user maps each to a known field, and that mapping arrives
+    here as {"their heading": "our field"}.
+
+    Unmapped columns are kept as-is, so a sheet that already uses the right
+    headings needs no mapping at all.
+    """
+    if not mapping:
+        return rows
+    lookup = {
+        str(k).strip().lower(): str(v).strip().lower()
+        for k, v in mapping.items()
+        if k and v
+    }
+    if not lookup:
+        return rows
+    return [{lookup.get(k, k): v for k, v in row.items()} for row in rows]
+
+
+def detected_columns(rows: list[dict]) -> list[str]:
+    """The headings actually present, so the UI can offer a mapping step."""
+    seen: list[str] = []
+    for row in rows[:5]:
+        for key in row:
+            if key and key not in seen:
+                seen.append(key)
+    return seen
+
+
+def parse_mapping(raw: str | None) -> dict | None:
+    """Mapping arrives as a JSON string alongside a multipart file upload."""
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError) as exc:
+        raise AppError("INVALID_MAPPING", "Column mapping must be valid JSON", 422) from exc
+    if not isinstance(parsed, dict):
+        raise AppError("INVALID_MAPPING", "Column mapping must be an object", 422)
+    return parsed
+
+
+# -- Menu items --------------------------------------------------------------
+
+MENU_TEMPLATE = [
+    "category", "name", "description", "price", "size", "active", "sku",
+]
+
+
+def _money_to_cents(raw: str) -> int | None:
+    cleaned = (raw or "").strip().replace("R", "").replace(",", "").replace(" ", "")
+    if not cleaned:
+        return None
+    return int(round(float(cleaned) * 100))
+
+
+def _parse_menu(rows: list[dict]) -> tuple[dict, list[RowError]]:
+    """
+    Parse a menu sheet into grouped items.
+
+    SIZES ARE NOT SEPARATE PRODUCTS. This platform models a size as an option
+    group on ONE menu item, and the recipe system scopes ingredient quantities
+    to those options - that is what lets a Large deduct more cheese than a
+    Small. So rows sharing a category+name are collapsed into one item with a
+    Size option group, priced as deltas from the cheapest size.
+
+    Returns ({(category, name): item_dict}, errors).
+    """
+    grouped: dict[tuple, dict] = {}
+    errors: list[RowError] = []
+
+    for index, row in enumerate(rows, start=2):  # row 1 is the header
+        name = (row.get("name") or row.get("product") or row.get("item") or "").strip()
+        if not name:
+            errors.append(RowError(index, "Missing 'name'"))
+            continue
+
+        category = (row.get("category") or "").strip() or "Menu"
+        size = (row.get("size") or "").strip()
+
+        raw_price = row.get("price") or row.get("selling price") or ""
+        try:
+            price_cents = _money_to_cents(str(raw_price))
+        except ValueError:
+            errors.append(RowError(index, f"Price {raw_price!r} is not a number"))
+            continue
+        if price_cents is None:
+            errors.append(RowError(index, f"{name}: price is missing"))
+            continue
+        if price_cents < 0:
+            errors.append(RowError(index, f"{name}: price cannot be negative"))
+            continue
+
+        active_raw = (row.get("active") or "").strip().lower()
+        is_active = active_raw not in ("no", "false", "0", "inactive", "n")
+
+        key = (category.casefold(), name.casefold())
+        entry = grouped.setdefault(key, {
+            "category": category,
+            "name": name,
+            "description": (row.get("description") or "").strip() or None,
+            "sku": (row.get("sku") or row.get("code") or "").strip() or None,
+            "is_active": is_active,
+            "sizes": [],
+            "price_cents": None,
+            "rows": [],
+        })
+        entry["rows"].append(index)
+
+        if size:
+            if any(s["name"].casefold() == size.casefold() for s in entry["sizes"]):
+                errors.append(
+                    RowError(index, f"Duplicate size {size!r} for {name!r}")
+                )
+                continue
+            entry["sizes"].append({"name": size, "price_cents": price_cents})
+        else:
+            if entry["price_cents"] is not None:
+                errors.append(RowError(index, f"Duplicate menu item {name!r}"))
+                continue
+            entry["price_cents"] = price_cents
+
+    # Resolve base price + option deltas now that every row is seen.
+    for key, entry in grouped.items():
+        if entry["sizes"]:
+            base = min(s["price_cents"] for s in entry["sizes"])
+            entry["price_cents"] = base
+            for size in entry["sizes"]:
+                size["price_delta_cents"] = size["price_cents"] - base
+        elif entry["price_cents"] is None:
+            errors.append(RowError(entry["rows"][0], f"{entry['name']}: no price"))
+
+    return grouped, errors
+
+
+@router.post("/menu/preview")
+async def preview_menu(
+    file: UploadFile = File(...),
+    mapping: str | None = Form(default=None),
+    user: AuthUser = Depends(require_owner_or_manager),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Parse and validate a menu spreadsheet without writing anything.
+
+    Returns the detected column headings so the UI can offer a mapping step,
+    plus row-level errors and exactly what would be created or updated.
+    """
+    raw_rows = await _read_rows(file)
+    rows = apply_mapping(raw_rows, parse_mapping(mapping))
+    grouped, errors = _parse_menu(rows)
+
+    existing = {
+        (item.name or "").casefold()
+        for item in (
+            await db.execute(
+                select(MenuItem).where(
+                    MenuItem.business_id == user.business_id,
+                    MenuItem.is_deleted.is_(False),
+                )
+            )
+        ).scalars().all()
+    }
+
+    preview = []
+    for entry in grouped.values():
+        preview.append({
+            "category": entry["category"],
+            "name": entry["name"],
+            "description": entry["description"],
+            "price_cents": entry["price_cents"],
+            "sizes": [
+                {"name": s["name"], "price_cents": s["price_cents"],
+                 "price_delta_cents": s.get("price_delta_cents", 0)}
+                for s in entry["sizes"]
+            ],
+            "is_active": entry["is_active"],
+            "action": "update" if entry["name"].casefold() in existing else "create",
+        })
+
+    return {
+        "template_columns": MENU_TEMPLATE,
+        "detected_columns": detected_columns(raw_rows),
+        "total_rows": len(rows),
+        "valid_items": len(grouped),
+        "error_count": len(errors),
+        "errors": [{"row": e.row, "message": e.message} for e in errors],
+        "would_create": sum(1 for p in preview if p["action"] == "create"),
+        "would_update": sum(1 for p in preview if p["action"] == "update"),
+        "preview": preview,
+    }
+
+
+@router.post("/menu/commit")
+async def commit_menu(
+    file: UploadFile = File(...),
+    mapping: str | None = Form(default=None),
+    user: AuthUser = Depends(require_owner_or_manager),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Import a menu. Refuses the whole file if ANY row is invalid, so a partial
+    menu can never go live looking complete.
+
+    Existing items with the same name are UPDATED in place rather than
+    duplicated, so re-uploading a corrected sheet is safe and repeatable -
+    which is the whole point of letting a restaurant fix and re-upload.
+    """
+    raw_rows = await _read_rows(file)
+    rows = apply_mapping(raw_rows, parse_mapping(mapping))
+    grouped, errors = _parse_menu(rows)
+
+    if errors:
+        raise AppError(
+            "IMPORT_HAS_ERRORS",
+            f"{len(errors)} row(s) have problems - nothing was imported",
+            422,
+            details={"errors": [{"row": e.row, "message": e.message} for e in errors[:50]]},
+        )
+    if not grouped:
+        raise AppError("EMPTY_IMPORT", "No usable menu rows were found in that file", 422)
+
+    categories = {
+        (c.name or "").casefold(): c
+        for c in (
+            await db.execute(
+                select(MenuCategory).where(MenuCategory.business_id == user.business_id)
+            )
+        ).scalars().all()
+    }
+    items = {
+        (i.name or "").casefold(): i
+        for i in (
+            await db.execute(
+                select(MenuItem).where(
+                    MenuItem.business_id == user.business_id,
+                    MenuItem.is_deleted.is_(False),
+                )
+            )
+        ).scalars().all()
+    }
+
+    created = updated = categories_created = 0
+
+    for entry in grouped.values():
+        cat_key = entry["category"].casefold()
+        category = categories.get(cat_key)
+        if not category:
+            category = MenuCategory(business_id=user.business_id, name=entry["category"])
+            db.add(category)
+            await db.flush()
+            categories[cat_key] = category
+            categories_created += 1
+
+        options_json = None
+        if entry["sizes"]:
+            options_json = {
+                "option_groups": [{
+                    "id": "size",
+                    "name": "Size",
+                    "required": True,
+                    "is_enabled": True,
+                    "options": [
+                        {
+                            # Stable, human-readable ids so a recipe sheet can
+                            # reference "size-large" without the manager
+                            # hunting for a UUID.
+                            "id": f"size-{s['name'].strip().lower().replace(' ', '-')}",
+                            "name": s["name"],
+                            "price_delta_cents": s["price_delta_cents"],
+                            "is_enabled": True,
+                        }
+                        for s in entry["sizes"]
+                    ],
+                }],
+                "removable_ingredients": [],
+            }
+
+        item = items.get(entry["name"].casefold())
+        if item:
+            item.category_id = category.id
+            item.name = entry["name"]
+            item.description = entry["description"]
+            item.price_cents = entry["price_cents"]
+            item.is_active = entry["is_active"]
+            if options_json:
+                # Preserve any removable ingredients the manager configured by
+                # hand; only the size group is replaced from the sheet.
+                previous = item.options_json or {}
+                options_json["removable_ingredients"] = previous.get(
+                    "removable_ingredients", []
+                ) or []
+                item.options_json = options_json
+            updated += 1
+        else:
+            db.add(MenuItem(
+                business_id=user.business_id,
+                category_id=category.id,
+                name=entry["name"],
+                description=entry["description"],
+                price_cents=entry["price_cents"],
+                is_active=entry["is_active"],
+                options_json=options_json,
+            ))
+            created += 1
+
+    await db.commit()
+    return {
+        "created": created,
+        "updated": updated,
+        "categories_created": categories_created,
+    }
+
+
 # ── Ingredients ──────────────────────────────────────────────────────────────
 
 INGREDIENT_TEMPLATE = [
-    "name", "unit", "pack_size", "pack_unit", "pack_cost", "count_method", "sku", "par_level",
+    "name", "unit", "unit_label", "category", "pack_size", "pack_unit",
+    "pack_cost", "count_method", "sku", "par_level", "opening_quantity",
 ]
 
 
@@ -154,7 +475,12 @@ def _parse_ingredients(rows: list[dict]) -> ParseResult:
         canonical = {
             "G": "GRAM", "GRAM": "GRAM", "GRAMS": "GRAM", "KG": "GRAM",
             "ML": "MILLILITRE", "MILLILITRE": "MILLILITRE", "L": "MILLILITRE",
-            "UNIT": "UNIT", "UNITS": "UNIT", "EACH": "UNIT",
+            "UNIT": "UNIT", "UNITS": "UNIT", "EACH": "UNIT", "EA": "UNIT",
+            "PORTION": "UNIT", "PORTIONS": "UNIT", "SACHET": "UNIT",
+            "SACHETS": "UNIT", "BOTTLE": "UNIT", "BOTTLES": "UNIT",
+            "BOX": "UNIT", "BOXES": "UNIT", "BALL": "UNIT", "BALLS": "UNIT",
+            "TUB": "UNIT", "SLICE": "UNIT", "SLICES": "UNIT",
+            "CAN": "UNIT", "CANS": "UNIT",
         }.get(unit_raw)
         if not canonical:
             result.errors.append(
@@ -197,10 +523,19 @@ def _parse_ingredients(rows: list[dict]) -> ParseResult:
                 "GRAM": "WEIGHT", "MILLILITRE": "VOLUME", "UNIT": "UNIT_COUNT"
             }[canonical]
 
+        # The noun staff use. Defaults to whatever countable word they typed
+        # in the unit column ("portion", "box"), so a franchise sheet needs no
+        # extra column to read naturally on screen.
+        unit_label = (row.get("unit_label") or "").strip() or None
+        if not unit_label and canonical == "UNIT" and unit_raw not in ("UNIT", "UNITS", ""):
+            unit_label = unit_raw.lower().rstrip("s") or None
+
         result.rows.append({
             "name": name,
             "canonical_unit": canonical,
             "count_method": count_method,
+            "unit_label": unit_label,
+            "category": (row.get("category") or "").strip() or None,
             "sku": (row.get("sku") or "").strip() or None,
             "purchase_unit_name": f"{pack_size} {pack_unit.lower()}" if pack_size != "1" else None,
             "purchase_pack_milli": pack_milli,
@@ -218,6 +553,7 @@ def _parse_ingredients(rows: list[dict]) -> ParseResult:
 @router.post("/ingredients/preview")
 async def preview_ingredients(
     file: UploadFile = File(...),
+    mapping: str | None = Form(default=None),
     user: AuthUser = Depends(require_owner_or_manager),
     db: AsyncSession = Depends(get_db),
 ):
@@ -228,7 +564,8 @@ async def preview_ingredients(
     skipped before committing.
     """
     await _require_inventory_enabled(db, user.business_id)
-    parsed = _parse_ingredients(await _read_rows(file))
+    raw_rows = await _read_rows(file)
+    parsed = _parse_ingredients(apply_mapping(raw_rows, parse_mapping(mapping)))
 
     existing = {
         name.casefold()
@@ -244,6 +581,7 @@ async def preview_ingredients(
 
     return {
         "template_columns": INGREDIENT_TEMPLATE,
+        "detected_columns": detected_columns(raw_rows),
         "total_rows": len(parsed.rows) + len(parsed.errors),
         "valid_rows": len(parsed.rows),
         "error_count": len(parsed.errors),
@@ -257,6 +595,7 @@ async def preview_ingredients(
 @router.post("/ingredients/commit")
 async def commit_ingredients(
     file: UploadFile = File(...),
+    mapping: str | None = Form(default=None),
     user: AuthUser = Depends(require_owner_or_manager),
     db: AsyncSession = Depends(get_db),
 ):
@@ -265,7 +604,8 @@ async def commit_ingredients(
     partial import can never leave stock data that looks complete but is not.
     """
     await _require_inventory_enabled(db, user.business_id)
-    parsed = _parse_ingredients(await _read_rows(file))
+    raw_rows = await _read_rows(file)
+    parsed = _parse_ingredients(apply_mapping(raw_rows, parse_mapping(mapping)))
 
     if parsed.errors:
         raise AppError(
@@ -395,6 +735,7 @@ def _parse_recipes(rows: list[dict], items: dict, ingredients: dict):
 @router.post("/recipes/preview")
 async def preview_recipes(
     file: UploadFile = File(...),
+    mapping: str | None = Form(default=None),
     user: AuthUser = Depends(require_owner_or_manager),
     db: AsyncSession = Depends(get_db),
 ):
@@ -403,12 +744,14 @@ async def preview_recipes(
     writing anything. One row per ingredient line, grouped by menu_item.
     """
     await _require_inventory_enabled(db, user.business_id)
-    rows = await _read_rows(file)
+    raw_rows = await _read_rows(file)
+    rows = apply_mapping(raw_rows, parse_mapping(mapping))
     items, ingredients = await _load_lookup(db, user.business_id)
     grouped, errors = _parse_recipes(rows, items, ingredients)
 
     return {
         "template_columns": RECIPE_TEMPLATE,
+        "detected_columns": detected_columns(raw_rows),
         "total_rows": len(rows),
         "valid_rows": sum(len(v) for v in grouped.values()),
         "error_count": len(errors),
@@ -424,6 +767,7 @@ async def preview_recipes(
 @router.post("/recipes/commit")
 async def commit_recipes(
     file: UploadFile = File(...),
+    mapping: str | None = Form(default=None),
     user: AuthUser = Depends(require_owner_or_manager),
     db: AsyncSession = Depends(get_db),
 ):
@@ -436,7 +780,8 @@ async def commit_recipes(
     at sale time, so past orders keep exactly what they consumed.
     """
     await _require_inventory_enabled(db, user.business_id)
-    rows = await _read_rows(file)
+    raw_rows = await _read_rows(file)
+    rows = apply_mapping(raw_rows, parse_mapping(mapping))
     items, ingredients = await _load_lookup(db, user.business_id)
     grouped, errors = _parse_recipes(rows, items, ingredients)
 

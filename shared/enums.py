@@ -153,6 +153,13 @@ class AssetKind(str, enum.Enum):
     MENU_ITEM_IMAGE = "MENU_ITEM_IMAGE"
     BUSINESS_LOGO = "BUSINESS_LOGO"
     SPECIAL_IMAGE = "SPECIAL_IMAGE"
+    # Onboarding reference documents a restaurant uploads about ITSELF. These
+    # are inputs we read to reproduce something the client already has — an
+    # existing menu, an existing till slip. Neither is ever rendered to a
+    # customer; the live menu and the printed receipt are always the
+    # structured records.
+    MENU_REFERENCE = "MENU_REFERENCE"
+    RECEIPT_REFERENCE = "RECEIPT_REFERENCE"
 
 
 # ── Audit ────────────────────────────────────────────────────────────────────

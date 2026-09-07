@@ -137,6 +137,7 @@ class StocktakeLineResponse(BaseModel):
     ingredient_name: str
     canonical_unit: str
     count_method: str
+    unit_label: str | None = None
     counted_quantity_milli: int | None
     counted_display: str | None
     opening_quantity_milli: int
@@ -239,14 +240,16 @@ def _line_response(
     line: StocktakeLine, ingredient: Ingredient, variance: IngredientVariance
 ) -> StocktakeLineResponse:
     unit = CanonicalUnit(ingredient.canonical_unit)
+    label = ingredient.unit_label
     return StocktakeLineResponse(
         ingredient_id=ingredient.id,
         ingredient_name=ingredient.name,
         canonical_unit=ingredient.canonical_unit,
         count_method=line.count_method_snapshot or ingredient.count_method,
+        unit_label=label,
         counted_quantity_milli=line.counted_quantity_milli,
         counted_display=(
-            format_quantity(line.counted_quantity_milli, unit)
+            format_quantity(line.counted_quantity_milli, unit, label)
             if line.counted_quantity_milli is not None
             else None
         ),
@@ -256,9 +259,9 @@ def _line_response(
         wastage_quantity_milli=variance.wastage_milli,
         adjustment_quantity_milli=variance.adjustment_milli,
         expected_quantity_milli=variance.expected_milli,
-        expected_display=format_quantity(variance.expected_milli, unit),
+        expected_display=format_quantity(variance.expected_milli, unit, label),
         variance_quantity_milli=variance.variance_milli,
-        variance_display=format_quantity(variance.variance_milli, unit),
+        variance_display=format_quantity(variance.variance_milli, unit, label),
         variance_value_cents=variance.variance_value_cents,
         variance_basis_points=variance.variance_basis_points,
         variance_percent=format_basis_points(variance.variance_basis_points),

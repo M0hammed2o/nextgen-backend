@@ -76,7 +76,27 @@ UNIT_DEFS: dict[str, tuple[MeasureFamily, Decimal]] = {
     "UNITS": (MeasureFamily.COUNT, Decimal("1")),
     "EACH": (MeasureFamily.COUNT, Decimal("1")),
     "EA": (MeasureFamily.COUNT, Decimal("1")),
+    # Franchise vocabulary. A prepacked restaurant genuinely counts portions,
+    # sachets and boxes — not grams — and forcing them to convert is how you
+    # get a stock system nobody keeps up to date. These are all COUNT: one
+    # portion is one indivisible thing as far as the ledger is concerned.
+    # (PACK and CASE are deliberately NOT here: those mean "a purchase pack of
+    # this ingredient's own size" and are handled by purchase_pack_milli.)
     "PORTION": (MeasureFamily.COUNT, Decimal("1")),
+    "PORTIONS": (MeasureFamily.COUNT, Decimal("1")),
+    "SACHET": (MeasureFamily.COUNT, Decimal("1")),
+    "SACHETS": (MeasureFamily.COUNT, Decimal("1")),
+    "BOTTLE": (MeasureFamily.COUNT, Decimal("1")),
+    "BOTTLES": (MeasureFamily.COUNT, Decimal("1")),
+    "BOX": (MeasureFamily.COUNT, Decimal("1")),
+    "BOXES": (MeasureFamily.COUNT, Decimal("1")),
+    "BALL": (MeasureFamily.COUNT, Decimal("1")),
+    "BALLS": (MeasureFamily.COUNT, Decimal("1")),
+    "TUB": (MeasureFamily.COUNT, Decimal("1")),
+    "SLICE": (MeasureFamily.COUNT, Decimal("1")),
+    "SLICES": (MeasureFamily.COUNT, Decimal("1")),
+    "CAN": (MeasureFamily.COUNT, Decimal("1")),
+    "CANS": (MeasureFamily.COUNT, Decimal("1")),
 }
 
 # Units we are willing to *display* in, largest first, per family. Renders
@@ -195,13 +215,45 @@ def _trim(d: Decimal) -> str:
     return format(normalised, "f")
 
 
-def format_quantity(quantity_milli: int, canonical: CanonicalUnit) -> str:
+def pluralise(label: str, quantity) -> str:
+    """
+    Naive but adequate pluralisation for stock nouns: 'portion' -> 'portions',
+    'box' -> 'boxes'. Restaurant vocabulary is short and regular, so a full
+    inflection library would be more machinery than the problem deserves.
+    """
+    label = (label or "").strip()
+    if not label:
+        return ""
+    try:
+        singular = abs(Decimal(str(quantity))) == 1
+    except Exception:
+        singular = False
+    if singular:
+        return label
+    if label.endswith(("s", "x", "z", "ch", "sh")):
+        return label + "es"
+    if label.endswith("y") and not label.endswith(("ay", "ey", "iy", "oy", "uy")):
+        return label[:-1] + "ies"
+    return label + "s"
+
+
+def format_quantity(
+    quantity_milli: int,
+    canonical: CanonicalUnit,
+    unit_label: str | None = None,
+) -> str:
     """
     Human-readable, picking the largest sensible unit.
 
-        format_quantity(10_000_000, GRAM) -> '10 kg'
-        format_quantity(150_000, GRAM)    -> '150 g'
-        format_quantity(72_000, UNIT)     -> '72'
+        format_quantity(10_000_000, GRAM)               -> '10 kg'
+        format_quantity(150_000, GRAM)                  -> '150 g'
+        format_quantity(72_000, UNIT)                   -> '72'
+        format_quantity(72_000, UNIT, 'portion')        -> '72 portions'
+        format_quantity(1_000, UNIT, 'portion')         -> '1 portion'
+
+    `unit_label` is the noun the restaurant actually uses. It applies only to
+    countable ingredients — a mass or volume already has a real unit, and
+    "150 g portions" would be nonsense.
     """
     family = CANONICAL_FAMILY[canonical]
     canonical_qty = to_canonical(quantity_milli)
@@ -210,8 +262,14 @@ def format_quantity(quantity_milli: int, canonical: CanonicalUnit) -> str:
 
     for symbol, size in DISPLAY_LADDER[family]:
         if magnitude >= size or size == Decimal("1"):
-            text = _trim(magnitude / size)
-            out = f"{text} {symbol}".strip()
+            value = magnitude / size
+            text = _trim(value)
+            noun = (
+                pluralise(unit_label, value)
+                if unit_label and family is MeasureFamily.COUNT
+                else symbol
+            )
+            out = f"{text} {noun}".strip()
             return f"-{out}" if negative else out
 
     return _trim(canonical_qty)
