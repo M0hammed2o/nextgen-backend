@@ -41,10 +41,11 @@ class OrderStatus(str, enum.Enum):
     FEE_SENT = "FEE_SENT"                          # staff set fee, waiting for customer approval
     NEW = "NEW"
     ACCEPTED = "ACCEPTED"
-    IN_PROGRESS = "IN_PROGRESS"
+    IN_PROGRESS = "IN_PROGRESS"                    # "Preparing" in the UI
     READY = "READY"
-    COLLECTED = "COLLECTED"
-    DELIVERED = "DELIVERED"
+    COLLECTED = "COLLECTED"                        # takeaway/pickup terminal state
+    DELIVERED = "DELIVERED"                        # delivery terminal state
+    COMPLETED = "COMPLETED"                         # dine-in terminal state, and grab-and-go POS sales
     CANCELLED = "CANCELLED"
 
 
@@ -55,9 +56,12 @@ ORDER_STATUS_TRANSITIONS: dict[OrderStatus, list[OrderStatus]] = {
     OrderStatus.NEW: [OrderStatus.ACCEPTED, OrderStatus.CANCELLED],
     OrderStatus.ACCEPTED: [OrderStatus.IN_PROGRESS, OrderStatus.CANCELLED],
     OrderStatus.IN_PROGRESS: [OrderStatus.READY, OrderStatus.CANCELLED],
-    OrderStatus.READY: [OrderStatus.COLLECTED, OrderStatus.DELIVERED, OrderStatus.CANCELLED],
+    OrderStatus.READY: [
+        OrderStatus.COLLECTED, OrderStatus.DELIVERED, OrderStatus.COMPLETED, OrderStatus.CANCELLED,
+    ],
     OrderStatus.COLLECTED: [],
     OrderStatus.DELIVERED: [],
+    OrderStatus.COMPLETED: [],
     OrderStatus.CANCELLED: [],
 }
 
@@ -79,9 +83,25 @@ class PaymentStatus(str, enum.Enum):
     UNPAID = "UNPAID"            # online payment required, instructions not yet sent
     PENDING = "PENDING"          # payment instructions sent / card at collection
     PAID = "PAID"                # payment confirmed
+    PARTIALLY_REFUNDED = "PARTIALLY_REFUNDED"  # amount_cents < total_cents refunded
+    REFUNDED = "REFUNDED"        # payment refunded in full
     FAILED = "FAILED"            # payment attempt failed
-    REFUNDED = "REFUNDED"        # payment refunded
+    VOIDED = "VOIDED"            # a mis-rung POS sale reversed with no external refund transaction
     CASH_ON_COLLECTION = "CASH_ON_COLLECTION"  # traditional cash flow
+
+
+class POSPaymentMethod(str, enum.Enum):
+    """
+    Payment methods a cashier can select at the POS till itself — distinct
+    from Order.payment_method's broader freeform value (which also covers
+    online/WhatsApp-flow methods like PAYSHAP/PAYFAST payment links). CARD
+    here means "any physical card terminal" (Yoco/iKhokha/etc.) confirmed
+    manually by the cashier — see Business.pos_card_enabled and friends for
+    which specific terminal brands a business has switched on.
+    """
+    CASH = "CASH"
+    CARD = "CARD"
+    OTHER = "OTHER"
 
 
 # ── Messages ─────────────────────────────────────────────────────────────────
@@ -140,3 +160,118 @@ class AssetKind(str, enum.Enum):
 class AuditScope(str, enum.Enum):
     PLATFORM = "PLATFORM"
     BUSINESS = "BUSINESS"
+
+
+# ── Inventory: units & measurement ───────────────────────────────────────────
+#
+# Canonical storage rule (see backend/app/inventory/units.py):
+#   every stock quantity in the database is an INTEGER count of
+#   thousandths ("milli") of the ingredient's canonical unit. Grams,
+#   millilitres and whole units are the only canonical units; kilograms,
+#   litres, cases and packs are *purchase* units that convert at the edge.
+#   Integers are used for the same reason money is stored in cents —
+#   binary floating point silently corrupts stock arithmetic.
+
+class CanonicalUnit(str, enum.Enum):
+    """The three units a stock quantity may actually be stored in."""
+    GRAM = "GRAM"              # mass      — cheese, chicken, flour
+    MILLILITRE = "MILLILITRE"  # volume    — oil, sauce (when poured)
+    UNIT = "UNIT"              # countable — dough balls, boxes, cans
+
+
+class MeasureFamily(str, enum.Enum):
+    """Groups units that may legally convert between each other."""
+    MASS = "MASS"
+    VOLUME = "VOLUME"
+    COUNT = "COUNT"
+
+
+class CountMethod(str, enum.Enum):
+    """
+    How staff are instructed to physically count this ingredient during a
+    stocktake. Shown on the count sheet — a half-full cheese bag counted
+    as "0.5" when the method is WEIGHT is the single most common source of
+    an unexplainable variance.
+    """
+    UNIT_COUNT = "UNIT_COUNT"  # count whole items
+    WEIGHT = "WEIGHT"          # put it on a scale
+    VOLUME = "VOLUME"          # measure the volume
+
+
+# ── Inventory: stock ledger ──────────────────────────────────────────────────
+
+class StockMovementType(str, enum.Enum):
+    """
+    Every reason stock may move. The ledger is append-only: a correction is
+    always a new compensating movement, never an edit of an existing row.
+    """
+    OPENING_BALANCE = "OPENING_BALANCE"
+    GOODS_RECEIVED = "GOODS_RECEIVED"
+    SALE_CONSUMPTION = "SALE_CONSUMPTION"
+    SALE_REVERSAL = "SALE_REVERSAL"
+    REMAKE_CONSUMPTION = "REMAKE_CONSUMPTION"
+    WASTAGE = "WASTAGE"
+    STAFF_MEAL = "STAFF_MEAL"
+    COMPLIMENTARY = "COMPLIMENTARY"
+    MANUAL_ADJUSTMENT = "MANUAL_ADJUSTMENT"
+    STOCKTAKE_ADJUSTMENT = "STOCKTAKE_ADJUSTMENT"
+    SUPPLIER_RETURN = "SUPPLIER_RETURN"
+
+
+class StockSourceType(str, enum.Enum):
+    """What kind of record a movement was caused by (with source_id)."""
+    ORDER = "ORDER"
+    GOODS_RECEIPT = "GOODS_RECEIPT"
+    WASTAGE_ENTRY = "WASTAGE_ENTRY"
+    STOCKTAKE = "STOCKTAKE"
+    MANUAL = "MANUAL"
+
+
+# ── Inventory: wastage ───────────────────────────────────────────────────────
+
+class WastageReason(str, enum.Enum):
+    """
+    Reason codes are what make a variance explainable. OTHER always
+    requires a note — an unexplained "other" is indistinguishable from
+    shrinkage at report time.
+    """
+    SPOILED = "SPOILED"
+    EXPIRED = "EXPIRED"
+    DROPPED = "DROPPED"
+    BURNT = "BURNT"
+    INCORRECT_PREPARATION = "INCORRECT_PREPARATION"
+    REMAKE = "REMAKE"
+    DAMAGED_PACKAGING = "DAMAGED_PACKAGING"
+    STAFF_MEAL = "STAFF_MEAL"
+    COMPLIMENTARY = "COMPLIMENTARY"
+    TRAINING = "TRAINING"
+    OTHER = "OTHER"
+
+
+# ── Inventory: stocktake ─────────────────────────────────────────────────────
+
+class StocktakeStatus(str, enum.Enum):
+    """
+    DRAFT   — counting in progress, lines may be edited
+    COMPLETED — counts submitted, variance computed, awaiting sign-off
+    APPROVED  — locked forever; adjustments posted to the ledger
+    CANCELLED — abandoned before completion
+    """
+    DRAFT = "DRAFT"
+    COMPLETED = "COMPLETED"
+    APPROVED = "APPROVED"
+    CANCELLED = "CANCELLED"
+
+
+# ── Receipts / printing ──────────────────────────────────────────────────────
+
+class ReceiptPaperWidth(int, enum.Enum):
+    """Standard thermal roll widths. 58 mm ≈ 32 chars, 80 mm ≈ 48 chars."""
+    MM_58 = 58
+    MM_80 = 80
+
+
+class PrinterProfile(str, enum.Enum):
+    """Which physical printer a document is destined for."""
+    CUSTOMER_RECEIPT = "CUSTOMER_RECEIPT"
+    KITCHEN = "KITCHEN"

@@ -12,14 +12,24 @@ from shared.models.audit import AuditEvent, MessageOutbox
 from shared.models.billing_invoice import BillingInvoice
 from shared.models.business import Business
 from shared.models.customer import ConversationSession, Customer
+from shared.models.inventory import (
+    GoodsReceipt,
+    GoodsReceiptLine,
+    Ingredient,
+    StockMovement,
+    Supplier,
+)
 from shared.models.loyalty import LoyaltyProgram, LoyaltyReward, LoyaltyTransaction
 from shared.models.menu import MenuAddOn, MenuCategory, MenuItem
 from shared.models.message import Message
 from shared.models.order import Order, OrderEvent, OrderItem
 from shared.models.push_subscription import PushSubscription
+from shared.models.recipe import Recipe, RecipeItem
 from shared.models.specials import Special
+from shared.models.stocktake import StocktakeLine, StocktakeSession
 from shared.models.till import TillSession
 from shared.models.user import AdminRefreshToken, BusinessUser, RefreshToken
+from shared.models.wastage import WastageEntry
 
 __all__ = [
     "Base",
@@ -36,6 +46,9 @@ __all__ = [
     "ConversationSession",
     "Customer",
     "DailyUsage",
+    "GoodsReceipt",
+    "GoodsReceiptLine",
+    "Ingredient",
     "LoyaltyProgram",
     "LoyaltyReward",
     "LoyaltyTransaction",
@@ -48,7 +61,14 @@ __all__ = [
     "OrderEvent",
     "OrderItem",
     "PushSubscription",
+    "Recipe",
+    "RecipeItem",
     "RefreshToken",
     "Special",
+    "StockMovement",
+    "StocktakeLine",
+    "StocktakeSession",
+    "Supplier",
     "TillSession",
+    "WastageEntry",
 ]

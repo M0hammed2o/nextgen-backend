@@ -176,6 +176,79 @@ class Business(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         comment="Max discount a STAFF/MANAGER can apply on a POS order without "
                  "owner sign-off; 0 = no staff discretion. OWNER is never limited."
     )
+    # ── POS till payment methods (Phase 2) ───────────────────────────────
+    # Distinct from payment_methods_enabled above, which governs the
+    # WhatsApp/online-order payment flow. These control what a cashier sees
+    # as buttons on the till's payment screen. CARD covers any physical card
+    # terminal (Yoco/iKhokha/etc.) confirmed manually by the cashier — the
+    # individual provider flags exist for future terminal-integration work,
+    # not because the till shows 7 separate buttons today.
+    pos_cash_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    pos_card_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    pos_payfast_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    pos_yoco_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    pos_ikhoka_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    pos_direct_eft_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    pos_other_payment_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    pos_table_number_required: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False,
+        comment="If true, the till requires a table number for DINE_IN orders"
+    )
+
+    # ── VAT / tax (Ciao Pizza P0) ────────────────────────────────────────
+    # Stored in basis points so 15% is 1500 and no float ever touches a
+    # tax figure. A VAT-registered SA business must show its VAT number and
+    # a tax breakdown on the slip for it to be a valid tax invoice.
+    vat_registered: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    vat_number: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    vat_rate_basis_points: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False,
+        comment="15% VAT = 1500 basis points"
+    )
+    vat_inclusive_pricing: Mapped[bool] = mapped_column(
+        Boolean, default=True, nullable=False,
+        comment="True (the SA norm): menu prices already include VAT, which is "
+                "back-calculated out of the total. False: VAT is added on top."
+    )
+
+    # ── Receipt / thermal printing (Ciao Pizza P0) ───────────────────────
+    receipt_paper_width_mm: Mapped[int] = mapped_column(
+        Integer, default=80, nullable=False,
+        comment="58 or 80 — drives both the print CSS and ESC/POS column count"
+    )
+    receipt_auto_print: Mapped[bool] = mapped_column(
+        Boolean, default=True, nullable=False,
+        comment="Print the customer receipt automatically on checkout"
+    )
+    receipt_copies: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    print_kitchen_receipt: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False,
+        comment="Also print a kitchen slip on checkout for items needing prep"
+    )
+    receipt_config_json: Mapped[dict | None] = mapped_column(
+        JSONB, nullable=True,
+        comment="Tenant receipt template config — trading/franchise name, branch, "
+                "address, phone, footer, QR, header lines. See backend/app/receipts/."
+    )
+    receipt_reference_asset_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True,
+        comment="Photo/scan/PDF of the client's CURRENT till slip, kept as an "
+                "onboarding design reference. Never printed — the live receipt is "
+                "always rendered from receipt_config_json."
+    )
+
+    # ── Inventory module (Ciao Pizza P0) ─────────────────────────────────
+    inventory_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False,
+        comment="Master switch. When false the POS behaves exactly as it did "
+                "before the inventory module existed — no recipe resolution, no "
+                "stock movements. Existing tenants are unaffected by default."
+    )
+    wastage_approval_threshold_cents: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False,
+        comment="Wastage valued above this needs manager approval; 0 = never"
+    )
+
     # EFT banking details
     eft_bank_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     eft_account_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
