@@ -81,6 +81,8 @@ class BusinessSettingsResponse(BaseModel):
     receipt_copies: int = 1
     print_kitchen_receipt: bool = False
     receipt_config_json: dict | None = None
+    receipt_reference_asset_id: uuid.UUID | None = None
+    menu_reference_asset_id: uuid.UUID | None = None
     inventory_enabled: bool = False
     wastage_approval_threshold_cents: int = 0
     eft_reference_prefix: str | None = None
@@ -132,6 +134,8 @@ class BusinessSettingsResponse(BaseModel):
             receipt_copies=b.receipt_copies,
             print_kitchen_receipt=b.print_kitchen_receipt,
             receipt_config_json=b.receipt_config_json,
+            receipt_reference_asset_id=b.receipt_reference_asset_id,
+            menu_reference_asset_id=b.menu_reference_asset_id,
             inventory_enabled=b.inventory_enabled,
             wastage_approval_threshold_cents=b.wastage_approval_threshold_cents,
             require_phone_number=b.require_phone_number,
@@ -223,6 +227,10 @@ class BusinessSettingsUpdate(BaseModel):
     print_kitchen_receipt: bool | None = None
     receipt_config_json: dict | None = None
     wastage_approval_threshold_cents: int | None = Field(default=None, ge=0)
+    # Onboarding reference documents the restaurant uploads about itself.
+    # Never printed or shown to a customer — see AssetKind.MENU_REFERENCE.
+    receipt_reference_asset_id: uuid.UUID | None = None
+    menu_reference_asset_id: uuid.UUID | None = None
 
     @field_validator("receipt_paper_width_mm")
     @classmethod
