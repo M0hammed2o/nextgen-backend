@@ -208,6 +208,12 @@ async def test_pos_settings_reflects_business_config():
         receipt_auto_print=True, receipt_copies=2, print_kitchen_receipt=True,
         receipt_config_json=None, inventory_enabled=True,
         wastage_approval_threshold_cents=0,
+        # Staff navigation flags. Set to the OPPOSITE of their model defaults
+        # so the assertions below prove the route reads the business row
+        # rather than falling through to the response model's own defaults.
+        staff_live_orders_tab_enabled=False,
+        staff_wastage_tab_enabled=False,
+        staff_stocktake_tab_enabled=True,
     )
     db = FakeDB([FakeResult(scalar=business)])
 
@@ -226,6 +232,43 @@ async def test_pos_settings_reflects_business_config():
     assert settings.receipt_copies == 2
     assert settings.print_kitchen_receipt is True
     assert settings.inventory_enabled is True
+    assert settings.staff_live_orders_tab_enabled is False
+    assert settings.staff_wastage_tab_enabled is False
+    assert settings.staff_stocktake_tab_enabled is True
+
+
+async def test_pos_settings_stocktake_tab_needs_the_inventory_module():
+    """
+    The stocktake tab is gated on BOTH its own flag and inventory_enabled.
+    Showing it without the module would land staff on a tab whose API
+    immediately refuses them with INVENTORY_NOT_ENABLED.
+    """
+    import types
+    user = make_user(role="STAFF")
+    business = types.SimpleNamespace(
+        pos_cash_enabled=True, pos_card_enabled=True,
+        pos_payfast_enabled=False, pos_yoco_enabled=False, pos_ikhoka_enabled=False,
+        pos_direct_eft_enabled=False, pos_other_payment_enabled=False,
+        pos_table_number_required=False, delivery_fee_cents=0, max_staff_discount_cents=0,
+        vat_registered=False, vat_number=None, vat_rate_basis_points=0,
+        vat_inclusive_pricing=True, receipt_paper_width_mm=80,
+        receipt_auto_print=True, receipt_copies=1, print_kitchen_receipt=False,
+        receipt_config_json=None,
+        # Tab switched on, module switched off.
+        inventory_enabled=False,
+        wastage_approval_threshold_cents=0,
+        staff_live_orders_tab_enabled=True,
+        staff_wastage_tab_enabled=True,
+        staff_stocktake_tab_enabled=True,
+    )
+    db = FakeDB([FakeResult(scalar=business)])
+
+    settings = await get_pos_settings(user=user, db=db)
+
+    assert settings.staff_stocktake_tab_enabled is False
+    # The other tabs are unaffected by the inventory module.
+    assert settings.staff_live_orders_tab_enabled is True
+    assert settings.staff_wastage_tab_enabled is True
 
 
 async def test_pos_settings_unknown_business_is_404():

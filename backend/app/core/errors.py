@@ -12,6 +12,7 @@ All API errors follow this format:
 """
 
 from fastapi import FastAPI, Request, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -125,13 +126,28 @@ def register_error_handlers(app: FastAPI) -> None:
     async def validation_error_handler(
         request: Request, exc: RequestValidationError
     ) -> JSONResponse:
+        # exc.errors() is NOT guaranteed to be JSON-serialisable. When a
+        # Pydantic `field_validator` rejects a value by raising ValueError,
+        # Pydantic puts the exception OBJECT itself into the entry's `ctx`,
+        # and json.dumps then raises inside this handler — turning what
+        # should be a clean 422 into an unhandled 500 with no useful body.
+        #
+        # Reproduced with the long-standing receipt_paper_width_mm validator,
+        # so this affects every custom validator in the codebase, not just
+        # recent ones. jsonable_encoder walks the structure and stringifies
+        # anything it cannot represent, which keeps the message a client
+        # needs while guaranteeing the response can actually be sent.
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             content={
                 "error": {
                     "code": "VALIDATION_ERROR",
                     "message": "Request validation failed",
-                    "details": {"errors": exc.errors()},
+                    "details": {
+                        "errors": jsonable_encoder(
+                            exc.errors(), custom_encoder={Exception: str}
+                        )
+                    },
                 }
             },
         )

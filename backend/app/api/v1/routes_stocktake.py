@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -50,6 +50,7 @@ from shared.models.audit import AuditEvent
 from shared.models.business import Business
 from shared.models.inventory import Ingredient
 from shared.models.stocktake import StocktakeLine, StocktakeSession
+from shared.models.user import BusinessUser
 
 router = APIRouter(prefix="/business/stocktake", tags=["stocktake"])
 
@@ -482,7 +483,16 @@ async def list_stocktakes(
     user: AuthUser = Depends(require_staff_or_above),
     db: AsyncSession = Depends(get_db),
 ):
-    """Historical counts, newest first. Approved counts are preserved forever."""
+    """
+    Historical counts, newest first. Approved counts are preserved forever.
+
+    Carries enough to read the history without opening each count: when it was
+    taken, the cut-off it was measured to, who took it, how many lines were
+    actually counted, and the rolled-up difference. The per-ingredient
+    expected/counted/variance detail lives on GET /{session_id}, which is the
+    same snapshot frozen at completion — never recomputed, so a count read
+    today shows what it showed the day it was signed off.
+    """
     rows = (
         (
             await db.execute(
@@ -495,14 +505,73 @@ async def list_stocktakes(
         .scalars()
         .all()
     )
+
+    # Staff names in one query rather than per row.
+    user_ids: set[uuid.UUID] = set()
+    for s in rows:
+        for uid in (s.opened_by_user_id, s.completed_by_user_id, s.approved_by_user_id):
+            if uid:
+                user_ids.add(uid)
+    names: dict[uuid.UUID, str] = {}
+    if user_ids:
+        for bu in (
+            (
+                await db.execute(
+                    select(BusinessUser).where(
+                        BusinessUser.business_id == user.business_id,
+                        BusinessUser.id.in_(user_ids),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        ):
+            names[bu.id] = bu.staff_name or bu.email or "Unknown"
+
+    # Line counts per session, again in one query.
+    counted_by_session: dict[uuid.UUID, int] = {}
+    total_by_session: dict[uuid.UUID, int] = {}
+    if rows:
+        session_ids = [s.id for s in rows]
+        for sid, total, counted in (
+            await db.execute(
+                select(
+                    StocktakeLine.stocktake_session_id,
+                    func.count(StocktakeLine.id),
+                    func.count(StocktakeLine.counted_quantity_milli),
+                )
+                .where(
+                    StocktakeLine.business_id == user.business_id,
+                    StocktakeLine.stocktake_session_id.in_(session_ids),
+                )
+                .group_by(StocktakeLine.stocktake_session_id)
+            )
+        ).all():
+            total_by_session[sid] = int(total or 0)
+            counted_by_session[sid] = int(counted or 0)
+
     return [
         {
             "id": str(s.id),
             "reference": s.reference,
             "status": s.status,
+            "opened_at": s.opened_at.isoformat() if s.opened_at else None,
             "cutoff_at": s.cutoff_at.isoformat() if s.cutoff_at else None,
+            "completed_at": s.completed_at.isoformat() if s.completed_at else None,
             "approved_at": s.approved_at.isoformat() if s.approved_at else None,
+            "opened_by_name": names.get(s.opened_by_user_id) if s.opened_by_user_id else None,
+            "completed_by_name": (
+                names.get(s.completed_by_user_id) if s.completed_by_user_id else None
+            ),
+            "approved_by_name": (
+                names.get(s.approved_by_user_id) if s.approved_by_user_id else None
+            ),
+            "line_count": total_by_session.get(s.id, 0),
+            "counted_line_count": counted_by_session.get(s.id, 0),
             "total_variance_value_cents": int(s.total_variance_value_cents or 0),
+            "total_theoretical_value_cents": int(s.total_theoretical_value_cents or 0),
+            "is_locked": s.is_locked,
+            "notes": s.notes,
         }
         for s in rows
     ]

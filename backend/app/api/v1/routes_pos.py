@@ -18,7 +18,7 @@ rationale.
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import select
 from sqlalchemy import update as sa_update
@@ -37,6 +37,7 @@ from shared.models.audit import AuditEvent
 from shared.models.business import Business
 from shared.models.order import Order, OrderEvent, OrderItem
 from shared.models.till import TillSession
+from shared.models.user import BusinessUser
 from shared.utils import format_order_number
 
 router = APIRouter(prefix="/business/pos", tags=["pos"])
@@ -111,6 +112,24 @@ class TillSessionResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class TillSessionHistoryEntry(BaseModel):
+    """
+    One past cash-up, for the owner/manager history view. Carries the staff
+    names resolved server-side so the client never has to hold a user
+    directory to render an audit trail.
+    """
+    id: uuid.UUID
+    status: str
+    opening_float_cents: int
+    expected_cash_cents: int | None
+    counted_cash_cents: int | None
+    variance_cents: int | None
+    opened_at: datetime
+    closed_at: datetime | None
+    opened_by_name: str | None = None
+    closed_by_name: str | None = None
+
+
 class POSRefundRequest(BaseModel):
     amount_cents: int | None = Field(default=None, ge=1, description="Defaults to a full refund of total_cents")
     reason: str | None = Field(default=None, max_length=255)
@@ -157,6 +176,13 @@ class POSSettingsResponse(BaseModel):
 
     # Inventory — the till shows the quick-wastage action only when enabled
     inventory_enabled: bool = False
+
+    # Staff navigation — which tabs this tenant's bottom bar should show.
+    # Display configuration only: a hidden tab never disables the underlying
+    # feature, and the API for each still enforces its own permissions.
+    staff_live_orders_tab_enabled: bool = True
+    staff_wastage_tab_enabled: bool = True
+    staff_stocktake_tab_enabled: bool = False
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -232,6 +258,14 @@ async def get_pos_settings(
         receipt_copies=business.receipt_copies,
         print_kitchen_receipt=business.print_kitchen_receipt,
         inventory_enabled=business.inventory_enabled,
+        staff_live_orders_tab_enabled=business.staff_live_orders_tab_enabled,
+        staff_wastage_tab_enabled=business.staff_wastage_tab_enabled,
+        # A stocktake tab is only useful if there is stock to count. Gating the
+        # display on both flags means enabling the tab before the inventory
+        # module cannot strand staff on a tab whose API will refuse them.
+        staff_stocktake_tab_enabled=(
+            business.staff_stocktake_tab_enabled and business.inventory_enabled
+        ),
     )
 
 
@@ -848,3 +882,68 @@ async def close_till(
     response.cash_sales_cents = cash_sales_cents
     response.cash_refunds_cents = cash_refunds_cents
     return response
+
+
+@router.get("/till/sessions", response_model=list[TillSessionHistoryEntry])
+async def list_till_sessions(
+    limit: int = Query(50, ge=1, le=200),
+    user: AuthUser = Depends(require_owner_or_manager),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Cash-up history, newest first — owner/manager only, because a variance is
+    a statement about a named cashier's drawer and is not every cashier's
+    business to browse.
+
+    Read-only by construction. A closed session is never mutated (close is a
+    one-way transition enforced in close_till), so this is the durable record
+    of who opened the drawer, what was expected, what was counted, and by how
+    much the two differed.
+    """
+    rows = (
+        (
+            await db.execute(
+                select(TillSession)
+                .where(TillSession.business_id == user.business_id)
+                .order_by(TillSession.opened_at.desc())
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    # Resolve staff names in one query rather than per row.
+    user_ids = {s.opened_by_user_id for s in rows if s.opened_by_user_id}
+    user_ids |= {s.closed_by_user_id for s in rows if s.closed_by_user_id}
+    names: dict[uuid.UUID, str] = {}
+    if user_ids:
+        for bu in (
+            (
+                await db.execute(
+                    select(BusinessUser).where(
+                        BusinessUser.business_id == user.business_id,
+                        BusinessUser.id.in_(user_ids),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        ):
+            names[bu.id] = bu.staff_name or bu.email or "Unknown"
+
+    return [
+        TillSessionHistoryEntry(
+            id=s.id,
+            status=s.status,
+            opening_float_cents=s.opening_float_cents,
+            expected_cash_cents=s.expected_cash_cents,
+            counted_cash_cents=s.counted_cash_cents,
+            variance_cents=s.variance_cents,
+            opened_at=s.opened_at,
+            closed_at=s.closed_at,
+            opened_by_name=names.get(s.opened_by_user_id) if s.opened_by_user_id else None,
+            closed_by_name=names.get(s.closed_by_user_id) if s.closed_by_user_id else None,
+        )
+        for s in rows
+    ]

@@ -255,6 +255,48 @@ class Business(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         comment="Wastage valued above this needs manager approval; 0 = never"
     )
 
+    # ── Staff app navigation (per-tenant, NOT per-platform) ──────────────
+    # These hide TABS, never features. A tenant that hides the wastage tab
+    # keeps the wastage route, its API, its manager reporting and all of its
+    # history — the feature is untouched platform-wide, this only decides
+    # what earns one of the five slots on a phone-width bottom bar.
+    staff_live_orders_tab_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=True, nullable=False,
+        comment="Show the Live Orders tab in the staff app. A till-only tenant "
+                "with no WhatsApp ordering has nothing to watch there, since a "
+                "POS sale is already paid and completed when it is rung up. "
+                "Defaults TRUE so no existing tenant loses the tab; this is a "
+                "deliberate per-tenant choice rather than being derived from "
+                "is_whatsapp_enabled, which governs the BOT, not the staff UI."
+    )
+    staff_wastage_tab_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=True, nullable=False,
+        comment="Show the Wastage tab in the staff app's bottom navigation. "
+                "Hiding it does NOT disable wastage — the page, API and "
+                "manager reports all continue to work."
+    )
+    staff_stocktake_tab_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False,
+        comment="Show the Stocktake tab in the staff app's bottom navigation. "
+                "Only meaningful when inventory_enabled is true; the API "
+                "enforces that independently of this display flag."
+    )
+
+    # ── Stocktake schedule ───────────────────────────────────────────────
+    # How often the owner expects a count. This is guidance shown to staff and
+    # used to flag an overdue count — it never blocks a count, because a
+    # restaurant that needs to recount at 3pm must always be able to.
+    stocktake_frequency: Mapped[str] = mapped_column(
+        String(16), default="DAILY_1", nullable=False,
+        comment="DAILY_1 | DAILY_2 | DAILY_3 | DAILY_4 | CUSTOM"
+    )
+    stocktake_times_json: Mapped[list | None] = mapped_column(
+        JSONB, nullable=True,
+        comment="Local 'HH:MM' times a count is expected. Required when "
+                "stocktake_frequency is CUSTOM; for DAILY_n it holds the n "
+                "chosen times so the owner can move them."
+    )
+
     # EFT banking details
     eft_bank_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     eft_account_name: Mapped[str | None] = mapped_column(String(255), nullable=True)

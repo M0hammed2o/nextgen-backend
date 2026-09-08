@@ -12,7 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.crypto import decrypt_credential, encrypt_credential
-from backend.app.core.errors import NotFoundError
+from backend.app.core.errors import AppError, NotFoundError
 from backend.app.core.rbac import AuthUser, require_owner_or_manager, require_staff_or_above
 from backend.app.db.session import get_db
 from backend.app.payments.registry import get_provider
@@ -85,6 +85,12 @@ class BusinessSettingsResponse(BaseModel):
     menu_reference_asset_id: uuid.UUID | None = None
     inventory_enabled: bool = False
     wastage_approval_threshold_cents: int = 0
+    # Staff app navigation + stocktake schedule (per-tenant configuration)
+    staff_live_orders_tab_enabled: bool = True
+    staff_wastage_tab_enabled: bool = True
+    staff_stocktake_tab_enabled: bool = False
+    stocktake_frequency: str = "DAILY_1"
+    stocktake_times_json: list | None = None
     eft_reference_prefix: str | None = None
     # Credential hints — never return raw keys, only show last-4 masked
     payment_api_key_hint: str | None = None
@@ -138,6 +144,11 @@ class BusinessSettingsResponse(BaseModel):
             menu_reference_asset_id=b.menu_reference_asset_id,
             inventory_enabled=b.inventory_enabled,
             wastage_approval_threshold_cents=b.wastage_approval_threshold_cents,
+            staff_live_orders_tab_enabled=b.staff_live_orders_tab_enabled,
+            staff_wastage_tab_enabled=b.staff_wastage_tab_enabled,
+            staff_stocktake_tab_enabled=b.staff_stocktake_tab_enabled,
+            stocktake_frequency=b.stocktake_frequency,
+            stocktake_times_json=b.stocktake_times_json,
             require_phone_number=b.require_phone_number,
             require_delivery_address=b.require_delivery_address,
             currency=b.currency,
@@ -231,6 +242,43 @@ class BusinessSettingsUpdate(BaseModel):
     # Never printed or shown to a customer — see AssetKind.MENU_REFERENCE.
     receipt_reference_asset_id: uuid.UUID | None = None
     menu_reference_asset_id: uuid.UUID | None = None
+    # Staff app navigation. These hide TABS, never features — the routes,
+    # APIs and manager reporting behind each one are untouched, and no other
+    # tenant is affected. Safe for an owner to set: it exposes nothing and
+    # disables nothing.
+    staff_live_orders_tab_enabled: bool | None = None
+    staff_wastage_tab_enabled: bool | None = None
+    staff_stocktake_tab_enabled: bool | None = None
+    # How often the owner expects a count. Guidance and overdue-flagging
+    # only — it never blocks staff from starting one.
+    stocktake_frequency: str | None = Field(default=None, max_length=16)
+    stocktake_times_json: list[str] | None = None
+
+    @field_validator("stocktake_frequency")
+    @classmethod
+    def _known_frequency(cls, v: str | None) -> str | None:
+        allowed = {"DAILY_1", "DAILY_2", "DAILY_3", "DAILY_4", "CUSTOM"}
+        if v is not None and v not in allowed:
+            raise ValueError(f"stocktake_frequency must be one of {sorted(allowed)}")
+        return v
+
+    @field_validator("stocktake_times_json")
+    @classmethod
+    def _valid_times(cls, v: list[str] | None) -> list[str] | None:
+        # Stored as local 'HH:MM' strings. Validated here so a typo cannot
+        # reach the overdue calculation and make every count look on-time.
+        if v is None:
+            return v
+        if len(v) > 12:
+            raise ValueError("at most 12 stocktake times")
+        for t in v:
+            parts = t.split(":")
+            if len(parts) != 2 or not all(p.isdigit() for p in parts):
+                raise ValueError(f"invalid time {t!r} — expected HH:MM")
+            hh, mm = int(parts[0]), int(parts[1])
+            if not (0 <= hh <= 23 and 0 <= mm <= 59):
+                raise ValueError(f"invalid time {t!r} — expected HH:MM")
+        return sorted(v)
 
     @field_validator("receipt_paper_width_mm")
     @classmethod
@@ -292,6 +340,16 @@ async def update_business_settings(
             setattr(business, field, encrypt_credential(value) if value else None)
         else:
             setattr(business, field, value)
+
+    # Validated against the RESULTING state rather than the request body: this
+    # is a partial update, so an owner may set the frequency in one call and
+    # the times in the next, and neither call sees the whole picture on its own.
+    if business.stocktake_frequency == "CUSTOM" and not business.stocktake_times_json:
+        raise AppError(
+            "STOCKTAKE_TIMES_REQUIRED",
+            "Choose at least one time of day for a custom stocktake schedule",
+            422,
+        )
 
     await db.commit()
     await db.refresh(business)

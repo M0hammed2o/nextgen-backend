@@ -65,6 +65,12 @@ class BusinessUpdate(BaseModel):
     # keeps WhatsApp on — without either affecting the other.
     is_whatsapp_enabled: bool | None = None
     inventory_enabled: bool | None = None
+    # Staff app navigation — set during onboarding so a new tenant's till
+    # app matches their workflow on day one. Also settable by the owner via
+    # the business plane; these hide tabs only, never features.
+    staff_live_orders_tab_enabled: bool | None = None
+    staff_wastage_tab_enabled: bool | None = None
+    staff_stocktake_tab_enabled: bool | None = None
 
 
 class LimitsUpdate(BaseModel):
