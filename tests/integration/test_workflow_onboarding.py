@@ -215,6 +215,17 @@ async def test_onboarding_progress_reflects_real_data_and_completion_revokes_acc
         menu_check = next(c for c in status_before.go_live.checks if c.key == "menu")
         assert menu_check.status == "fail"
 
+        # Real-browser go-live fixes: an untouched tenant must NOT pass
+        # "VAT & receipt settings" just because of the paper-width column's
+        # server default, and the "no staff PIN yet" detail must not claim
+        # the owner/manager can trade at the till instead (PIN login is
+        # STAFF-only — nobody but a PIN-holding staff member can operate it).
+        vat_receipt_before = next(c for c in status_before.go_live.checks if c.key == "vat_receipt")
+        assert vat_receipt_before.status == "fail"
+        staff_pin_before = next(c for c in status_before.go_live.checks if c.key == "staff_pin")
+        assert "owner/manager can still trade alone" not in staff_pin_before.detail
+        assert "STAFF-only" in staff_pin_before.detail
+
         # ── Create the onboarder's own temporary working login ──────────────
         owner_creation = await create_business_owner(
             business_id=created.id,
@@ -254,6 +265,12 @@ async def test_onboarding_progress_reflects_real_data_and_completion_revokes_acc
         # person can confirm (which modules were purchased; slip printed OK).
         biz_row = await db.get(Business, created.id)
         biz_row.address = "1 Test Street, Durban"
+        # Real-browser go-live fix: the "VAT & receipt settings" check now
+        # requires actual evidence receipt settings were configured (a
+        # trading name / any receipt_config_json), not just the column's
+        # server-default paper width, which every untouched business already
+        # has — see admin_api/app/services/onboarding.py.
+        biz_row.receipt_config_json = {"trading_name": f"Go Live Biz {unique}"}
         await db.commit()
         await close_till(
             session_id=till.id, body=TillCloseRequest(counted_cash_cents=6000),
@@ -269,6 +286,16 @@ async def test_onboarding_progress_reflects_real_data_and_completion_revokes_acc
         status_after = await get_onboarding_status(business_id=created.id, user=auth, db=db)
         menu_check_after = next(c for c in status_after.go_live.checks if c.key == "menu")
         assert menu_check_after.status == "pass"
+        vat_receipt_after = next(c for c in status_after.go_live.checks if c.key == "vat_receipt")
+        assert vat_receipt_after.status == "pass"
+
+        # Real-browser fix: the modules_confirmed detail must show the
+        # confirming admin's display name, never their raw UUID.
+        modules_check = next(c for c in status_after.go_live.checks if c.key == "modules_confirmed")
+        assert modules_check.status == "pass"
+        assert onboarder.display_name in modules_check.detail
+        assert str(onboarder.id) not in modules_check.detail
+
         failing = [c for c in status_after.go_live.checks if c.status == "fail"]
         assert failing == [], f"unexpected failing checks: {failing}"
         assert status_after.ready is True

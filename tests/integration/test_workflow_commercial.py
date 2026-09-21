@@ -40,6 +40,7 @@ from admin_api.app.api.v1.routes_commercial import (
     MarkPaidRequest,
     cancel_invoice_route,
     create_invoice_draft,
+    get_commercial_client,
     get_commercial_dashboard,
     get_invoice_pdf,
     issue_invoice_route,
@@ -167,12 +168,15 @@ async def test_trial_start_and_extend_with_cap_enforcement(_db_or_skip, _invoici
         assert result.trial_ends_at is not None
 
         # ONBOARDER capped
-        await extend_business_trial(
+        extend_result = await extend_business_trial(
             business_id=created.id, body=TrialExtendRequest(days=10, reason="Customer requested more time"),
             user=auth, db=db,
         )
         await db.refresh(biz)
         assert biz.trial_extension_days_total == 10
+        # Additive field (admin-suite request): the ONBOARDER cap so the UI
+        # can show remaining allowance without a second call.
+        assert extend_result.trial_extension_cap_days == 14
 
         with pytest.raises(AppError) as exc:
             await extend_business_trial(
@@ -184,11 +188,12 @@ async def test_trial_start_and_extend_with_cap_enforcement(_db_or_skip, _invoici
         super_admin = await _make_admin(db, AdminRole.SUPER_ADMIN, f"super-trial-{unique}@test.co.za")
         admin_ids.append(super_admin.id)
         super_auth = _admin_auth(super_admin.id, AdminRole.SUPER_ADMIN)
-        await extend_business_trial(
+        super_extend_result = await extend_business_trial(
             business_id=created.id, body=TrialExtendRequest(days=300, reason="Manual override"), user=super_auth, db=db,
         )
         await db.refresh(biz)
         assert biz.trial_extension_days_total == 310
+        assert super_extend_result.trial_extension_cap_days is None  # SUPER_ADMIN: no cap
     finally:
         await _cleanup(db, business_ids=business_ids, admin_ids=admin_ids)
 
@@ -450,6 +455,10 @@ async def test_onboarder_commercial_access_survives_handover_but_config_access_d
         # restaurant_details go-live check needs a name + address/phone.
         biz_row = await db.get(Business, created.id)
         biz_row.phone = "0311234567"
+        # vat_receipt go-live check needs actual evidence receipt settings
+        # were configured (a trading name), not just the paper-width column's
+        # server default — see admin_api/app/services/onboarding.py.
+        biz_row.receipt_config_json = {"trading_name": f"Handover Biz {unique}"}
         await db.commit()
 
         owner = BusinessUser(
@@ -606,7 +615,58 @@ async def test_dashboard_and_clients_never_leak_bank_details(_db_or_skip, _invoi
         assert "123456789" not in str([c.model_dump() for c in clients])
         assert any(c.business_id == created.id for c in clients)
 
+        # Additive fields (admin-suite request): alerts + trial-extension
+        # allowance, already computed by compute_account_status/the trial
+        # model — just returned now instead of discarded.
+        row = next(c for c in clients if c.business_id == created.id)
+        assert isinstance(row.alerts, list)
+        assert row.trial_extension_days_total == 0
+        assert row.trial_extension_cap_days is None  # SUPER_ADMIN caller: no cap
+        dash_row = next(
+            r for bucket in (
+                dashboard.trials_ending_soon, dashboard.payments_awaiting_confirmation,
+                dashboard.overdue_clients, dashboard.recently_created_trials,
+                dashboard.recently_converted, dashboard.expired_trials,
+            ) for r in bucket if r.business_id == created.id
+        )
+        assert isinstance(dash_row.alerts, list)
+        assert dash_row.trial_extension_days_total == 0
+
+        # GET .../clients/{business_id} — same derived fields as one row of
+        # the list, for the admin-suite's client detail page.
+        single = await get_commercial_client(business_id=created.id, user=auth, db=db)
+        assert single.business_id == created.id
+        assert single.account_status == row.account_status
+        assert single.outstanding_cents == row.outstanding_cents
+        assert "123456789" not in str(single.model_dump())
+
         invoices = await list_invoices(business_id=created.id, status=None, page=1, per_page=25, user=auth, db=db)
         assert "123456789" not in str([i.model_dump() for i in invoices])
+    finally:
+        await _cleanup(db, business_ids=business_ids, admin_ids=admin_ids)
+
+
+async def test_get_commercial_client_is_onboarder_scoped(_db_or_skip, _invoicing_configured):
+    """ONBOARDER can fetch their own client via the single-client route, but
+    gets the same non-revealing 404 as every other commercial route for a
+    business they didn't onboard."""
+    db = _db_or_skip
+    unique = uuid.uuid4().hex[:8]
+    owning_onboarder = await _make_admin(db, AdminRole.ONBOARDER, f"onb-owns-{unique}@test.co.za")
+    other_onboarder = await _make_admin(db, AdminRole.ONBOARDER, f"onb-other-{unique}@test.co.za")
+    owning_auth = _admin_auth(owning_onboarder.id, AdminRole.ONBOARDER)
+    other_auth = _admin_auth(other_onboarder.id, AdminRole.ONBOARDER)
+    business_ids = []
+    admin_ids = [owning_onboarder.id, other_onboarder.id]
+    try:
+        created = await create_business(body=BusinessCreate(name=f"Scoped Client Biz {unique}"), user=owning_auth, db=db)
+        business_ids.append(created.id)
+
+        own = await get_commercial_client(business_id=created.id, user=owning_auth, db=db)
+        assert own.business_id == created.id
+        assert own.trial_extension_cap_days == 14  # ONBOARDER caller: capped
+
+        with pytest.raises(NotFoundError):
+            await get_commercial_client(business_id=created.id, user=other_auth, db=db)
     finally:
         await _cleanup(db, business_ids=business_ids, admin_ids=admin_ids)

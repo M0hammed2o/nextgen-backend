@@ -977,6 +977,10 @@ class TrialExtendResponse(BaseModel):
     billing_status: str
     trial_ends_at: datetime | None
     trial_extension_days_total: int
+    # Additive (admin-suite Wave 0A request): the remaining-allowance cap so
+    # the UI can show it without a second call — ONBOARDER_MAX_TRIAL_EXTENSION_DAYS
+    # for an ONBOARDER caller, null (no cap) for SUPER_ADMIN.
+    trial_extension_cap_days: int | None = None
 
 
 @router.post(
@@ -1013,9 +1017,16 @@ async def extend_business_trial(
     ))
     await db.commit()
     await db.refresh(biz)
+
+    cap_days = None
+    if user.role == AdminRole.ONBOARDER:
+        from backend.app.core.config import get_settings as _get_backend_settings
+        cap_days = _get_backend_settings().ONBOARDER_MAX_TRIAL_EXTENSION_DAYS
+
     return TrialExtendResponse(
         business_id=biz.id, billing_status=biz.billing_status,
         trial_ends_at=biz.trial_ends_at, trial_extension_days_total=biz.trial_extension_days_total,
+        trial_extension_cap_days=cap_days,
     )
 
 

@@ -403,6 +403,19 @@ async def update_business_settings(
             422,
         )
 
+    # A VAT-registered business must charge a real, non-zero VAT rate — a
+    # tax invoice showing 0%/no VAT while marked VAT-registered is invalid.
+    # Also validated against the RESULTING state (partial-update safe): an
+    # owner may flip vat_registered on in one call and set the rate in the
+    # next, and this must reject the in-between state either way round.
+    if business.vat_registered and business.vat_rate_basis_points <= 0:
+        raise AppError(
+            "VAT_RATE_REQUIRED",
+            "A VAT-registered business must set a VAT rate greater than 0% — "
+            "a tax invoice cannot show 0% VAT.",
+            422,
+        )
+
     # Audit trail for money-routing changes — field names only, never the
     # credential/EFT values themselves (SECURITY.md: secrets never appear
     # in logs). Only OWNER can reach this point with a non-empty list.

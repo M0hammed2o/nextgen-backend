@@ -188,3 +188,68 @@ async def test_get_settings_returns_is_whatsapp_enabled():
 
 def test_is_whatsapp_enabled_not_settable_via_update_schema():
     assert "is_whatsapp_enabled" not in BusinessSettingsUpdate.model_fields
+
+
+# ── VAT rate validation (real-browser fix) ──────────────────────────────────
+# A VAT-registered business must charge a real, non-zero VAT rate — a 0%/
+# missing rate would make its receipts an invalid tax invoice.
+
+async def test_vat_registered_with_zero_rate_is_rejected():
+    owner = make_user(role="OWNER")
+    business = make_business(owner.business_id, vat_registered=False, vat_rate_basis_points=0)
+    db = FakeDB([FakeResult(business)])
+
+    body = BusinessSettingsUpdate(vat_registered=True, vat_number="4123456789")
+    with pytest.raises(AppError) as exc:
+        await update_business_settings(body=body, user=owner, db=db)
+    assert exc.value.code == "VAT_RATE_REQUIRED"
+    assert exc.value.status_code == 422
+    assert db.commits == 0
+
+
+async def test_vat_registered_with_explicit_zero_rate_is_rejected():
+    owner = make_user(role="OWNER")
+    business = make_business(owner.business_id, vat_registered=False, vat_rate_basis_points=0)
+    db = FakeDB([FakeResult(business)])
+
+    body = BusinessSettingsUpdate(vat_registered=True, vat_number="4123456789", vat_rate_basis_points=0)
+    with pytest.raises(AppError) as exc:
+        await update_business_settings(body=body, user=owner, db=db)
+    assert exc.value.code == "VAT_RATE_REQUIRED"
+
+
+async def test_vat_registered_with_real_rate_is_accepted():
+    owner = make_user(role="OWNER")
+    business = make_business(owner.business_id, vat_registered=False, vat_rate_basis_points=0)
+    db = FakeDB([FakeResult(business)])
+
+    body = BusinessSettingsUpdate(vat_registered=True, vat_number="4123456789", vat_rate_basis_points=1500)
+    result = await update_business_settings(body=body, user=owner, db=db)
+    assert result.vat_registered is True
+    assert result.vat_rate_basis_points == 1500
+    assert db.commits == 1
+
+
+async def test_vat_registered_already_true_setting_rate_to_zero_is_rejected():
+    """RESULTING-state check: a business already VAT-registered with a real
+    rate must not be allowed to zero the rate out via a partial update that
+    doesn't even touch vat_registered."""
+    owner = make_user(role="OWNER")
+    business = make_business(owner.business_id, vat_registered=True, vat_rate_basis_points=1500)
+    db = FakeDB([FakeResult(business)])
+
+    body = BusinessSettingsUpdate(vat_rate_basis_points=0)
+    with pytest.raises(AppError) as exc:
+        await update_business_settings(body=body, user=owner, db=db)
+    assert exc.value.code == "VAT_RATE_REQUIRED"
+
+
+async def test_non_vat_registered_zero_rate_is_fine():
+    owner = make_user(role="OWNER")
+    business = make_business(owner.business_id, vat_registered=False, vat_rate_basis_points=0)
+    db = FakeDB([FakeResult(business)])
+
+    body = BusinessSettingsUpdate(greeting_text="Welcome!")
+    result = await update_business_settings(body=body, user=owner, db=db)
+    assert result.greeting_text == "Welcome!"
+    assert db.commits == 1

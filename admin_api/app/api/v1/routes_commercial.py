@@ -361,6 +361,20 @@ async def get_invoice_pdf(
 
 # ── Dashboard & client list ──────────────────────────────────────────────────
 
+def _trial_extension_cap_days(role: str) -> int | None:
+    """
+    The remaining-allowance cap the UI needs to show alongside
+    trial_extension_days_total — ONBOARDER extensions are capped at
+    settings.ONBOARDER_MAX_TRIAL_EXTENSION_DAYS (see
+    backend/app/billing/trials.py::extend_trial); SUPER_ADMIN is
+    unrestricted, so null means "no cap" here, not "unknown".
+    """
+    if role != AdminRole.ONBOARDER:
+        return None
+    from backend.app.core.config import get_settings as _get_backend_settings
+    return _get_backend_settings().ONBOARDER_MAX_TRIAL_EXTENSION_DAYS
+
+
 class DashboardRow(BaseModel):
     business_id: uuid.UUID
     business_name: str
@@ -371,6 +385,13 @@ class DashboardRow(BaseModel):
     outstanding_cents: int
     onboarding_readiness: str
     onboarded_by: str | None = None
+    # Additive (admin-suite Wave 0A request): compute_account_status already
+    # computes these alerts (TRIAL_ENDS_7D/3D/1D, INVOICE_OVERDUE,
+    # PAYMENT_AWAITING, SUSPENDED) — this just returns what was already
+    # computed instead of discarding it after the bucket-routing decision.
+    alerts: list[str] = []
+    trial_extension_days_total: int
+    trial_extension_cap_days: int | None = None
 
 
 class CommercialDashboardResponse(BaseModel):
@@ -468,6 +489,9 @@ async def get_commercial_dashboard(
             outstanding_cents=sum(inv.total_cents for inv in open_invs),
             onboarding_readiness=f"{go_live.readiness.passed}/{go_live.readiness.total}",
             onboarded_by=(admin_names.get(biz.onboarded_by_admin_id) if user.role == AdminRole.SUPER_ADMIN else None),
+            alerts=list(acct.alerts),
+            trial_extension_days_total=biz.trial_extension_days_total,
+            trial_extension_cap_days=_trial_extension_cap_days(user.role),
         )
         for bucket in bucket_names:
             buckets[bucket].append(row)
@@ -494,6 +518,9 @@ class ClientRow(BaseModel):
     days_remaining: int | None
     outstanding_cents: int
     onboarded_by: str | None = None
+    alerts: list[str] = []
+    trial_extension_days_total: int
+    trial_extension_cap_days: int | None = None
 
 
 @router.get("/clients", response_model=list[ClientRow])
@@ -526,10 +553,45 @@ async def list_commercial_clients(
         acct = compute_account_status(biz, open_invs, now)
         if status and acct.status != status:
             continue
-        rows.append(ClientRow(
-            business_id=biz.id, business_name=biz.name, account_status=acct.status,
-            plan=biz.plan, trial_ends_at=biz.trial_ends_at, days_remaining=acct.trial_days_remaining,
-            outstanding_cents=sum(inv.total_cents for inv in open_invs),
-            onboarded_by=(admin_names.get(biz.onboarded_by_admin_id) if user.role == AdminRole.SUPER_ADMIN else None),
-        ))
+        rows.append(_client_row(biz, acct, open_invs, admin_names, user))
     return rows
+
+
+def _client_row(biz: Business, acct, open_invs: list, admin_names: dict, user: AuthUser) -> ClientRow:
+    return ClientRow(
+        business_id=biz.id, business_name=biz.name, account_status=acct.status,
+        plan=biz.plan, trial_ends_at=biz.trial_ends_at, days_remaining=acct.trial_days_remaining,
+        outstanding_cents=sum(inv.total_cents for inv in open_invs),
+        onboarded_by=(admin_names.get(biz.onboarded_by_admin_id) if user.role == AdminRole.SUPER_ADMIN else None),
+        alerts=list(acct.alerts),
+        trial_extension_days_total=biz.trial_extension_days_total,
+        trial_extension_cap_days=_trial_extension_cap_days(user.role),
+    )
+
+
+@router.get("/clients/{business_id}", response_model=ClientRow)
+async def get_commercial_client(
+    business_id: uuid.UUID,
+    user: AuthUser = Depends(require_onboarding_role),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Single-client detail — same derived fields as one row of GET /clients,
+    for the admin-suite's client detail page (avoids re-fetching and
+    client-side-filtering the whole list just to view one business).
+    Uses get_business_commercial_scoped: an ONBOARDER sees only their own
+    clients (404 otherwise, matching every other commercial route in this
+    file), and this stays available after handover (onboarding_completed_at
+    set) — only the CONFIGURATION routes lose ONBOARDER access then.
+    """
+    biz = await get_business_commercial_scoped(business_id, user, db)
+    open_invs = (await _open_invoices_by_business(db, [biz.id])).get(biz.id, [])
+
+    admin_names: dict[uuid.UUID, str] = {}
+    if user.role == AdminRole.SUPER_ADMIN and biz.onboarded_by_admin_id:
+        admin = await db.get(AdminUser, biz.onboarded_by_admin_id)
+        if admin:
+            admin_names[admin.id] = admin.display_name
+
+    acct = compute_account_status(biz, open_invs, datetime.now(timezone.utc))
+    return _client_row(biz, acct, open_invs, admin_names, user)

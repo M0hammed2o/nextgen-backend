@@ -26,6 +26,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from shared.enums import OrderSource
+from shared.models.admin import AdminUser
 from shared.models.audit import MessageOutbox
 from shared.models.business import Business
 from shared.models.inventory import Ingredient
@@ -108,7 +109,15 @@ async def compute_go_live_checks(db: AsyncSession, business: Business) -> GoLive
         status=STATUS_PASS if staff_with_pin else STATUS_WARN,
         detail=(
             f"{staff_with_pin} staff member(s) can clock in at the till" if staff_with_pin
-            else "No staff member has a PIN yet — the owner/manager can still trade alone"
+            # PIN login (POST /auth/login/pin, see auth_service.py::login_pin)
+            # is STAFF-only by design — an owner/manager cannot log into the
+            # staff-ops till PWA at all. Without at least one staff PIN, the
+            # till literally cannot be operated by anyone; owners/managers
+            # manage the business (including voiding/refunding a till sale)
+            # from the Manager Dashboard instead, not the till itself.
+            else "No staff member has a PIN yet — the till cannot be operated "
+                 "(PIN login is STAFF-only; owners/managers void/refund from "
+                 "the Manager Dashboard instead, not the till)"
         ),
     ))
 
@@ -133,16 +142,36 @@ async def compute_go_live_checks(db: AsyncSession, business: Business) -> GoLive
     ))
 
     # ── VAT / receipt settings ──────────────────────────────────────────────
-    vat_ok = (not business.vat_registered) or bool(business.vat_number)
-    paper_ok = bool(business.receipt_paper_width_mm)  # column is NOT NULL with a server default
-    if vat_ok and paper_ok:
-        detail = "VAT and receipt paper width are configured"
+    # Real-browser fix (Wave 0A): this used to pass for a completely
+    # untouched tenant, because BOTH of its old signals are true by default
+    # on a freshly created business — vat_registered defaults False (so
+    # vat_ok was trivially True) and receipt_paper_width_mm is NOT NULL with
+    # a server default of 80mm (so paper_ok was trivially True even though
+    # nobody had ever opened receipt settings). Paper width is no longer
+    # used as evidence of configuration for exactly that reason. Now
+    # requires actual evidence the owner touched receipt settings (a
+    # trading name, or any receipt_config_json at all), and — if
+    # VAT-registered — a real VAT number AND a non-zero rate (a 0% VAT tax
+    # invoice is invalid; see routes_business.py's matching VAT_RATE_REQUIRED
+    # validation on PUT /settings).
+    receipt_config = business.receipt_config_json or {}
+    receipt_configured = bool(receipt_config.get("trading_name")) or bool(receipt_config)
+    if business.vat_registered:
+        vat_ok = bool(business.vat_number) and business.vat_rate_basis_points > 0
+    else:
+        vat_ok = True
+
+    if vat_ok and receipt_configured:
+        detail = "VAT and receipt settings are configured"
         status = STATUS_PASS
     elif not vat_ok:
-        detail = "Business is marked VAT-registered but has no VAT number set"
+        if not business.vat_number:
+            detail = "Business is marked VAT-registered but has no VAT number set"
+        else:
+            detail = "Business is marked VAT-registered but its VAT rate is 0% — a tax invoice needs a real rate"
         status = STATUS_FAIL
     else:
-        detail = "Receipt paper width is not set"
+        detail = "Receipt settings have not been configured yet (e.g. trading name)"
         status = STATUS_FAIL
     checks.append(GoLiveCheck(key="vat_receipt", label="VAT & receipt settings", status=status, detail=detail))
 
@@ -275,12 +304,51 @@ async def compute_go_live_checks(db: AsyncSession, business: Business) -> GoLive
 
     # ── Manual confirmations the system cannot observe automatically ───────
     confirmations = business.onboarding_confirmations or {}
+
+    # Real-browser fix: the detail text used to show the confirming admin's
+    # raw UUID (confirmed_by is stored as a bare id — see
+    # routes_businesses.py::confirm_onboarding_item). Resolve every id
+    # actually referenced to its current display_name in one query.
+    # Null-safe: a missing/malformed id, or an admin row that no longer
+    # exists (e.g. deleted since), falls back to a plain label rather than
+    # raising or ever showing a raw UUID.
+    confirmed_by_name: dict[str, str] = {}
+    _raw_admin_ids = {
+        c.get("confirmed_by") for c in confirmations.values()
+        if isinstance(c, dict) and c.get("confirmed_by")
+    }
+    _admin_ids: list[uuid.UUID] = []
+    for _raw in _raw_admin_ids:
+        try:
+            _admin_ids.append(uuid.UUID(str(_raw)))
+        except (ValueError, TypeError, AttributeError):
+            continue
+    if _admin_ids:
+        _admin_rows = (await db.execute(
+            select(AdminUser.id, AdminUser.display_name).where(AdminUser.id.in_(_admin_ids))
+        )).all()
+        confirmed_by_name = {str(admin_id): name for admin_id, name in _admin_rows}
+
+    def _confirmed_by_label(item_key: str) -> str:
+        raw = confirmations.get(item_key, {}).get("confirmed_by")
+        if not raw:
+            return "an admin"
+        try:
+            # Normalise through uuid.UUID so both the hex-no-dashes form
+            # (routes_businesses.py::confirm_onboarding_item stores
+            # user.user_id.hex) and a standard dashed string match the
+            # same dict key.
+            normalized = str(uuid.UUID(str(raw)))
+        except (ValueError, TypeError, AttributeError):
+            return "an admin"
+        return confirmed_by_name.get(normalized, "an admin (account no longer active)")
+
     modules_confirmed = "modules" in confirmations
     checks.append(GoLiveCheck(
         key="modules_confirmed", label="Purchased modules confirmed",
         status=STATUS_PASS if modules_confirmed else STATUS_FAIL,
         detail=(
-            f"Confirmed by {confirmations['modules'].get('confirmed_by', 'an admin')} "
+            f"Confirmed by {_confirmed_by_label('modules')} "
             f"on {confirmations['modules'].get('confirmed_at', 'unknown date')}"
         ) if modules_confirmed else
         "No admin has confirmed which modules this client purchased yet — "
@@ -342,7 +410,7 @@ async def compute_go_live_checks(db: AsyncSession, business: Business) -> GoLive
             status=STATUS_PASS if whatsapp_ok else STATUS_FAIL,
             detail=(
                 f"{sent_message_count} outbound message(s) reached SENT" if sent_message_count
-                else "Confirmed by an admin" if whatsapp_confirmed
+                else f"Confirmed by {_confirmed_by_label('whatsapp_test')}" if whatsapp_confirmed
                 else "No outbound WhatsApp message has been sent yet, and no test-send has been confirmed"
             ),
         ))
