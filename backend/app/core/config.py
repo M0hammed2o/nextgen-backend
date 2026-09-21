@@ -222,6 +222,11 @@ class Settings(BaseSettings):
     ACCOUNT_LOCKOUT_ATTEMPTS: int = 5
     ACCOUNT_LOCKOUT_MINUTES: int = 30
     CUSTOMER_MESSAGE_RATE_PER_MINUTE: int = 10
+    # WhatsApp Embedded Signup connect flow (Wave 0A / Milestone C) — each
+    # call burns a ~30s-TTL Meta authorization code and hits several Graph
+    # endpoints, so this is deliberately low, matching LOGIN's sensitivity.
+    WHATSAPP_CONNECT_RATE_LIMIT_PER_MINUTE: int = 5
+    WHATSAPP_TEST_MESSAGE_RATE_LIMIT_PER_MINUTE: int = 5
 
     # ── Readiness ────────────────────────────────────────────────────────
     # GET /ready reports the ARQ worker's heartbeat as "stale" whenever it's

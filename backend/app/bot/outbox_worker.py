@@ -1,8 +1,18 @@
 """
 Outbox Worker — background task for reliable message delivery.
 
-Model 1: Uses platform token from env (WHATSAPP_DEFAULT_ACCESS_TOKEN).
-No per-business token lookup needed.
+Model 1: Uses platform token from env (WHATSAPP_DEFAULT_ACCESS_TOKEN) for
+any business with no active customer-owned WhatsApp connection.
+
+Wave 0A / Milestone C / DECISION-0022: for a business with a CONNECTED
+whatsapp_connections row, sends resolve to that business's OWN token
+instead (backend/app/whatsapp/token_resolver.py via
+_send_via_business_connection) — with NO fallback to the platform token on
+a Graph error 190 (the platform token has no rights on a customer-owned
+WABA). A retry that finds no usable credentials (e.g. connection is
+NEEDS_ATTENTION) fails this attempt and is retried later by the existing
+backoff below, same as any other send failure — it does not raise or skip
+the batch.
 
 Picks up PENDING messages from message_outbox, attempts to send via Meta API,
 and marks as SENT or FAILED (up to max_attempts).
@@ -18,7 +28,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from backend.app.bot.whatsapp_sender import _send_via_meta_api
+from backend.app.bot.whatsapp_sender import _send_via_business_connection
 from backend.app.core.config import get_settings
 from shared.models.audit import MessageOutbox
 from shared.models.business import Business
@@ -105,7 +115,10 @@ async def _process_single(db: AsyncSession, msg: MessageOutbox) -> None:
     msg.status = "SENDING"
     await db.flush()
 
-    # Attempt send using platform token (from env, NOT per-business)
+    # Resolve per-business credentials (Wave 0A / Milestone C) — falls back
+    # to the platform token internally when this business has no active
+    # customer-owned connection; NO fallback when a connection exists but
+    # isn't CONNECTED (see _send_via_business_connection docstring).
     payload = {
         "messaging_product": "whatsapp",
         "recipient_type": "individual",
@@ -114,11 +127,7 @@ async def _process_single(db: AsyncSession, msg: MessageOutbox) -> None:
         "text": {"body": msg.message_text},
     }
 
-    wa_message_id = await _send_via_meta_api(
-        phone_number_id=business.whatsapp_phone_number_id,
-        recipient_wa_id=msg.customer_wa_id,
-        payload=payload,
-    )
+    wa_message_id, error_detail = await _send_via_business_connection(db, business, payload)
 
     if wa_message_id:
         msg.status = "SENT"
@@ -127,13 +136,13 @@ async def _process_single(db: AsyncSession, msg: MessageOutbox) -> None:
     else:
         if msg.attempts >= msg.max_attempts:
             msg.status = "FAILED"
-            msg.last_error = f"Max attempts ({msg.max_attempts}) reached"
+            msg.last_error = error_detail or f"Max attempts ({msg.max_attempts}) reached"
         else:
             msg.status = "PENDING"
             # Exponential backoff: 5s, 25s, 125s
             delay = POLL_INTERVAL_SECONDS * (5 ** (msg.attempts - 1))
             msg.scheduled_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
-            msg.last_error = "Send failed, retrying"
+            msg.last_error = error_detail or "Send failed, retrying"
 
 
 # ── Entry point for standalone worker ────────────────────────────────────────

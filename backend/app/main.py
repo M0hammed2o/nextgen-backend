@@ -209,6 +209,7 @@ from backend.app.api.v1.routes_staff import router as staff_router
 from backend.app.api.v1.routes_export import router as export_router
 from backend.app.api.v1.routes_payments import router as payments_router
 from backend.app.api.v1.routes_push import router as push_router
+from backend.app.api.v1.routes_whatsapp_connect import router as whatsapp_connect_router
 from backend.app.realtime.sse import router as sse_router
 from backend.app.billing.stripe_webhooks import router as billing_router
 
@@ -240,6 +241,12 @@ app.include_router(staff_router, prefix=PREFIX)
 app.include_router(export_router, prefix=PREFIX)
 app.include_router(payments_router, prefix=PREFIX)
 app.include_router(push_router, prefix=PREFIX)
+# Wave 0A / Milestone C / DECISION-0022 — customer-owned WhatsApp via Meta
+# Embedded Signup, additive alongside the existing platform-token webhook
+# router above. META_APP_ID/META_ES_CONFIG_ID are optional (GET .../config
+# reports available:false when unset) so registering this router never
+# affects a deployment that hasn't configured Embedded Signup.
+app.include_router(whatsapp_connect_router, prefix=PREFIX)
 app.include_router(sse_router, prefix=PREFIX)
 app.include_router(billing_router, prefix=PREFIX)
 

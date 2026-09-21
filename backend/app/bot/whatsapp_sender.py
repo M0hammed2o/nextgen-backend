@@ -13,6 +13,17 @@ Supports:
 
 Uses outbox pattern: writes to message_outbox first, then sends.
 If send fails, the outbox worker retries later.
+
+Wave 0A / Milestone C / DECISION-0022: send_text_message() and
+send_notification_message() below accept an OPTIONAL `business` (+ `db` for
+the latter) parameter. When provided, the send resolves per-business
+WhatsApp credentials (backend/app/whatsapp/token_resolver.py) and, if the
+business has an active customer-owned connection, sends via
+backend/app/whatsapp/graph_client.py instead of the platform token — with
+NO fallback to the platform token on a Graph error 190 (see
+_send_via_business_connection below). Every EXISTING caller that omits
+`business` keeps sending on the platform token exactly as before —
+zero behaviour change for callers not updated to pass it.
 """
 
 import logging
@@ -167,6 +178,68 @@ async def _send_via_meta_api_with_detail(
         return None, msg
 
 
+# ── Business-connection send (Wave 0A / Milestone C) ─────────────────────────
+
+async def _send_via_business_connection(
+    db: AsyncSession,
+    business,
+    payload: dict,
+) -> tuple[str | None, str | None]:
+    """
+    Resolve credentials for `business` (backend/app/whatsapp/token_resolver.py)
+    and send via the customer-owned connection's Graph client when one is
+    CONNECTED; falls back to the existing platform-token path
+    (_send_via_meta_api_with_detail) only when the business has NO active
+    connection at all. A business whose connection exists but is not
+    CONNECTED gets NO send attempt and NO platform fallback — the platform
+    token has no rights on a customer-owned WABA (see token_resolver.py's
+    module docstring). On Graph error 190, marks the connection
+    NEEDS_ATTENTION and does not retry with a different credential.
+
+    Returns (wamid | None, error_detail | None), matching
+    _send_via_meta_api_with_detail's contract.
+    """
+    from backend.app.whatsapp.connection_service import get_connection, mark_invalid_token
+    from backend.app.whatsapp.graph_client import GraphAPIError, MetaGraphClient
+    from backend.app.whatsapp.token_resolver import resolve_whatsapp_credentials
+
+    creds = await resolve_whatsapp_credentials(db, business)
+    if creds is None:
+        connection = await get_connection(db, business.id)
+        if connection is not None and connection.status != "CONNECTED":
+            return None, (
+                f"WhatsApp connection for business {business.id} is "
+                f"{connection.status} — no send attempted (no platform-token fallback)."
+            )
+        return None, f"No WhatsApp credentials configured for business {business.id}"
+
+    if creds.source == "platform":
+        return await _send_via_meta_api_with_detail(
+            phone_number_id=creds.phone_number_id,
+            recipient_wa_id=payload.get("to", ""),
+            payload=payload,
+        )
+
+    client = MetaGraphClient()
+    try:
+        data = await client.send_message(creds.phone_number_id, creds.access_token, payload)
+    except GraphAPIError as exc:
+        if exc.is_invalid_token and creds.connection_id is not None:
+            connection = await get_connection(db, business.id)
+            if connection is not None:
+                await mark_invalid_token(
+                    db, connection,
+                    "Meta reports this connection's token is no longer valid "
+                    "(error 190) — reconnect required.",
+                )
+        return None, f"Meta API error (business connection): {exc}"
+
+    messages = data.get("messages", [])
+    if messages:
+        return messages[0].get("id"), None
+    return None, "Meta API returned 200 but no messages[] in response (business connection)"
+
+
 # ── Text message (with outbox persistence) ───────────────────────────────────
 
 async def send_text_message(
@@ -181,15 +254,23 @@ async def send_text_message(
     llm_provider: str | None = None,
     intent: str | None = None,
     customer_id: uuid.UUID | None = None,
+    business=None,
 ) -> str | None:
     """
     Send a text message to a WhatsApp user.
 
     1. Persist outbound message to messages table
     2. Write to outbox (reliable delivery)
-    3. Attempt immediate send via Meta API (platform token)
+    3. Attempt immediate send via Meta API (platform token, unless `business`
+       is passed AND has an active customer-owned connection — see
+       _send_via_business_connection)
     4. If send succeeds, mark outbox as SENT
     5. If send fails, outbox worker retries later
+
+    `business` (optional, Wave 0A / Milestone C): pass the loaded Business
+    ORM row to resolve per-business WhatsApp credentials instead of always
+    using the platform token. Omitted by every caller not yet updated for
+    Milestone C — behaviour for those callers is unchanged.
 
     Returns the wa_message_id on success, None on failure.
     """
@@ -226,11 +307,18 @@ async def send_text_message(
         "text": {"body": text},
     }
 
-    wa_message_id = await _send_via_meta_api(
-        phone_number_id=phone_number_id,
-        recipient_wa_id=customer_wa_id,
-        payload=payload,
-    )
+    if business is not None:
+        # Wave 0A / Milestone C — resolve per-business credentials; the
+        # helper falls back to the platform token itself when the business
+        # has no active connection, so `phone_number_id` above is only used
+        # as-is for callers that don't pass `business`.
+        wa_message_id, _detail = await _send_via_business_connection(db, business, payload)
+    else:
+        wa_message_id = await _send_via_meta_api(
+            phone_number_id=phone_number_id,
+            recipient_wa_id=customer_wa_id,
+            payload=payload,
+        )
 
     if wa_message_id:
         outbound.wa_message_id = wa_message_id
@@ -253,12 +341,19 @@ async def send_notification_message(
     phone_number_id: str,
     recipient_wa_id: str,
     text: str,
+    db: AsyncSession | None = None,
+    business=None,
 ) -> str | None:
     """
     Send a short notification to a customer — e.g. order status updates.
     Unlike send_text_message, this does NOT persist to the messages table or outbox.
     Call fire-and-forget inside a try/except.
     Returns wamid on success, None on failure.
+
+    `db` + `business` (optional, Wave 0A / Milestone C): pass BOTH to resolve
+    per-business WhatsApp credentials instead of always using the platform
+    token (see _send_via_business_connection). Omitted by every caller not
+    yet updated for Milestone C — behaviour for those callers is unchanged.
     """
     payload = {
         "messaging_product": "whatsapp",
@@ -267,6 +362,9 @@ async def send_notification_message(
         "type": "text",
         "text": {"body": text},
     }
+    if db is not None and business is not None:
+        wa_message_id, _detail = await _send_via_business_connection(db, business, payload)
+        return wa_message_id
     return await _send_via_meta_api(phone_number_id, recipient_wa_id, payload)
 
 
