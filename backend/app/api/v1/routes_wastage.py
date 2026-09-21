@@ -24,7 +24,7 @@ from backend.app.core.errors import AppError, NotFoundError
 from backend.app.core.ownership import require_owned
 from backend.app.core.rbac import AuthUser, require_owner_or_manager, require_staff_or_above
 from backend.app.db.session import get_db
-from backend.app.inventory.ledger import build_movement
+from backend.app.inventory.ledger import build_movement, wastage_idempotency_key
 from backend.app.inventory.units import UnitError, format_quantity, to_milli, value_cents
 from shared.enums import (
     CanonicalUnit,
@@ -36,6 +36,7 @@ from shared.models.asset import Asset
 from shared.models.business import Business
 from shared.models.inventory import Ingredient
 from shared.models.order import Order
+from shared.models.user import BusinessUser
 from shared.models.wastage import WastageEntry
 
 router = APIRouter(prefix="/business/wastage", tags=["wastage"])
@@ -51,11 +52,15 @@ _MOVEMENT_TYPE_FOR_REASON = {
 _REASON_PATTERN = "^(" + "|".join(r.value for r in WastageReason) + ")$"
 
 
-async def _require_inventory_enabled(db: AsyncSession, business_id: uuid.UUID) -> None:
+async def _require_inventory_enabled(db: AsyncSession, business_id: uuid.UUID) -> Business:
     """
     Same entitlement gate record_wastage already applies inline — factored
-    out here only for the two routes below that were missing it (list and
-    approve), without touching record_wastage's own body.
+    out here for the two routes below that were missing it (list and
+    approve). Also returns the Business row so callers can read its current
+    wastage_approval_threshold_cents (list/approve derive "did this need
+    approval" from the CURRENT threshold — the threshold isn't persisted
+    per-entry, so a threshold change after the fact changes how old entries
+    are labelled; documented here rather than silently assumed).
     """
     business = (
         await db.execute(select(Business).where(Business.id == business_id))
@@ -68,6 +73,31 @@ async def _require_inventory_enabled(db: AsyncSession, business_id: uuid.UUID) -
             "The inventory module is not enabled for this business",
             409,
         )
+    return business
+
+
+async def _staff_name_map(
+    db: AsyncSession, business_id: uuid.UUID, user_ids: set
+) -> dict:
+    """
+    Tenant-scoped, null-safe display-name lookup for a batch of
+    business_user ids. WastageEntry.created_by_user_id/approved_by_user_id
+    deliberately have no FK to business_users (same pattern as
+    Order.cancelled_by_user_id) — a permanently-deleted staff member's past
+    entries must keep their (now orphaned) id and simply show no name.
+    """
+    ids = {uid for uid in user_ids if uid is not None}
+    if not ids:
+        return {}
+    rows = (
+        await db.execute(
+            select(BusinessUser.id, BusinessUser.staff_name).where(
+                BusinessUser.business_id == business_id,
+                BusinessUser.id.in_(ids),
+            )
+        )
+    ).all()
+    return {row[0]: row[1] for row in rows}
 
 
 class WastageCreateRequest(BaseModel):
@@ -100,6 +130,8 @@ class WastageResponse(BaseModel):
     value_cents: int
     requires_approval: bool
     approved_by_user_id: uuid.UUID | None
+    logged_by_name: str | None = None
+    approved_by_name: str | None = None
     occurred_at: datetime
 
 
@@ -140,18 +172,19 @@ async def record_wastage(
     user: AuthUser = Depends(require_staff_or_above),
     db: AsyncSession = Depends(get_db),
 ):
-    """Record a loss and post the matching negative stock movement."""
-    business = (
-        await db.execute(select(Business).where(Business.id == user.business_id))
-    ).scalar_one_or_none()
-    if not business:
-        raise NotFoundError("Business")
-    if not business.inventory_enabled:
-        raise AppError(
-            "INVENTORY_NOT_ENABLED",
-            "The inventory module is not enabled for this business",
-            409,
-        )
+    """
+    Record a loss and post the matching negative stock movement.
+
+    A STAFF entry valued at or above the approval threshold is still SAVED
+    (with approved_by_user_id left null, i.e. pending) — it is never
+    rejected. The food/stock is already physically gone by the time this is
+    called, so refusing to record it would make a real loss silently
+    disappear from the ledger, which is worse than an unapproved entry. The
+    stock movement posts immediately either way so stock-on-hand is always
+    correct; approval above threshold is a review/sign-off step afterwards
+    (see approve_wastage), never a second deduction.
+    """
+    business = await _require_inventory_enabled(db, user.business_id)
 
     ingredient = (
         await db.execute(
@@ -185,14 +218,9 @@ async def record_wastage(
     threshold = int(business.wastage_approval_threshold_cents or 0)
     is_manager = user.role in ("OWNER", "MANAGER")
     requires_approval = bool(threshold) and loss_value >= threshold
-
-    if requires_approval and not is_manager:
-        raise AppError(
-            "WASTAGE_APPROVAL_REQUIRED",
-            f"Wastage valued at {loss_value} cents needs manager approval "
-            f"(threshold is {threshold} cents)",
-            403,
-        )
+    # A STAFF entry above threshold is saved pending approval (see docstring)
+    # rather than rejected. OWNER/MANAGER entries above threshold are
+    # auto-approved by the person who logged them.
 
     occurred = body.occurred_at or datetime.now(timezone.utc)
     entry = WastageEntry(
@@ -226,12 +254,17 @@ async def record_wastage(
             source_type=StockSourceType.WASTAGE_ENTRY.value,
             source_id=entry.id,
             created_by_user_id=user.user_id,
+            idempotency_key=wastage_idempotency_key(entry.id, ingredient.id),
             notes=f"{body.reason}: {body.note}" if body.note else body.reason,
             occurred_at=occurred,
         )
     )
     await db.commit()
     await db.refresh(entry)
+
+    names = await _staff_name_map(
+        db, user.business_id, {entry.created_by_user_id, entry.approved_by_user_id}
+    )
 
     return WastageResponse(
         id=entry.id,
@@ -246,6 +279,8 @@ async def record_wastage(
         value_cents=loss_value,
         requires_approval=requires_approval,
         approved_by_user_id=entry.approved_by_user_id,
+        logged_by_name=names.get(entry.created_by_user_id),
+        approved_by_name=names.get(entry.approved_by_user_id),
         occurred_at=entry.occurred_at,
     )
 
@@ -258,7 +293,8 @@ async def list_wastage(
     db: AsyncSession = Depends(get_db),
 ):
     """Recent wastage, newest first."""
-    await _require_inventory_enabled(db, user.business_id)
+    business = await _require_inventory_enabled(db, user.business_id)
+    threshold = int(business.wastage_approval_threshold_cents or 0)
     stmt = (
         select(WastageEntry, Ingredient)
         .join(Ingredient, Ingredient.id == WastageEntry.ingredient_id)
@@ -270,6 +306,15 @@ async def list_wastage(
         stmt = stmt.where(WastageEntry.occurred_at >= since)
 
     rows = (await db.execute(stmt)).all()
+
+    # One batched tenant-scoped name lookup for every entry on this page,
+    # instead of a query per row.
+    name_ids = set()
+    for entry, _ in rows:
+        name_ids.add(entry.created_by_user_id)
+        name_ids.add(entry.approved_by_user_id)
+    names = await _staff_name_map(db, user.business_id, name_ids)
+
     return [
         WastageResponse(
             id=entry.id,
@@ -283,8 +328,15 @@ async def list_wastage(
             reason=entry.reason,
             note=entry.note,
             value_cents=int(entry.value_cents or 0),
-            requires_approval=entry.approved_by_user_id is not None,
+            # Derived from the business's CURRENT threshold (not persisted
+            # per-entry) — whether this loss needed sign-off, independent of
+            # whether it has been approved yet. Previously this incorrectly
+            # equated "requires_approval" with "already approved", which
+            # made a pending entry look like it needed no approval at all.
+            requires_approval=bool(threshold) and int(entry.value_cents or 0) >= threshold,
             approved_by_user_id=entry.approved_by_user_id,
+            logged_by_name=names.get(entry.created_by_user_id),
+            approved_by_name=names.get(entry.approved_by_user_id),
             occurred_at=entry.occurred_at,
         )
         for entry, ingredient in rows
@@ -303,8 +355,14 @@ async def approve_wastage(
     Note this does NOT re-post a stock movement — the loss was already
     recorded when it happened. Approval is a control record, not a second
     deduction; treating it as one would double-count the loss.
+
+    Idempotent: once an entry has an approver, a repeat call is a no-op
+    that returns the same state rather than reassigning the approver (or
+    writing a second time) — a double-tapped "approve" button can never
+    change who signed off or touch the ledger again.
     """
-    await _require_inventory_enabled(db, user.business_id)
+    business = await _require_inventory_enabled(db, user.business_id)
+    threshold = int(business.wastage_approval_threshold_cents or 0)
     row = (
         await db.execute(
             select(WastageEntry, Ingredient)
@@ -319,9 +377,14 @@ async def approve_wastage(
         raise NotFoundError("Wastage entry", str(entry_id))
     entry, ingredient = row
 
-    entry.approved_by_user_id = user.user_id
-    await db.commit()
-    await db.refresh(entry)
+    if entry.approved_by_user_id is None:
+        entry.approved_by_user_id = user.user_id
+        await db.commit()
+        await db.refresh(entry)
+
+    names = await _staff_name_map(
+        db, user.business_id, {entry.created_by_user_id, entry.approved_by_user_id}
+    )
 
     return WastageResponse(
         id=entry.id,
@@ -335,7 +398,9 @@ async def approve_wastage(
         reason=entry.reason,
         note=entry.note,
         value_cents=int(entry.value_cents or 0),
-        requires_approval=True,
+        requires_approval=bool(threshold) and int(entry.value_cents or 0) >= threshold,
         approved_by_user_id=entry.approved_by_user_id,
+        logged_by_name=names.get(entry.created_by_user_id),
+        approved_by_name=names.get(entry.approved_by_user_id),
         occurred_at=entry.occurred_at,
     )

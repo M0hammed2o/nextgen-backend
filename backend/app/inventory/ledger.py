@@ -77,6 +77,18 @@ def stocktake_adjustment_idempotency_key(
     return f"STOCKTAKE_ADJUSTMENT:{session_id}:{ingredient_id}"
 
 
+def wastage_idempotency_key(entry_id: uuid.UUID, ingredient_id: uuid.UUID) -> str:
+    """
+    Scoped per (wastage entry, ingredient) — one entry always maps to exactly
+    one ingredient today, but keyed the same way as the other loss/adjustment
+    keys above for consistency. Approval (routes_wastage.py::approve_wastage)
+    never posts a second movement — it only signs off the one posted here —
+    so this key alone is enough to guarantee "exactly one movement per
+    wastage entry, forever" even under a retried POST.
+    """
+    return f"WASTAGE:{entry_id}:{ingredient_id}"
+
+
 # ── Loading recipes ──────────────────────────────────────────────────────────
 
 async def load_recipe_specs(
