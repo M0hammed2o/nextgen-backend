@@ -158,6 +158,8 @@ async def _mark_order_paid(
                     phone_number_id=phone_number_id,
                     recipient_wa_id=wa_id,
                     text=build_payment_confirmed_message(order),
+                    db=db, order_id=order.id, business_id=business_id,
+                    order_status=order.status,
                 )
         except Exception:
             logger.exception("Failed to send payment confirmation WhatsApp for order %s", order.order_number)

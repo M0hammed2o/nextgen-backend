@@ -32,6 +32,8 @@ import uuid
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.app.bot import meta_errors
+from backend.app.bot.meta_errors import MetaErrorInfo
 from backend.app.core.config import get_settings
 from shared.models.audit import MessageOutbox
 from shared.models.message import Message
@@ -53,12 +55,17 @@ async def _send_via_meta_api(
     phone_number_id: str,
     recipient_wa_id: str,
     payload: dict,
-) -> str | None:
+) -> tuple[str | None, MetaErrorInfo | None]:
     """
     Send any message payload via Meta WhatsApp Cloud API v22.0.
 
     Uses WHATSAPP_DEFAULT_ACCESS_TOKEN from env (platform-level).
-    Returns the wamid on success, None on failure.
+    Returns (wamid, None) on success, or (None, MetaErrorInfo) on failure —
+    the MetaErrorInfo (backend/app/bot/meta_errors.py) is what lets a
+    caller (send_text_message, outbox_worker.py) distinguish a permanent
+    failure (invalid token, outside the 24h service window, invalid
+    recipient) from a transient one worth retrying, instead of treating
+    every failure identically.
     """
     url = (
         f"{settings.META_API_BASE_URL}/{settings.META_API_VERSION}"
@@ -86,18 +93,24 @@ async def _send_via_meta_api(
                 data = resp.json()
                 messages = data.get("messages", [])
                 if messages:
-                    return messages[0].get("id")
+                    return messages[0].get("id"), None
+                # 200 with no messages[] is itself an anomaly worth surfacing,
+                # not a silent None.
+                info = meta_errors.parse_meta_error(resp.status_code, resp.text)
+                meta_errors.log_meta_error(info, phone_number_id)
+                return None, info
             else:
-                logger.error(
-                    "Meta API error: status=%d, phone_number_id=%s, body=%s",
-                    resp.status_code, phone_number_id, resp.text[:500],
-                )
+                info = meta_errors.parse_meta_error(resp.status_code, resp.text)
+                meta_errors.log_meta_error(info, phone_number_id)
+                return None, info
     except httpx.TimeoutException:
-        logger.error("Meta API timeout: phone_number_id=%s", phone_number_id)
-    except Exception:
+        info = meta_errors.transport_error(f"Meta API timeout after 10s (phone_number_id={phone_number_id})")
+        logger.error(info.last_error)
+        return None, info
+    except Exception as exc:
+        info = meta_errors.transport_error(f"Unexpected error sending WhatsApp message: {exc!r}")
         logger.exception("Unexpected error sending WhatsApp message")
-
-    return None
+        return None, info
 
 
 async def _send_via_meta_api_with_detail(
@@ -184,20 +197,20 @@ async def _send_via_business_connection(
     db: AsyncSession,
     business,
     payload: dict,
-) -> tuple[str | None, str | None]:
+) -> "tuple[str | None, meta_errors.MetaErrorInfo | None]":
     """
     Resolve credentials for `business` (backend/app/whatsapp/token_resolver.py)
     and send via the customer-owned connection's Graph client when one is
     CONNECTED; falls back to the existing platform-token path
-    (_send_via_meta_api_with_detail) only when the business has NO active
-    connection at all. A business whose connection exists but is not
-    CONNECTED gets NO send attempt and NO platform fallback — the platform
-    token has no rights on a customer-owned WABA (see token_resolver.py's
-    module docstring). On Graph error 190, marks the connection
-    NEEDS_ATTENTION and does not retry with a different credential.
+    (_send_via_meta_api) only when the business has NO active connection at
+    all. A business whose connection exists but is not CONNECTED gets NO send
+    attempt and NO platform fallback — the platform token has no rights on a
+    customer-owned WABA (see token_resolver.py's module docstring). On Graph
+    error 190, marks the connection NEEDS_ATTENTION and does not retry with a
+    different credential.
 
-    Returns (wamid | None, error_detail | None), matching
-    _send_via_meta_api_with_detail's contract.
+    Returns (wamid | None, MetaErrorInfo | None), the same contract as
+    _send_via_meta_api, so callers classify every failure identically.
     """
     from backend.app.whatsapp.connection_service import get_connection, mark_invalid_token
     from backend.app.whatsapp.graph_client import GraphAPIError, MetaGraphClient
@@ -207,14 +220,14 @@ async def _send_via_business_connection(
     if creds is None:
         connection = await get_connection(db, business.id)
         if connection is not None and connection.status != "CONNECTED":
-            return None, (
-                f"WhatsApp connection for business {business.id} is "
-                f"{connection.status} — no send attempted (no platform-token fallback)."
+            return None, meta_errors.not_sendable(
+                f"WhatsApp connection is {connection.status} — reconnect required "
+                "(no platform-token fallback)"
             )
-        return None, f"No WhatsApp credentials configured for business {business.id}"
+        return None, meta_errors.not_sendable("No WhatsApp credentials configured")
 
     if creds.source == "platform":
-        return await _send_via_meta_api_with_detail(
+        return await _send_via_meta_api(
             phone_number_id=creds.phone_number_id,
             recipient_wa_id=payload.get("to", ""),
             payload=payload,
@@ -232,12 +245,19 @@ async def _send_via_business_connection(
                     "Meta reports this connection's token is no longer valid "
                     "(error 190) — reconnect required.",
                 )
-        return None, f"Meta API error (business connection): {exc}"
+        info = meta_errors.from_graph_error(exc)
+        logger.error(
+            "Meta API error (business connection): business=%s, retryable=%s, %s",
+            business.id, info.retryable, info.last_error,
+        )
+        return None, info
 
     messages = data.get("messages", [])
     if messages:
         return messages[0].get("id"), None
-    return None, "Meta API returned 200 but no messages[] in response (business connection)"
+    return None, meta_errors.transport_error(
+        "Meta API returned 200 but no messages[] in response (business connection)"
+    )
 
 
 # ── Text message (with outbox persistence) ───────────────────────────────────
@@ -312,9 +332,9 @@ async def send_text_message(
         # helper falls back to the platform token itself when the business
         # has no active connection, so `phone_number_id` above is only used
         # as-is for callers that don't pass `business`.
-        wa_message_id, _detail = await _send_via_business_connection(db, business, payload)
+        wa_message_id, error_info = await _send_via_business_connection(db, business, payload)
     else:
-        wa_message_id = await _send_via_meta_api(
+        wa_message_id, error_info = await _send_via_meta_api(
             phone_number_id=phone_number_id,
             recipient_wa_id=customer_wa_id,
             payload=payload,
@@ -327,9 +347,21 @@ async def send_text_message(
         from shared.utils.time import utc_now
         outbox_entry.sent_at = utc_now()
         logger.info("Message sent: wa_id=%s, business=%s", wa_message_id, business_id)
+    elif error_info is not None and not error_info.retryable:
+        # A permanent failure (invalid token, outside the 24h service
+        # window, invalid recipient) — the outbox worker's retry loop
+        # could never succeed here, so don't queue it to burn attempts.
+        outbox_entry.status = "FAILED"
+        outbox_entry.attempts = 1
+        outbox_entry.last_error = error_info.last_error
+        logger.warning(
+            "Message send failed permanently, not queued for retry: business=%s, %s",
+            business_id, error_info.last_error,
+        )
     else:
         outbox_entry.status = "PENDING"
         outbox_entry.attempts = 1
+        outbox_entry.last_error = error_info.last_error if error_info else None
         logger.warning("Message send failed, queued for retry: business=%s", business_id)
 
     return wa_message_id
@@ -343,6 +375,10 @@ async def send_notification_message(
     text: str,
     db: AsyncSession | None = None,
     business=None,
+    *,
+    order_id: uuid.UUID | None = None,
+    business_id: uuid.UUID | None = None,
+    order_status: str | None = None,
 ) -> str | None:
     """
     Send a short notification to a customer — e.g. order status updates.
@@ -354,6 +390,18 @@ async def send_notification_message(
     per-business WhatsApp credentials instead of always using the platform
     token (see _send_via_business_connection). Omitted by every caller not
     yet updated for Milestone C — behaviour for those callers is unchanged.
+
+    `db`/`order_id`/`business_id`/`order_status` are optional and additive
+    — every existing call site keeps working unchanged with none of them.
+    When ALL FOUR are supplied by a caller that already has the order (and
+    business) loaded, and the failure is Meta error 131047 (outside the
+    24-hour customer-service window — this business cannot free-text this
+    customer right now), an OrderEvent is written so staff can see, on the
+    order itself, that the customer was never reached — instead of the
+    notification just silently vanishing. Deliberately takes the caller's
+    already-loaded order_status/business_id rather than re-querying, so
+    this never needs its own extra round trip. `business_id` defaults to
+    `business.id` when only `business` is passed.
     """
     payload = {
         "messaging_product": "whatsapp",
@@ -363,9 +411,33 @@ async def send_notification_message(
         "text": {"body": text},
     }
     if db is not None and business is not None:
-        wa_message_id, _detail = await _send_via_business_connection(db, business, payload)
-        return wa_message_id
-    return await _send_via_meta_api(phone_number_id, recipient_wa_id, payload)
+        wa_message_id, error_info = await _send_via_business_connection(db, business, payload)
+    else:
+        wa_message_id, error_info = await _send_via_meta_api(phone_number_id, recipient_wa_id, payload)
+
+    if business_id is None and business is not None:
+        business_id = getattr(business, "id", None)
+
+    if (
+        wa_message_id is None
+        and db is not None
+        and order_id is not None
+        and business_id is not None
+        and meta_errors.is_outside_service_window(error_info)
+    ):
+        from shared.models.order import OrderEvent
+
+        db.add(OrderEvent(
+            order_id=order_id,
+            business_id=business_id,
+            old_status=order_status,
+            new_status=order_status or "UNKNOWN",
+            changed_by_user_id=None,
+            reason="Customer notification not delivered: outside WhatsApp 24-hour window",
+        ))
+        await db.flush()
+
+    return wa_message_id
 
 
 # ── Image message ────────────────────────────────────────────────────────────
@@ -395,11 +467,12 @@ async def send_image_message(
         "Sending image: phone_number_id=%s, to=%s, url=%s",
         phone_number_id, recipient_wa_id, image_url[:60],
     )
-    return await _send_via_meta_api(
+    wa_message_id, _error_info = await _send_via_meta_api(
         phone_number_id=phone_number_id,
         recipient_wa_id=recipient_wa_id,
         payload=payload,
     )
+    return wa_message_id
 
 
 # ── Template message ─────────────────────────────────────────────────────────
@@ -427,11 +500,12 @@ async def send_template_message(
     if components:
         payload["template"]["components"] = components
 
-    return await _send_via_meta_api(
+    wa_message_id, _error_info = await _send_via_meta_api(
         phone_number_id=phone_number_id,
         recipient_wa_id=recipient_wa_id,
         payload=payload,
     )
+    return wa_message_id
 
 
 # ── Interactive buttons ──────────────────────────────────────────────────────
@@ -463,8 +537,9 @@ async def send_interactive_buttons(
         },
     }
 
-    return await _send_via_meta_api(
+    wa_message_id, _error_info = await _send_via_meta_api(
         phone_number_id=phone_number_id,
         recipient_wa_id=recipient_wa_id,
         payload=payload,
     )
+    return wa_message_id

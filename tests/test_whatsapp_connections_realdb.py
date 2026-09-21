@@ -372,7 +372,10 @@ async def test_send_error_190_marks_needs_attention_and_no_platform_fallback(db)
             db, business, {"to": "27821234567", "type": "text", "text": {"body": "hi"}}
         )
     assert wamid is None
-    assert "business connection" in error_detail
+    # Contract since the merge with meta_errors: a structured, classified error.
+    assert error_detail is not None
+    assert error_detail.code == 190
+    assert error_detail.retryable is False
 
     result = await db.execute(
         select(WhatsAppConnection).where(WhatsAppConnection.business_id == business.id)

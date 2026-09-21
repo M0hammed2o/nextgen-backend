@@ -127,22 +127,33 @@ async def _process_single(db: AsyncSession, msg: MessageOutbox) -> None:
         "text": {"body": msg.message_text},
     }
 
-    wa_message_id, error_detail = await _send_via_business_connection(db, business, payload)
+    wa_message_id, error_info = await _send_via_business_connection(db, business, payload)
 
     if wa_message_id:
         msg.status = "SENT"
         msg.sent_wa_message_id = wa_message_id
         msg.sent_at = datetime.now(timezone.utc)
+    elif error_info is not None and not error_info.retryable:
+        # Invalid token (190), outside the 24h service window (131047), or
+        # an invalid recipient (131026) — retrying can never succeed, so
+        # fail immediately instead of burning max_attempts worth of
+        # exponential backoff on something that will never change.
+        msg.status = "FAILED"
+        msg.last_error = error_info.last_error
     else:
         if msg.attempts >= msg.max_attempts:
             msg.status = "FAILED"
-            msg.last_error = error_detail or f"Max attempts ({msg.max_attempts}) reached"
+            msg.last_error = (
+                f"Max attempts ({msg.max_attempts}) reached — last error: "
+                f"{error_info.last_error}" if error_info else
+                f"Max attempts ({msg.max_attempts}) reached"
+            )
         else:
             msg.status = "PENDING"
             # Exponential backoff: 5s, 25s, 125s
             delay = POLL_INTERVAL_SECONDS * (5 ** (msg.attempts - 1))
             msg.scheduled_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
-            msg.last_error = error_detail or "Send failed, retrying"
+            msg.last_error = error_info.last_error if error_info else "Send failed, retrying"
 
 
 # ── Entry point for standalone worker ────────────────────────────────────────
