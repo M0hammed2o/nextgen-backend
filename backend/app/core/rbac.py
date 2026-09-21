@@ -73,14 +73,30 @@ async def get_current_user(
     except jwt.ExpiredSignatureError:
         raise _expired
     except jwt.InvalidTokenError:
-        # Not a business-plane token — try the admin plane (SUPER_ADMIN only).
+        # Not a business-plane token — try the admin plane.
         try:
             payload = decode_admin_token(credentials.credentials)
         except jwt.ExpiredSignatureError:
             raise _expired
         except jwt.InvalidTokenError:
             raise _invalid
-        if payload.get("role") != "SUPER_ADMIN":
+        # Milestone B (sales-partner onboarding): this function is the ONE
+        # place every admin_api request authenticates through — including
+        # ONBOARDER, a second admin-plane role added alongside SUPER_ADMIN
+        # (shared/models/admin.py::AdminRole). Before this, this check
+        # hardcoded "SUPER_ADMIN", which silently made every ONBOARDER
+        # token invalid everywhere, including on admin_api's own routes —
+        # found via a real-JWT integration test, not by inspection alone.
+        # This does NOT grant ONBOARDER any new reach: business-plane
+        # dependencies (require_business_access below) only special-case
+        # role == "SUPER_ADMIN" for their cross-plane bypass, so an
+        # ONBOARDER token — which also carries business_id=None — still
+        # fails every business-plane role/tenant check exactly like any
+        # other unrecognised role would. Per-request re-validation of the
+        # CURRENT role/is_active (not just this token claim) happens one
+        # layer up, in admin_api/app/core/deps.py::get_current_admin.
+        from shared.models.admin import ADMIN_ROLES
+        if payload.get("role") not in ADMIN_ROLES:
             raise _invalid
 
     bid_str = payload.get("bid")
