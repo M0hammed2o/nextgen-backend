@@ -26,6 +26,11 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.app.analytics.revenue import (
+    IS_SALE,
+    refunds_cents_expr,
+    sale_timestamp_expr,
+)
 from backend.app.api.v1.routes_import import _read_rows, parse_mapping
 from backend.app.core.errors import AppError, NotFoundError
 from backend.app.core.rbac import AuthUser, require_owner_or_manager
@@ -620,6 +625,15 @@ async def channel_breakdown(
     Sales by channel. Deliberately simple for the pilot — commission and
     settlement are not modelled, but the data needed to add them later
     (per-order gross, per-channel source) is all recorded.
+
+    BUG-0043 fix: now uses the shared sale definition
+    (backend/app/analytics/revenue.py) instead of a narrower, ad hoc
+    `payment_status IN (PAID, PARTIALLY_REFUNDED)` filter, which silently
+    excluded a fully REFUNDED order (still a real sale, just netting to 0)
+    and any WhatsApp cash-on-collection order (payment_status never becomes
+    PAID for those — only the fulfilment status does). The date cutoff also
+    now uses the sale's own timestamp (external_placed_at for imports,
+    created_at otherwise) rather than row-insert time.
     """
     since = datetime.now(timezone.utc) - timedelta(days=days)
     rows = (
@@ -629,11 +643,12 @@ async def channel_breakdown(
                 func.count(),
                 func.coalesce(func.sum(Order.total_cents), 0),
                 func.coalesce(func.sum(Order.tax_cents), 0),
+                refunds_cents_expr(),
             )
             .where(
                 Order.business_id == user.business_id,
-                Order.created_at >= since,
-                Order.payment_status.in_(("PAID", "PARTIALLY_REFUNDED")),
+                sale_timestamp_expr() >= since,
+                IS_SALE,
             )
             .group_by(Order.source)
         )
@@ -651,8 +666,10 @@ async def channel_breakdown(
             "order_count": int(count or 0),
             "gross_cents": int(gross or 0),
             "vat_cents": int(vat or 0),
+            "refunds_cents": int(refunds or 0),
+            "net_cents": int(gross or 0) - int(refunds or 0),
         }
-        for source, count, gross, vat in rows
+        for source, count, gross, vat, refunds in rows
     ]
     channels.sort(key=lambda c: -c["gross_cents"])
 
@@ -662,6 +679,8 @@ async def channel_breakdown(
         "channels": channels,
         "total_orders": sum(c["order_count"] for c in channels),
         "total_gross_cents": sum(c["gross_cents"] for c in channels),
+        "total_refunds_cents": sum(c["refunds_cents"] for c in channels),
+        "total_net_cents": sum(c["net_cents"] for c in channels),
         "external_gross_cents": sum(
             c["gross_cents"] for c in channels if c["is_external"]
         ),
