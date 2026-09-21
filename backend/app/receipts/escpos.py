@@ -28,7 +28,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
 
-from backend.app.receipts.document import ReceiptDocument
+from backend.app.receipts.document import ReceiptDocument, format_money
 
 # ── Raw ESC/POS control sequences ────────────────────────────────────────────
 ESC = b"\x1b"
@@ -85,11 +85,12 @@ def _encode(text: str, capabilities: PrinterCapabilities) -> bytes:
 
 # ── Width-aware text helpers (pure, unit-testable) ───────────────────────────
 
-def format_money(cents: int, currency: str = "ZAR") -> str:
-    symbol = "R" if currency == "ZAR" else ""
-    negative = cents < 0
-    value = Decimal(abs(int(cents))) / Decimal(100)
-    return f"{'-' if negative else ''}{symbol}{value:.2f}"
+# format_money() now lives in document.py — the JSON document's *_display
+# fields and both text-based renderers must all format money identically,
+# so there is exactly one implementation. Re-exported here (rather than
+# just imported-and-unused) because existing callers do
+# `from backend.app.receipts.escpos import format_money`.
+__all__ = ["format_money", "PrinterCapabilities", "render_text", "render_escpos"]
 
 
 def two_column(left: str, right: str, columns: int) -> str:
@@ -262,12 +263,22 @@ def render_text(document: ReceiptDocument) -> str:
     out.append(two_column("Subtotal", money(totals.subtotal_cents), cols))
     if totals.discount_cents:
         out.append(two_column("Discount", "-" + money(totals.discount_cents), cols))
+        if totals.discount_reason:
+            out.extend(wrap(f"  ({totals.discount_reason})", cols))
     if totals.delivery_fee_cents:
         out.append(two_column("Delivery", money(totals.delivery_fee_cents), cols))
 
     if totals.vat_cents:
-        rate = Decimal(totals.vat_rate_basis_points) / Decimal(100)
-        label = f"VAT @ {rate:.2f}%" + (" (incl)" if totals.vat_inclusive else "")
+        # vat_rate_basis_points is None when the tenant's LIVE VAT rate no
+        # longer reconciles with this order's own stored VAT amount (see
+        # document.py's _vat_rate_display() docstring) — print the amount,
+        # which is always correct from the snapshot, without a rate that
+        # would contradict it.
+        if totals.vat_rate_basis_points:
+            rate = Decimal(totals.vat_rate_basis_points) / Decimal(100)
+            label = f"VAT @ {rate:.2f}%" + (" (incl)" if totals.vat_inclusive else "")
+        else:
+            label = "VAT"
         out.append(two_column(label, money(totals.vat_cents), cols))
 
     out.append(divider(cols))

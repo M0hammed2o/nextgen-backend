@@ -33,6 +33,7 @@ from shared.models.audit import AuditEvent
 from shared.models.business import Business
 from shared.models.order import Order
 from shared.models.user import BusinessUser
+from shared.utils.time import utc_now
 from sqlalchemy.ext.asyncio import AsyncSession
 
 router = APIRouter(prefix="/business/receipts", tags=["receipts"])
@@ -63,16 +64,56 @@ async def _load(db: AsyncSession, business_id: uuid.UUID, order_id: uuid.UUID):
 
 
 async def _cashier_name(db: AsyncSession, business_id: uuid.UUID, user_id) -> str | None:
+    """
+    Resolve a cashier's display name, scoped to the caller's own business.
+
+    BUG-0045 follow-up fix: this previously selected `BusinessUser.name`,
+    a column that does not exist on the model (only `staff_name`, for
+    PIN-auth staff, and `email`, for password-auth owners/managers) — every
+    receipt fetch for a POS-rung order (any order with created_by_user_id
+    set) raised AttributeError building the SELECT, i.e. every receipt for
+    a till sale was actually broken end-to-end, not just missing a name.
+    `staff_name or email` matches the resolution convention already used
+    elsewhere for the same column pair (routes_pos.py, routes_stocktake.py).
+    """
     if not user_id:
         return None
     row = (
         await db.execute(
-            select(BusinessUser.name).where(
+            select(BusinessUser.staff_name, BusinessUser.email).where(
                 BusinessUser.id == user_id, BusinessUser.business_id == business_id
             )
         )
     ).first()
-    return row[0] if row else None
+    if not row:
+        return None
+    staff_name, email = row
+    return staff_name or email
+
+
+async def _reprint_history(
+    db: AsyncSession, business_id: uuid.UUID, order_id: uuid.UUID
+) -> tuple[int, str | None]:
+    """
+    Prior reprints of this order, scoped to the caller's own business — used
+    to show "reprinted N times, last at ..." on the document. Cross-tenant
+    isolation matters here exactly as much as it does for the order itself:
+    both business_id and target_id are filtered together.
+    """
+    rows = (
+        await db.execute(
+            select(AuditEvent.created_at)
+            .where(
+                AuditEvent.business_id == business_id,
+                AuditEvent.target_type == "order",
+                AuditEvent.target_id == order_id,
+                AuditEvent.action == "receipt.reprinted",
+            )
+            .order_by(AuditEvent.created_at.desc())
+        )
+    ).scalars().all()
+    last_at = rows[0].isoformat() if rows else None
+    return len(rows), last_at
 
 
 async def _document(
@@ -84,12 +125,25 @@ async def _document(
 ):
     order, business = await _load(db, user.business_id, order_id)
     cashier = await _cashier_name(db, user.business_id, getattr(order, "created_by_user_id", None))
+    prior_count, prior_last_at = await _reprint_history(db, user.business_id, order_id)
+    if is_reprint:
+        # This request is itself the next reprint — the audit row for it is
+        # written by the caller (reprint_receipt()) right after this
+        # document is built, so count/stamp it as of now rather than
+        # waiting a round trip for a row that is about to exist anyway.
+        reprint_count = prior_count + 1
+        last_reprinted_at = utc_now().isoformat()
+    else:
+        reprint_count = prior_count
+        last_reprinted_at = prior_last_at
     return build_receipt_document(
         order,
         business,
         document_type=document_type,
         cashier_name=cashier,
         is_reprint=is_reprint,
+        reprint_count=reprint_count,
+        last_reprinted_at=last_reprinted_at,
     )
 
 
