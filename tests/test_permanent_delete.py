@@ -43,7 +43,7 @@ def make_caller(role="OWNER", business_id=None):
 
 
 def make_staff(**overrides):
-    s = types.SimpleNamespace(id=uuid.uuid4(), business_id=uuid.uuid4(), is_active=False)
+    s = types.SimpleNamespace(id=uuid.uuid4(), business_id=uuid.uuid4(), is_active=False, role="STAFF")
     for k, v in overrides.items():
         setattr(s, k, v)
     return s

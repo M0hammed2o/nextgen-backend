@@ -26,6 +26,26 @@ def _generate_pin() -> str:
     return f"{secrets.randbelow(10000):04d}"
 
 
+def _guard_target(user: AuthUser, staff: BusinessUser, action: str) -> None:
+    """
+    Role-hierarchy guard shared by every staff-mutating route (update,
+    PIN rotation, deactivate, permanent delete).
+
+    Rule: a MANAGER may only act on STAFF targets; an OWNER may act on
+    STAFF and MANAGER targets; nobody may act on themself or on any OWNER
+    through these routes — the owner has no self-service recovery if
+    locked out of their own account. A cross-role attempt is a 403 naming
+    the reason; unknown/other-tenant ids stay a 404, raised by the caller
+    before this guard ever runs.
+    """
+    if staff.id == user.user_id:
+        raise AppError("SELF_ACTION_FORBIDDEN", f"Cannot {action} your own account", 403)
+    if staff.role == "OWNER":
+        raise AppError("CANNOT_TARGET_OWNER", f"Cannot {action} the business owner", 403)
+    if user.role == "MANAGER" and staff.role != "STAFF":
+        raise AppError("INSUFFICIENT_ROLE", f"Managers can only {action} staff accounts", 403)
+
+
 # ── Schemas ──────────────────────────────────────────────────────────────────
 
 class StaffCreate(BaseModel):
@@ -164,6 +184,8 @@ async def update_staff(
     if not staff:
         raise NotFoundError("Staff", str(staff_id))
 
+    _guard_target(user, staff, "update")
+
     for field, value in body.model_dump(exclude_unset=True).items():
         setattr(staff, field, value)
 
@@ -189,6 +211,8 @@ async def rotate_pin(
     staff = result.scalar_one_or_none()
     if not staff:
         raise NotFoundError("Staff", str(staff_id))
+
+    _guard_target(user, staff, "rotate the PIN of")
 
     staff.pin_hash = hash_pin(body.new_pin)
     staff.pin_updated_at = datetime.now(timezone.utc)
@@ -224,6 +248,8 @@ async def auto_rotate_pin(
     if not staff:
         raise NotFoundError("Staff", str(staff_id))
 
+    _guard_target(user, staff, "rotate the PIN of")
+
     new_pin = _generate_pin()
 
     staff.pin_hash = hash_pin(new_pin)
@@ -255,6 +281,10 @@ async def deactivate_staff(
     # Prevent deactivating yourself
     if staff.id == user.user_id:
         raise AppError("SELF_DEACTIVATION", "Cannot deactivate your own account", 422)
+    if staff.role == "OWNER":
+        raise AppError("CANNOT_TARGET_OWNER", "Cannot deactivate the business owner", 403)
+    if user.role == "MANAGER" and staff.role != "STAFF":
+        raise AppError("INSUFFICIENT_ROLE", "Managers can only deactivate staff accounts", 403)
 
     staff.is_active = False
 
@@ -300,6 +330,8 @@ async def delete_staff_permanently(
 
     if staff.id == user.user_id:
         raise AppError("SELF_DELETION", "Cannot delete your own account", 422)
+    if staff.role == "OWNER":
+        raise AppError("CANNOT_TARGET_OWNER", "Cannot delete the business owner", 403)
 
     if staff.is_active:
         raise AppError(

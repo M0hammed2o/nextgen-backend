@@ -17,7 +17,9 @@ from backend.app.core.ownership import require_owned
 from backend.app.core.rbac import AuthUser, require_owner_or_manager, require_staff_or_above
 from backend.app.db.session import get_db
 from backend.app.payments.registry import get_provider
+from shared.enums import AuditScope
 from shared.models.asset import Asset
+from shared.models.audit import AuditEvent
 from shared.models.business import Business
 from shared.models.user import BusinessUser
 
@@ -33,6 +35,21 @@ router = APIRouter(prefix="/business", tags=["business"])
 # so this constraint and the registry can never silently drift apart
 # (BUG-0006: this field previously had no validation at all).
 _VALID_PAYMENT_PROVIDERS = r"^(DIRECT_EFT|MOCK|YOCO|PAYFAST|STITCH|IKHOKA)$"
+
+# Money-routing fields: a MANAGER changing any of these could redirect where
+# the restaurant's payments end up (own bank account, own payment-provider
+# API keys). OWNER-only; a MANAGER attempt is a 403 naming the field. Every
+# other BusinessSettingsUpdate field is unchanged for managers.
+_OWNER_ONLY_MONEY_FIELDS = (
+    "payment_provider",
+    "payment_api_key",
+    "payment_api_secret",
+    "payment_webhook_secret",
+    "eft_bank_name",
+    "eft_account_name",
+    "eft_account_number",
+    "eft_branch_code",
+)
 
 
 # ── Schemas ──────────────────────────────────────────────────────────────────
@@ -91,6 +108,13 @@ class BusinessSettingsResponse(BaseModel):
     receipt_reference_asset_id: uuid.UUID | None = None
     menu_reference_asset_id: uuid.UUID | None = None
     inventory_enabled: bool = False
+    # Platform-admin kill switch (Business.is_whatsapp_enabled) — read-only
+    # here so the manager dashboard can hide WhatsApp sections for a
+    # POS-only client. Not settable via BusinessSettingsUpdate: enabling/
+    # disabling WhatsApp is a platform decision made through the admin
+    # plane, not something a tenant switches on themselves (same rule
+    # already applied to inventory_enabled above).
+    is_whatsapp_enabled: bool = True
     wastage_approval_threshold_cents: int = 0
     # Staff app navigation + stocktake schedule (per-tenant configuration)
     staff_live_orders_tab_enabled: bool = True
@@ -150,6 +174,7 @@ class BusinessSettingsResponse(BaseModel):
             receipt_reference_asset_id=b.receipt_reference_asset_id,
             menu_reference_asset_id=b.menu_reference_asset_id,
             inventory_enabled=b.inventory_enabled,
+            is_whatsapp_enabled=b.is_whatsapp_enabled,
             wastage_approval_threshold_cents=b.wastage_approval_threshold_cents,
             staff_live_orders_tab_enabled=b.staff_live_orders_tab_enabled,
             staff_wastage_tab_enabled=b.staff_wastage_tab_enabled,
@@ -328,6 +353,21 @@ async def update_business_settings(
     db: AsyncSession = Depends(get_db),
 ):
     """Update business settings (partial update — only provided fields)."""
+    update_data = body.model_dump(exclude_unset=True)
+
+    # Money-routing fields are OWNER-only — checked before any DB lookup,
+    # same pattern as the staff-management role gates, so a MANAGER attempt
+    # never touches the row at all. Named in the error so the dashboard can
+    # tell the manager exactly which field was rejected.
+    if user.role != "OWNER":
+        for field in _OWNER_ONLY_MONEY_FIELDS:
+            if field in update_data:
+                raise AppError(
+                    "OWNER_ONLY_FIELD",
+                    f"Only the business owner can change '{field}' — it controls where payments are routed",
+                    403,
+                )
+
     result = await db.execute(
         select(Business).where(Business.id == user.business_id)
     )
@@ -338,7 +378,7 @@ async def update_business_settings(
     # Exclude credential fields from the generic setattr loop —
     # they are handled separately so empty strings clear the stored value.
     _CREDENTIAL_FIELDS = {"payment_api_key", "payment_api_secret", "payment_webhook_secret"}
-    update_data = body.model_dump(exclude_unset=True)
+    changed_money_fields = [f for f in _OWNER_ONLY_MONEY_FIELDS if f in update_data]
 
     for field in _ASSET_REFERENCE_FIELDS:
         value = update_data.get(field)
@@ -362,6 +402,20 @@ async def update_business_settings(
             "Choose at least one time of day for a custom stocktake schedule",
             422,
         )
+
+    # Audit trail for money-routing changes — field names only, never the
+    # credential/EFT values themselves (SECURITY.md: secrets never appear
+    # in logs). Only OWNER can reach this point with a non-empty list.
+    if changed_money_fields:
+        db.add(AuditEvent(
+            scope=AuditScope.BUSINESS.value,
+            business_id=user.business_id,
+            actor_user_id=user.user_id,
+            action="business.payment_settings.changed",
+            target_type="business",
+            target_id=business.id,
+            diff_json={"fields_changed": changed_money_fields, "actor_role": user.role},
+        ))
 
     await db.commit()
     await db.refresh(business)
