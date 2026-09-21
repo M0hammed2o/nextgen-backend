@@ -172,15 +172,25 @@ def require_business_access(allowed_roles: list[str] | None = None):
     """
     Dependency factory: ensures the user is authenticated AND has a business_id.
     Optionally filters by role.
-    
+
     This is the standard dependency for all business-facing endpoints.
     business_id comes from the JWT, never from the client.
+
+    Admin-plane tokens (SUPER_ADMIN, ONBOARDER — any role decoded via the
+    admin-plane JWT secret, see get_current_user) are NEVER allowed through
+    here, even for SUPER_ADMIN. There used to be a SUPER_ADMIN bypass so an
+    admin token could "pass through" business-plane routes; it was removed
+    (Wave 0A verifier finding F5) because it let admin tokens reach
+    business-plane routes with business_id=None and was never re-validated
+    against the DB for admin tokens the way admin_api's get_current_admin
+    does. No frontend depends on this — the admin suite only calls
+    admin_api, never /v1/business (verified by repo-wide grep). Admin
+    tooling that genuinely needs to act on a specific business must go
+    through admin_api's own routes, which are business_id-scoped from a
+    path/query parameter under require_super_admin, not through this
+    business-plane bypass.
     """
     async def _check(user: AuthUser = Depends(get_current_user)) -> AuthUser:
-        # Super admins can pass through (they may use query params for business_id)
-        if user.role == "SUPER_ADMIN":
-            return user
-
         if not user.business_id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
