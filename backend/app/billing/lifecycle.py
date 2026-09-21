@@ -46,11 +46,31 @@ def mark_invoice_paid(
 def mark_payment_failed(
     business: Business, db=None, amount_cents: int | None = None,
     provider: str | None = None, provider_reference: str | None = None,
+    event_time: datetime | None = None,
 ) -> None:
     """
     A billing-period payment failed. Starts (or continues) the grace period —
     does NOT suspend immediately. `is_past_grace_period` decides suspension.
+
+    event_time (when the provider says the failure actually happened, e.g.
+    Stripe's invoice.created) is optional ordering protection: webhooks can
+    arrive out of order, and a *stale* payment_failed for an invoice that
+    predates the business's current billing period (business has since paid
+    successfully — billing_period_started_at was bumped forward by
+    mark_invoice_paid) must not re-flip an already-ACTIVE business back to
+    PAST_DUE. When event_time isn't available (not every provider exposes a
+    reliable one — PayFast's ITN has no equivalent field), this check is
+    skipped and the failure is applied as before; that gap is real and
+    documented, not silently patched over.
     """
+    if event_time is not None and event_time < business.billing_period_started_at:
+        logger.info(
+            "Business %s: ignoring stale payment_failed event (event_time=%s predates "
+            "current billing period started_at=%s) — already paid since",
+            business.id, event_time, business.billing_period_started_at,
+        )
+        return
+
     business.billing_status = "PAST_DUE"
     logger.info("Business %s marked PAST_DUE after a failed billing payment", business.id)
 

@@ -1,6 +1,16 @@
 """
 Stripe webhook handler — subscription status enforcement.
 Automatically suspends/reactivates businesses based on payment status.
+
+Signature verification (BUG-0001, now fixed): a missing/placeholder
+STRIPE_WEBHOOK_SECRET or PAYFAST_BILLING_PASSPHRASE must NEVER mean "trust
+the payload unverified" — that only happens in explicit ENVIRONMENT=
+development/test, matching the pattern used by every other webhook in this
+codebase (Meta, tenant Yoco/PayFast/Stitch/iKhoka). Each of these two routes
+also only acts as a trusted endpoint for its OWN active, configured
+provider — the inactive provider's billing route (and both, if billing is
+disabled) reject with 404, so a stale/misconfigured route can't be used to
+flip billing_status on a tenant.
 """
 
 import logging
@@ -10,13 +20,35 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi import Depends
 
-from backend.app.core.config import get_settings
+from backend.app.core.config import _looks_like_placeholder, get_settings
 from backend.app.db.session import get_db
+from shared.models.billing_invoice import BillingInvoice
 from shared.models.business import Business
 
 logger = logging.getLogger("nextgen.billing")
 router = APIRouter(prefix="/billing", tags=["billing"])
 settings = get_settings()
+
+
+async def _invoice_already_recorded(db: AsyncSession, provider: str, provider_reference: str | None) -> bool:
+    """
+    Application-level duplicate guard: a re-delivered webhook for an event
+    already recorded as a BillingInvoice must be a full no-op (no second
+    invoice row, no repeated billing_status mutation). No unique DB
+    constraint exists on (provider, provider_reference) today — this is an
+    existence check, not a race-proof constraint; a genuinely concurrent
+    duplicate delivery is a real (low-probability) gap, tracked as a
+    follow-up for a proper unique index (see KNOWN_BUGS.md).
+    """
+    if not provider_reference:
+        return False
+    result = await db.execute(
+        select(BillingInvoice.id).where(
+            BillingInvoice.provider == provider,
+            BillingInvoice.provider_reference == provider_reference,
+        )
+    )
+    return result.scalar_one_or_none() is not None
 
 
 @router.post("/webhook", status_code=200)
@@ -27,28 +59,51 @@ async def stripe_webhook(
 ):
     """
     Handle Stripe webhook events for subscription management.
-    
+
     Handled events:
     - customer.subscription.updated → update billing_status
     - invoice.paid → reactivate if was past_due
     - invoice.payment_failed → mark as PAST_DUE, eventually suspend
     - customer.subscription.deleted → suspend business
     """
+    if settings.BILLING_ENABLED and settings.BILLING_PROVIDER.upper() != "STRIPE":
+        # This route only acts as a trusted endpoint for the ACTIVE billing
+        # provider. Stripe isn't active — refuse rather than silently
+        # accepting/ignoring, so a stale dashboard webhook config can't be
+        # used against this deployment.
+        raise HTTPException(status_code=404, detail="Not found")
+    if not settings.BILLING_ENABLED:
+        raise HTTPException(status_code=404, detail="Not found")
+
     body = await request.body()
 
-    # Verify signature in production
-    if settings.ENVIRONMENT != "development" and settings.STRIPE_WEBHOOK_SECRET:
+    if settings.ENVIRONMENT in ("development", "test"):
+        import json
+        try:
+            event = json.loads(body)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid payload")
+    else:
+        # An absent/placeholder secret must NEVER fall back to unverified
+        # json.loads() — that was BUG-0001. Fail closed instead.
+        if _looks_like_placeholder(settings.STRIPE_WEBHOOK_SECRET):
+            logger.error("Stripe webhook rejected: STRIPE_WEBHOOK_SECRET is not configured")
+            raise HTTPException(status_code=503, detail="Webhook not configured")
+        if not stripe_signature:
+            raise HTTPException(status_code=400, detail="Invalid signature")
         try:
             import stripe
-            event = stripe.Webhook.construct_event(
+            verified_event = stripe.Webhook.construct_event(
                 body, stripe_signature, settings.STRIPE_WEBHOOK_SECRET
             )
+            # .to_dict() so downstream code (event.get(...)) works identically
+            # regardless of which stripe-python major version is installed —
+            # StripeObject's dict-vs-attribute behaviour has changed across
+            # versions; converting once here avoids depending on that.
+            event = verified_event.to_dict()
         except Exception as e:
             logger.warning("Stripe signature verification failed: %s", e)
             raise HTTPException(status_code=400, detail="Invalid signature")
-    else:
-        import json
-        event = json.loads(body)
 
     event_type = event.get("type", "")
     data = event.get("data", {}).get("object", {})
@@ -82,6 +137,11 @@ async def payfast_billing_webhook(
     (each business's own customer payments). Verifies with the platform's
     own PAYFAST_BILLING_PASSPHRASE, never a tenant's payment_webhook_secret.
     """
+    if settings.BILLING_ENABLED and settings.BILLING_PROVIDER.upper() != "PAYFAST":
+        raise HTTPException(status_code=404, detail="Not found")
+    if not settings.BILLING_ENABLED:
+        raise HTTPException(status_code=404, detail="Not found")
+
     raw_body = await request.body()
     import urllib.parse
     try:
@@ -89,7 +149,12 @@ async def payfast_billing_webhook(
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid form data")
 
-    from backend.app.payments.payfast import PayFastProvider
+    from backend.app.payments.payfast import PayFastProvider, rand_amount_to_cents
+
+    # PayFastProvider.verify_signature() fails closed on an empty/unset
+    # passphrase (see payments/payfast.py) — no development bypass here, this
+    # is NextGen's own money, not a tenant's, so there is no local-dev sender
+    # for it either way.
     params_copy = dict(params)
     if not PayFastProvider.verify_signature(params_copy, settings.PAYFAST_BILLING_PASSPHRASE):
         logger.warning("PayFast billing ITN: invalid signature")
@@ -110,18 +175,24 @@ async def payfast_billing_webhook(
     if token:
         biz.payfast_subscription_token = token
 
-    amount_cents = None
-    if params.get("amount_gross"):
-        try:
-            amount_cents = round(float(params["amount_gross"]) * 100)
-        except ValueError:
-            amount_cents = None
+    amount_cents = rand_amount_to_cents(params.get("amount_gross"))
+    provider_reference = params.get("pf_payment_id")
+
+    if await _invoice_already_recorded(db, "PAYFAST", provider_reference):
+        logger.info("PayFast billing ITN: %s already recorded — skipping duplicate delivery", provider_reference)
+        await db.commit()  # persist the subscription token update, if any
+        return {"received": True}
 
     from backend.app.billing.lifecycle import mark_invoice_paid, mark_payment_failed
     if payment_status == "COMPLETE":
-        mark_invoice_paid(biz, db=db, amount_cents=amount_cents, provider="PAYFAST", provider_reference=params.get("pf_payment_id"))
+        mark_invoice_paid(biz, db=db, amount_cents=amount_cents, provider="PAYFAST", provider_reference=provider_reference)
     elif payment_status in ("FAILED", "CANCELLED"):
-        mark_payment_failed(biz, db=db, amount_cents=amount_cents, provider="PAYFAST", provider_reference=params.get("pf_payment_id"))
+        # PayFast's ITN carries no reliable "when did this actually happen"
+        # field distinct from delivery time, so the stale-event ordering
+        # guard in mark_payment_failed (event_time) cannot be applied here —
+        # a documented gap, not a silent one (see mark_payment_failed's
+        # docstring and KNOWN_BUGS.md).
+        mark_payment_failed(biz, db=db, amount_cents=amount_cents, provider="PAYFAST", provider_reference=provider_reference)
 
     await db.commit()
     return {"received": True}
@@ -186,10 +257,15 @@ async def _handle_invoice_paid(db: AsyncSession, data: dict) -> None:
     if not biz:
         return
 
+    provider_reference = data.get("id")
+    if await _invoice_already_recorded(db, "STRIPE", provider_reference):
+        logger.info("Stripe invoice.paid: %s already recorded — skipping duplicate delivery", provider_reference)
+        return
+
     from backend.app.billing.lifecycle import mark_invoice_paid
     mark_invoice_paid(
         biz, db=db, amount_cents=data.get("amount_paid"),
-        provider="STRIPE", provider_reference=data.get("id"),
+        provider="STRIPE", provider_reference=provider_reference,
     )
     await db.commit()
 
@@ -199,10 +275,26 @@ async def _handle_payment_failed(db: AsyncSession, data: dict) -> None:
     if not biz:
         return
 
+    provider_reference = data.get("id")
+    if await _invoice_already_recorded(db, "STRIPE", provider_reference):
+        logger.info("Stripe invoice.payment_failed: %s already recorded — skipping duplicate delivery", provider_reference)
+        return
+
+    # Stripe invoice objects carry `created` (unix epoch seconds) — used as
+    # the ordering guard in mark_payment_failed so a stale, out-of-order
+    # payment_failed delivery can't flip a business that has since paid back
+    # to PAST_DUE.
+    event_time = None
+    created_ts = data.get("created")
+    if isinstance(created_ts, (int, float)):
+        from datetime import datetime, timezone
+        event_time = datetime.fromtimestamp(created_ts, tz=timezone.utc)
+
     from backend.app.billing.lifecycle import mark_payment_failed
     mark_payment_failed(
         biz, db=db, amount_cents=data.get("amount_due"),
-        provider="STRIPE", provider_reference=data.get("id"),
+        provider="STRIPE", provider_reference=provider_reference,
+        event_time=event_time,
     )
     await db.commit()
 

@@ -23,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import urllib.parse
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 import httpx
 
@@ -33,6 +34,21 @@ logger = logging.getLogger("nextgen.payments.payfast")
 _LIVE_URL = "https://www.payfast.co.za/eng/process"
 _SANDBOX_URL = "https://sandbox.payfast.co.za/eng/process"
 _REFUND_API_URL = "https://api.payfast.co.za/orders/{payment_id}/refund"
+
+
+def rand_amount_to_cents(raw: str | None) -> int | None:
+    """
+    Convert a PayFast decimal-rand amount string (e.g. "amount_gross") to
+    integer cents using Decimal arithmetic — never float, which can misround
+    real money values (e.g. float(90.10) * 100 != 9010 on some inputs).
+    Returns None if `raw` is missing or not a valid decimal.
+    """
+    if not raw:
+        return None
+    try:
+        return int((Decimal(raw) * 100).to_integral_value(rounding=ROUND_HALF_UP))
+    except (InvalidOperation, ValueError):
+        return None
 
 
 def _build_signature(params: dict, passphrase: str | None) -> str:
@@ -105,7 +121,13 @@ class PayFastProvider(PaymentProvider):
         PayFast sends application/x-www-form-urlencoded with:
           m_payment_id  — our order UUID
           payment_status — "COMPLETE" | "FAILED" | "CANCELLED"
+          amount_gross  — decimal rand string, e.g. "90.00"
           signature     — for verification (already verified in the route)
+
+        amount_cents/currency are returned so the caller (routes_payments.py)
+        can verify the paid amount actually matches the order before marking
+        it PAID — PayFast is ZAR-only (it has no multi-currency support and
+        sends no currency field), so currency is hardcoded here, not parsed.
         """
         order_id = payload.get("m_payment_id", "")
         payment_status = payload.get("payment_status", "")
@@ -113,7 +135,14 @@ class PayFastProvider(PaymentProvider):
         # pf_payment_id is PayFast's own transaction id — captured so a later
         # refund can target the real provider transaction.
         reference = payload.get("pf_payment_id")
-        return {"paid": paid, "order_id": order_id, "reference": reference}
+        amount_cents = rand_amount_to_cents(payload.get("amount_gross"))
+        return {
+            "paid": paid,
+            "order_id": order_id,
+            "reference": reference,
+            "amount_cents": amount_cents,
+            "currency": "ZAR",
+        }
 
     async def refund_payment(self, order, business, amount_cents: int) -> RefundResult:
         """
@@ -180,7 +209,17 @@ class PayFastProvider(PaymentProvider):
         Args:
             params: the full form data dict from the ITN POST
             passphrase: the business's PayFast passphrase (stored as payment_webhook_secret)
+
+        An empty/unset passphrase MUST fail closed. _build_signature() simply
+        omits the passphrase segment when one isn't supplied, which means the
+        "signature" becomes a hash of only the (attacker-controlled, entirely
+        public) POST body — anyone can compute a valid-looking signature
+        without ever knowing a secret. This covers both the tenant PayFast
+        webhook (routes_payments.py::payfast_webhook) and NextGen's own
+        PayFast billing ITN (billing/stripe_webhooks.py::payfast_billing_webhook).
         """
+        if not passphrase:
+            return False
         received_sig = params.pop("signature", None)
         if not received_sig:
             return False
