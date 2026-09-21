@@ -20,6 +20,7 @@ from backend.app.payments.registry import get_provider
 from shared.models.audit import AuditEvent
 from shared.models.business import Business
 from shared.models.order import Order, OrderEvent, OrderItem
+from shared.pricing.engine import apply_vat_to_total
 from shared.utils import format_order_number
 
 router = APIRouter(prefix="/business/orders", tags=["orders"])
@@ -223,12 +224,23 @@ async def create_order(
     # Record usage (fire and forget) — feeds the monthly order-quota/pack
     # tracking (backend/app/billing/usage.py). Every order-creation path
     # (WhatsApp, manual, POS) must call this — previously only the bot did.
+    # `increment_usage` only flushes, it never commits — this call used to
+    # run after the handler's only commit, so the increment was flushed
+    # into a session that then closed without ever committing it, silently
+    # discarding it (BUG-0050). Committing here, inside this same
+    # try/except, means a usage-tracking failure still can never fail the
+    # order itself (the order already committed above).
     try:
         from backend.app.bot.usage_tracker import increment_usage
+        biz_tz_row = await db.execute(
+            select(Business.timezone).where(Business.id == user.business_id)
+        )
+        biz_timezone = biz_tz_row.scalar_one_or_none() or "Africa/Johannesburg"
         await increment_usage(
-            db, user.business_id, "Africa/Johannesburg",
+            db, user.business_id, biz_timezone,
             orders_created=1, revenue_cents=order.total_cents,
         )
+        await db.commit()
     except Exception:
         import logging
         logging.getLogger("nextgen").warning("Failed to record usage for manual order %s", order.id)
@@ -574,9 +586,29 @@ async def set_delivery_fee(
         from backend.app.core.errors import InvalidTransitionError
         raise InvalidTransitionError(order.status, "FEE_SENT")
 
+    biz_result = await db.execute(select(Business).where(Business.id == user.business_id))
+    business = biz_result.scalar_one_or_none()
+    if not business:
+        raise NotFoundError("Business")
+
     fee = body.delivery_fee_cents
     order.delivery_fee_cents = fee
-    order.total_cents = order.subtotal_cents + fee
+
+    # Recompute total through the same VAT/discount path used at order
+    # creation (shared/pricing/engine.py::apply_vat_to_total) instead of
+    # `subtotal + fee`, which silently dropped discount_cents and never
+    # applied VAT at all — for an exclusive-VAT, VAT-registered business
+    # that meant total_cents came out short of what the customer actually
+    # owes once a delivery fee is added.
+    net_total_cents = max(0, order.subtotal_cents - order.discount_cents + fee)
+    if business.vat_registered:
+        total_cents, tax_cents = apply_vat_to_total(
+            net_total_cents, business.vat_rate_basis_points, business.vat_inclusive_pricing,
+        )
+    else:
+        total_cents, tax_cents = net_total_cents, 0
+    order.total_cents = total_cents
+    order.tax_cents = tax_cents
     order.status = "FEE_SENT"
 
     event = OrderEvent(
@@ -594,7 +626,6 @@ async def set_delivery_fee(
     try:
         if order.customer_id:
             from shared.models.customer import Customer
-            from shared.models.business import Business
             from backend.app.bot.whatsapp_sender import send_notification_message
             from shared.utils.money import format_currency
 
@@ -603,22 +634,15 @@ async def set_delivery_fee(
             )
             wa_id = cust_row.scalar_one_or_none()
 
-            biz_row = await db.execute(
-                select(Business.whatsapp_phone_number_id, Business.currency).where(
-                    Business.id == order.business_id
-                )
-            )
-            biz = biz_row.one_or_none()
-
-            if wa_id and biz and biz.whatsapp_phone_number_id:
-                fee_str = format_currency(fee, biz.currency)
+            if wa_id and business.whatsapp_phone_number_id:
+                fee_str = format_currency(fee, business.currency)
                 msg = (
                     f"🚗 *Delivery Fee for Order {order.order_number}*\n\n"
                     f"Your delivery fee is *{fee_str}*.\n\n"
                     f"Reply *yes* to confirm and place your order, or *no* to cancel."
                 )
                 await send_notification_message(
-                    phone_number_id=biz.whatsapp_phone_number_id,
+                    phone_number_id=business.whatsapp_phone_number_id,
                     recipient_wa_id=wa_id,
                     text=msg,
                 )
@@ -675,8 +699,11 @@ async def set_delivery_fee(
 
 
 class PaymentUpdateRequest(BaseModel):
+    # REFUNDED/PARTIALLY_REFUNDED/VOIDED are accepted here only so the
+    # handler can reject them with a clear, actionable message pointing at
+    # the refund/void endpoints — see update_payment_status.
     payment_status: str = Field(
-        pattern=r"^(UNPAID|PENDING|PAID|FAILED|REFUNDED|CASH_ON_COLLECTION)$"
+        pattern=r"^(UNPAID|PENDING|PAID|FAILED|REFUNDED|PARTIALLY_REFUNDED|VOIDED|CASH_ON_COLLECTION)$"
     )
     payment_method: str | None = Field(
         default=None,
@@ -697,10 +724,17 @@ async def update_payment_status(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Record payment on an order.
+    Record HOW and WHEN payment was taken on an order — not a general-purpose
+    payment_status setter.
 
-    Staff / Manager / Owner set payment_status + optional method + reference.
-    paid_at is stamped automatically when payment_status == PAID.
+    Staff/Manager/Owner may record UNPAID/PENDING -> PAID (the "customer paid
+    at collection" flow the staff app actually uses). REFUNDED/
+    PARTIALLY_REFUNDED/VOIDED are rejected here — those carry their own
+    money-movement bookkeeping (refund amount, stock-reversal decision) that
+    only `POST /{order_id}/refund` and the POS refund/void endpoints collect.
+    Moving an already-PAID order back to any non-PAID status (e.g. a
+    correction) requires an owner/manager and is audited — a cashier
+    shouldn't be able to reverse a completed sale outside that audited path.
     """
     result = await db.execute(
         select(Order).where(
@@ -712,32 +746,50 @@ async def update_payment_status(
     if not order:
         raise NotFoundError("Order", str(order_id))
 
-    was_unpaid = order.payment_status in ("UNPAID", "PENDING")
-    payment_required = order.payment_required
+    new_status = body.payment_status
     old_payment_status = order.payment_status
 
-    order.payment_status = body.payment_status
+    if new_status in ("REFUNDED", "PARTIALLY_REFUNDED", "VOIDED"):
+        raise AppError(
+            "USE_REFUND_ENDPOINT",
+            "Use POST /orders/{id}/refund (or the POS refund/void endpoints) "
+            "to record a refund or void — this endpoint only records how and "
+            "when payment was taken.",
+            422,
+        )
+
+    if old_payment_status == "PAID" and new_status != "PAID" and user.role not in ("OWNER", "MANAGER"):
+        raise AppError(
+            "OWNER_OR_MANAGER_REQUIRED",
+            "Moving a PAID order back to an unpaid status requires an owner or manager.",
+            403,
+        )
+
+    was_unpaid = old_payment_status in ("UNPAID", "PENDING")
+    payment_required = order.payment_required
+
+    order.payment_status = new_status
     if body.payment_method is not None:
         order.payment_method = body.payment_method
     if body.payment_reference is not None:
         order.payment_reference = body.payment_reference
-    if body.payment_status == "PAID" and order.paid_at is None:
+    if new_status == "PAID" and order.paid_at is None:
         order.paid_at = datetime.now(timezone.utc)
 
-    # Refunds have no dedicated OrderEvent trail today (see PROJECT.md/Phase 1
-    # POS discovery) — record it in the shared business-scope audit log.
-    if body.payment_status == "REFUNDED" and old_payment_status != "REFUNDED":
+    # A PAID -> non-PAID correction is rare and money-affecting enough to
+    # leave its own audit trail, same as a refund would.
+    if old_payment_status == "PAID" and new_status != "PAID":
         db.add(AuditEvent(
             scope=AuditScope.BUSINESS.value,
             business_id=user.business_id,
             actor_user_id=user.user_id,
-            action="order.payment.refunded",
+            action="order.payment.reverted_from_paid",
             target_type="order",
             target_id=order.id,
             diff_json={
                 "old_payment_status": old_payment_status,
-                "new_payment_status": body.payment_status,
-                "payment_reference": body.payment_reference,
+                "new_payment_status": new_status,
+                "actor_role": user.role,
             },
         ))
 
@@ -820,8 +872,15 @@ async def refund_order_payment(
     `PATCH /{order_id}/payment` endpoint to mark REFUNDED once they've
     completed the manual transfer themselves.
     """
+    # Locked FOR UPDATE before any provider call — two concurrent refund
+    # requests on the same order must not both read payment_status=PAID and
+    # both ask the provider to refund it (which would send money back
+    # twice). The second call blocks until the first commits, then sees the
+    # already-REFUNDED status and is correctly rejected below.
     result = await db.execute(
-        select(Order).where(Order.id == order_id, Order.business_id == user.business_id)
+        select(Order)
+        .where(Order.id == order_id, Order.business_id == user.business_id)
+        .with_for_update()
     )
     order = result.scalar_one_or_none()
     if not order:

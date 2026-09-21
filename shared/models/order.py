@@ -6,7 +6,7 @@ Includes order items (snapshots at time of order) and audit events.
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -15,6 +15,16 @@ from shared.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 
 class Order(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     __tablename__ = "orders"
+
+    # order_number is human-friendly (BO-000123) and only meaningful scoped
+    # to one business — enforced in the DB (migration 0033) since two
+    # concurrent order-number-sequence increments must never be able to
+    # produce a duplicate for the same tenant.
+    __table_args__ = (
+        UniqueConstraint(
+            "business_id", "order_number", name="uq_orders_business_id_order_number"
+        ),
+    )
 
     business_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("businesses.id", ondelete="CASCADE"),
