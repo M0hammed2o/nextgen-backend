@@ -75,6 +75,7 @@ class FakeOrder:
         self.delivery_address = kw.get("delivery_address", None)
         self.items = kw.get("items", [])   # list of cart-item dicts
         self.payment_status = kw.get("payment_status", None)
+        self.special_instructions = kw.get("special_instructions", None)
 
 
 class FakeMenuItem:

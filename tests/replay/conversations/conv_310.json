@@ -1,0 +1,48 @@
+{
+  "id": "conv_310",
+  "title": "BUG-notes-as-address — Pickup + require_delivery_address=True: note must land in special_instructions, not delivery_address",
+  "category": "confirmation",
+  "tags": ["deterministic", "pickup", "order_notes", "regression"],
+
+  "notes": "Regression for the bug where _handle_collecting_details captured the order-notes answer as a delivery_address whenever business.require_delivery_address was True, even for a PICKUP order (which never asks for an address). See KNOWN_BUGS.md BUG-notes-as-address.",
+
+  "business": {
+    "delivery_enabled": false,
+    "require_customer_name": false,
+    "require_phone_number": false,
+    "require_delivery_address": true
+  },
+
+  "turns": [
+    {
+      "message": "Can I get a Classic Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {
+        "state": "COLLECTING_DETAILS",
+        "response_contains": ["special instructions"]
+      }
+    },
+    {
+      "message": "extra ice please, allergic to nuts",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Classic Smash Burger", "quantity": 1}],
+    "subtotal_cents": 7500,
+    "total_cents": 7500,
+    "order_mode": "PICKUP",
+    "special_instructions": "extra ice please, allergic to nuts",
+    "delivery_address": null
+  }
+}

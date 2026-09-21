@@ -436,6 +436,9 @@ class ReplayRunner:
                 phone_number=ctx.get("phone_number") or getattr(customer, "phone_number", None),
                 delivery_address=ctx.get("delivery_address"),
                 items=copy.deepcopy(cart),
+                # Mirrors order_creator.create_order_from_cart's
+                # special_instructions=ctx.get("order_notes") or None (order_creator.py:107)
+                special_instructions=ctx.get("order_notes") or None,
             )
             # Patch fake_db row's subtotal so finalize response text is accurate
             fake_db.execute.return_value.one_or_none.return_value.subtotal_cents = subtotal
@@ -637,3 +640,29 @@ class ReplayRunner:
                 f"final_order.payment_status: "
                 f"expected {expected['payment_status']!r}, got {order.payment_status!r}"
             )
+
+        if "special_instructions" in expected:
+            exp_si = expected["special_instructions"]
+            if exp_si is None:
+                assert not order.special_instructions, (
+                    f"final_order.special_instructions: expected None/empty, "
+                    f"got {order.special_instructions!r}"
+                )
+            else:
+                assert (order.special_instructions or "") == exp_si, (
+                    f"final_order.special_instructions: "
+                    f"expected {exp_si!r}, got {order.special_instructions!r}"
+                )
+
+        if "delivery_address" in expected:
+            exp_addr = expected["delivery_address"]
+            if exp_addr is None:
+                assert not order.delivery_address, (
+                    f"final_order.delivery_address: expected None/empty, "
+                    f"got {order.delivery_address!r}"
+                )
+            else:
+                assert (order.delivery_address or "") == exp_addr, (
+                    f"final_order.delivery_address: "
+                    f"expected {exp_addr!r}, got {order.delivery_address!r}"
+                )

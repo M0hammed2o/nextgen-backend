@@ -4400,14 +4400,17 @@ async def _handle_collecting_details(
         return "Please send a valid phone number (e.g., 0812345678).", False, None, None, None
 
     # ── Collect delivery address ──────────────────────────────────────────────
-    # Fire when the business explicitly requires an address OR when the current
-    # order is a delivery (address is always required for delivery orders even if
-    # require_delivery_address is False on the business).
+    # Only fire for an actual DELIVERY order — this must match the condition
+    # that decides whether an address was ASKED FOR in the first place
+    # (_handle_order_confirmation's `need_address` and _check_missing_details's
+    # `_need_addr and order_mode == "DELIVERY"`, both gated on DELIVERY only).
+    # Previously this also fired whenever business.require_delivery_address was
+    # True regardless of order_mode, so on a PICKUP order (which never asks for
+    # an address) the next free-text reply — the order-notes answer — was
+    # silently captured as delivery_address instead of special_instructions.
+    # See KNOWN_BUGS.md BUG-notes-as-address.
     _order_mode_for_addr = ctx.get("order_mode", "PICKUP")
-    _need_delivery_addr = (
-        business.require_delivery_address
-        or _order_mode_for_addr == "DELIVERY"
-    )
+    _need_delivery_addr = _order_mode_for_addr == "DELIVERY"
     if _need_delivery_addr and "delivery_address" not in ctx:
         state_machine.set_context(session, "delivery_address", text)
         still_missing = _check_missing_details(business, session)

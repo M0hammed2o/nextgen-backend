@@ -1,0 +1,48 @@
+{
+  "id": "conv_312",
+  "title": "BUG-notes-as-address — Pickup + require_delivery_address=True + 'skip': no note, no address",
+  "category": "confirmation",
+  "tags": ["deterministic", "pickup", "order_notes", "regression"],
+
+  "notes": "Regression companion to conv_310: replying 'skip' to the notes question must leave both special_instructions and delivery_address empty, even when business.require_delivery_address is True on a PICKUP order.",
+
+  "business": {
+    "delivery_enabled": false,
+    "require_customer_name": false,
+    "require_phone_number": false,
+    "require_delivery_address": true
+  },
+
+  "turns": [
+    {
+      "message": "Can I get a Classic Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {
+        "state": "COLLECTING_DETAILS",
+        "response_contains": ["special instructions"]
+      }
+    },
+    {
+      "message": "skip",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Classic Smash Burger", "quantity": 1}],
+    "subtotal_cents": 7500,
+    "total_cents": 7500,
+    "order_mode": "PICKUP",
+    "special_instructions": null,
+    "delivery_address": null
+  }
+}

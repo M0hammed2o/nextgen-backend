@@ -1,0 +1,56 @@
+{
+  "id": "conv_311",
+  "title": "BUG-notes-as-address — Delivery still captures address, then a separately-asked note",
+  "category": "delivery",
+  "tags": ["deterministic", "delivery", "order_notes", "regression"],
+
+  "notes": "Regression companion to conv_310: for a real DELIVERY order the address must still be captured from the address turn, and the order-notes question (asked afterwards) must capture the note text separately, not overwrite the address.",
+
+  "business": {
+    "delivery_enabled": true,
+    "require_customer_name": false,
+    "require_phone_number": false,
+    "require_delivery_address": false
+  },
+
+  "turns": [
+    {
+      "message": "Can I get a Classic Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Delivery",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "5 Pine Avenue, Claremont",
+      "expect": {
+        "state": "COLLECTING_DETAILS",
+        "response_contains": ["special instructions"],
+        "context_has": {"delivery_address": "5 Pine Avenue, Claremont"}
+      }
+    },
+    {
+      "message": "no onions please",
+      "expect": {
+        "state": "WAITING_DELIVERY_FEE_APPROVAL",
+        "cart": []
+      }
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Classic Smash Burger", "quantity": 1}],
+    "subtotal_cents": 7500,
+    "order_mode": "DELIVERY",
+    "special_instructions": "no onions please",
+    "delivery_address": "5 Pine Avenue, Claremont"
+  }
+}
