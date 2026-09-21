@@ -505,6 +505,8 @@ async def update_order_status(
                             phone_number_id=phone_number_id,
                             recipient_wa_id=wa_id,
                             text=payment_msg,
+                            db=db, order_id=order.id, business_id=order.business_id,
+                            order_status=order.status,
                         )
                 else:
                     msg = _customer_status_message(
@@ -518,6 +520,8 @@ async def update_order_status(
                             phone_number_id=phone_number_id,
                             recipient_wa_id=wa_id,
                             text=msg,
+                            db=db, order_id=order.id, business_id=order.business_id,
+                            order_status=order.status,
                         )
     except Exception:
         import logging
@@ -645,6 +649,8 @@ async def set_delivery_fee(
                     phone_number_id=business.whatsapp_phone_number_id,
                     recipient_wa_id=wa_id,
                     text=msg,
+                    db=db, order_id=order.id, business_id=order.business_id,
+                    order_status=order.status,
                 )
 
             # Store fee in customer's conversation session so pipeline can finalise
@@ -707,7 +713,13 @@ class PaymentUpdateRequest(BaseModel):
     )
     payment_method: str | None = Field(
         default=None,
-        pattern=r"^(CASH|CARD|PAY_ON_COLLECTION|DIRECT_EFT|PAYSHAP|YOCO|PAYFAST|STITCH)$",
+        # MANUAL: the staff app's "mark paid" button on an order awaiting
+        # ONLINE payment (payment_required=True, e.g. YOCO/PAYFAST/STITCH) —
+        # staff confirming, outside the online flow, that payment was
+        # received some other way (cash on collection, EFT proof shown in
+        # person, etc.). Distinct from the specific provider values, which
+        # record how an online payment actually cleared.
+        pattern=r"^(CASH|CARD|PAY_ON_COLLECTION|DIRECT_EFT|PAYSHAP|YOCO|PAYFAST|STITCH|MANUAL)$",
         description="Payment method used",
     )
     payment_reference: str | None = Field(
@@ -776,6 +788,25 @@ async def update_payment_status(
     if new_status == "PAID" and order.paid_at is None:
         order.paid_at = datetime.now(timezone.utc)
 
+    # A MANUAL confirmation overrides the online-payment flow the order was
+    # actually placed under (payment_required=True) — worth its own event
+    # so staff/owner can see, on the order timeline, that this PAID status
+    # came from a staff override rather than the payment provider clearing.
+    if body.payment_method == "MANUAL":
+        db.add(OrderEvent(
+            order_id=order.id,
+            business_id=user.business_id,
+            old_status=order.status,
+            new_status=order.status,
+            changed_by_user_id=user.user_id,
+            reason=(
+                f"Payment marked {new_status} manually by staff "
+                f"(payment_reference={body.payment_reference!r})"
+                if body.payment_reference else
+                f"Payment marked {new_status} manually by staff"
+            ),
+        ))
+
     # A PAID -> non-PAID correction is rare and money-affecting enough to
     # leave its own audit trail, same as a refund would.
     if old_payment_status == "PAID" and new_status != "PAID":
@@ -825,6 +856,8 @@ async def update_payment_status(
                     phone_number_id=phone_number_id,
                     recipient_wa_id=wa_id,
                     text=build_payment_confirmed_message(order),
+                    db=db, order_id=order.id, business_id=order.business_id,
+                    order_status=order.status,
                 )
         except Exception:
             import logging
