@@ -10,7 +10,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.app.core.config import WORKER_HEARTBEAT_REDIS_KEY, _looks_like_placeholder, get_settings
-from backend.app.core.errors import register_error_handlers
+from backend.app.core.errors import UnhandledExceptionMiddleware, register_error_handlers
 from backend.app.core.middleware import CorrelationIDMiddleware, RequestLoggingMiddleware, setup_logging
 from backend.app.db.session import close_db, close_redis
 
@@ -145,10 +145,21 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# ── Middleware (order matters — outermost first) ─────────────────────────────
+# ── Middleware ─────────────────────────────────────────────────────────────
+# Order matters, but not "outermost first": Starlette's `add_middleware()`
+# inserts at the front of its internal list, so the LAST middleware added
+# here ends up OUTERMOST at runtime (empirically confirmed — see
+# tests/test_error_handlers_cors.py). Runtime order for the four calls below
+# is therefore: CORSMiddleware (outermost) -> UnhandledExceptionMiddleware ->
+# CorrelationIDMiddleware -> RequestLoggingMiddleware (innermost, closest to
+# routing). UnhandledExceptionMiddleware MUST stay added before
+# CORSMiddleware (see its docstring in backend/app/core/errors.py) — moving
+# it after CORSMiddleware would silently reopen BUG-0067's CORS-masking gap
+# for any future unhandled exception.
 
 app.add_middleware(RequestLoggingMiddleware)
 app.add_middleware(CorrelationIDMiddleware)
+app.add_middleware(UnhandledExceptionMiddleware)
 # In development, ALSO allow any localhost port via regex. A static
 # ALLOWED_ORIGINS list can never fully cover local frontend dev servers,
 # whose Vite dev server silently falls back to the next free port whenever

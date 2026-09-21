@@ -11,11 +11,63 @@ All API errors follow this format:
 }
 """
 
+import logging
+
 from fastapi import FastAPI, Request, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
+from starlette.responses import Response as StarletteResponse
+
+logger = logging.getLogger("nextgen.errors")
+
+
+def _unhandled_exception_response() -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={
+            "error": {
+                "code": "INTERNAL_SERVER_ERROR",
+                "message": "An unexpected error occurred. Please try again or contact support.",
+                "details": None,
+            }
+        },
+    )
+
+
+class UnhandledExceptionMiddleware(BaseHTTPMiddleware):
+    """
+    Catches any exception that has no more specific registered handler
+    (`AppError`/`RequestValidationError`/`HTTPException` are already
+    resolved to a `Response` by Starlette's `ExceptionMiddleware` before
+    this middleware ever sees them) — e.g. `FPDFUnicodeEncodingException`
+    from `backend/app/billing/commercial_invoice_pdf.py` (BUG-0067).
+
+    MUST be registered with `app.add_middleware()` BEFORE `CORSMiddleware`
+    (i.e. earlier in the call sequence — Starlette's `add_middleware` makes
+    the LAST-added middleware outermost, so adding this one first keeps it
+    INSIDE `CORSMiddleware`). This is not just style: registering a catch-all
+    via `@app.exception_handler(Exception)` alone does NOT fix the CORS gap,
+    because Starlette special-cases the literal `Exception`/500 key — it
+    routes that handler to `ServerErrorMiddleware`, which sits OUTSIDE every
+    `add_middleware()` layer including CORS, so the resulting response still
+    never passes through CORS's header injection. Catching the exception
+    here, inside CORSMiddleware, and returning a normal `Response` is what
+    actually gets Access-Control-Allow-Origin onto a genuine 500 — without
+    it, the browser reports a misleading "blocked by CORS policy" error
+    instead of the real failure (BUG-0067's secondary symptom).
+    """
+
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> StarletteResponse:
+        try:
+            return await call_next(request)
+        except Exception:
+            logger.exception(
+                "Unhandled exception on %s %s", request.method, request.url.path
+            )
+            return _unhandled_exception_response()
 
 
 class ErrorDetail(BaseModel):
@@ -151,3 +203,21 @@ def register_error_handlers(app: FastAPI) -> None:
                 }
             },
         )
+
+    @app.exception_handler(Exception)
+    async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+        # Secondary, last-resort safety net only — Starlette routes a
+        # registered `Exception` handler to `ServerErrorMiddleware`, which is
+        # OUTSIDE CORSMiddleware, so a response built here alone would still
+        # be missing CORS headers. The actual CORS-preserving fix is
+        # `UnhandledExceptionMiddleware` above, which MUST be registered via
+        # `app.add_middleware()` before `CORSMiddleware` in main.py. This
+        # handler only fires if something escapes even that middleware (e.g.
+        # an exception raised by a middleware layer added outside it) — it
+        # still guarantees a structured JSON body instead of Starlette's
+        # bare-text debug/500 fallback, just without a CORS-header guarantee.
+        logger.exception(
+            "Unhandled exception reached the last-resort handler on %s %s",
+            request.method, request.url.path,
+        )
+        return _unhandled_exception_response()

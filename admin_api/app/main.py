@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from admin_api.app.core.config import get_admin_settings
 from backend.app.core.config import _looks_like_placeholder
-from backend.app.core.errors import register_error_handlers
+from backend.app.core.errors import UnhandledExceptionMiddleware, register_error_handlers
 from backend.app.core.middleware import CorrelationIDMiddleware, RequestLoggingMiddleware, setup_logging
 from backend.app.db.session import close_db, close_redis
 
@@ -76,6 +76,12 @@ app = FastAPI(
 
 app.add_middleware(RequestLoggingMiddleware)
 app.add_middleware(CorrelationIDMiddleware)
+# UnhandledExceptionMiddleware MUST be added before CORSMiddleware — see its
+# docstring in backend/app/core/errors.py and the matching comment in
+# backend/app/main.py (Starlette's add_middleware() makes the LAST-added
+# middleware outermost, so this keeps it INSIDE CORSMiddleware, which is
+# what actually gets CORS headers onto an unhandled-exception 500).
+app.add_middleware(UnhandledExceptionMiddleware)
 # See backend/app/main.py's matching comment: a static ALLOWED_ORIGINS list
 # can't cover Vite's automatic port-fallback for local frontend dev servers.
 # Development-only; production keeps the static allowlist only.
