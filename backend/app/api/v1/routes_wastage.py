@@ -21,6 +21,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.errors import AppError, NotFoundError
+from backend.app.core.ownership import require_owned
 from backend.app.core.rbac import AuthUser, require_owner_or_manager, require_staff_or_above
 from backend.app.db.session import get_db
 from backend.app.inventory.ledger import build_movement
@@ -31,8 +32,10 @@ from shared.enums import (
     StockSourceType,
     WastageReason,
 )
+from shared.models.asset import Asset
 from shared.models.business import Business
 from shared.models.inventory import Ingredient
+from shared.models.order import Order
 from shared.models.wastage import WastageEntry
 
 router = APIRouter(prefix="/business/wastage", tags=["wastage"])
@@ -151,6 +154,11 @@ async def record_wastage(
         raise AppError("INVALID_UNIT", str(exc), 422) from exc
     if quantity_milli <= 0:
         raise AppError("INVALID_QUANTITY", "Wasted quantity must be greater than zero", 422)
+
+    if body.photo_asset_id is not None:
+        await require_owned(db, Asset, body.photo_asset_id, user.business_id, label="Asset")
+    if body.related_order_id is not None:
+        await require_owned(db, Order, body.related_order_id, user.business_id, label="Order")
 
     unit_cost = int(ingredient.cost_per_canonical_micro_cents or 0)
     loss_value = value_cents(quantity_milli, unit_cost)

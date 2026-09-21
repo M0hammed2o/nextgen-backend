@@ -11,8 +11,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.errors import NotFoundError
+from backend.app.core.ownership import require_owned
 from backend.app.core.rbac import AuthUser, require_owner_or_manager
 from backend.app.db.session import get_db
+from shared.models.asset import Asset
 from shared.models.specials import Special
 
 router = APIRouter(prefix="/business/specials", tags=["specials"])
@@ -78,6 +80,9 @@ async def create_special(
     user: AuthUser = Depends(require_owner_or_manager),
     db: AsyncSession = Depends(get_db),
 ):
+    if body.image_asset_id is not None:
+        await require_owned(db, Asset, body.image_asset_id, user.business_id, label="Asset")
+
     special = Special(business_id=user.business_id, **body.model_dump())
     db.add(special)
     await db.commit()
@@ -99,7 +104,11 @@ async def update_special(
     if not special:
         raise NotFoundError("Special", str(special_id))
 
-    for field, value in body.model_dump(exclude_unset=True).items():
+    update_data = body.model_dump(exclude_unset=True)
+    if update_data.get("image_asset_id") is not None:
+        await require_owned(db, Asset, update_data["image_asset_id"], user.business_id, label="Asset")
+
+    for field, value in update_data.items():
         setattr(special, field, value)
     await db.commit()
     await db.refresh(special)

@@ -13,11 +13,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.crypto import decrypt_credential, encrypt_credential
 from backend.app.core.errors import AppError, NotFoundError
+from backend.app.core.ownership import require_owned
 from backend.app.core.rbac import AuthUser, require_owner_or_manager, require_staff_or_above
 from backend.app.db.session import get_db
 from backend.app.payments.registry import get_provider
+from shared.models.asset import Asset
 from shared.models.business import Business
 from shared.models.user import BusinessUser
+
+# Body fields that reference an Asset row by id — every one of them must be
+# ownership-checked before being written to Business, the same principle
+# routes_menu.py::_resolve_item_image already applies to menu item images.
+_ASSET_REFERENCE_FIELDS = ("receipt_reference_asset_id", "menu_reference_asset_id")
 
 router = APIRouter(prefix="/business", tags=["business"])
 
@@ -332,6 +339,11 @@ async def update_business_settings(
     # they are handled separately so empty strings clear the stored value.
     _CREDENTIAL_FIELDS = {"payment_api_key", "payment_api_secret", "payment_webhook_secret"}
     update_data = body.model_dump(exclude_unset=True)
+
+    for field in _ASSET_REFERENCE_FIELDS:
+        value = update_data.get(field)
+        if value is not None:
+            await require_owned(db, Asset, value, user.business_id, label="Asset")
 
     for field, value in update_data.items():
         if field in _CREDENTIAL_FIELDS:

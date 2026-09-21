@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.api.v1.routes_assets import asset_public_url
 from backend.app.core.errors import AppError, NotFoundError
+from backend.app.core.ownership import require_owned
 from backend.app.core.rbac import AuthUser, require_owner_or_manager, require_staff_or_above
 from backend.app.db.session import get_db
 from shared.models.asset import Asset
@@ -337,20 +338,19 @@ async def create_item(
 ):
     image_url, asset = await _resolve_item_image(db, user.business_id, body.image_asset_id)
 
+    if body.category_id is not None:
+        await require_owned(db, MenuCategory, body.category_id, user.business_id, label="Category")
+
+    # Inherit currency from the business (ZAR fallback if it's somehow gone).
+    from shared.models.business import Business
+    biz = await db.get(Business, user.business_id)
+
     item = MenuItem(
         business_id=user.business_id,
-        currency=( # Inherit from business
-            await db.execute(
-                select(MenuItem.currency).limit(1)
-            )
-        ).scalar() or "ZAR",
+        currency=biz.currency if biz else "ZAR",
         **body.model_dump(),
         image_url=image_url,
     )
-    # Actually get currency from business
-    from shared.models.business import Business
-    biz = await db.get(Business, user.business_id)
-    item.currency = biz.currency if biz else "ZAR"
 
     db.add(item)
     await db.flush()  # assigns item.id before the asset backfill below
@@ -380,6 +380,12 @@ async def update_item(
         raise NotFoundError("MenuItem", str(item_id))
 
     update_fields = body.model_dump(exclude_unset=True)
+
+    if update_fields.get("category_id") is not None:
+        await require_owned(
+            db, MenuCategory, update_fields["category_id"], user.business_id, label="Category"
+        )
+
     asset = None
     if "image_asset_id" in update_fields:
         image_url, asset = await _resolve_item_image(
@@ -572,6 +578,18 @@ async def detach_add_on(
     db: AsyncSession = Depends(get_db),
 ):
     """Detach an add-on from a menu item."""
+    # Verify ownership of both item and add-on — same principle as attach_add_on.
+    # Without this, any owner/manager could detach a join row belonging to
+    # another business purely by guessing/knowing its two UUIDs.
+    await require_owned(
+        db, MenuItem, item_id, user.business_id,
+        label="MenuItem", extra_filters=(MenuItem.is_deleted == False,),
+    )
+    await require_owned(
+        db, MenuAddOn, add_on_id, user.business_id,
+        label="MenuAddOn", extra_filters=(MenuAddOn.is_deleted == False,),
+    )
+
     from sqlalchemy import delete as _delete
     await db.execute(
         _delete(menu_item_add_ons).where(

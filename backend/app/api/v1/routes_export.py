@@ -57,7 +57,10 @@ async def export_orders_csv(
     for order in orders:
         # Load items for each order
         items_result = await db.execute(
-            select(OrderItem).where(OrderItem.order_id == order.id)
+            select(OrderItem).where(
+                OrderItem.order_id == order.id,
+                OrderItem.business_id == user.business_id,
+            )
         )
         items = items_result.scalars().all()
         items_text = "; ".join(

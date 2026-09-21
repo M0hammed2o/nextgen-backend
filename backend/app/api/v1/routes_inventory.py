@@ -34,6 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from backend.app.core.errors import AppError, NotFoundError
+from backend.app.core.ownership import require_owned
 from backend.app.core.rbac import AuthUser, require_owner_or_manager, require_staff_or_above
 from backend.app.db.session import get_db
 from backend.app.inventory.ledger import build_movement, stock_on_hand
@@ -595,6 +596,9 @@ async def create_goods_receipt(
         raise AppError(
             "UNKNOWN_INGREDIENT", f"Unknown ingredient(s): {', '.join(missing)}", 422
         )
+
+    if body.supplier_id is not None:
+        await require_owned(db, Supplier, body.supplier_id, user.business_id, label="Supplier")
 
     occurred = body.occurred_at or datetime.now(timezone.utc)
     receipt = GoodsReceipt(

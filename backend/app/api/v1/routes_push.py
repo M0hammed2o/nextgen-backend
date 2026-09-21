@@ -52,16 +52,36 @@ async def subscribe(
     if not user.business_id:
         raise HTTPException(status_code=403, detail="No business context")
 
-    # Upsert: if the endpoint already exists for this user, update keys.
+    # `endpoint` is globally unique (uq_push_subscription_endpoint) — a real
+    # browser subscription can legitimately move between staff on the same
+    # shared till device, and can legitimately move between businesses if
+    # the same physical device is reused at another restaurant. But it must
+    # never let a caller who merely knows/guesses a victim's endpoint URL
+    # re-point that victim's subscription to themselves.
+    #
+    # Rule: same-business re-assignment is always allowed (ordinary staff
+    # handover on a shared device). Cross-business re-assignment is only
+    # allowed when the presented p256dh/auth keys match what's already
+    # stored — those keys come from the browser's own subscription object,
+    # so a match is proof this request really originated from the same
+    # browser that owns the subscription, not just knowledge of the URL.
+    # A cross-business request with mismatched keys leaves the other
+    # tenant's row untouched and gets the same success-shaped response, so
+    # it learns nothing about whether that row exists.
     result = await db.execute(
         select(PushSubscription).where(PushSubscription.endpoint == body.endpoint)
     )
     sub = result.scalar_one_or_none()
 
-    if sub:
+    if sub and sub.business_id != user.business_id:
+        if sub.p256dh == body.p256dh and sub.auth == body.auth:
+            sub.business_id = user.business_id
+            sub.user_id = user.user_id
+        # else: mismatched keys — leave the other tenant's row alone and
+        # fall through to the same response as a normal success.
+    elif sub:
         sub.p256dh = body.p256dh
         sub.auth = body.auth
-        sub.business_id = user.business_id
         sub.user_id = user.user_id
     else:
         sub = PushSubscription(
