@@ -19,7 +19,7 @@ from sqlalchemy import delete
 
 from backend.app.api.v1.routes_analytics import get_daily_breakdown, get_summary, get_top_items
 from backend.app.api.v1.routes_business import BusinessSettingsUpdate, update_business_settings
-from backend.app.api.v1.routes_external_orders import channel_breakdown
+from backend.app.api.v1.routes_external_orders import channel_breakdown, external_sales_status
 from backend.app.api.v1.routes_menu import CategoryCreate, ItemCreate, create_category, create_item
 from backend.app.api.v1.routes_pos import (
     POSOrderCreateRequest,
@@ -329,3 +329,36 @@ async def test_imported_order_counts_once_with_right_channel_and_vat_sums(db, te
     summary = await get_summary(period="today", user=owner, db=db)
     assert summary.vat_cents == pos_sale.tax_cents + 1826
     assert summary.gross_cents == pos_sale.total_cents + 14000
+
+
+async def test_external_sales_status_gross_uses_shared_sale_predicate(db, test_business: Business):
+    """
+    F7 fix (Wave 0A verifier): GET /external-orders/status's
+    total_gross_cents_all_time must agree with the same IS_SALE definition
+    every other revenue endpoint uses — previously it summed total_cents
+    over EVERY row for the source, including a CANCELLED-and-never-paid
+    order that is not a "sale" anywhere else in the platform's reporting.
+    """
+    owner = _owner(test_business.id)
+
+    real_sale = Order(
+        business_id=test_business.id, order_number="UBER-STATUS-1", status="COMPLETED",
+        payment_status="PAID", order_mode="DELIVERY", source="UBER_EATS",
+        subtotal_cents=14000, total_cents=14000, tax_cents=0, currency="ZAR",
+        external_order_id="uber-status-1",
+    )
+    never_a_sale = Order(
+        business_id=test_business.id, order_number="UBER-STATUS-2", status="CANCELLED",
+        payment_status="UNPAID", order_mode="DELIVERY", source="UBER_EATS",
+        subtotal_cents=50000, total_cents=50000, tax_cents=0, currency="ZAR",
+        external_order_id="uber-status-2",
+    )
+    db.add_all([real_sale, never_a_sale])
+    await db.commit()
+
+    status = await external_sales_status(user=owner, db=db)
+    uber = next(p for p in status["platforms"] if p["platform"] == "UBER_EATS")
+    assert uber["total_orders_all_time"] == 1, "a CANCELLED/never-paid order must not count as a sale"
+    assert uber["total_gross_cents_all_time"] == 14000, (
+        "gross must exclude the CANCELLED order's total_cents entirely, not just discount it"
+    )

@@ -28,7 +28,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.analytics.revenue import (
     IS_SALE,
+    gross_cents_expr,
     refunds_cents_expr,
+    sale_count_expr,
     sale_timestamp_expr,
 )
 from backend.app.api.v1.routes_import import _read_rows, parse_mapping
@@ -354,9 +356,19 @@ async def external_sales_status(
         ).scalar_one_or_none()
 
         source = PLATFORM_TO_ORDER_SOURCE[platform]
+        # F7 fix (Wave 0A verifier): previously summed Order.total_cents over
+        # EVERY row for this source — including CANCELLED/never-paid orders
+        # that are not a "sale" anywhere else in the platform's reporting —
+        # ignoring the single shared sale definition (analytics/revenue.py's
+        # IS_SALE) every other revenue endpoint uses. Now uses the same
+        # predicate so this figure is directly comparable to (and doesn't
+        # contradict) the summary/channel-breakdown endpoints. This is GROSS
+        # (pre-refund) — matches the field's existing name/label; it is NOT
+        # netted against refund_amount_cents (see channel_breakdown's
+        # separate net_cents if a netted figure is needed later).
         totals = (
             await db.execute(
-                select(func.count(), func.coalesce(func.sum(Order.total_cents), 0)).where(
+                select(sale_count_expr(), gross_cents_expr()).where(
                     Order.business_id == user.business_id,
                     Order.source == source,
                 )
