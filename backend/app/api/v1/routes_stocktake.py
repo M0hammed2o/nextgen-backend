@@ -31,7 +31,12 @@ from sqlalchemy.orm import selectinload
 from backend.app.core.errors import AppError, NotFoundError
 from backend.app.core.rbac import AuthUser, require_owner_or_manager, require_staff_or_above
 from backend.app.db.session import get_db
-from backend.app.inventory.ledger import build_movement, movement_totals_by_type, stock_on_hand
+from backend.app.inventory.ledger import (
+    build_movement,
+    movement_totals_by_type,
+    stock_on_hand,
+    stocktake_adjustment_idempotency_key,
+)
 from backend.app.inventory.units import UnitError, format_quantity, to_milli, value_cents
 from backend.app.inventory.variance import (
     DEFAULT_VARIANCE_ALERT_BASIS_POINTS,
@@ -84,18 +89,30 @@ async def _require_inventory_enabled(db: AsyncSession, business_id: uuid.UUID) -
 
 
 async def _load_session(
-    db: AsyncSession, business_id: uuid.UUID, session_id: uuid.UUID
+    db: AsyncSession,
+    business_id: uuid.UUID,
+    session_id: uuid.UUID,
+    *,
+    for_update: bool = False,
 ) -> StocktakeSession:
-    session = (
-        await db.execute(
-            select(StocktakeSession)
-            .options(selectinload(StocktakeSession.lines))
-            .where(
-                StocktakeSession.id == session_id,
-                StocktakeSession.business_id == business_id,
-            )
+    """
+    `for_update` locks the StocktakeSession row (SELECT ... FOR UPDATE) so a
+    double-submitted approval serializes: the second caller blocks until the
+    first commits, then re-reads status == APPROVED and is rejected by the
+    checks in approve_stocktake — see stocktake_adjustment_idempotency_key()
+    for the belt-and-braces DB-level guarantee behind that same check.
+    """
+    stmt = (
+        select(StocktakeSession)
+        .options(selectinload(StocktakeSession.lines))
+        .where(
+            StocktakeSession.id == session_id,
+            StocktakeSession.business_id == business_id,
         )
-    ).scalar_one_or_none()
+    )
+    if for_update:
+        stmt = stmt.with_for_update()
+    session = (await db.execute(stmt)).scalar_one_or_none()
     if not session:
         raise NotFoundError("Stocktake", str(session_id))
     return session
@@ -125,7 +142,11 @@ class StocktakeOpenRequest(BaseModel):
 class CountLineRequest(BaseModel):
     ingredient_id: uuid.UUID
     quantity: str
-    unit: str | None = Field(default=None, max_length=32)
+    # Required — a count submitted without a unit used to be silently
+    # interpreted in the ingredient's canonical unit (grams/millilitres/each),
+    # which is wrong whenever staff count in kg, L, or a pack/portion unit.
+    # See KNOWN_BUGS.md BUG-0047.
+    unit: str = Field(min_length=1, max_length=32)
     notes: str | None = None
 
 
@@ -141,6 +162,8 @@ class StocktakeLineResponse(BaseModel):
     unit_label: str | None = None
     counted_quantity_milli: int | None
     counted_display: str | None
+    entered_quantity: str | None = None
+    entered_unit: str | None = None
     opening_quantity_milli: int
     received_quantity_milli: int
     theoretical_consumption_milli: int
@@ -254,6 +277,8 @@ def _line_response(
             if line.counted_quantity_milli is not None
             else None
         ),
+        entered_quantity=line.entered_quantity,
+        entered_unit=line.entered_unit,
         opening_quantity_milli=variance.opening_milli,
         received_quantity_milli=variance.received_milli,
         theoretical_consumption_milli=variance.theoretical_consumption_milli,
@@ -388,6 +413,27 @@ async def open_stocktake(
         raise AppError(
             "STOCKTAKE_ALREADY_OPEN",
             "A stocktake is already in progress — complete or cancel it first",
+            409,
+        )
+
+    completed_unapproved = (
+        await db.execute(
+            select(StocktakeSession).where(
+                StocktakeSession.business_id == user.business_id,
+                StocktakeSession.status == StocktakeStatus.COMPLETED.value,
+            )
+        )
+    ).scalar_one_or_none()
+    if completed_unapproved:
+        # A COMPLETED session still owns the period up to its cutoff_at — the
+        # next session's period_start_at is only ever set from an APPROVED
+        # count's cutoff (see `previous` below), so starting a new DRAFT here
+        # would reuse the same period_start_at as the still-pending one and
+        # silently produce two overlapping variance periods.
+        raise AppError(
+            "STOCKTAKE_PENDING_APPROVAL",
+            "A completed stocktake is awaiting manager approval — approve or "
+            "cancel it before starting a new count",
             409,
         )
 
@@ -601,6 +647,20 @@ async def submit_counts(
     await _require_inventory_enabled(db, user.business_id)
     session = await _load_session(db, user.business_id, session_id)
     _reject_if_locked(session)
+    if session.status == StocktakeStatus.COMPLETED.value:
+        # _reject_if_locked only blocks APPROVED/CANCELLED (cancel_stocktake
+        # must still be able to act on a COMPLETED-unapproved session per the
+        # lifecycle diagram above), but editing counts after COMPLETED would
+        # let approval post a variance that no longer matches what was
+        # actually snapshotted. There is no "reopen" transition in this
+        # codebase today, so this is a hard lock, not a re-snapshot.
+        raise AppError(
+            "STOCKTAKE_COMPLETED",
+            "This stocktake has already been completed and its variance snapshotted — "
+            "counts can no longer be edited. Cancel it and open a new count if the "
+            "figures were wrong.",
+            409,
+        )
 
     lines = {line.ingredient_id: line for line in (session.lines or [])}
     ingredients = {
@@ -628,7 +688,7 @@ async def submit_counts(
                 f"Ingredient {entry.ingredient_id} is not part of this stocktake",
                 422,
             )
-        unit = entry.unit or ingredient.canonical_unit
+        unit = entry.unit
         try:
             counted = to_milli(
                 entry.quantity, unit, canonical=CanonicalUnit(ingredient.canonical_unit)
@@ -746,7 +806,10 @@ async def approve_stocktake(
     movements rather than by editing history — the ledger stays append-only.
     """
     await _require_inventory_enabled(db, user.business_id)
-    session = await _load_session(db, user.business_id, session_id)
+    # Row-locked: a double-clicked approve must not post adjustments twice.
+    # See _load_session's docstring for how this pairs with the idempotency
+    # key on each movement below.
+    session = await _load_session(db, user.business_id, session_id, for_update=True)
 
     if session.status == StocktakeStatus.APPROVED.value:
         raise AppError("STOCKTAKE_LOCKED", "This stocktake is already approved", 409)
@@ -777,6 +840,9 @@ async def approve_stocktake(
                     # inside the period it belongs to and the next period
                     # opens from a clean, reconciled position.
                     occurred_at=session.cutoff_at,
+                    idempotency_key=stocktake_adjustment_idempotency_key(
+                        session.id, line.ingredient_id
+                    ),
                 )
             )
             posted += 1
