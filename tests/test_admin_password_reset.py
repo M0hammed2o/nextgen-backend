@@ -117,7 +117,11 @@ async def test_reset_password_generates_new_temp_password_and_flags_reset():
     biz = make_business()
     target = make_business_user(password="OldTemp123", business_id=biz.id, must_change_password=False)
 
-    db = FakeDB([FakeResult(target), FakeResult(None)])  # select target, then the revoke-tokens update
+    # get_business_scoped's db.get(Business, ...) now runs first (least-
+    # privilege scoping added for the ONBOARDER onboarding allow-list —
+    # see admin_api/app/core/deps.py::get_business_scoped), then the
+    # existing sequence: select target, then the revoke-tokens update.
+    db = FakeDB([biz, FakeResult(target), FakeResult(None)])
     res = await reset_business_user_password(
         business_id=biz.id, user_id=target.id, user=make_admin_user(), db=db
     )
@@ -133,7 +137,19 @@ async def test_reset_password_generates_new_temp_password_and_flags_reset():
 
 
 async def test_reset_password_404_for_unknown_user():
-    db = FakeDB([FakeResult(None)])
+    biz = make_business()
+    # get_business_scoped's db.get(Business, ...) succeeds, but the
+    # subsequent user select finds nothing.
+    db = FakeDB([biz, FakeResult(None)])
+    with pytest.raises(AppError) as exc:
+        await reset_business_user_password(
+            business_id=biz.id, user_id=uuid.uuid4(), user=make_admin_user(), db=db
+        )
+    assert exc.value.status_code == 404
+
+
+async def test_reset_password_404_for_unknown_business():
+    db = FakeDB([None])  # get_business_scoped's db.get(Business, ...) finds nothing
     with pytest.raises(AppError) as exc:
         await reset_business_user_password(
             business_id=uuid.uuid4(), user_id=uuid.uuid4(), user=make_admin_user(), db=db
