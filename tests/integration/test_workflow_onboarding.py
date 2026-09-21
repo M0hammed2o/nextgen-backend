@@ -390,6 +390,67 @@ async def test_admin_user_management_and_self_protection(_db_or_skip):
         await _cleanup(db, admin_ids=created_ids)
 
 
+async def test_concurrent_demotions_of_the_last_two_super_admins_cannot_both_succeed(_db_or_skip):
+    """
+    F9a fix (Wave 0A verifier): with exactly 2 active SUPER_ADMINs (A, B),
+    A demoting B and B demoting A CONCURRENTLY (two independent sessions —
+    a real DB, not the same in-process transaction) must never both
+    succeed, which would leave the platform with zero active SUPER_ADMINs.
+    Before the fix, `_active_super_admin_count` ran unlocked: both sessions
+    could read "the other one is still active" before either committed,
+    both pass the check, and both demote — exactly this scenario.
+    """
+    import asyncio
+
+    from backend.app.db.session import async_session_factory
+
+    db = _db_or_skip
+    unique = uuid.uuid4().hex[:8]
+    admin_a = await _make_admin(db, AdminRole.SUPER_ADMIN, f"concurrent-a-{unique}@test.co.za")
+    admin_b = await _make_admin(db, AdminRole.SUPER_ADMIN, f"concurrent-b-{unique}@test.co.za")
+    created_ids = [admin_a.id, admin_b.id]
+
+    async def _demote(actor_id: uuid.UUID, target_id: uuid.UUID):
+        async with async_session_factory() as session:
+            try:
+                result = await update_admin_user(
+                    admin_id=target_id,
+                    body=AdminUserPatch(role=AdminRole.ONBOARDER),
+                    user=_admin_auth(actor_id, AdminRole.SUPER_ADMIN),
+                    db=session,
+                )
+                return ("success", result)
+            except AppError as exc:
+                await session.rollback()
+                return ("blocked", exc.code, exc.status_code)
+
+    try:
+        outcomes = await asyncio.gather(
+            _demote(admin_a.id, admin_b.id),  # A demotes B
+            _demote(admin_b.id, admin_a.id),  # B demotes A, concurrently
+        )
+
+        successes = [o for o in outcomes if o[0] == "success"]
+        blocked = [o for o in outcomes if o[0] == "blocked"]
+        assert len(successes) == 1, f"expected exactly one demotion to succeed, got: {outcomes}"
+        assert len(blocked) == 1, f"expected exactly one demotion to be blocked, got: {outcomes}"
+        assert blocked[0][1] == "LAST_SUPER_ADMIN"
+        assert blocked[0][2] == 409
+
+        # Final DB state: exactly one of {admin_a, admin_b} is still an
+        # active SUPER_ADMIN — never zero.
+        remaining = await db.execute(
+            select(AdminUser).where(
+                AdminUser.id.in_([admin_a.id, admin_b.id]),
+                AdminUser.role == AdminRole.SUPER_ADMIN,
+                AdminUser.is_active.is_(True),
+            )
+        )
+        assert len(remaining.scalars().all()) == 1
+    finally:
+        await _cleanup(db, admin_ids=created_ids)
+
+
 async def test_business_plane_token_cannot_reach_admin_dependency(_db_or_skip):
     db = _db_or_skip
     unique = uuid.uuid4().hex[:8]

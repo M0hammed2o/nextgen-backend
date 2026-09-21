@@ -1,7 +1,7 @@
 """Sales-partner onboarding: ONBOARDER admin role + business ownership stamp
 
 Revision ID: 0034_onboarding_role
-Revises: 0031_tenant_nav_stocktake
+Revises: 0033_order_number_uniqueness
 Create Date: 2026-09-21
 
 MILESTONE B — a sales partner must be able to onboard a restaurant without
@@ -28,10 +28,15 @@ onboarded_by_admin_id=NULL, onboarding_completed_at=NULL, i.e. "not an
 ONBOARDER-owned tenant" — correct, since ONBOARDER did not exist before
 this migration).
 
-NOTE (merge instruction from the lead): down_revision is temporarily
-0031_tenant_nav_stocktake to allow standalone testing on this branch's
-throwaway DB while migrations 0032_*/0033_* land concurrently on another
-track. Re-point down_revision to the real chain head at merge time.
+NOTE (historical — merge instruction from the lead, now stale; F9b fix,
+Wave 0A verifier): down_revision was temporarily 0031_tenant_nav_stocktake
+while this migration was authored standalone on this branch's throwaway DB,
+before migrations 0032_till_one_open_per_business/
+0033_order_number_uniqueness landed concurrently on another track. It has
+since been re-pointed to the real chain head at merge time (see
+down_revision below — 0033_order_number_uniqueness) — this docstring's
+Revision-ID header previously still said "Revises: 0031", which no longer
+matched the code and would have misled anyone reading the chain by hand.
 """
 from alembic import op
 import sqlalchemy as sa

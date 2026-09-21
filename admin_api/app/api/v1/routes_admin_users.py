@@ -145,7 +145,23 @@ async def update_admin_user(
 
     # Last-SUPER_ADMIN protection: block a deactivation or demotion that
     # would leave zero active SUPER_ADMINs platform-wide.
+    #
+    # F9a fix (Wave 0A verifier): the count below used to run unlocked, so
+    # two concurrent demotions of two DIFFERENT super admins (e.g. exactly
+    # 2 active — A demotes B, B simultaneously demotes A) could both read
+    # "1 other still active" and both proceed, leaving zero. Lock every
+    # currently-active SUPER_ADMIN row FIRST (ordered by id so concurrent
+    # transactions always acquire locks in the same order — avoids a
+    # deadlock rather than just serializing) so the second request blocks
+    # here until the first commits, then counts against the now-current,
+    # already-updated state.
     if target.role == AdminRole.SUPER_ADMIN and target.is_active and (would_deactivate or would_demote):
+        await db.execute(
+            select(AdminUser.id)
+            .where(AdminUser.role == AdminRole.SUPER_ADMIN, AdminUser.is_active.is_(True))
+            .order_by(AdminUser.id)
+            .with_for_update()
+        )
         remaining = await _active_super_admin_count(db, excluding_id=target.id)
         if remaining == 0:
             raise AppError(
