@@ -420,6 +420,26 @@ async def suspend_past_due_businesses(ctx: dict) -> None:
     access once the grace period given in backend/app/billing/lifecycle.py
     has actually elapsed. Never deletes any data — only flips is_active/
     billing_status, same fields the admin suite's manual suspend already uses.
+
+    NOTE (Wave 0A): the commercial-trials task brief asked for this exact
+    function's BODY to be extended with a trial-expiry sweep. Verified
+    (empirically, via a real `python -c` repro) that doing so breaks every
+    pre-existing test in tests/test_billing_suspension_cron.py: those tests
+    mock `db.execute` with a single fixed return value shared across ALL
+    calls within the job, so a second/third `db.execute` call (the trial
+    query, then commercial_invoices.sweep_overdue_invoices' own query)
+    would silently replay the SAME (wrongly-typed) rows into the new logic
+    and crash with `TypeError: '>' not supported between instances of
+    'datetime.datetime' and 'MagicMock'` when comparing a Business mock's
+    un-set `trial_ends_at` against `now` — which the job's own try/except
+    swallows, silently skipping the commit `test_business_past_grace_period_
+    is_suspended` requires. Per this task's hard rule against regressing
+    existing tests, the trial/invoice sweep is instead
+    `sweep_trial_and_invoice_expiry` below — a SEPARATE function on the
+    identical hourly cadence (see WorkerSettings.cron_jobs), not a second
+    call glued into this one. Functionally equivalent (same hour, same
+    suspended_reason convention); only the code-organisation differs from
+    the literal instruction — see this task's final report.
     """
     from backend.app.billing.lifecycle import is_past_grace_period, suspend_for_nonpayment
 
@@ -440,6 +460,59 @@ async def suspend_past_due_businesses(ctx: dict) -> None:
         except Exception:
             await db.rollback()
             logger.exception("Billing grace-period suspension job failed — rolled back.")
+
+
+async def sweep_trial_and_invoice_expiry(ctx: dict) -> None:
+    """
+    Companion sweep to `suspend_past_due_businesses` above, run on the same
+    hourly cadence (see WorkerSettings.cron_jobs) but as its own function —
+    see that function's docstring NOTE for why this isn't inlined into it.
+
+    1. Suspends any business whose commercial TRIAL expired more than
+       TRIAL_EXPIRY_GRACE_DAYS (config) ago and was never converted, using
+       `suspended_reason = "TRIAL_EXPIRED"` — a distinct, independently
+       reversible reason from non-payment suspension (see
+       backend/app/billing/trials.py::_unsuspend_if_trial_expired, which
+       only ever lifts a suspension carrying this exact string). Never
+       deletes any data.
+    2. Marks OVERDUE any issued-unpaid commercial (EFT/cash) invoice past
+       its due date (backend/app/billing/commercial_invoices.py).
+    """
+    from backend.app.billing.commercial_invoices import sweep_overdue_invoices
+    from backend.app.core.config import get_settings as _get_settings
+
+    settings = _get_settings()
+
+    async with ctx["session_factory"]() as db:
+        try:
+            result = await db.execute(
+                select(Business).where(
+                    Business.billing_status == "TRIAL",
+                    Business.is_active.is_(True),
+                    Business.trial_ends_at.isnot(None),
+                )
+            )
+            now = datetime.now(timezone.utc)
+            trial_suspended = 0
+            for business in result.scalars().all():
+                deadline = business.trial_ends_at + timedelta(days=settings.TRIAL_EXPIRY_GRACE_DAYS)
+                if now > deadline:
+                    business.is_active = False
+                    business.suspended_reason = "TRIAL_EXPIRED"
+                    trial_suspended += 1
+
+            overdue_count = await sweep_overdue_invoices(db)
+
+            if trial_suspended or overdue_count:
+                await db.commit()
+                logger.warning(
+                    "Trial/invoice sweep: suspended %d business(es) for expired trial, "
+                    "marked %d invoice(s) OVERDUE.",
+                    trial_suspended, overdue_count,
+                )
+        except Exception:
+            await db.rollback()
+            logger.exception("Trial/invoice expiry sweep failed — rolled back.")
 
 
 # ── Worker Settings ───────────────────────────────────────────────────────────
@@ -490,6 +563,15 @@ class WorkerSettings:
         # Suspend businesses whose billing grace period has elapsed — hourly.
         cron(
             suspend_past_due_businesses,
+            minute=0,
+            second=0,
+            run_at_startup=True,
+        ),
+        # Suspend businesses whose trial expired past its grace period, and
+        # mark overdue commercial invoices — hourly, same cadence as above
+        # (Wave 0A commercial/sales-onboarding push).
+        cron(
+            sweep_trial_and_invoice_expiry,
             minute=0,
             second=0,
             run_at_startup=True,

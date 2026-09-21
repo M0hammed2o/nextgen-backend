@@ -228,6 +228,46 @@ class Settings(BaseSettings):
     WHATSAPP_CONNECT_RATE_LIMIT_PER_MINUTE: int = 5
     WHATSAPP_TEST_MESSAGE_RATE_LIMIT_PER_MINUTE: int = 5
 
+    # ── Commercial / sales-onboarding (Wave 0A) ───────────────────────────
+    # Trial policy. `trial_ends_at` is computed at trial-start time from
+    # TRIAL_DEFAULT_DAYS and never recomputed on read — see
+    # backend/app/billing/account_status.py.
+    TRIAL_DEFAULT_DAYS: int = 14
+    # Cap on an ONBOARDER's own cumulative trial extensions for a single
+    # business (Business.trial_extension_days_total). SUPER_ADMIN is
+    # unlimited. See POST /admin/businesses/{id}/trial/extend.
+    ONBOARDER_MAX_TRIAL_EXTENSION_DAYS: int = 14
+    # Days after trial_ends_at before the hourly suspension cron auto-
+    # suspends an expired, unconverted trial (suspended_reason=TRIAL_EXPIRED).
+    TRIAL_EXPIRY_GRACE_DAYS: int = 3
+
+    # NextGen's own VAT registration — governs whether a commercial invoice
+    # is titled "INVOICE" (not registered) or "TAX INVOICE" (registered,
+    # with a VAT number and VAT line). Distinct from Business.vat_registered/
+    # vat_number, which describe each TENANT's own VAT status for their
+    # customer-facing receipts.
+    NEXTGEN_VAT_REGISTERED: bool = False
+    NEXTGEN_VAT_NUMBER: str = ""
+    NEXTGEN_VAT_RATE_BPS: int = 1500
+
+    # NextGen's own supplier/banking details for commercial (EFT/cash)
+    # invoices issued to restaurant clients — printed ONLY inside an issued
+    # invoice PDF, never in any settings/config API response or log line.
+    # Issuing a commercial invoice is refused (409 INVOICING_NOT_CONFIGURED)
+    # while NEXTGEN_LEGAL_NAME or any NEXTGEN_BANK_* value below is unset.
+    NEXTGEN_LEGAL_NAME: str = ""
+    NEXTGEN_TRADING_NAME: str = ""
+    NEXTGEN_REGISTRATION_NUMBER: str = ""
+    NEXTGEN_ADDRESS: str = ""
+    NEXTGEN_CONTACT_EMAIL: str = ""
+    NEXTGEN_CONTACT_PHONE: str = ""
+    NEXTGEN_BANK_NAME: str = ""
+    NEXTGEN_BANK_ACCOUNT_NAME: str = ""
+    NEXTGEN_BANK_ACCOUNT_NUMBER: str = ""
+    NEXTGEN_BANK_BRANCH_CODE: str = ""
+    NEXTGEN_BANK_ACCOUNT_TYPE: str = ""
+    NEXTGEN_INVOICE_PAYMENT_TERMS_DAYS: int = 7
+
     # ── Readiness ────────────────────────────────────────────────────────
     # GET /ready reports the ARQ worker's heartbeat as "stale" whenever it's
     # missing/expired. Whether that alone should flip the whole endpoint to
