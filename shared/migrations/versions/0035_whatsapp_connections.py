@@ -23,7 +23,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 revision = "0035_whatsapp_connections"
-down_revision = "0033_order_number_uniqueness"
+down_revision = "0034_onboarding_role"
 branch_labels = None
 depends_on = None
 
