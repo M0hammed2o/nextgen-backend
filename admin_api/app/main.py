@@ -102,6 +102,7 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # ── Routers ──────────────────────────────────────────────────────────────────
+from admin_api.app.api.v1.routes_admin_users import router as admin_admin_users_router
 from admin_api.app.api.v1.routes_ai_emails import router as admin_ai_emails_router
 from admin_api.app.api.v1.routes_auth import router as admin_auth_router
 from admin_api.app.api.v1.routes_businesses import router as admin_biz_router
@@ -113,6 +114,7 @@ app.include_router(admin_auth_router, prefix=PREFIX)
 app.include_router(admin_biz_router, prefix=PREFIX)
 app.include_router(admin_usage_router, prefix=PREFIX)
 app.include_router(admin_ai_emails_router, prefix=PREFIX)
+app.include_router(admin_admin_users_router, prefix=PREFIX)
 
 
 @app.get("/health")

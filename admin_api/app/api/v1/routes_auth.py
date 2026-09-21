@@ -1,7 +1,8 @@
 """
-Admin auth routes — POST /admin/login, /admin/refresh, /admin/logout
+Admin auth routes — POST /admin/login, /admin/refresh, /admin/logout, GET /admin/me
 """
 
+import uuid
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Request
@@ -10,12 +11,14 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.ratelimit import limiter
+from backend.app.core.rbac import AuthUser
 from backend.app.core.security import (
     create_admin_access_token,
     hash_refresh_token,
     verify_password,
 )
 from admin_api.app.core.config import get_admin_settings
+from admin_api.app.core.deps import get_current_admin
 from shared.models.admin import AdminUser
 from shared.models.user import AdminRefreshToken
 from shared.utils import generate_refresh_token
@@ -105,12 +108,19 @@ class AdminRefreshRequest(BaseModel):
 
 
 @router.post("/refresh", response_model=AdminTokenResponse)
+@limiter.limit("5/minute")
 async def admin_refresh(
     body: AdminRefreshRequest,
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
-    """Rotate an admin refresh token and issue a new access + refresh pair."""
+    """Rotate an admin refresh token and issue a new access + refresh pair.
+
+    Rate-limited the same as /admin/login (5/minute) — this endpoint had no
+    limit at all before, which is a meaningful gap given a stolen/guessed
+    refresh token could otherwise be hammered to mint fresh access tokens
+    without ever touching the password-checking /login path.
+    """
     from datetime import datetime, timezone
     from backend.app.core.security import hash_refresh_token, create_admin_access_token
     from shared.utils import generate_refresh_token
@@ -157,4 +167,35 @@ async def admin_refresh(
         access_token=new_access,
         refresh_token=new_refresh_raw,
         expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+    )
+
+
+class AdminMeResponse(BaseModel):
+    id: uuid.UUID
+    email: str
+    display_name: str
+    role: str
+    is_active: bool
+
+
+@router.get("/me", response_model=AdminMeResponse)
+async def admin_me(
+    admin: AuthUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Who am I, and what can I do — the admin UI needs `role` to decide
+    whether to show ONBOARDER's reduced navigation or SUPER_ADMIN's full
+    one. Goes through get_current_admin (not just the token payload) so a
+    demoted/deactivated admin sees that reflected immediately, same as
+    every other admin_api route.
+    """
+    result = await db.execute(select(AdminUser).where(AdminUser.id == admin.user_id))
+    row = result.scalar_one_or_none()
+    if not row:
+        from backend.app.core.errors import NotFoundError
+        raise NotFoundError("Admin user", str(admin.user_id))
+    return AdminMeResponse(
+        id=row.id, email=row.email, display_name=row.display_name,
+        role=row.role, is_active=row.is_active,
     )

@@ -10,7 +10,8 @@ from pydantic import BaseModel
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.app.core.rbac import AuthUser, require_super_admin
+from admin_api.app.core.deps import require_super_admin
+from backend.app.core.rbac import AuthUser
 from backend.app.db.session import get_db
 from shared.models.analytics import DailyUsage
 from shared.models.audit import AuditEvent

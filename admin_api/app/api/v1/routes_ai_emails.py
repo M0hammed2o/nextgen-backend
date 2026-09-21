@@ -24,7 +24,8 @@ from admin_api.app.schemas.ai_emails import (
 from admin_api.app.services.ai_emails_import import apply_confirm, create_import_preview
 from backend.app.core.errors import AppError, NotFoundError
 from backend.app.core.pagination import OffsetParams, PaginatedResponse, PaginationMeta
-from backend.app.core.rbac import AuthUser, require_super_admin
+from admin_api.app.core.deps import require_super_admin
+from backend.app.core.rbac import AuthUser
 from backend.app.db.session import get_db
 from shared.models.ai_emails import AiEmailCaseStudy, AiEmailImportBatch, AiEmailLead
 from shared.models.audit import AuditEvent
