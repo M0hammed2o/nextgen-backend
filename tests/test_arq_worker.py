@@ -307,18 +307,23 @@ class TestWorkerSettings:
         names = [f.__name__ for f in WorkerSettings.functions]
         assert "process_whatsapp_message" in names
 
-    def test_five_cron_jobs_registered(self):
+    def test_six_cron_jobs_registered(self):
         """
         Outbox, delivery fee, payment timeout, billing grace-period
-        suspension, and (added for wave0a/sec — GET /ready worker-heartbeat
-        check) the worker heartbeat cron jobs must be registered.
+        suspension, (added for wave0a/sec — GET /ready worker-heartbeat
+        check) the worker heartbeat, and (added for the Wave 0A commercial/
+        sales-onboarding push — trial-expiry + commercial-invoice-overdue
+        sweep, see worker.py::sweep_trial_and_invoice_expiry's own docstring
+        for why this is a separate cron job rather than folded into
+        suspend_past_due_businesses) cron jobs must be registered.
         """
-        assert len(WorkerSettings.cron_jobs) == 5
+        assert len(WorkerSettings.cron_jobs) == 6
         names = {c.name for c in WorkerSettings.cron_jobs}
         assert "cron:run_outbox_batch" in names
         assert "cron:cancel_stale_delivery_fee_orders" in names
         assert "cron:cancel_unpaid_orders" in names
         assert "cron:suspend_past_due_businesses" in names
+        assert "cron:sweep_trial_and_invoice_expiry" in names
         assert "cron:write_worker_heartbeat" in names
 
     def test_max_tries_is_positive(self):
