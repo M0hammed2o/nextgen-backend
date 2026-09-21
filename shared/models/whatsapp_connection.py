@@ -41,9 +41,15 @@ class WhatsAppConnection(Base, UUIDPrimaryKeyMixin, TimestampMixin):
 
     # ── Meta identifiers (confirmed against the Graph API, never trusted
     #    blindly from what the browser's Embedded Signup callback claims) ──
-    waba_id: Mapped[str] = mapped_column(String(64), nullable=False)
-    phone_number_id: Mapped[str] = mapped_column(
-        String(64), nullable=False, unique=True,
+    # Nullable: a freshly-created PENDING row (before the connect flow has
+    # even started, or after a pre-check rejection before either id is set)
+    # has neither yet. NULL (not "") is required for phone_number_id's
+    # uniqueness — Postgres allows multiple NULLs but only one "" across
+    # every business's still-PENDING row, which previously collided (see
+    # WORKLOG.md — found via tests/test_whatsapp_connections_realdb.py).
+    waba_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    phone_number_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, unique=True,
         comment="Also mirrored onto businesses.whatsapp_phone_number_id for inbound routing"
     )
     meta_business_id: Mapped[str | None] = mapped_column(String(64), nullable=True)

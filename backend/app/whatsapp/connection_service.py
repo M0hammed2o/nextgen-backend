@@ -77,8 +77,11 @@ async def get_connection(db: AsyncSession, business_id) -> WhatsAppConnection | 
 async def _get_or_create_connection(db: AsyncSession, business_id) -> WhatsAppConnection:
     connection = await get_connection(db, business_id)
     if connection is None:
+        # waba_id/phone_number_id start as NULL, not "" — see model
+        # docstring: "" would collide with every OTHER business's still-
+        # unset row on phone_number_id's unique constraint.
         connection = WhatsAppConnection(
-            business_id=business_id, waba_id="", phone_number_id="", status="PENDING"
+            business_id=business_id, waba_id=None, phone_number_id=None, status="PENDING"
         )
         db.add(connection)
         await db.flush()

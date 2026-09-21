@@ -37,8 +37,12 @@ def upgrade() -> None:
             sa.ForeignKey("businesses.id", ondelete="CASCADE"),
             nullable=False,
         ),
-        sa.Column("waba_id", sa.String(64), nullable=False),
-        sa.Column("phone_number_id", sa.String(64), nullable=False),
+        # Nullable — a freshly-created PENDING row (before either id is
+        # confirmed) has neither yet. NULL, not "", is required for
+        # phone_number_id's uniqueness (Postgres allows multiple NULLs but
+        # only one "" across every still-PENDING business's row).
+        sa.Column("waba_id", sa.String(64), nullable=True),
+        sa.Column("phone_number_id", sa.String(64), nullable=True),
         sa.Column("meta_business_id", sa.String(64), nullable=True),
         sa.Column("display_phone_number", sa.String(32), nullable=True),
         sa.Column("verified_name", sa.String(255), nullable=True),
