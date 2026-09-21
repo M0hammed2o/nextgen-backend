@@ -505,7 +505,8 @@ async def update_order_status(
                             phone_number_id=phone_number_id,
                             recipient_wa_id=wa_id,
                             text=payment_msg,
-                            db=db, order_id=order.id, business_id=order.business_id,
+                            db=db, business=business_obj,
+                            order_id=order.id, business_id=order.business_id,
                             order_status=order.status,
                         )
                 else:
@@ -520,7 +521,8 @@ async def update_order_status(
                             phone_number_id=phone_number_id,
                             recipient_wa_id=wa_id,
                             text=msg,
-                            db=db, order_id=order.id, business_id=order.business_id,
+                            db=db, business=business_obj,
+                            order_id=order.id, business_id=order.business_id,
                             order_status=order.status,
                         )
     except Exception:
@@ -649,7 +651,8 @@ async def set_delivery_fee(
                     phone_number_id=business.whatsapp_phone_number_id,
                     recipient_wa_id=wa_id,
                     text=msg,
-                    db=db, order_id=order.id, business_id=order.business_id,
+                    db=db, business=business,
+                    order_id=order.id, business_id=order.business_id,
                     order_status=order.status,
                 )
 
@@ -845,18 +848,18 @@ async def update_payment_status(
             wa_id = cust_row.scalar_one_or_none()
 
             biz_row = await db.execute(
-                select(Business.whatsapp_phone_number_id).where(
-                    Business.id == order.business_id
-                )
+                select(Business).where(Business.id == order.business_id)
             )
-            phone_number_id = biz_row.scalar_one_or_none()
+            business_obj = biz_row.scalar_one_or_none()
+            phone_number_id = business_obj.whatsapp_phone_number_id if business_obj else None
 
             if wa_id and phone_number_id:
                 await send_notification_message(
                     phone_number_id=phone_number_id,
                     recipient_wa_id=wa_id,
                     text=build_payment_confirmed_message(order),
-                    db=db, order_id=order.id, business_id=order.business_id,
+                    db=db, business=business_obj,
+                    order_id=order.id, business_id=order.business_id,
                     order_status=order.status,
                 )
         except Exception:

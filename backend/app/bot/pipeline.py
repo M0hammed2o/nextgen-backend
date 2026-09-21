@@ -553,6 +553,8 @@ async def _handle_message(
                     recipient_wa_id=customer.wa_id,
                     image_url=menu_image_url,
                     caption=caption,
+                    db=db,
+                    business=business,
                 )
                 # Image + caption covers everything — no separate text menu needed.
                 return "", False, None, None, None
@@ -596,6 +598,8 @@ async def _handle_message(
                         recipient_wa_id=customer.wa_id,
                         image_url=special.image_url,
                         caption=special.title,
+                        db=db,
+                        business=business,
                     )
                 except Exception:
                     logger.exception(
@@ -4576,6 +4580,7 @@ async def _send_response(
         llm_provider=llm_provider,
         intent=intent,
         customer_id=customer.id,
+        business=business,
     )
 
 

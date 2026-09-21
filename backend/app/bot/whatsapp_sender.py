@@ -447,11 +447,17 @@ async def send_image_message(
     recipient_wa_id: str,
     image_url: str,
     caption: str | None = None,
+    db: AsyncSession | None = None,
+    business=None,
 ) -> str | None:
     """
     Send an image message via Meta WhatsApp Cloud API.
     image_url must be a publicly accessible HTTPS URL.
     Returns the wamid on success, None on failure.
+
+    `db` + `business` (optional, Milestone C): pass BOTH to send with the
+    business's own customer-owned connection when it has one (platform token
+    otherwise), exactly like send_text_message.
     """
     payload: dict = {
         "messaging_product": "whatsapp",
@@ -467,11 +473,14 @@ async def send_image_message(
         "Sending image: phone_number_id=%s, to=%s, url=%s",
         phone_number_id, recipient_wa_id, image_url[:60],
     )
-    wa_message_id, _error_info = await _send_via_meta_api(
-        phone_number_id=phone_number_id,
-        recipient_wa_id=recipient_wa_id,
-        payload=payload,
-    )
+    if db is not None and business is not None:
+        wa_message_id, _error_info = await _send_via_business_connection(db, business, payload)
+    else:
+        wa_message_id, _error_info = await _send_via_meta_api(
+            phone_number_id=phone_number_id,
+            recipient_wa_id=recipient_wa_id,
+            payload=payload,
+        )
     return wa_message_id
 
 
