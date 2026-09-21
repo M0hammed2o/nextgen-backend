@@ -16,18 +16,114 @@ AUTH: This router has NO authentication dependencies.
 import hmac
 import json
 import logging
+from datetime import datetime, timezone
 
-from fastapi import APIRouter, Header, Query, Request, Response, status
+from fastapi import APIRouter, Depends, Header, Query, Request, Response, status
 from fastapi.responses import JSONResponse
+from sqlalchemy import select
+from sqlalchemy import update as sa_update
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.config import get_settings
 from backend.app.core.security import verify_meta_signature
+from backend.app.db.session import get_db
+from shared.models.business import Business
+from shared.models.whatsapp_connection import WhatsAppConnection
 
 logger = logging.getLogger("nextgen.webhook")
 
 # NO dependencies=[] here intentionally — this router is fully public.
 router = APIRouter(prefix="/webhook", tags=["webhook"])
 settings = get_settings()
+
+# ── Wave 0A / Milestone C / DECISION-0022 — account_update event handling ──
+# VERIFY AGAINST META DOCS: event names/payload shape researched 2026-09-21,
+# not exercised against a live Meta app. entry.id in these payloads may be
+# the partner's portfolio id, not the WABA id — the WABA id always comes
+# from value.waba_info.waba_id per the task brief, never from entry.id.
+_ACCOUNT_EVENT_OUTCOMES = {
+    "PARTNER_APP_UNINSTALLED": ("DISCONNECTED", "Meta reports this app was uninstalled from the WhatsApp Business Account."),
+    "PARTNER_REMOVED": ("DISCONNECTED", "Meta reports this app's access to the WhatsApp Business Account was removed."),
+    "ACCOUNT_DELETED": ("DISCONNECTED", "Meta reports this WhatsApp Business Account was deleted."),
+    "DISABLED_UPDATE": ("NEEDS_ATTENTION", "Meta reports this WhatsApp Business Account was disabled."),
+    "ACCOUNT_VIOLATION": ("NEEDS_ATTENTION", "Meta reports a policy violation on this WhatsApp Business Account."),
+    "ACCOUNT_RESTRICTION": ("NEEDS_ATTENTION", "Meta reports a restriction on this WhatsApp Business Account."),
+}
+
+
+async def _stamp_last_webhook(db: AsyncSession, phone_number_id: str) -> None:
+    """
+    Best-effort: record that a webhook was just received for this
+    phone_number_id, on whatsapp_connections.last_webhook_at (Wave 0A /
+    Milestone C) and the pre-existing Business.last_webhook_received_at
+    column. If no connection row exists, the first UPDATE simply matches
+    zero rows — never an error. Wrapped so ANY failure here can never slow
+    or break inbound message handling or the 200 response Meta needs.
+    """
+    try:
+        now = datetime.now(timezone.utc)
+        await db.execute(
+            sa_update(WhatsAppConnection)
+            .where(WhatsAppConnection.phone_number_id == phone_number_id)
+            .values(last_webhook_at=now)
+        )
+        await db.execute(
+            sa_update(Business)
+            .where(Business.whatsapp_phone_number_id == phone_number_id)
+            .values(last_webhook_received_at=now)
+        )
+        await db.commit()
+    except Exception:
+        logger.exception("WEBHOOK_STAMP_FAILED (non-fatal): phone_number_id=%s", phone_number_id)
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+
+
+async def _handle_account_update_event(db: AsyncSession, value: dict) -> None:
+    """
+    React to an account_update webhook change (Wave 0A / Milestone C) — an
+    account-lifecycle event, distinct from an ordinary message/status.
+    Best-effort: any failure here is logged, never raised.
+    """
+    try:
+        event = value.get("event")
+        waba_id = (value.get("waba_info") or {}).get("waba_id")
+        if not event or not waba_id:
+            logger.info("WEBHOOK_ACCOUNT_EVENT_MISSING_FIELDS: value=%s", value)
+            return
+        outcome = _ACCOUNT_EVENT_OUTCOMES.get(event)
+        if outcome is None:
+            logger.info("WEBHOOK_ACCOUNT_EVENT_UNHANDLED: event=%s waba_id=%s", event, waba_id)
+            return
+        new_status, reason = outcome
+
+        result = await db.execute(
+            select(WhatsAppConnection).where(WhatsAppConnection.waba_id == waba_id)
+        )
+        connection = result.scalar_one_or_none()
+        if connection is None:
+            logger.info("WEBHOOK_ACCOUNT_EVENT_NO_CONNECTION: event=%s waba_id=%s", event, waba_id)
+            return
+
+        connection.status = new_status
+        connection.status_reason = reason
+        if new_status == "DISCONNECTED":
+            connection.disconnected_at = datetime.now(timezone.utc)
+            connection.access_token_encrypted = None
+            connection.registration_pin_encrypted = None
+        await db.commit()
+        logger.warning(
+            "WEBHOOK_ACCOUNT_EVENT_APPLIED: event=%s waba_id=%s business=%s new_status=%s",
+            event, waba_id, connection.business_id, new_status,
+        )
+    except Exception:
+        logger.exception("WEBHOOK_ACCOUNT_EVENT_ERROR (non-fatal)")
+        try:
+            await db.rollback()
+        except Exception:
+            pass
 
 
 @router.get("/meta")
@@ -100,6 +196,7 @@ async def verify_webhook(
 async def receive_webhook(
     request: Request,
     x_hub_signature_256: str | None = Header(None),
+    db: AsyncSession = Depends(get_db),
 ):
     """
     Receive inbound WhatsApp messages from Meta (POST).
@@ -215,6 +312,14 @@ async def receive_webhook(
         changes = entry.get("changes", [])
         for change_idx, change in enumerate(changes):
             value = change.get("value", {})
+
+            # ── Wave 0A / Milestone C: account-level event, not a message —
+            #    handled separately and never falls through to message
+            #    processing below (no metadata.phone_number_id to route on).
+            if change.get("field") == "account_update":
+                await _handle_account_update_event(db, value)
+                continue
+
             metadata = value.get("metadata", {})
             phone_number_id = metadata.get("phone_number_id")
             display_phone = metadata.get("display_phone_number", "unknown")
@@ -232,6 +337,10 @@ async def receive_webhook(
                     entry_idx, change_idx, metadata,
                 )
                 continue
+
+            # Wave 0A / Milestone C — best-effort, never blocks/breaks
+            # message handling below (see _stamp_last_webhook docstring).
+            await _stamp_last_webhook(db, phone_number_id)
 
             contacts = value.get("contacts", [])
             contact_name = None
