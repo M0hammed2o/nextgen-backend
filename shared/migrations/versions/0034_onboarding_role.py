@@ -39,7 +39,7 @@ from sqlalchemy.dialects import postgresql
 
 # Kept under 32 characters: alembic_version.version_num is VARCHAR(32).
 revision = "0034_onboarding_role"
-down_revision = "0031_tenant_nav_stocktake"
+down_revision = "0033_order_number_uniqueness"
 branch_labels = None
 depends_on = None
 
