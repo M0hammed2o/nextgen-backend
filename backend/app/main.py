@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from backend.app.core.config import get_settings
+from backend.app.core.config import WORKER_HEARTBEAT_REDIS_KEY, _looks_like_placeholder, get_settings
 from backend.app.core.errors import register_error_handlers
 from backend.app.core.middleware import CorrelationIDMiddleware, RequestLoggingMiddleware, setup_logging
 from backend.app.db.session import close_db, close_redis
@@ -28,36 +28,18 @@ logger = logging.getLogger("nextgen")
 
 # ── Lifespan ─────────────────────────────────────────────────────────────────
 
-def _looks_like_placeholder(value: str) -> bool:
-    """
-    Broader placeholder detection than an exact-string match.
-
-    A real incident showed the gap in exact matching: JWT_SECRET_KEY was set
-    to "CHANGE-ME-generate-a-strong-random-string" in production — clearly a
-    never-rotated placeholder, but not equal to the one literal string this
-    check used to look for ("CHANGE-ME-IN-PRODUCTION"), so it silently passed.
-    Catch anything placeholder-shaped by substring/length instead of relying
-    on one exact value.
-    """
-    if not value:
-        return True
-    lowered = value.lower()
-    if any(marker in lowered for marker in ("change-me", "change_me", "your-", "your_", "example", "replace-me")):
-        return True
-    # A real secrets.token_urlsafe(64)/Fernet key is comfortably over 32 chars;
-    # anything shorter is suspicious for a value that's supposed to be a
-    # high-entropy signing key.
-    if len(value) < 32:
-        return True
-    return False
-
-
 def _validate_production_secrets() -> None:
     """
-    Crash immediately if placeholder secrets are present in production.
-    A misconfigured production deployment is worse than a failed startup.
+    Crash immediately if placeholder secrets are present in a real deployment.
+
+    Runs for every ENVIRONMENT except explicit "development"/"test" — staging
+    is validated exactly like production. A misconfigured deployment is worse
+    than a failed startup (see KNOWN_BUGS.md BUG-0014: ENVIRONMENT silently
+    defaulting to "development" in production once disabled this entire
+    check, Meta webhook HMAC verification, and Stripe webhook verification
+    at once).
     """
-    if settings.ENVIRONMENT != "production":
+    if settings.ENVIRONMENT in ("development", "test"):
         return
 
     _PLACEHOLDER_META = {"CHANGE-ME", "", "your-app-secret", "your-webhook-verify-token"}
@@ -114,7 +96,10 @@ def _validate_production_secrets() -> None:
                 )
 
     if errors:
-        msg = "FATAL: Production deployment with unconfigured secrets:\n" + "\n".join(f"  • {e}" for e in errors)
+        msg = (
+            f"FATAL: {settings.ENVIRONMENT} deployment with unconfigured secrets:\n"
+            + "\n".join(f"  • {e}" for e in errors)
+        )
         logger.critical(msg)
         raise RuntimeError(msg)
 
@@ -269,24 +254,57 @@ async def health():
 
 @app.get("/ready")
 async def readiness():
-    """Readiness check — DB and Redis are connected."""
-    checks = {}
+    """
+    Readiness check — DB, Redis, and (if required) the ARQ worker's heartbeat.
+
+    Returns HTTP 503 when DB or Redis is unreachable, or when the worker
+    heartbeat is stale AND settings.READY_REQUIRES_WORKER is true (the
+    default — a deployment with genuinely no worker process can opt out).
+
+    Never returns exception text, hostnames, or credentials to the caller —
+    only fixed strings ("ok"/"error"/"stale"). Full exception detail is
+    logged server-side only.
+    """
+    from fastapi.responses import JSONResponse
+    from sqlalchemy import text as sa_text
+
+    from backend.app.db.session import engine, get_redis
+
+    db_ok = False
     try:
-        from backend.app.db.session import engine
         async with engine.connect() as conn:
-            await conn.execute(
-                __import__("sqlalchemy").text("SELECT 1")
-            )
-        checks["database"] = "ok"
-    except Exception as e:
-        checks["database"] = f"error: {e}"
+            await conn.execute(sa_text("SELECT 1"))
+        db_ok = True
+    except Exception:
+        logger.exception("Readiness check: database unreachable")
 
+    redis_ok = False
+    redis_client = None
     try:
-        redis = await __import__("backend.app.db.session", fromlist=["get_redis"]).get_redis()
-        await redis.ping()
-        checks["redis"] = "ok"
-    except Exception as e:
-        checks["redis"] = f"error: {e}"
+        redis_client = await get_redis()
+        await redis_client.ping()
+        redis_ok = True
+    except Exception:
+        logger.exception("Readiness check: redis unreachable")
 
-    all_ok = all(v == "ok" for v in checks.values())
-    return {"status": "ok" if all_ok else "degraded", "checks": checks}
+    worker_status = "stale"
+    if redis_ok:
+        try:
+            heartbeat = await redis_client.get(WORKER_HEARTBEAT_REDIS_KEY)
+            worker_status = "ok" if heartbeat else "stale"
+        except Exception:
+            logger.exception("Readiness check: failed to read worker heartbeat")
+
+    checks = {
+        "database": "ok" if db_ok else "error",
+        "redis": "ok" if redis_ok else "error",
+        "worker": worker_status,
+    }
+
+    worker_blocks_ready = worker_status == "stale" and settings.READY_REQUIRES_WORKER
+    all_ok = db_ok and redis_ok and not worker_blocks_ready
+
+    return JSONResponse(
+        status_code=200 if all_ok else 503,
+        content={"status": "ok" if all_ok else "degraded", "checks": checks},
+    )

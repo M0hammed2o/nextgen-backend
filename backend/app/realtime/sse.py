@@ -13,6 +13,7 @@ import jwt
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sse_starlette.sse import EventSourceResponse
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.rbac import AuthUser
@@ -31,6 +32,7 @@ async def _get_sse_user(
     request: Request,
     token_param: str | None = Query(default=None, alias="token"),
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
+    db: AsyncSession = Depends(get_db),
 ) -> AuthUser:
     """
     Auth dependency for SSE endpoints.
@@ -76,6 +78,39 @@ async def _get_sse_user(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={"code": "INSUFFICIENT_ROLE", "message": "Staff or above required"},
+        )
+
+    # Same instant-cutoff check as backend/app/core/rbac.py::get_current_user
+    # — without it, a suspended business or deactivated staff member could
+    # keep a live order stream open until their JWT naturally expired.
+    from shared.models.business import Business
+    from shared.models.user import BusinessUser
+
+    result = await db.execute(
+        select(BusinessUser.is_active, Business.is_active, Business.suspended_reason)
+        .join(Business, Business.id == BusinessUser.business_id)
+        .where(BusinessUser.id == user.user_id)
+    )
+    row = result.one_or_none()
+    if not row:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "ACCOUNT_DISABLED", "message": "This account has been disabled"},
+        )
+    user_active, business_active, suspended_reason = row
+    if not user_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "ACCOUNT_DISABLED", "message": "This account has been disabled"},
+        )
+    if not business_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "BUSINESS_SUSPENDED",
+                "message": "This business account has been suspended.",
+                "details": {"reason": suspended_reason} if suspended_reason else None,
+            },
         )
 
     return user

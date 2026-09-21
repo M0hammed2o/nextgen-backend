@@ -13,6 +13,7 @@ AUTH: This router has NO authentication dependencies.
       Security is enforced via HMAC signature verification on POST requests.
 """
 
+import hmac
 import json
 import logging
 
@@ -74,7 +75,9 @@ async def verify_webhook(
         )
 
     # ── Case 1: Meta verification ─────────────────────────────────────────
-    token_matches = token == settings.META_VERIFY_TOKEN
+    # Constant-time comparison — matches the pattern used for every other
+    # provider signature/secret check in this codebase (see SECURITY.md).
+    token_matches = hmac.compare_digest(token, settings.META_VERIFY_TOKEN)
     if mode == "subscribe" and token_matches:
         logger.warning(
             "WEBHOOK_GET_VERIFIED: Meta webhook challenge accepted, returning challenge"
@@ -206,6 +209,7 @@ async def receive_webhook(
     entries = payload.get("entry", [])
     total_messages = 0
     total_statuses = 0
+    enqueue_failed = False
 
     for entry_idx, entry in enumerate(entries):
         changes = entry.get("changes", [])
@@ -305,6 +309,7 @@ async def receive_webhook(
                         wa_message_id, wa_id,
                     )
                 except Exception:
+                    enqueue_failed = True
                     logger.exception(
                         "WEBHOOK_POST_ENQUEUE_ERROR: wa_message_id=%s, wa_id=%s — "
                         "message was NOT queued; check ARQ pool health.",
@@ -316,9 +321,20 @@ async def receive_webhook(
                 _handle_status_update(wa_status)
 
     logger.warning(
-        "WEBHOOK_POST_COMPLETE: total_messages=%d enqueued, total_statuses=%d",
-        total_messages, total_statuses,
+        "WEBHOOK_POST_COMPLETE: total_messages=%d enqueued, total_statuses=%d, "
+        "enqueue_failed=%s",
+        total_messages, total_statuses, enqueue_failed,
     )
+
+    if enqueue_failed:
+        # A message failed to enqueue — it was never queued for processing.
+        # Return 5xx so Meta retries the whole delivery (Meta retries failed
+        # webhook deliveries automatically). The pipeline de-duplicates by
+        # wa_message_id, so re-processing already-enqueued messages on retry
+        # is safe. Returning 200 here (the old behaviour) silently dropped
+        # the customer's message forever — Meta never retries a 200.
+        return JSONResponse(status_code=503, content={"status": "enqueue_failed"})
+
     return {"status": "ok"}
 
 

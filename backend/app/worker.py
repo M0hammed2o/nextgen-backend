@@ -30,13 +30,18 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from backend.app.bot.outbox_worker import _process_batch
 from backend.app.bot.pipeline import process_inbound_message
 from backend.app.bot.whatsapp_sender import send_notification_message
-from backend.app.core.config import get_settings
+from backend.app.core.config import WORKER_HEARTBEAT_REDIS_KEY, get_settings
 from backend.app.db.session import DATABASE_URL
 from shared.models.business import Business
 from shared.models.customer import Customer
 from shared.models.order import Order, OrderEvent
 
 logger = logging.getLogger("nextgen.worker")
+
+# Heartbeat TTL must comfortably outlive the ~30s write interval so a single
+# missed tick doesn't flip GET /ready to "stale" — but still expire quickly
+# enough after the worker actually stops that /ready reflects reality.
+WORKER_HEARTBEAT_TTL_SECONDS = 100
 
 # How long a delivery order may sit in PENDING_DELIVERY_FEE before auto-cancel.
 DELIVERY_FEE_TIMEOUT_MINUTES = 45
@@ -351,6 +356,31 @@ async def cancel_unpaid_orders(ctx: dict) -> None:
             )
 
 
+# ── Cron: Worker heartbeat ────────────────────────────────────────────────────
+
+async def write_worker_heartbeat(ctx: dict) -> None:
+    """
+    Write a liveness heartbeat to Redis so GET /ready (backend/app/main.py)
+    can detect a hung/crashed worker process instead of reporting "ready"
+    while inbound WhatsApp messages silently pile up unprocessed.
+
+    Runs every ~30s (see WorkerSettings.cron_jobs, run_at_startup=True) with
+    a TTL of WORKER_HEARTBEAT_TTL_SECONDS — a worker that stops running
+    (crashed, deployment rolled back, never started) has its heartbeat key
+    expire shortly after, rather than staying "ok" forever.
+    """
+    try:
+        from backend.app.db.session import get_redis
+        redis = await get_redis()
+        await redis.set(
+            WORKER_HEARTBEAT_REDIS_KEY,
+            datetime.now(timezone.utc).isoformat(),
+            ex=WORKER_HEARTBEAT_TTL_SECONDS,
+        )
+    except Exception:
+        logger.exception("Failed to write worker heartbeat")
+
+
 # ── Cron: Billing grace-period suspension ────────────────────────────────────
 
 async def suspend_past_due_businesses(ctx: dict) -> None:
@@ -436,6 +466,13 @@ class WorkerSettings:
             suspend_past_due_businesses,
             minute=0,
             second=0,
+            run_at_startup=True,
+        ),
+        # Worker liveness heartbeat — every 30 seconds, also on startup so
+        # GET /ready sees a fresh heartbeat immediately after a deploy.
+        cron(
+            write_worker_heartbeat,
+            second={0, 30},
             run_at_startup=True,
         ),
     ]
