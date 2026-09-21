@@ -22,6 +22,7 @@ from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import select
 from sqlalchemy import update as sa_update
+from sqlalchemy.exc import IntegrityError, MultipleResultsFound
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.api.v1.routes_orders import OrderResponse
@@ -188,13 +189,45 @@ class POSSettingsResponse(BaseModel):
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 async def _get_open_till(db: AsyncSession, business_id: uuid.UUID) -> TillSession:
-    result = await db.execute(
-        select(TillSession).where(
+    """
+    Load (and lock) this business's OPEN till session.
+
+    Locked FOR UPDATE for the rest of the caller's transaction so a checkout
+    cannot attach to a session that a concurrent `close_till` is in the
+    middle of totalling (see `close_till`, which locks the same row) — one
+    of the two commits will simply wait for the other instead of both
+    reading a stale/half-computed state.
+
+    `uq_till_sessions_one_open_per_business` (migration 0032) should make
+    more than one OPEN row impossible, but this is belt-and-braces: if it
+    ever happens anyway (e.g. a row inserted before that migration ran),
+    `scalar_one_or_none()` raises `MultipleResultsFound` rather than 500ing
+    every checkout for this business — fall back to the most recently
+    opened session and log it as the real bug it would be.
+    """
+    query = (
+        select(TillSession)
+        .where(
             TillSession.business_id == business_id,
             TillSession.status == "OPEN",
         )
+        .with_for_update()
     )
-    session = result.scalar_one_or_none()
+    try:
+        session = (await db.execute(query)).scalar_one_or_none()
+    except MultipleResultsFound:
+        import logging
+        logging.getLogger("nextgen").error(
+            "Multiple OPEN till sessions found for business %s — this should "
+            "be impossible after uq_till_sessions_one_open_per_business; "
+            "falling back to the most recently opened session",
+            business_id,
+        )
+        fallback = await db.execute(
+            query.order_by(TillSession.opened_at.desc()).limit(1)
+        )
+        session = fallback.scalars().first()
+
     if not session:
         raise AppError(
             "TILL_NOT_OPEN",
@@ -202,6 +235,64 @@ async def _get_open_till(db: AsyncSession, business_id: uuid.UUID) -> TillSessio
             409,
         )
     return session
+
+
+def _is_unique_violation(exc: IntegrityError, constraint_name: str) -> bool:
+    """
+    True if this IntegrityError is a violation of the named unique
+    constraint/index — checked against the driver's own error text (what
+    Postgres actually reports for a unique_violation) rather than an
+    asyncpg-specific attribute, so this stays driver-agnostic.
+    """
+    return constraint_name in str(getattr(exc, "orig", exc))
+
+
+async def _replay_idempotent_checkout(
+    db: AsyncSession,
+    business_id: uuid.UUID,
+    idempotency_key: str | None,
+    exc: IntegrityError,
+    attempted_total_cents: int,
+    attempted_item_count: int,
+) -> Order | None:
+    """
+    A double-tapped checkout with the SAME idempotency key can both pass the
+    initial "does this key already exist?" lookup before either has
+    committed — `uq_orders_business_idempotency_key` (migration 0023) is
+    what actually decides the winner, and the loser must replay the
+    winner's order instead of 500ing.
+
+    Returns the winning order, or None if this IntegrityError was NOT an
+    idempotency-key collision — the caller must re-raise in that case, since
+    any other constraint violation is a real bug this must never mask.
+    """
+    if not idempotency_key or not _is_unique_violation(exc, "uq_orders_business_idempotency_key"):
+        return None
+
+    existing = await db.execute(
+        select(Order).where(
+            Order.business_id == business_id,
+            Order.idempotency_key == idempotency_key,
+        )
+    )
+    existing_order = existing.scalar_one_or_none()
+    if not existing_order:
+        # The row that won the race committed strictly before this insert
+        # could fail against it, so it should be visible by now. If it
+        # somehow isn't, this wasn't a clean replay — let the original
+        # error propagate rather than silently returning nothing useful.
+        return None
+
+    if existing_order.total_cents != attempted_total_cents or len(existing_order.items) != attempted_item_count:
+        import logging
+        logging.getLogger("nextgen").warning(
+            "Idempotency replay for key=%s returned a different order than "
+            "this request would have created: existing total_cents=%s "
+            "items=%s vs this request's total_cents=%s items=%s",
+            idempotency_key, existing_order.total_cents, len(existing_order.items),
+            attempted_total_cents, attempted_item_count,
+        )
+    return existing_order
 
 
 _POS_METHOD_SETTING = {
@@ -455,93 +546,116 @@ async def create_pos_order(
         completed_at=now if initial_status == OrderStatus.COMPLETED else None,
     )
     db.add(order)
-    await db.flush()
 
-    for resolved in resolved_items:
-        db.add(OrderItem(
+    # ── Everything from here to the final commit is one all-or-nothing
+    #    attempt. A double-tapped checkout with the SAME idempotency_key can
+    #    race past the early replay-lookup above before either side has
+    #    committed — the partial unique index on (business_id,
+    #    idempotency_key) is what actually decides the winner. The loser's
+    #    flush/commit raises IntegrityError here (Postgres enforces a
+    #    non-deferred unique index immediately, so this most often surfaces
+    #    at the `db.flush()` right after `db.add(order)`, not at the final
+    #    commit) — caught below and replayed into the winner's order instead
+    #    of propagating as an unhandled 500. ───────────────────────────────
+    try:
+        await db.flush()
+
+        for resolved in resolved_items:
+            db.add(OrderItem(
+                order_id=order.id,
+                business_id=user.business_id,
+                menu_item_id=resolved.menu_item_id,
+                name_snapshot=resolved.name,
+                base_price_cents=resolved.breakdown.base_price_cents,
+                option_adjustment_cents=resolved.breakdown.option_adjustment_cents,
+                add_on_total_cents=resolved.breakdown.add_on_total_cents,
+                unit_price_cents=resolved.breakdown.unit_price_cents,
+                quantity=resolved.breakdown.quantity,
+                line_total_cents=resolved.breakdown.line_total_cents,
+                selected_options_snapshot=resolved.selected_options_snapshot or None,
+                add_ons_snapshot=resolved.add_ons_snapshot or None,
+                removed_ingredients_snapshot=resolved.removed_ingredients_snapshot or None,
+                special_instructions=resolved.special_instructions,
+            ))
+
+        db.add(OrderEvent(
             order_id=order.id,
             business_id=user.business_id,
-            menu_item_id=resolved.menu_item_id,
-            name_snapshot=resolved.name,
-            base_price_cents=resolved.breakdown.base_price_cents,
-            option_adjustment_cents=resolved.breakdown.option_adjustment_cents,
-            add_on_total_cents=resolved.breakdown.add_on_total_cents,
-            unit_price_cents=resolved.breakdown.unit_price_cents,
-            quantity=resolved.breakdown.quantity,
-            line_total_cents=resolved.breakdown.line_total_cents,
-            selected_options_snapshot=resolved.selected_options_snapshot or None,
-            add_ons_snapshot=resolved.add_ons_snapshot or None,
-            removed_ingredients_snapshot=resolved.removed_ingredients_snapshot or None,
-            special_instructions=resolved.special_instructions,
+            old_status=None,
+            new_status=initial_status.value,
+            changed_by_user_id=user.user_id,
+            reason=f"POS checkout — paid by {body.payment_method}",
         ))
 
-    db.add(OrderEvent(
-        order_id=order.id,
-        business_id=user.business_id,
-        old_status=None,
-        new_status=initial_status.value,
-        changed_by_user_id=user.user_id,
-        reason=f"POS checkout — paid by {body.payment_method}",
-    ))
-
-    if body.discount_cents > 0:
-        db.add(AuditEvent(
-            scope=AuditScope.BUSINESS.value,
-            business_id=user.business_id,
-            actor_user_id=user.user_id,
-            action="order.pos.discount_applied",
-            target_type="order",
-            target_id=order.id,
-            diff_json={
-                "discount_cents": body.discount_cents,
-                "discount_reason": body.discount_reason,
-                "actor_role": user.role,
-            },
-        ))
-
-    # ── Theoretical stock consumption ─────────────────────────────────────
-    # Staged inside this same transaction so a sale and its stock deduction
-    # commit together or not at all — a sale that silently failed to deduct
-    # would show up later as unexplained variance, which is exactly what
-    # this subsystem exists to eliminate.
-    #
-    # Deliberately atomic rather than best-effort: resolution reads the
-    # recipes and costs BEFORE staging any movement, so the only way it can
-    # fail is a database problem that would have failed the order insert
-    # too. A menu item with no recipe is NOT an error — it resolves to
-    # nothing and is reported back, because blocking a sale over missing
-    # reference data would be far worse than a known reporting gap.
-    #
-    # Skipped entirely for tenants without the inventory module, so every
-    # existing restaurant's checkout behaves exactly as it did before.
-    consumption = None
-    if business.inventory_enabled:
-        consumption = await post_sale_consumption(
-            db,
-            business_id=user.business_id,
-            order_id=order.id,
-            resolved_items=resolved_items,
-            created_by_user_id=user.user_id,
-            occurred_at=now,
-        )
-        if consumption.menu_items_without_recipe:
+        if body.discount_cents > 0:
             db.add(AuditEvent(
                 scope=AuditScope.BUSINESS.value,
                 business_id=user.business_id,
                 actor_user_id=user.user_id,
-                action="inventory.sale.missing_recipe",
+                action="order.pos.discount_applied",
                 target_type="order",
                 target_id=order.id,
                 diff_json={
-                    "menu_item_ids": [
-                        str(i) for i in consumption.menu_items_without_recipe
-                    ],
-                    "note": "Sold with no active recipe — no stock was deducted "
-                            "for these items, so variance will understate usage",
+                    "discount_cents": body.discount_cents,
+                    "discount_reason": body.discount_reason,
+                    "actor_role": user.role,
                 },
             ))
 
-    await db.commit()
+        # ── Theoretical stock consumption ───────────────────────────────
+        # Staged inside this same transaction so a sale and its stock
+        # deduction commit together or not at all — a sale that silently
+        # failed to deduct would show up later as unexplained variance,
+        # which is exactly what this subsystem exists to eliminate.
+        #
+        # Deliberately atomic rather than best-effort: resolution reads the
+        # recipes and costs BEFORE staging any movement, so the only way it
+        # can fail is a database problem that would have failed the order
+        # insert too. A menu item with no recipe is NOT an error — it
+        # resolves to nothing and is reported back, because blocking a sale
+        # over missing reference data would be far worse than a known
+        # reporting gap.
+        #
+        # Skipped entirely for tenants without the inventory module, so
+        # every existing restaurant's checkout behaves exactly as before.
+        consumption = None
+        if business.inventory_enabled:
+            consumption = await post_sale_consumption(
+                db,
+                business_id=user.business_id,
+                order_id=order.id,
+                resolved_items=resolved_items,
+                created_by_user_id=user.user_id,
+                occurred_at=now,
+            )
+            if consumption.menu_items_without_recipe:
+                db.add(AuditEvent(
+                    scope=AuditScope.BUSINESS.value,
+                    business_id=user.business_id,
+                    actor_user_id=user.user_id,
+                    action="inventory.sale.missing_recipe",
+                    target_type="order",
+                    target_id=order.id,
+                    diff_json={
+                        "menu_item_ids": [
+                            str(i) for i in consumption.menu_items_without_recipe
+                        ],
+                        "note": "Sold with no active recipe — no stock was deducted "
+                                "for these items, so variance will understate usage",
+                    },
+                ))
+
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        replayed = await _replay_idempotent_checkout(
+            db, user.business_id, body.idempotency_key, exc,
+            attempted_total_cents=total_cents, attempted_item_count=len(resolved_items),
+        )
+        if replayed is not None:
+            return OrderResponse.model_validate(replayed)
+        raise
+
     await db.refresh(order)
 
     # ── Award loyalty points — POS orders are already PAID at creation, so
@@ -557,12 +671,20 @@ async def create_pos_order(
 
     # Record usage (fire and forget) — see routes_orders.py::create_order
     # for why every order-creation path must call this, not just the bot.
+    # `increment_usage` only flushes, it never commits (by design, so a
+    # caller mid-transaction isn't forced to commit early) — this was the
+    # entire bug (BUG-0050): every previous caller committed BEFORE calling
+    # it, so the increment was flushed into a session that then closed
+    # without ever committing it, silently discarding it. Committing here,
+    # inside this same try/except, means a usage-tracking failure still can
+    # never fail the sale itself (the sale already committed above).
     try:
         from backend.app.bot.usage_tracker import increment_usage
         await increment_usage(
-            db, user.business_id, "Africa/Johannesburg",
+            db, user.business_id, business.timezone or "Africa/Johannesburg",
             orders_created=1, revenue_cents=order.total_cents,
         )
+        await db.commit()
     except Exception:
         import logging
         logging.getLogger("nextgen").warning("Failed to record usage for POS order %s", order.id)
@@ -594,8 +716,15 @@ async def create_pos_order(
 #    provider-dependent and is not appropriate for a physical till sale) ──
 
 async def _load_pos_order_for_reversal(db: AsyncSession, business_id: uuid.UUID, order_id: uuid.UUID) -> Order:
+    # Locked FOR UPDATE for the rest of the caller's transaction so two
+    # concurrent refund/void calls on the same order can't both read it as
+    # still PAID and both reverse it — the second call blocks until the
+    # first commits, then sees the already-reversed payment_status and is
+    # correctly rejected by the check below instead of double-reversing.
     result = await db.execute(
-        select(Order).where(Order.id == order_id, Order.business_id == business_id)
+        select(Order)
+        .where(Order.id == order_id, Order.business_id == business_id)
+        .with_for_update()
     )
     order = result.scalar_one_or_none()
     if not order:
@@ -615,6 +744,32 @@ async def _load_pos_order_for_reversal(db: AsyncSession, business_id: uuid.UUID,
     return order
 
 
+async def _require_open_till_for_cash_reversal(db: AsyncSession, business_id: uuid.UUID, order: Order) -> None:
+    """
+    A CASH refund/void hands physical cash back out of a drawer — if no
+    till is open, that cash-out has nowhere to be reconciled against at the
+    next cash-up (`close_till`'s expected-cash calculation only nets
+    refunds against whichever session happens to be OPEN when it closes).
+    Non-cash reversals (card/other) never touch a physical drawer, so they
+    are unaffected.
+    """
+    if order.payment_method != POSPaymentMethod.CASH.value:
+        return
+    result = await db.execute(
+        select(TillSession).where(
+            TillSession.business_id == business_id,
+            TillSession.status == "OPEN",
+        )
+    )
+    if not result.scalar_one_or_none():
+        raise AppError(
+            "TILL_NOT_OPEN",
+            "A cash refund or void requires an open till session so the "
+            "cash paid out is reconciled at the next cash-up — open the till first.",
+            409,
+        )
+
+
 @router.post("/orders/{order_id}/refund", response_model=OrderResponse)
 async def refund_pos_order(
     order_id: uuid.UUID,
@@ -631,6 +786,7 @@ async def refund_pos_order(
     above the staff limit.
     """
     order = await _load_pos_order_for_reversal(db, user.business_id, order_id)
+    await _require_open_till_for_cash_reversal(db, user.business_id, order)
 
     amount_cents = body.amount_cents or order.total_cents
     if amount_cents > order.total_cents:
@@ -694,6 +850,7 @@ async def void_pos_order(
     than REFUNDED so reporting can tell the two apart. OWNER/MANAGER only.
     """
     order = await _load_pos_order_for_reversal(db, user.business_id, order_id)
+    await _require_open_till_for_cash_reversal(db, user.business_id, order)
 
     order.payment_status = "VOIDED"
     order.refund_amount_cents = order.total_cents
@@ -781,7 +938,17 @@ async def open_till(
         status="OPEN",
     )
     db.add(session)
-    await db.commit()
+    # The SELECT above is a friendly pre-check for the common (non-racing)
+    # case — the actual guarantee is `uq_till_sessions_one_open_per_business`
+    # (migration 0032). Two simultaneous opens can both pass that pre-check;
+    # the loser's commit then raises IntegrityError here instead of a 500.
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        if _is_unique_violation(exc, "uq_till_sessions_one_open_per_business"):
+            raise AppError("TILL_ALREADY_OPEN", "A till is already open.", 409)
+        raise
     await db.refresh(session)
     return TillSessionResponse.model_validate(session)
 
@@ -798,11 +965,17 @@ async def close_till(
     their own cash-up. Closing is a one-way transition; an already-closed
     session is rejected rather than silently re-mutated.
     """
+    # Locked FOR UPDATE so a checkout that's mid-transaction against this
+    # same till row (`_get_open_till` also locks it) can't attach a sale to
+    # this session after its totals have already been computed below — one
+    # of the two commits simply waits for the other's lock to release.
     result = await db.execute(
-        select(TillSession).where(
+        select(TillSession)
+        .where(
             TillSession.id == session_id,
             TillSession.business_id == user.business_id,
         )
+        .with_for_update()
     )
     session = result.scalar_one_or_none()
     if not session:
