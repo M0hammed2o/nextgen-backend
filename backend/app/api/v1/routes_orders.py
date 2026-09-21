@@ -388,6 +388,23 @@ async def update_order_status(
         order.cancelled_reason = body.reason
         order.cancelled_by_user_id = user.user_id
 
+        # Reverse any stock consumption posted at sale time — but only if the
+        # order never reached the kitchen (see backend/app/inventory/cancellation.py
+        # for the full rule and the exact pre-preparation status set).
+        from backend.app.inventory.cancellation import reverse_consumption_on_cancel
+        inv_row = await db.execute(
+            select(Business.inventory_enabled).where(Business.id == user.business_id)
+        )
+        inventory_enabled = bool(inv_row.scalar_one_or_none())
+        await reverse_consumption_on_cancel(
+            db,
+            business_id=user.business_id,
+            inventory_enabled=inventory_enabled,
+            order_id=order.id,
+            previous_status=old_status,
+            created_by_user_id=user.user_id,
+        )
+
     # ── When accepted with online payment required → set PENDING ────────
     if requested == OrderStatus.ACCEPTED and order.payment_required:
         order.payment_status = "PENDING"

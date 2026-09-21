@@ -3635,6 +3635,7 @@ async def _cancel_prior_live_orders(
             redis = None
 
         for old_order in old_orders:
+            _previous_status = old_order.status
             old_order.status = "CANCELLED"
             db.add(_OrderEvent(
                 order_id=old_order.id,
@@ -3643,6 +3644,17 @@ async def _cancel_prior_live_orders(
                 new_status="CANCELLED",
                 reason="Superseded by new customer order",
             ))
+            # _CANCELLABLE_STATUSES above is already the pre-preparation set,
+            # so this always reverses — routed through the shared helper for
+            # consistency with every other cancel path.
+            from backend.app.inventory.cancellation import reverse_consumption_on_cancel
+            await reverse_consumption_on_cancel(
+                db,
+                business_id=business.id,
+                inventory_enabled=bool(getattr(business, "inventory_enabled", False)),
+                order_id=old_order.id,
+                previous_status=_previous_status,
+            )
             logger.warning(
                 "PRIOR_ORDER_CANCELLED: order_id=%s, old_status=%s",
                 old_order.id, old_order.status,
@@ -3679,6 +3691,18 @@ async def _cancel_superseded_order(
     if not superseded_id:
         return
     try:
+        # Fetch the pre-cancellation status (needed for the stock-reversal
+        # decision below) with the same WHERE clause as the update itself, so
+        # a hit here always matches the row the update actually changes.
+        _prev_status_row = await db.execute(
+            select(_Order.status).where(
+                _Order.id == _parse_uuid(superseded_id),
+                _Order.business_id == business.id,
+                _Order.status.not_in(["CANCELLED", "COLLECTED", "DELIVERED"]),
+            )
+        )
+        _previous_status = _prev_status_row.scalar_one_or_none()
+
         await db.execute(
             _sa_update(_Order)
             .where(
@@ -3695,6 +3719,15 @@ async def _cancel_superseded_order(
             new_status="CANCELLED",
             reason="Superseded by customer modification",
         ))
+        if _previous_status is not None:
+            from backend.app.inventory.cancellation import reverse_consumption_on_cancel
+            await reverse_consumption_on_cancel(
+                db,
+                business_id=business.id,
+                inventory_enabled=bool(getattr(business, "inventory_enabled", False)),
+                order_id=_parse_uuid(superseded_id),
+                previous_status=_previous_status,
+            )
         await db.flush()
         # Publish SSE so staff dashboard removes the old card immediately
         try:
@@ -4088,6 +4121,14 @@ async def _handle_waiting_delivery_fee(
         # Cancel the pending order
         if pending_order_id:
             try:
+                _prev_status_row = await db.execute(
+                    select(_Order.status).where(
+                        _Order.id == _parse_uuid(pending_order_id),
+                        _Order.business_id == business.id,
+                    )
+                )
+                _previous_status = _prev_status_row.scalar_one_or_none()
+
                 await db.execute(
                     _sa_update(_Order)
                     .where(
@@ -4103,6 +4144,17 @@ async def _handle_waiting_delivery_fee(
                     new_status="CANCELLED",
                     reason="Customer rejected delivery fee",
                 ))
+                # This state is only reachable pre-preparation (PENDING_DELIVERY_FEE
+                # or FEE_SENT) — reverses any consumption posted at order creation.
+                if _previous_status is not None:
+                    from backend.app.inventory.cancellation import reverse_consumption_on_cancel
+                    await reverse_consumption_on_cancel(
+                        db,
+                        business_id=business.id,
+                        inventory_enabled=bool(getattr(business, "inventory_enabled", False)),
+                        order_id=_parse_uuid(pending_order_id),
+                        previous_status=_previous_status,
+                    )
                 await db.flush()
             except Exception:
                 logger.exception("Failed to cancel delivery order. pending_order_id=%s", pending_order_id)

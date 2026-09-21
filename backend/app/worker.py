@@ -186,6 +186,7 @@ async def cancel_stale_delivery_fee_orders(ctx: dict) -> None:
                     Order,
                     _Cust.wa_id,
                     _Biz.whatsapp_phone_number_id,
+                    _Biz.inventory_enabled,
                 )
                 .select_from(
                     outerjoin(Order, _Cust, and_(Order.customer_id == _Cust.id))
@@ -207,7 +208,9 @@ async def cancel_stale_delivery_fee_orders(ctx: dict) -> None:
                 DELIVERY_FEE_TIMEOUT_MINUTES,
             )
 
-            for order, wa_id, phone_number_id in stale_rows:
+            from backend.app.inventory.cancellation import reverse_consumption_on_cancel
+
+            for order, wa_id, phone_number_id, inventory_enabled in stale_rows:
                 order.status = "CANCELLED"
                 order.cancelled_reason = (
                     f"Delivery fee not confirmed within {DELIVERY_FEE_TIMEOUT_MINUTES} minutes"
@@ -219,6 +222,15 @@ async def cancel_stale_delivery_fee_orders(ctx: dict) -> None:
                     new_status="CANCELLED",
                     reason="Automated timeout: delivery fee not set by staff",
                 ))
+                # Order was PENDING_DELIVERY_FEE (pre-preparation) — reverses
+                # any consumption posted when the order was created.
+                await reverse_consumption_on_cancel(
+                    db,
+                    business_id=order.business_id,
+                    inventory_enabled=bool(inventory_enabled),
+                    order_id=order.id,
+                    previous_status="PENDING_DELIVERY_FEE",
+                )
 
                 if wa_id and phone_number_id:
                     notifications.append((phone_number_id, wa_id, order.order_number))
@@ -283,6 +295,7 @@ async def cancel_unpaid_orders(ctx: dict) -> None:
                     _Cust.wa_id,
                     _Biz.whatsapp_phone_number_id,
                     _Biz.payment_timeout_minutes,
+                    _Biz.inventory_enabled,
                 )
                 .select_from(
                     outerjoin(Order, _Cust, and_(Order.customer_id == _Cust.id))
@@ -301,11 +314,11 @@ async def cancel_unpaid_orders(ctx: dict) -> None:
 
             now = datetime.now(timezone.utc)
             timed_out = []
-            for order, wa_id, phone_number_id, timeout_minutes in all_rows:
+            for order, wa_id, phone_number_id, timeout_minutes, inventory_enabled in all_rows:
                 timeout = timeout_minutes or DEFAULT_PAYMENT_TIMEOUT_MINUTES
                 cutoff = order.created_at + timedelta(minutes=timeout)
                 if now >= cutoff:
-                    timed_out.append((order, wa_id, phone_number_id, timeout))
+                    timed_out.append((order, wa_id, phone_number_id, timeout, inventory_enabled))
 
             if not timed_out:
                 return
@@ -314,7 +327,9 @@ async def cancel_unpaid_orders(ctx: dict) -> None:
                 "Payment timeout: cancelling %d order(s).", len(timed_out)
             )
 
-            for order, wa_id, phone_number_id, timeout in timed_out:
+            from backend.app.inventory.cancellation import reverse_consumption_on_cancel
+
+            for order, wa_id, phone_number_id, timeout, inventory_enabled in timed_out:
                 old_status = order.status
                 order.status = "CANCELLED"
                 order.payment_status = "FAILED"
@@ -326,6 +341,17 @@ async def cancel_unpaid_orders(ctx: dict) -> None:
                     new_status="CANCELLED",
                     reason="Automated timeout: payment not received",
                 ))
+                # A payment-required order can never reach IN_PROGRESS while
+                # unpaid (routes_orders.py's payment gate blocks it), so
+                # old_status here is always pre-preparation — reverses any
+                # consumption posted when the order was created.
+                await reverse_consumption_on_cancel(
+                    db,
+                    business_id=order.business_id,
+                    inventory_enabled=bool(inventory_enabled),
+                    order_id=order.id,
+                    previous_status=old_status,
+                )
                 if wa_id and phone_number_id:
                     notifications.append((phone_number_id, wa_id, order.order_number))
 

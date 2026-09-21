@@ -12,6 +12,9 @@ from datetime import datetime, timezone
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.app.inventory.ledger import build_line_specs_from_bot_cart, post_sale_consumption
+from shared.enums import AuditScope
+from shared.models.audit import AuditEvent
 from shared.models.business import Business
 from shared.models.customer import ConversationSession, Customer
 from shared.models.order import Order, OrderEvent, OrderItem
@@ -135,6 +138,40 @@ async def create_order_from_cart(
             special_instructions=cart_item.get("special_instructions"),
         )
         db.add(oi)
+
+    # ── 4b. Theoretical stock consumption ────────────────────────────────
+    # Staged inside this same transaction (process_inbound_message commits
+    # once at the very end) so a WhatsApp sale and its stock deduction
+    # commit together or not at all — mirrors routes_pos.py's checkout path
+    # exactly, including letting a ledger error propagate uncaught so the
+    # whole order rolls back rather than silently under-deducting stock.
+    # Skipped entirely for tenants without the inventory module, so every
+    # existing restaurant's bot checkout behaves exactly as it did before.
+    if business.inventory_enabled:
+        line_specs = build_line_specs_from_bot_cart(cart)
+        consumption = await post_sale_consumption(
+            db,
+            business_id=business.id,
+            order_id=order.id,
+            line_specs=line_specs,
+            occurred_at=datetime.now(timezone.utc),
+        )
+        if consumption.menu_items_without_recipe:
+            db.add(AuditEvent(
+                scope=AuditScope.BUSINESS.value,
+                business_id=business.id,
+                actor_user_id=None,
+                action="inventory.sale.missing_recipe",
+                target_type="order",
+                target_id=order.id,
+                diff_json={
+                    "menu_item_ids": [
+                        str(i) for i in consumption.menu_items_without_recipe
+                    ],
+                    "note": "Sold with no active recipe — no stock was deducted "
+                            "for these items, so variance will understate usage",
+                },
+            ))
 
     # ── 5. Create initial order event ────────────────────────────────────
     event = OrderEvent(

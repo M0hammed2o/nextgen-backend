@@ -65,6 +65,18 @@ def reversal_idempotency_key(order_id: uuid.UUID, ingredient_id: uuid.UUID) -> s
     return f"REVERSAL:{order_id}:{ingredient_id}"
 
 
+def stocktake_adjustment_idempotency_key(
+    session_id: uuid.UUID, ingredient_id: uuid.UUID
+) -> str:
+    """
+    Scoped per (stocktake session, ingredient), same scheme as the sale keys
+    above — paired with the same partial unique index on
+    (business_id, idempotency_key), a double-submitted approval can post at
+    most one adjustment per ingredient for a given stocktake, forever.
+    """
+    return f"STOCKTAKE_ADJUSTMENT:{session_id}:{ingredient_id}"
+
+
 # ── Loading recipes ──────────────────────────────────────────────────────────
 
 async def load_recipe_specs(
@@ -123,6 +135,45 @@ async def load_recipe_specs(
     return item_specs, add_on_specs
 
 
+def _selected_option_ids(selected_options_snapshot) -> dict:
+    """{group_id: option_id} from a selected-options snapshot, string-keyed."""
+    selected: dict = {}
+    for option in selected_options_snapshot or []:
+        group_id = option.get("group_id") if isinstance(option, dict) else None
+        option_id = option.get("option_id") if isinstance(option, dict) else None
+        if group_id and option_id:
+            selected[str(group_id)] = str(option_id)
+    return selected
+
+
+def _add_on_selections(add_ons_snapshot) -> tuple:
+    """AddOnSelectionSpec tuple from an add-ons snapshot (add_on_id/id + quantity)."""
+    add_ons = []
+    for add_on in add_ons_snapshot or []:
+        if not isinstance(add_on, dict):
+            continue
+        raw_id = add_on.get("add_on_id") or add_on.get("id")
+        if not raw_id:
+            continue
+        try:
+            add_on_uuid = uuid.UUID(str(raw_id))
+        except (ValueError, AttributeError, TypeError):
+            continue
+        add_ons.append(
+            AddOnSelectionSpec(add_on_uuid, int(add_on.get("quantity", 1) or 1))
+        )
+    return tuple(add_ons)
+
+
+def _removed_ref_ids(removed_ingredients_snapshot) -> tuple:
+    """removable_ref_id tuple from a removed-ingredients snapshot."""
+    return tuple(
+        str(r.get("id"))
+        for r in (removed_ingredients_snapshot or [])
+        if isinstance(r, dict) and r.get("id")
+    )
+
+
 def build_line_specs(resolved_items) -> list[LineItemSpec]:
     """
     Adapt the POS pricing layer's ResolvedPOSItem list into the stock layer's
@@ -135,41 +186,49 @@ def build_line_specs(resolved_items) -> list[LineItemSpec]:
     """
     specs: list[LineItemSpec] = []
     for item in resolved_items:
-        selected = {}
-        for option in item.selected_options_snapshot or []:
-            group_id = option.get("group_id") if isinstance(option, dict) else None
-            option_id = option.get("option_id") if isinstance(option, dict) else None
-            if group_id and option_id:
-                selected[str(group_id)] = str(option_id)
-
-        add_ons = []
-        for add_on in item.add_ons_snapshot or []:
-            if not isinstance(add_on, dict):
-                continue
-            raw_id = add_on.get("add_on_id") or add_on.get("id")
-            if not raw_id:
-                continue
-            try:
-                add_on_uuid = uuid.UUID(str(raw_id))
-            except (ValueError, AttributeError, TypeError):
-                continue
-            add_ons.append(
-                AddOnSelectionSpec(add_on_uuid, int(add_on.get("quantity", 1) or 1))
-            )
-
-        removed = tuple(
-            str(r.get("id"))
-            for r in (item.removed_ingredients_snapshot or [])
-            if isinstance(r, dict) and r.get("id")
-        )
-
         specs.append(
             LineItemSpec(
                 menu_item_id=item.menu_item_id,
                 quantity=int(item.breakdown.quantity),
-                selected_option_ids=selected,
-                add_on_selections=tuple(add_ons),
-                removed_ref_ids=removed,
+                selected_option_ids=_selected_option_ids(item.selected_options_snapshot),
+                add_on_selections=_add_on_selections(item.add_ons_snapshot),
+                removed_ref_ids=_removed_ref_ids(item.removed_ingredients_snapshot),
+            )
+        )
+    return specs
+
+
+def build_line_specs_from_bot_cart(cart: list[dict]) -> list[LineItemSpec]:
+    """
+    Adapt the WhatsApp bot's plain-dict cart/OrderItem snapshots into the
+    stock layer's LineItemSpec list — the bot equivalent of build_line_specs()
+    above, sharing the same option/add-on extraction rules so both call sites
+    resolve recipes identically.
+
+    The bot cart has no structured removed-ingredient concept today (a
+    WhatsApp customer's "no onion" is captured as free-text
+    special_instructions, never as a removable_ref_id — order_creator.py
+    never sets removed_ingredients_snapshot on the OrderItem it writes
+    either), so removed_ref_ids is always empty here. That is a known
+    reporting gap, not a fabrication: nothing is invented, and it will
+    resolve identically to a POS sale of the same item with nothing removed.
+    """
+    specs: list[LineItemSpec] = []
+    for item in cart:
+        raw_menu_item_id = item.get("menu_item_id")
+        if not raw_menu_item_id:
+            continue
+        try:
+            menu_item_id = uuid.UUID(str(raw_menu_item_id))
+        except (ValueError, AttributeError, TypeError):
+            continue
+        specs.append(
+            LineItemSpec(
+                menu_item_id=menu_item_id,
+                quantity=int(item.get("quantity", 1) or 1),
+                selected_option_ids=_selected_option_ids(item.get("selected_options")),
+                add_on_selections=_add_on_selections(item.get("add_ons")),
+                removed_ref_ids=(),
             )
         )
     return specs
@@ -235,7 +294,8 @@ async def post_sale_consumption(
     *,
     business_id: uuid.UUID,
     order_id: uuid.UUID,
-    resolved_items,
+    resolved_items=None,
+    line_specs: list[LineItemSpec] | None = None,
     created_by_user_id: uuid.UUID | None = None,
     occurred_at: datetime | None = None,
     movement_type: str = StockMovementType.SALE_CONSUMPTION.value,
@@ -246,10 +306,15 @@ async def post_sale_consumption(
     Does NOT commit — the caller adds these inside its own transaction so a
     sale and its stock deduction commit together or not at all.
 
+    Callers pass either `resolved_items` (POS's ResolvedPOSItem list, adapted
+    via build_line_specs) or a pre-built `line_specs` (e.g. the WhatsApp bot's
+    build_line_specs_from_bot_cart output) — exactly one of the two.
+
     Returns the ConsumptionResult so the caller can surface any menu item
     that had no recipe (a real data gap, not something to swallow silently).
     """
-    line_specs = build_line_specs(resolved_items)
+    if line_specs is None:
+        line_specs = build_line_specs(resolved_items)
 
     menu_item_ids = [spec.menu_item_id for spec in line_specs]
     add_on_ids = [

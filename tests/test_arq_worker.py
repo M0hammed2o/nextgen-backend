@@ -202,9 +202,10 @@ class TestCancelStaleDeliveryFeeOrders:
 
         mock_db = AsyncMock()
 
-        # Worker uses a single JOIN query returning (Order, wa_id, phone_number_id).
+        # Worker uses a single JOIN query returning
+        # (Order, wa_id, phone_number_id, inventory_enabled).
         stale_result = MagicMock()
-        stale_result.all.return_value = [(stale, None, None)]
+        stale_result.all.return_value = [(stale, None, None, False)]
 
         mock_db.execute = AsyncMock(return_value=stale_result)
         mock_db.add = MagicMock()
@@ -226,7 +227,7 @@ class TestCancelStaleDeliveryFeeOrders:
 
         # Single JOIN query returns all rows at once.
         stale_result = MagicMock()
-        stale_result.all.return_value = [(o, None, None) for o in orders]
+        stale_result.all.return_value = [(o, None, None, False) for o in orders]
 
         mock_db.execute = AsyncMock(return_value=stale_result)
         mock_db.add = MagicMock()
@@ -252,7 +253,7 @@ class TestCancelStaleDeliveryFeeOrders:
 
         # JOIN query returns wa_id and phone_number_id in the tuple.
         stale_result = MagicMock()
-        stale_result.all.return_value = [(stale, "27831234567", "111222333")]
+        stale_result.all.return_value = [(stale, "27831234567", "111222333", False)]
 
         mock_db.execute = AsyncMock(return_value=stale_result)
         mock_db.add = MagicMock()
@@ -281,7 +282,7 @@ class TestCancelStaleDeliveryFeeOrders:
 
         # wa_id=None → no notification sent
         stale_result = MagicMock()
-        stale_result.all.return_value = [(stale, None, None)]
+        stale_result.all.return_value = [(stale, None, None, False)]
 
         mock_db.execute = AsyncMock(return_value=stale_result)
         mock_db.add = MagicMock()
