@@ -1,0 +1,263 @@
+"""
+Go-live checks — the admin-plane half of onboarding readiness.
+
+`backend.app.api.v1.routes_setup.compute_setup_progress` (reused as-is, see
+routes_businesses.py) answers "has the owner configured their restaurant
+yet?" in owner-facing language. This module adds the narrower, stricter
+question a sales partner and NextGen itself need answered before calling a
+tenant handed-over: "will this tenant actually work end to end?" Every
+check here is computed from real data — nothing is a manually-ticked flag —
+matching routes_setup.py's own stated philosophy.
+
+Deliberately NOT a duplicate of get_recipe_coverage's full per-item,
+per-size logic (routes_setup.py ~:506-599): that function is scoped to
+`AuthUser`-based owner auth, not `(db, business)`, and the task's file
+boundary for this branch only permits extracting routes_setup.py's existing
+*progress* computation, not adding new admin-facing logic to that file.
+Recipe coverage here is intentionally a simpler count-based signal (items
+with zero recipe lines) — good enough to gate go-live, not a replacement
+for the richer per-size owner-facing report.
+"""
+
+import uuid
+
+from pydantic import BaseModel
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from shared.enums import OrderSource
+from shared.models.business import Business
+from shared.models.inventory import Ingredient
+from shared.models.menu import MenuCategory, MenuItem
+from shared.models.order import Order
+from shared.models.recipe import Recipe
+from shared.models.stocktake import StocktakeSession
+from shared.models.till import TillSession
+from shared.models.user import BusinessUser
+
+STATUS_PASS = "pass"
+STATUS_FAIL = "fail"
+STATUS_WARN = "warn"
+STATUS_NA = "n/a"
+
+
+class GoLiveCheck(BaseModel):
+    key: str
+    label: str
+    status: str  # pass | fail | warn | n/a
+    detail: str
+
+
+class GoLiveResult(BaseModel):
+    ready: bool
+    passed: int
+    failed: int
+    warned: int
+    checks: list[GoLiveCheck]
+
+
+async def compute_go_live_checks(db: AsyncSession, business: Business) -> GoLiveResult:
+    business_id = business.id
+    checks: list[GoLiveCheck] = []
+
+    # ── Owner login exists and has set a real password ─────────────────────
+    owner_result = await db.execute(
+        select(BusinessUser).where(
+            BusinessUser.business_id == business_id,
+            BusinessUser.role == "OWNER",
+            BusinessUser.is_active.is_(True),
+        )
+    )
+    owners = owner_result.scalars().all()
+    if not owners:
+        checks.append(GoLiveCheck(
+            key="owner_login", label="Owner login",
+            status=STATUS_FAIL, detail="No active OWNER login exists yet",
+        ))
+    else:
+        password_set = any(not o.must_change_password for o in owners)
+        checks.append(GoLiveCheck(
+            key="owner_login", label="Owner login",
+            status=STATUS_PASS if password_set else STATUS_FAIL,
+            detail=(
+                "Owner has set their own password" if password_set
+                else "Owner still has a temporary password — they must sign in and set a real one"
+            ),
+        ))
+
+    # ── At least one active staff member with a PIN ────────────────────────
+    staff_with_pin = int((await db.execute(
+        select(func.count()).select_from(BusinessUser).where(
+            BusinessUser.business_id == business_id,
+            BusinessUser.role == "STAFF",
+            BusinessUser.is_active.is_(True),
+            BusinessUser.pin_hash.isnot(None),
+        )
+    )).scalar() or 0)
+    checks.append(GoLiveCheck(
+        key="staff_pin", label="Staff PIN login",
+        status=STATUS_PASS if staff_with_pin else STATUS_WARN,
+        detail=(
+            f"{staff_with_pin} staff member(s) can clock in at the till" if staff_with_pin
+            else "No staff member has a PIN yet — the owner/manager can still trade alone"
+        ),
+    ))
+
+    # ── Menu: at least one active category and item ────────────────────────
+    active_categories = int((await db.execute(
+        select(func.count()).select_from(MenuCategory).where(
+            MenuCategory.business_id == business_id, MenuCategory.is_active.is_(True),
+        )
+    )).scalar() or 0)
+    active_items = int((await db.execute(
+        select(func.count()).select_from(MenuItem).where(
+            MenuItem.business_id == business_id,
+            MenuItem.is_deleted.is_(False),
+            MenuItem.is_active.is_(True),
+        )
+    )).scalar() or 0)
+    menu_ok = active_categories > 0 and active_items > 0
+    checks.append(GoLiveCheck(
+        key="menu", label="Menu",
+        status=STATUS_PASS if menu_ok else STATUS_FAIL,
+        detail=f"{active_categories} active categor{'y' if active_categories == 1 else 'ies'}, {active_items} active item(s)",
+    ))
+
+    # ── VAT / receipt settings ──────────────────────────────────────────────
+    vat_ok = (not business.vat_registered) or bool(business.vat_number)
+    paper_ok = bool(business.receipt_paper_width_mm)  # column is NOT NULL with a server default
+    if vat_ok and paper_ok:
+        detail = "VAT and receipt paper width are configured"
+        status = STATUS_PASS
+    elif not vat_ok:
+        detail = "Business is marked VAT-registered but has no VAT number set"
+        status = STATUS_FAIL
+    else:
+        detail = "Receipt paper width is not set"
+        status = STATUS_FAIL
+    checks.append(GoLiveCheck(key="vat_receipt", label="VAT & receipt settings", status=status, detail=detail))
+
+    # ── At least one POS payment method enabled ─────────────────────────────
+    pos_methods = [
+        business.pos_cash_enabled, business.pos_card_enabled, business.pos_payfast_enabled,
+        business.pos_yoco_enabled, business.pos_ikhoka_enabled, business.pos_direct_eft_enabled,
+        business.pos_other_payment_enabled,
+    ]
+    checks.append(GoLiveCheck(
+        key="pos_payment_method", label="POS payment method",
+        status=STATUS_PASS if any(pos_methods) else STATUS_FAIL,
+        detail="At least one till payment method is enabled" if any(pos_methods)
+               else "No till payment method is enabled — the till cannot take a sale",
+    ))
+
+    # ── A till session has been opened at least once ───────────────────────
+    till_opened = int((await db.execute(
+        select(func.count()).select_from(TillSession).where(TillSession.business_id == business_id)
+    )).scalar() or 0)
+    checks.append(GoLiveCheck(
+        key="till_session", label="Till opened",
+        status=STATUS_PASS if till_opened else STATUS_FAIL,
+        detail=f"{till_opened} till session(s) opened" if till_opened else "The till has never been opened",
+    ))
+
+    # ── At least one POS test order + a receipt document can be built ──────
+    pos_order_result = await db.execute(
+        select(Order).where(
+            Order.business_id == business_id, Order.source == OrderSource.POS.value,
+        ).order_by(Order.created_at.desc()).limit(1)
+    )
+    pos_order = pos_order_result.scalar_one_or_none()
+    if not pos_order:
+        checks.append(GoLiveCheck(
+            key="pos_test_order", label="POS test order",
+            status=STATUS_FAIL, detail="No POS order has been rung up yet",
+        ))
+    else:
+        try:
+            from backend.app.receipts.document import build_receipt_document
+            await db.refresh(pos_order, attribute_names=["items"])
+            build_receipt_document(pos_order, business, order_items=pos_order.items)
+            checks.append(GoLiveCheck(
+                key="pos_test_order", label="POS test order",
+                status=STATUS_PASS, detail="A POS order exists and its receipt renders correctly",
+            ))
+        except Exception as exc:  # noqa: BLE001 — intentionally broad: any receipt-build failure fails this check
+            checks.append(GoLiveCheck(
+                key="pos_test_order", label="POS test order",
+                status=STATUS_FAIL, detail=f"A POS order exists but its receipt failed to build: {exc}",
+            ))
+
+    # ── Inventory (only if the module is switched on) ──────────────────────
+    if business.inventory_enabled:
+        ingredient_count = int((await db.execute(
+            select(func.count()).select_from(Ingredient).where(
+                Ingredient.business_id == business_id, Ingredient.is_deleted.is_(False), Ingredient.is_active.is_(True),
+            )
+        )).scalar() or 0)
+        checks.append(GoLiveCheck(
+            key="ingredients", label="Ingredients",
+            status=STATUS_PASS if ingredient_count else STATUS_FAIL,
+            detail=f"{ingredient_count} ingredient(s)" if ingredient_count else "No ingredients recorded yet",
+        ))
+
+        items_with_recipe = {
+            r.menu_item_id for r in (
+                await db.execute(
+                    select(Recipe).where(
+                        Recipe.business_id == business_id, Recipe.is_active.is_(True), Recipe.menu_item_id.isnot(None),
+                    )
+                )
+            ).scalars().all()
+        }
+        covered = int((await db.execute(
+            select(func.count()).select_from(MenuItem).where(
+                MenuItem.business_id == business_id, MenuItem.is_deleted.is_(False), MenuItem.is_active.is_(True),
+                MenuItem.id.in_(items_with_recipe or [uuid.uuid4()]),
+            )
+        )).scalar() or 0) if active_items else 0
+        recipe_ok = active_items > 0 and covered == active_items
+        checks.append(GoLiveCheck(
+            key="recipe_coverage", label="Recipe coverage",
+            status=STATUS_PASS if recipe_ok else (STATUS_WARN if covered else STATUS_FAIL),
+            detail=f"{covered} of {active_items} active menu item(s) have a recipe",
+        ))
+
+        opening_stocktake = int((await db.execute(
+            select(func.count()).select_from(StocktakeSession).where(
+                StocktakeSession.business_id == business_id, StocktakeSession.status == "APPROVED",
+            )
+        )).scalar() or 0)
+        checks.append(GoLiveCheck(
+            key="opening_stocktake", label="Opening stocktake",
+            status=STATUS_PASS if opening_stocktake else STATUS_FAIL,
+            detail=f"{opening_stocktake} approved count(s)" if opening_stocktake else "No approved opening stocktake yet",
+        ))
+    else:
+        checks.append(GoLiveCheck(key="ingredients", label="Ingredients", status=STATUS_NA, detail="Inventory module is off"))
+        checks.append(GoLiveCheck(key="recipe_coverage", label="Recipe coverage", status=STATUS_NA, detail="Inventory module is off"))
+        checks.append(GoLiveCheck(key="opening_stocktake", label="Opening stocktake", status=STATUS_NA, detail="Inventory module is off"))
+
+    # ── WhatsApp (only if the module is switched on) ───────────────────────
+    if business.is_whatsapp_enabled:
+        checks.append(GoLiveCheck(
+            key="whatsapp_phone_number", label="WhatsApp phone number",
+            status=STATUS_PASS if business.whatsapp_phone_number_id else STATUS_FAIL,
+            detail="Configured" if business.whatsapp_phone_number_id else "WhatsApp is on but no phone_number_id is set",
+        ))
+    else:
+        checks.append(GoLiveCheck(key="whatsapp_phone_number", label="WhatsApp phone number", status=STATUS_NA, detail="WhatsApp is off for this business"))
+
+    # ── Billing status ──────────────────────────────────────────────────────
+    billing_ok = business.billing_status in ("TRIAL", "ACTIVE")
+    checks.append(GoLiveCheck(
+        key="billing_status", label="Billing status",
+        status=STATUS_PASS if billing_ok else STATUS_FAIL,
+        detail=f"Billing status is {business.billing_status}",
+    ))
+
+    passed = sum(1 for c in checks if c.status == STATUS_PASS)
+    failed = sum(1 for c in checks if c.status == STATUS_FAIL)
+    warned = sum(1 for c in checks if c.status == STATUS_WARN)
+    ready = failed == 0 and all(c.status in (STATUS_PASS, STATUS_WARN, STATUS_NA) for c in checks)
+
+    return GoLiveResult(ready=ready, passed=passed, failed=failed, warned=warned, checks=checks)

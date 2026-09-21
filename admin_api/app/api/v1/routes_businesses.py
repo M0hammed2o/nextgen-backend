@@ -1,7 +1,13 @@
 """
 Admin business management — CRUD, suspend/unsuspend, set limits,
-create owner login, WhatsApp test send.
-Only accessible by SUPER_ADMIN.
+create owner login, WhatsApp test send, sales-partner onboarding.
+
+Most routes here stay SUPER_ADMIN-only (default-deny). A small explicit
+allow-list (see require_onboarding_role usages below) also accepts the
+ONBOARDER role, scoped to businesses that admin personally onboarded and
+only until that business's onboarding is marked complete — see
+admin_api/app/core/deps.py::get_business_scoped, the single helper every
+one of those routes uses.
 """
 
 import logging
@@ -14,18 +20,46 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from admin_api.app.core.deps import get_business_scoped, require_onboarding_role, require_super_admin
+from admin_api.app.services.onboarding import GoLiveResult, compute_go_live_checks
+from backend.app.api.v1.routes_setup import SetupProgress, compute_setup_progress
 from backend.app.core.errors import AppError, DuplicateError, NotFoundError
-from backend.app.core.rbac import AuthUser, require_super_admin
+from backend.app.core.rbac import AuthUser
 from backend.app.core.security import hash_password
 from backend.app.db.session import get_db
-from shared.enums import AuditScope
+from shared.enums import AuditScope, PlanTier
+from shared.models.admin import AdminRole
 from shared.models.audit import AuditEvent
 from shared.models.business import Business
-from shared.models.user import BusinessUser
+from shared.models.user import BusinessUser, RefreshToken
 from shared.utils import generate_business_code, generate_temp_password
 
 logger = logging.getLogger("nextgen.admin")
 router = APIRouter(prefix="/admin/businesses", tags=["admin-businesses"])
+
+# Reserved staff_name marking an onboarder's own temporary MANAGER login on
+# `business_users` — see OwnerCreateRequest.is_onboarding_account below. No
+# suitable dedicated column exists on business_users, and the task scope for
+# this branch permits no second migration, so this convention (rather than a
+# new column) is how POST .../onboarding/complete finds and deactivates it.
+# See this task's DOC NOTE for DECISIONS.md (memory files are not edited
+# directly by this branch — see CLAUDE.md's task instructions).
+ONBOARDING_ACCOUNT_STAFF_NAME = "NextGen Onboarding"
+
+# Fields an ONBOARDER may change via PATCH /admin/businesses/{id}. Everything
+# else (billing_status, stripe_*, limits, is_active) is default-deny for
+# that role — SUPER_ADMIN is unaffected by this list.
+ONBOARDER_PATCH_ALLOWED_FIELDS = {
+    "name", "timezone", "plan", "whatsapp_phone_number_id",
+    "is_whatsapp_enabled", "inventory_enabled",
+    "staff_live_orders_tab_enabled", "staff_wastage_tab_enabled", "staff_stocktake_tab_enabled",
+}
+
+# Daily limits an ONBOARDER must not raise/lower at creation time either —
+# same "NOT limits" invariant as the PATCH allow-list above, applied
+# symmetrically to POST so an ONBOARDER can't achieve the same effect by
+# setting a non-default value on create instead of PATCH.
+_DEFAULT_DAILY_LIMITS = {"daily_message_limit": 800, "daily_llm_call_limit": 400, "daily_order_limit": 200}
 
 
 # ── Schemas ──────────────────────────────────────────────────────────────────
@@ -106,10 +140,61 @@ class BusinessAdminResponse(BaseModel):
     monthly_orders_remaining: int = 1500
     last_webhook_received_at: datetime | None
     created_at: datetime
+    # Module flags — were accepted by BusinessUpdate but never returned,
+    # so the admin UI showed "Unknown" for all four (found while wiring the
+    # onboarding go-live checks — see this task's DOC NOTE for KNOWN_BUGS.md).
+    is_whatsapp_enabled: bool
+    inventory_enabled: bool
+    staff_live_orders_tab_enabled: bool
+    staff_wastage_tab_enabled: bool
+    staff_stocktake_tab_enabled: bool
+    onboarded_by_admin_id: uuid.UUID | None
+    onboarding_completed_at: datetime | None
     # Populated only by POST /admin/businesses when owner_email was provided —
     # shown once, never returned by GET/PATCH.
     owner_temporary_password: str | None = None
     model_config = {"from_attributes": True}
+
+
+class BusinessOnboarderResponse(BaseModel):
+    """
+    Reduced business view for ONBOARDER admins. A sales partner doing
+    setup does not need Stripe/PayFast identifiers or usage/cost figures —
+    those are NextGen's own commercial data, not onboarding data — so this
+    is a genuinely smaller schema rather than the same fields nulled out.
+    """
+    id: uuid.UUID
+    name: str
+    slug: str
+    business_code: str
+    is_active: bool
+    suspended_reason: str | None
+    timezone: str
+    plan: str
+    billing_status: str
+    currency: str
+    whatsapp_phone_number_id: str | None
+    daily_message_limit: int
+    daily_llm_call_limit: int
+    daily_order_limit: int
+    last_webhook_received_at: datetime | None
+    created_at: datetime
+    is_whatsapp_enabled: bool
+    inventory_enabled: bool
+    staff_live_orders_tab_enabled: bool
+    staff_wastage_tab_enabled: bool
+    staff_stocktake_tab_enabled: bool
+    onboarded_by_admin_id: uuid.UUID | None
+    onboarding_completed_at: datetime | None
+    owner_temporary_password: str | None = None
+    model_config = {"from_attributes": True}
+
+
+def _business_response(biz: Business, role: str) -> "BusinessAdminResponse | BusinessOnboarderResponse":
+    """The one place that decides which of the two response shapes a caller sees."""
+    if role == AdminRole.ONBOARDER:
+        return BusinessOnboarderResponse.model_validate(biz)
+    return BusinessAdminResponse.model_validate(biz)
 
 
 class OwnerCreateRequest(BaseModel):
@@ -122,6 +207,13 @@ class OwnerCreateRequest(BaseModel):
     email: EmailStr
     full_name: str = Field(max_length=255)
     role: str = Field(default="OWNER", pattern=r"^(OWNER|MANAGER)$")
+    is_onboarding_account: bool = Field(
+        default=False,
+        description="Mark this as the onboarder's own temporary working login "
+                     "(NextGen Onboarding), not a real restaurant staff member. "
+                     "Deactivated automatically by POST .../onboarding/complete. "
+                     "Must be role=MANAGER.",
+    )
 
 
 class OwnerResponse(BaseModel):
@@ -159,30 +251,49 @@ class WhatsAppTestSendResponse(BaseModel):
 
 # ── Existing CRUD Routes (unchanged) ────────────────────────────────────────
 
-@router.get("", response_model=list[BusinessAdminResponse])
+@router.get("", response_model=None)
 async def list_businesses(
     is_active: bool | None = None,
     page: int = Query(default=1, ge=1),
     per_page: int = Query(default=25, ge=1, le=100),
-    user: AuthUser = Depends(require_super_admin),
+    user: AuthUser = Depends(require_onboarding_role),
     db: AsyncSession = Depends(get_db),
-):
+) -> list[BusinessAdminResponse] | list[BusinessOnboarderResponse]:
+    """SUPER_ADMIN sees every business. ONBOARDER sees only businesses they
+    personally onboarded whose onboarding isn't complete yet — see
+    get_business_scoped's docstring for the full rule."""
     query = select(Business)
     if is_active is not None:
         query = query.where(Business.is_active == is_active)
+    if user.role == AdminRole.ONBOARDER:
+        query = query.where(
+            Business.onboarded_by_admin_id == user.user_id,
+            Business.onboarding_completed_at.is_(None),
+        )
     query = query.order_by(Business.created_at.desc())
     query = query.offset((page - 1) * per_page).limit(per_page)
 
     result = await db.execute(query)
-    return [BusinessAdminResponse.model_validate(b) for b in result.scalars().all()]
+    return [_business_response(b, user.role) for b in result.scalars().all()]
 
 
-@router.post("", response_model=BusinessAdminResponse, status_code=201)
+@router.post("", response_model=None, status_code=201)
 async def create_business(
     body: BusinessCreate,
-    user: AuthUser = Depends(require_super_admin),
+    user: AuthUser = Depends(require_onboarding_role),
     db: AsyncSession = Depends(get_db),
-):
+) -> BusinessAdminResponse | BusinessOnboarderResponse:
+    if user.role == AdminRole.ONBOARDER:
+        if body.plan not in (t.value for t in PlanTier):
+            raise AppError(
+                "INVALID_PLAN",
+                f"plan must be one of: {', '.join(t.value for t in PlanTier)}",
+                422,
+            )
+        for field, default in _DEFAULT_DAILY_LIMITS.items():
+            if getattr(body, field) != default:
+                raise AppError("FIELD_NOT_ALLOWED", f"ONBOARDER cannot set {field}", 403)
+
     # Auto-generate slug from name if not provided
     import re as _re
     slug = body.slug
@@ -228,7 +339,11 @@ async def create_business(
 
     # Create business
     biz_data = body.model_dump(exclude={"owner_email", "owner_full_name", "slug"})
-    biz = Business(business_code=code, slug=body_slug, **biz_data)
+    biz = Business(
+        business_code=code, slug=body_slug,
+        onboarded_by_admin_id=user.user_id if user.role == AdminRole.ONBOARDER else None,
+        **biz_data,
+    )
     db.add(biz)
     await db.flush()  # Get biz.id before creating user
 
@@ -260,20 +375,21 @@ async def create_business(
     await db.commit()
     await db.refresh(biz)
 
-    response = BusinessAdminResponse.model_validate(biz)
+    response = _business_response(biz, user.role)
     response.owner_temporary_password = owner_temp_password
     return response
 
 
-@router.get("/{business_id}", response_model=BusinessAdminResponse)
+@router.get("/{business_id}", response_model=None)
 async def get_business(
     business_id: uuid.UUID,
-    user: AuthUser = Depends(require_super_admin),
+    user: AuthUser = Depends(require_onboarding_role),
     db: AsyncSession = Depends(get_db),
-):
-    biz = await db.get(Business, business_id)
-    if not biz:
-        raise NotFoundError("Business", str(business_id))
+) -> BusinessAdminResponse | BusinessOnboarderResponse:
+    biz = await get_business_scoped(business_id, user, db)
+
+    if user.role == AdminRole.ONBOARDER:
+        return _business_response(biz, user.role)
 
     from backend.app.billing.usage import get_order_quota_status
     quota = await get_order_quota_status(db, biz)
@@ -329,18 +445,32 @@ async def grant_order_pack(
     return response
 
 
-@router.patch("/{business_id}", response_model=BusinessAdminResponse)
+@router.patch("/{business_id}", response_model=None)
 async def update_business(
     business_id: uuid.UUID,
     body: BusinessUpdate,
-    user: AuthUser = Depends(require_super_admin),
+    user: AuthUser = Depends(require_onboarding_role),
     db: AsyncSession = Depends(get_db),
-):
-    biz = await db.get(Business, business_id)
-    if not biz:
-        raise NotFoundError("Business", str(business_id))
+) -> BusinessAdminResponse | BusinessOnboarderResponse:
+    biz = await get_business_scoped(business_id, user, db)
 
     changes = body.model_dump(exclude_unset=True)
+
+    if user.role == AdminRole.ONBOARDER:
+        disallowed = set(changes) - ONBOARDER_PATCH_ALLOWED_FIELDS
+        if disallowed:
+            raise AppError(
+                "FIELD_NOT_ALLOWED",
+                f"ONBOARDER cannot set: {', '.join(sorted(disallowed))}",
+                403,
+            )
+        if "plan" in changes and changes["plan"] != biz.plan and changes["plan"] not in (t.value for t in PlanTier):
+            raise AppError(
+                "INVALID_PLAN",
+                f"plan must be one of: {', '.join(t.value for t in PlanTier)}",
+                422,
+            )
+
     for field, value in changes.items():
         setattr(biz, field, value)
     db.add(AuditEvent(
@@ -365,7 +495,7 @@ async def update_business(
         await db.rollback()
         raise DuplicateError("business field", "value you entered") from exc
     await db.refresh(biz)
-    return BusinessAdminResponse.model_validate(biz)
+    return _business_response(biz, user.role)
 
 
 @router.post("/{business_id}/suspend", response_model=BusinessAdminResponse)
@@ -463,17 +593,21 @@ async def set_business_limits(
 async def create_business_owner(
     business_id: uuid.UUID,
     body: OwnerCreateRequest,
-    user: AuthUser = Depends(require_super_admin),
+    user: AuthUser = Depends(require_onboarding_role),
     db: AsyncSession = Depends(get_db),
 ):
     """
     Create a BusinessUser with OWNER or MANAGER role linked to the business.
     Uses email + password auth (same as POST /auth/login on backend).
     """
-    # Check business exists
-    biz = await db.get(Business, business_id)
-    if not biz:
-        raise NotFoundError("Business", str(business_id))
+    biz = await get_business_scoped(business_id, user, db)
+
+    if body.is_onboarding_account and body.role != "MANAGER":
+        raise AppError(
+            "INVALID_ONBOARDING_ACCOUNT",
+            "An onboarding working account must be role=MANAGER",
+            422,
+        )
 
     # Check email uniqueness (globally unique)
     email_lower = body.email.lower().strip()
@@ -485,11 +619,11 @@ async def create_business_owner(
 
     temp_password = generate_temp_password()
     owner = BusinessUser(
-        business_id=business_id,
+        business_id=biz.id,
         role=body.role,
         email=email_lower,
         password_hash=hash_password(temp_password),
-        staff_name=body.full_name,
+        staff_name=ONBOARDING_ACCOUNT_STAFF_NAME if body.is_onboarding_account else body.full_name,
         is_active=True,
         must_change_password=True,
     )
@@ -543,12 +677,10 @@ class ResetPasswordResponse(BaseModel):
 )
 async def list_business_users(
     business_id: uuid.UUID,
-    user: AuthUser = Depends(require_super_admin),
+    user: AuthUser = Depends(require_onboarding_role),
     db: AsyncSession = Depends(get_db),
 ):
-    biz = await db.get(Business, business_id)
-    if not biz:
-        raise NotFoundError("Business", str(business_id))
+    biz = await get_business_scoped(business_id, user, db)
 
     result = await db.execute(
         select(BusinessUser)
@@ -569,16 +701,21 @@ async def list_business_users(
 async def reset_business_user_password(
     business_id: uuid.UUID,
     user_id: uuid.UUID,
-    user: AuthUser = Depends(require_super_admin),
+    user: AuthUser = Depends(require_onboarding_role),
     db: AsyncSession = Depends(get_db),
 ):
     """
     Generate a new temporary password for an existing OWNER/MANAGER login,
     force a reset via must_change_password (same flow as account creation),
     and revoke their live sessions — same pattern as staff deactivation.
+
+    ONBOARDER may only do this while the business's onboarding is not yet
+    complete — enforced by get_business_scoped below, same rule as every
+    other onboarder-accessible route.
     """
     from sqlalchemy import update as sa_update
-    from shared.models.user import RefreshToken
+
+    await get_business_scoped(business_id, user, db)
 
     result = await db.execute(
         select(BusinessUser).where(
@@ -617,6 +754,151 @@ async def reset_business_user_password(
 
     target.temporary_password = temp_password
     return ResetPasswordResponse.model_validate(target)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# NEW: Milestone B — onboarding progress, go-live checks, and handover
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class OnboardingStatusResponse(BaseModel):
+    business_id: uuid.UUID
+    business_name: str
+    setup: SetupProgress
+    go_live: GoLiveResult
+    ready: bool
+
+
+@router.get(
+    "/{business_id}/onboarding",
+    response_model=OnboardingStatusResponse,
+    summary="Onboarding progress + go-live checks for a business",
+)
+async def get_onboarding_status(
+    business_id: uuid.UUID,
+    user: AuthUser = Depends(require_onboarding_role),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Two computations, both derived from real data, never a manually-ticked
+    checklist:
+      - `setup`: the SAME owner-facing "how far have you configured your
+        restaurant" progress shown on the owner dashboard
+        (backend/app/api/v1/routes_setup.py::compute_setup_progress) —
+        reused, not duplicated, so the two views can never disagree.
+      - `go_live`: a stricter, admin-facing pass/fail/warn/n-a gate (see
+        admin_api/app/services/onboarding.py) that also checks things the
+        owner-facing progress view doesn't need to: a till has actually
+        been opened, a POS order and its receipt actually render, billing
+        status, etc.
+    """
+    biz = await get_business_scoped(business_id, user, db)
+    setup = await compute_setup_progress(db, biz)
+    go_live = await compute_go_live_checks(db, biz)
+    return OnboardingStatusResponse(
+        business_id=biz.id, business_name=biz.name,
+        setup=setup, go_live=go_live, ready=go_live.ready,
+    )
+
+
+class OnboardingCompleteRequest(BaseModel):
+    force: bool = Field(
+        default=False,
+        description="Complete onboarding even though a go-live check is failing. "
+                     "SUPER_ADMIN only — an ONBOARDER may never force this.",
+    )
+
+
+class OnboardingCompleteResponse(BaseModel):
+    business_id: uuid.UUID
+    onboarding_completed_at: datetime
+    forced: bool
+    deactivated_onboarding_accounts: int
+
+
+@router.post(
+    "/{business_id}/onboarding/complete",
+    response_model=OnboardingCompleteResponse,
+    summary="Complete onboarding: hand the business over, revoke the onboarder's access",
+)
+async def complete_onboarding(
+    business_id: uuid.UUID,
+    body: OnboardingCompleteRequest,
+    user: AuthUser = Depends(require_onboarding_role),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Requires every go-live check to pass, unless `force=true` — which only
+    SUPER_ADMIN may pass; an ONBOARDER attempting `force=true` is rejected
+    outright, not silently downgraded to force=false.
+
+    Deactivates the onboarder's own temporary working login(s) (identified
+    by the reserved ONBOARDING_ACCOUNT_STAFF_NAME convention — see
+    OwnerCreateRequest.is_onboarding_account) and revokes their refresh
+    tokens, stamps onboarding_completed_at, and writes an audit event.
+    From the next request onward, get_business_scoped denies this
+    ONBOARDER access to this business (404) — SUPER_ADMIN is unaffected.
+    """
+    from sqlalchemy import update as sa_update
+
+    biz = await get_business_scoped(business_id, user, db)
+
+    if body.force and user.role != AdminRole.SUPER_ADMIN:
+        raise AppError(
+            "FORCE_NOT_ALLOWED",
+            "Only SUPER_ADMIN may force-complete onboarding with failing go-live checks",
+            403,
+        )
+
+    go_live = await compute_go_live_checks(db, biz)
+    if not go_live.ready and not body.force:
+        raise AppError(
+            "NOT_READY",
+            "This business has failing go-live checks — resolve them or pass force=true (SUPER_ADMIN only)",
+            409,
+            details={"failed": go_live.failed, "checks": [c.model_dump() for c in go_live.checks if c.status == "fail"]},
+        )
+
+    accounts_result = await db.execute(
+        select(BusinessUser).where(
+            BusinessUser.business_id == biz.id,
+            BusinessUser.staff_name == ONBOARDING_ACCOUNT_STAFF_NAME,
+            BusinessUser.role == "MANAGER",
+            BusinessUser.is_active.is_(True),
+        )
+    )
+    onboarding_accounts = accounts_result.scalars().all()
+    now = datetime.now(timezone.utc)
+    for account in onboarding_accounts:
+        account.is_active = False
+        await db.execute(
+            sa_update(RefreshToken)
+            .where(RefreshToken.user_id == account.id, RefreshToken.revoked_at.is_(None))
+            .values(revoked_at=now)
+        )
+
+    biz.onboarding_completed_at = now
+    db.add(AuditEvent(
+        scope=AuditScope.PLATFORM.value,
+        business_id=biz.id,
+        actor_user_id=user.user_id,
+        action="admin.business.onboarding_completed",
+        target_type="business",
+        target_id=biz.id,
+        diff_json={
+            "forced": bool(body.force and not go_live.ready),
+            "ready": go_live.ready,
+            "deactivated_onboarding_accounts": len(onboarding_accounts),
+        },
+    ))
+    await db.commit()
+    await db.refresh(biz)
+
+    return OnboardingCompleteResponse(
+        business_id=biz.id,
+        onboarding_completed_at=biz.onboarding_completed_at,
+        forced=bool(body.force and not go_live.ready),
+        deactivated_onboarding_accounts=len(onboarding_accounts),
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -104,9 +104,26 @@ async def get_setup_progress(
     if not business:
         raise NotFoundError("Business")
 
+    return await compute_setup_progress(db, business)
+
+
+async def compute_setup_progress(db: AsyncSession, business: Business) -> SetupProgress:
+    """
+    The actual progress computation, extracted so both the owner dashboard
+    (above) and the admin-plane onboarding endpoint
+    (admin_api/app/api/v1/routes_businesses.py) compute the exact same
+    "is this restaurant ready to trade" answer from a `(db, business)` pair
+    — no client-supplied business_id ever reaches this function directly;
+    each caller resolves `business` through its own tenant-scoping first.
+
+    Behaviour-preserving extraction: identical logic to the pre-existing
+    route body, with `user.business_id` replaced by `business.id`.
+    """
+    business_id = business.id
+
     async def count(model, *where):
         stmt = select(func.count()).select_from(model).where(
-            model.business_id == user.business_id, *where
+            model.business_id == business_id, *where
         )
         return int((await db.execute(stmt)).scalar() or 0)
 
@@ -207,7 +224,7 @@ async def get_setup_progress(
             for r in (
                 await db.execute(
                     select(Recipe).where(
-                        Recipe.business_id == user.business_id,
+                        Recipe.business_id == business_id,
                         Recipe.is_active.is_(True),
                         Recipe.menu_item_id.isnot(None),
                     )
@@ -218,7 +235,7 @@ async def get_setup_progress(
         if active_items:
             covered = int((await db.execute(
                 select(func.count()).select_from(MenuItem).where(
-                    MenuItem.business_id == user.business_id,
+                    MenuItem.business_id == business_id,
                     MenuItem.is_deleted.is_(False),
                     MenuItem.is_active.is_(True),
                     MenuItem.id.in_(with_recipe or [uuid.uuid4()]),
@@ -245,7 +262,7 @@ async def get_setup_progress(
 
         opening = int((await db.execute(
             select(func.count()).select_from(StocktakeSession).where(
-                StocktakeSession.business_id == user.business_id,
+                StocktakeSession.business_id == business_id,
                 StocktakeSession.status == "APPROVED",
             )
         )).scalar() or 0)
