@@ -486,6 +486,185 @@ async def test_account_update_webhook_unknown_waba_is_a_noop(db):
     assert len(before) == len(after)
 
 
+# ── F1 (Wave 0A verifier): unverified phone_number_id squat must not block
+#    the real owner's later legitimate connect ──────────────────────────────
+
+async def test_squat_attempt_does_not_block_victims_legitimate_connect(db):
+    """
+    A business calling /exchange with ANOTHER business's phone_number_id and
+    a bad/junk code must never let that id get stuck (committed) on the
+    squatter's row before ownership is verified — the real owner's later
+    legitimate exchange for the same number must still succeed, not crash
+    with an unhandled IntegrityError on whatsapp_connections.phone_number_id.
+    """
+    attacker = await _make_business(db)
+    victim = await _make_business(db)
+    victim_phone = f"phone-{uuid.uuid4().hex[:8]}"
+    # Randomised (not a short literal like "w-att") — this file's `db`
+    # fixture only rolls back UNCOMMITTED work; run_exchange commits
+    # internally, so rows persist in the throwaway DB across repeated runs.
+    # A fixed literal waba_id would collide with a previous run's leftover
+    # row now that migration 0037 makes waba_id partially unique.
+    attacker_waba = f"waba-att-{uuid.uuid4().hex[:8]}"
+    victim_waba = f"waba-vic-{uuid.uuid4().hex[:8]}"
+
+    squat_fake = _FakeGraphClient(attacker_waba, victim_phone, fail_at="code_exchange")
+    squat_outcome = await connection_service.run_exchange(
+        db, attacker,
+        code="junk", waba_id=attacker_waba, phone_number_id=victim_phone,
+        connected_by_user_id=uuid.uuid4(), graph_client=squat_fake,
+    )
+    assert squat_outcome.success is False
+
+    result = await db.execute(
+        select(WhatsAppConnection).where(WhatsAppConnection.business_id == attacker.id)
+    )
+    attacker_conn = result.scalar_one()
+    assert attacker_conn.phone_number_id is None, (
+        "a failed exchange must never leave the client-supplied phone_number_id "
+        "committed on the row before ownership is verified"
+    )
+
+    victim_fake = _FakeGraphClient(victim_waba, victim_phone)
+    victim_outcome = await connection_service.run_exchange(
+        db, victim,
+        code="good", waba_id=victim_waba, phone_number_id=victim_phone,
+        connected_by_user_id=uuid.uuid4(), graph_client=victim_fake,
+    )
+    assert victim_outcome.success is True
+    assert victim_outcome.connection.status == "CONNECTED"
+    assert victim_outcome.connection.phone_number_id == victim_phone
+
+
+async def test_squat_with_same_waba_id_still_yields_documented_409(db):
+    """
+    F1 x F8 interaction: migration 0037 added a partial UNIQUE index on
+    whatsapp_connections.waba_id (see model docstring). The id-persist
+    commit in run_exchange must handle a waba_id collision exactly like a
+    phone_number_id collision — the documented 409, never an unhandled
+    IntegrityError. Found via the independent verifier's own adversarial
+    script hitting a real (stale, same-run-id) waba_id collision.
+    """
+    owner = await _make_business(db)
+    other = await _make_business(db)
+    shared_waba = f"waba-shared-{uuid.uuid4().hex[:8]}"
+
+    fake1 = _FakeGraphClient(shared_waba, f"phone-{uuid.uuid4().hex[:8]}")
+    outcome1 = await connection_service.run_exchange(
+        db, owner,
+        code="c1", waba_id=shared_waba, phone_number_id=fake1.phone_number_id,
+        connected_by_user_id=uuid.uuid4(), graph_client=fake1,
+    )
+    assert outcome1.success is True
+
+    # A different business's Embedded Signup happens to resolve to the SAME
+    # waba_id but a DIFFERENT phone_number_id.
+    fake2 = _FakeGraphClient(shared_waba, f"phone-{uuid.uuid4().hex[:8]}")
+    err = None
+    try:
+        outcome2 = await connection_service.run_exchange(
+            db, other,
+            code="c2", waba_id=shared_waba, phone_number_id=fake2.phone_number_id,
+            connected_by_user_id=uuid.uuid4(), graph_client=fake2,
+        )
+    except Exception as exc:  # noqa: BLE001 — must never raise
+        err = exc
+    assert err is None, f"expected a handled 409, got an unhandled exception: {err!r}"
+    assert outcome2.success is False
+    assert outcome2.failed_step == "claim_routing_number"
+    assert outcome2.connection.status == "NEEDS_ATTENTION"
+
+    # The first (rightful) owner is completely untouched.
+    await db.refresh(owner)
+    result = await db.execute(
+        select(WhatsAppConnection).where(WhatsAppConnection.business_id == owner.id)
+    )
+    assert result.scalar_one().status == "CONNECTED"
+
+
+async def test_squat_with_valid_verify_still_yields_documented_409(db):
+    """
+    If the squatter's token genuinely CAN pass verify_assets for a number
+    another business already legitimately holds (a real race, not a squat),
+    the unique-constraint collision must surface as the documented 409
+    (failed_step == "claim_routing_number"), never an unhandled 500.
+    """
+    owner = await _make_business(db)
+    other = await _make_business(db)
+    shared_phone = f"phone-{uuid.uuid4().hex[:8]}"
+    owner_waba = f"waba-owner-{uuid.uuid4().hex[:8]}"
+    other_waba = f"waba-other-{uuid.uuid4().hex[:8]}"
+
+    fake1 = _FakeGraphClient(owner_waba, shared_phone)
+    outcome1 = await connection_service.run_exchange(
+        db, owner,
+        code="c1", waba_id=owner_waba, phone_number_id=shared_phone,
+        connected_by_user_id=uuid.uuid4(), graph_client=fake1,
+    )
+    assert outcome1.success is True
+
+    fake2 = _FakeGraphClient(other_waba, shared_phone)
+    err = None
+    try:
+        outcome2 = await connection_service.run_exchange(
+            db, other,
+            code="c2", waba_id=other_waba, phone_number_id=shared_phone,
+            connected_by_user_id=uuid.uuid4(), graph_client=fake2,
+        )
+    except Exception as exc:  # noqa: BLE001 — must never raise
+        err = exc
+    assert err is None, f"expected a handled 409, got an unhandled exception: {err!r}"
+    assert outcome2.success is False
+    assert outcome2.failed_step == "claim_routing_number"
+    assert outcome2.connection.status == "NEEDS_ATTENTION"
+
+
+# ── F2 (Wave 0A verifier): a failed reconnect must never fall back to the
+#    platform token for a customer-owned number ─────────────────────────────
+
+async def test_failed_reconnect_does_not_fall_back_to_platform(db):
+    business = await _make_business(db)
+    n1 = f"phone-{uuid.uuid4().hex[:8]}"
+    n2 = f"phone-{uuid.uuid4().hex[:8]}"
+    w1 = f"waba-1-{uuid.uuid4().hex[:8]}"
+    w2 = f"waba-2-{uuid.uuid4().hex[:8]}"
+
+    fake1 = _FakeGraphClient(w1, n1)
+    ok = await connection_service.run_exchange(
+        db, business,
+        code="c1", waba_id=w1, phone_number_id=n1,
+        connected_by_user_id=uuid.uuid4(), graph_client=fake1,
+    )
+    assert ok.success is True
+    await db.refresh(business)
+    creds = await resolve_whatsapp_credentials(db, business)
+    assert creds.source == "business"
+
+    # Reconnect to a DIFFERENT number: ownership of n2 IS verified (so its
+    # ids legitimately land on the connection row) but a later step fails,
+    # leaving the row pointed at n2/NEEDS_ATTENTION while the business's
+    # live routing number (businesses.whatsapp_phone_number_id) is still n1.
+    fake2 = _FakeGraphClient(w2, n2, fail_at="subscribe_webhooks")
+    bad = await connection_service.run_exchange(
+        db, business,
+        code="c2", waba_id=w2, phone_number_id=n2,
+        connected_by_user_id=uuid.uuid4(), graph_client=fake2,
+    )
+    assert bad.success is False
+    await db.refresh(business)
+
+    result = await db.execute(
+        select(WhatsAppConnection).where(WhatsAppConnection.business_id == business.id)
+    )
+    conn = result.scalar_one()
+    assert conn.phone_number_id == n2
+    assert conn.status == "NEEDS_ATTENTION"
+    assert business.whatsapp_phone_number_id == n1
+
+    creds2 = await resolve_whatsapp_credentials(db, business)
+    assert creds2 is None, "non-CONNECTED customer-owned number fell back to the platform token"
+
+
 async def test_stamp_last_webhook_updates_connection_and_business(db):
     from backend.app.api.v1.routes_webhook import _stamp_last_webhook
 

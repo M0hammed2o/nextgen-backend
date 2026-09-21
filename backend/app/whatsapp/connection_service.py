@@ -134,9 +134,20 @@ async def run_exchange(
             "business. Disconnect it there first, or choose a different number.",
         )
 
+    # NOTE (F1 fix, Wave 0A verifier): the client-supplied waba_id/
+    # phone_number_id are deliberately NOT written onto `connection` here.
+    # Persisting them before Meta has confirmed this caller's token can
+    # actually access them let one tenant "squat" another tenant's
+    # phone_number_id (globally UNIQUE on this table) just by calling
+    # /exchange with a junk code and the victim's id — the squatter's row
+    # claimed the unique slot, a failed exchange left it there (_fail never
+    # cleared it), and the victim's later legitimate exchange crashed with
+    # an unhandled IntegrityError (500) it could never recover from. Now
+    # these fields are only ever set once step 2 (verify_assets) has
+    # confirmed against the Graph API that this access token really can see
+    # both ids — see below. Steps 1-2 use the `waba_id`/`phone_number_id`
+    # function parameters directly and do not need them on the row yet.
     connection = await _get_or_create_connection(db, business.id)
-    connection.waba_id = waba_id
-    connection.phone_number_id = phone_number_id
     connection.status = "PENDING"
     connection.status_reason = None
     await db.commit()
@@ -183,10 +194,34 @@ async def run_exchange(
             "The WhatsApp Business Account Meta returned did not match the one selected.",
         )
 
+    # Ownership of both ids is now confirmed by Meta — safe to claim them
+    # onto this row. Wrapped in try/except because two businesses racing to
+    # claim the same phone_number_id OR the same waba_id (both genuinely
+    # able to pass verify_assets, e.g. re-adding the same number, or the
+    # partial UNIQUE index migration 0037 added on waba_id — see F8) must
+    # land on the documented 409, not an unhandled 500 — same handling as
+    # _claim_routing_number's businesses.whatsapp_phone_number_id race below.
+    connection.waba_id = waba_id
+    connection.phone_number_id = phone_number_id
     connection.display_phone_number = phone_data.get("display_phone_number")
     connection.verified_name = phone_data.get("verified_name")
     connection.quality_rating = phone_data.get("quality_rating")
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        if (
+            _is_unique_violation(exc, "phone_number_id")
+            or _is_unique_violation(exc, "waba_id")
+        ):
+            await db.refresh(connection)
+            return await _fail(
+                db, connection, "claim_routing_number",
+                "This WhatsApp number or account is already connected to a "
+                "different NextGen business. Disconnect it there first, or "
+                "choose a different number/account.",
+            )
+        raise
     await db.refresh(connection)
 
     # ── Step 3: subscribe our app's webhooks to this WABA ────────────────
@@ -303,6 +338,14 @@ async def disconnect(
 
     if business.whatsapp_phone_number_id == connection.phone_number_id:
         business.whatsapp_phone_number_id = None
+    # F2 fix, Wave 0A verifier: token_resolver.py now also refuses the
+    # platform-token fallback whenever businesses.whatsapp_business_account_id
+    # still points at a customer WABA, so it must be cleared here too — else
+    # a business that legitimately disconnects would be permanently unable
+    # to fall back to the platform token afterwards (this field was
+    # previously never cleared by disconnect() at all).
+    if business.whatsapp_business_account_id == connection.waba_id:
+        business.whatsapp_business_account_id = None
 
     connection.status = "DISCONNECTED"
     connection.status_reason = "Disconnected by owner"

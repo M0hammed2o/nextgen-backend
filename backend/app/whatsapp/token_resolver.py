@@ -108,6 +108,39 @@ async def resolve_whatsapp_credentials(
             connection_id=connection.id,
         )
 
+    # F2 fix, Wave 0A verifier: a connection row's ids can legitimately
+    # diverge from businesses.whatsapp_phone_number_id mid-reconnect (the
+    # new number is only committed onto the connection row once Meta
+    # confirms ownership — see connection_service.run_exchange's F1 fix —
+    # but a FAILED reconnect can still leave connection.phone_number_id
+    # pointed at a still-unverified target while the business's live
+    # routing number is unchanged). Falling through to the platform-token
+    # branch in that case would route a customer-owned number through a
+    # token that has no Graph rights on it — a guaranteed, confusing
+    # failure, not a working fallback. So: ANY connection row that is not
+    # DISCONNECTED means this business is under self-service WhatsApp
+    # management and must never receive a platform-token fallback, even if
+    # its ids don't currently match. Same for a business whose WABA was
+    # ever claimed via a customer connection (businesses.
+    # whatsapp_business_account_id set) even if the connection row itself
+    # is gone — disconnect() clears this field, so it only stays set for a
+    # business that is still, or was left, mid-connection.
+    if connection is not None and connection.status != "DISCONNECTED":
+        logger.info(
+            "WhatsApp connection for business=%s is %s and does not own the "
+            "current routing number — no platform-token fallback while a "
+            "non-DISCONNECTED customer connection exists.",
+            business.id, connection.status,
+        )
+        return None
+    if business.whatsapp_business_account_id:
+        logger.info(
+            "Business=%s has a customer WABA on record (%s) but no active "
+            "connection row — no platform-token fallback.",
+            business.id, business.whatsapp_business_account_id,
+        )
+        return None
+
     # No connection owns this business's routing number — Model 1
     # platform-token path, unchanged from pre-Milestone-C behaviour.
     if routing_number:

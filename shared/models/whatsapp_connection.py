@@ -22,7 +22,7 @@ routes_whatsapp_connect.py's response models, which deliberately omit them.
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -31,6 +31,23 @@ from shared.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 
 class WhatsAppConnection(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     __tablename__ = "whatsapp_connections"
+
+    # Partial UNIQUE (waba_id IS NOT NULL) — migration 0037. NULL is expected
+    # for a freshly-created PENDING row before verify_assets confirms the
+    # waba_id (see connection_service.py's F1 fix — waba_id/phone_number_id
+    # are only committed after ownership is verified). Without this, the
+    # account_update webhook handler's waba_id lookup
+    # (routes_webhook.py::_handle_account_update_event) could match more
+    # than one row and raise MultipleResultsFound, silently dropping the
+    # event (Wave 0A verifier finding F8).
+    __table_args__ = (
+        Index(
+            "uq_whatsapp_connections_waba_id",
+            "waba_id",
+            unique=True,
+            postgresql_where=text("waba_id IS NOT NULL"),
+        ),
+    )
 
     # ── Ownership ────────────────────────────────────────────────────────
     business_id: Mapped[uuid.UUID] = mapped_column(

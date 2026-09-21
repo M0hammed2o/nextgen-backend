@@ -22,6 +22,7 @@ from fastapi import APIRouter, Depends, Header, Query, Request, Response, status
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy import update as sa_update
+from sqlalchemy.exc import MultipleResultsFound
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.config import get_settings
@@ -102,7 +103,26 @@ async def _handle_account_update_event(db: AsyncSession, value: dict) -> None:
         result = await db.execute(
             select(WhatsAppConnection).where(WhatsAppConnection.waba_id == waba_id)
         )
-        connection = result.scalar_one_or_none()
+        try:
+            connection = result.scalar_one_or_none()
+        except MultipleResultsFound:
+            # Should be impossible after migration 0037's partial UNIQUE
+            # index on waba_id, but never silently drop the event if it
+            # somehow happens (e.g. against a DB not yet migrated) — log
+            # loudly with the waba_id and every matching connection id
+            # rather than letting the broad except below swallow it as a
+            # generic, unidentifiable error.
+            dup_ids = (
+                await db.execute(
+                    select(WhatsAppConnection.id).where(WhatsAppConnection.waba_id == waba_id)
+                )
+            ).scalars().all()
+            logger.error(
+                "WEBHOOK_ACCOUNT_EVENT_DUPLICATE_WABA: waba_id=%s event=%s matches "
+                "multiple connections=%s — refusing to guess which one.",
+                waba_id, event, dup_ids,
+            )
+            return
         if connection is None:
             logger.info("WEBHOOK_ACCOUNT_EVENT_NO_CONNECTION: event=%s waba_id=%s", event, waba_id)
             return
