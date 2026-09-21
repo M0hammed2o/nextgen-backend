@@ -20,6 +20,7 @@ The worker wrapper provides the DB session; the pipeline handles everything else
 """
 
 import logging
+import uuid
 from datetime import datetime, timedelta, timezone
 
 from arq import cron
@@ -170,7 +171,11 @@ async def cancel_stale_delivery_fee_orders(ctx: dict) -> None:
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=DELIVERY_FEE_TIMEOUT_MINUTES)
 
     # Collect notification data before committing so we can send outside the session.
-    notifications: list[tuple[str, str, str]] = []  # (phone_number_id, wa_id, order_number)
+    # business_id is carried through so each notification is sent using a
+    # short-lived session that resolves THIS business's own WhatsApp
+    # connection (see token_resolver.py) instead of unconditionally using
+    # the platform token — F6 fix, Wave 0A verifier.
+    notifications: list[tuple[str, str, str, uuid.UUID]] = []  # (phone_number_id, wa_id, order_number, business_id)
 
     async with ctx["session_factory"]() as db:
         try:
@@ -233,7 +238,7 @@ async def cancel_stale_delivery_fee_orders(ctx: dict) -> None:
                 )
 
                 if wa_id and phone_number_id:
-                    notifications.append((phone_number_id, wa_id, order.order_number))
+                    notifications.append((phone_number_id, wa_id, order.order_number, order.business_id))
 
             await db.commit()
 
@@ -242,19 +247,28 @@ async def cancel_stale_delivery_fee_orders(ctx: dict) -> None:
             logger.exception("Delivery fee timeout job failed — rolled back.")
             return
 
-    # Send notifications after the session is closed — fire-and-forget.
-    # send_notification_message is a direct Meta API call with no DB dependency.
-    for phone_number_id, wa_id, order_number in notifications:
+    # Send notifications after the main session is closed — fire-and-forget —
+    # but each send opens its own short-lived session (read-only: it only
+    # loads the Business row) so send_notification_message can resolve THIS
+    # business's own WhatsApp connection (token_resolver.py) rather than
+    # always falling back to the platform token, which fails for every
+    # business on a customer-owned number (F6 fix, Wave 0A verifier). This
+    # does NOT reopen or extend the job's own write transaction above.
+    for phone_number_id, wa_id, order_number, business_id in notifications:
         try:
-            await send_notification_message(
-                phone_number_id=phone_number_id,
-                recipient_wa_id=wa_id,
-                text=(
-                    f"❌ Sorry, your order *{order_number}* has been cancelled.\n"
-                    f"We were unable to confirm the delivery fee in time. "
-                    f"Please place a new order or contact us directly. 🙏"
-                ),
-            )
+            async with ctx["session_factory"]() as ndb:
+                business = await ndb.get(Business, business_id)
+                await send_notification_message(
+                    phone_number_id=phone_number_id,
+                    recipient_wa_id=wa_id,
+                    text=(
+                        f"❌ Sorry, your order *{order_number}* has been cancelled.\n"
+                        f"We were unable to confirm the delivery fee in time. "
+                        f"Please place a new order or contact us directly. 🙏"
+                    ),
+                    db=ndb,
+                    business=business,
+                )
             logger.info(
                 "Timeout notification sent: order=%s, wa_id=%s", order_number, wa_id
             )
@@ -282,7 +296,7 @@ async def cancel_unpaid_orders(ctx: dict) -> None:
     from sqlalchemy import and_, or_, outerjoin
     from sqlalchemy.orm import aliased
 
-    notifications: list[tuple[str, str, str]] = []  # (phone_number_id, wa_id, order_number)
+    notifications: list[tuple[str, str, str, uuid.UUID]] = []  # (phone_number_id, wa_id, order_number, business_id)
 
     async with ctx["session_factory"]() as db:
         try:
@@ -353,7 +367,7 @@ async def cancel_unpaid_orders(ctx: dict) -> None:
                     previous_status=old_status,
                 )
                 if wa_id and phone_number_id:
-                    notifications.append((phone_number_id, wa_id, order.order_number))
+                    notifications.append((phone_number_id, wa_id, order.order_number, order.business_id))
 
             await db.commit()
 
@@ -362,7 +376,12 @@ async def cancel_unpaid_orders(ctx: dict) -> None:
             logger.exception("Payment timeout job failed — rolled back.")
             return
 
-    for phone_number_id, wa_id, order_number in notifications:
+    # Each send opens its own short-lived (read-only) session so
+    # send_notification_message can resolve this business's own WhatsApp
+    # connection instead of always using the platform token — F6 fix, Wave
+    # 0A verifier. See cancel_stale_delivery_fee_orders above for the same
+    # pattern/rationale.
+    for phone_number_id, wa_id, order_number, business_id in notifications:
         try:
             from backend.app.payments.messages import build_payment_timeout_message
 
@@ -370,11 +389,15 @@ async def cancel_unpaid_orders(ctx: dict) -> None:
                 pass
             fake = _FakeOrder()
             fake.order_number = order_number
-            await send_notification_message(
-                phone_number_id=phone_number_id,
-                recipient_wa_id=wa_id,
-                text=build_payment_timeout_message(fake),
-            )
+            async with ctx["session_factory"]() as ndb:
+                business = await ndb.get(Business, business_id)
+                await send_notification_message(
+                    phone_number_id=phone_number_id,
+                    recipient_wa_id=wa_id,
+                    text=build_payment_timeout_message(fake),
+                    db=ndb,
+                    business=business,
+                )
             logger.info("Payment timeout notification sent: order=%s", order_number)
         except Exception:
             logger.exception(

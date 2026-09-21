@@ -31,6 +31,7 @@ from backend.app.worker import (
     process_whatsapp_message,
     run_outbox_batch,
 )
+from shared.models.business import Business
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -270,6 +271,14 @@ class TestCancelStaleDeliveryFeeOrders:
         assert call_kwargs.kwargs["recipient_wa_id"] == "27831234567"
         assert call_kwargs.kwargs["phone_number_id"] == "111222333"
         assert "NG-042" in call_kwargs.kwargs["text"]
+        # F6 fix (Wave 0A verifier): db + business must be passed so
+        # send_notification_message resolves this business's own WhatsApp
+        # connection (token_resolver.py) instead of always using the
+        # platform token — see cancel_stale_delivery_fee_orders's own
+        # short-lived-session-per-send comment.
+        assert call_kwargs.kwargs["db"] is not None
+        assert call_kwargs.kwargs["business"] is not None
+        mock_db.get.assert_any_call(Business, stale.business_id)
 
     async def test_no_notification_when_wa_id_missing(self):
         """
@@ -296,6 +305,55 @@ class TestCancelStaleDeliveryFeeOrders:
 
         mock_notify.assert_not_called()
         mock_db.commit.assert_called_once()
+
+
+# ── cancel_unpaid_orders ──────────────────────────────────────────────────────
+
+class TestCancelUnpaidOrdersNotifications:
+    """
+    F6 fix (Wave 0A verifier): cancel_unpaid_orders' payment-timeout
+    notification had the exact same gap as cancel_stale_delivery_fee_orders
+    (no db/business passed) — same fix, same short-lived-session pattern.
+    """
+
+    def _make_unpaid_order(self) -> MagicMock:
+        order = MagicMock()
+        order.id = uuid.uuid4()
+        order.business_id = uuid.uuid4()
+        order.customer_id = uuid.uuid4()
+        order.order_number = "NG-900"
+        order.status = "NEW"
+        order.payment_status = "UNPAID"
+        order.created_at = datetime.now(timezone.utc) - timedelta(minutes=60)
+        return order
+
+    async def test_notification_passes_db_and_business(self):
+        from backend.app.worker import DEFAULT_PAYMENT_TIMEOUT_MINUTES, cancel_unpaid_orders
+
+        order = self._make_unpaid_order()
+        mock_db = AsyncMock()
+
+        rows_result = MagicMock()
+        rows_result.all.return_value = [
+            (order, "27831234567", "111222333", DEFAULT_PAYMENT_TIMEOUT_MINUTES, False)
+        ]
+        mock_db.execute = AsyncMock(return_value=rows_result)
+        mock_db.add = MagicMock()
+
+        ctx = _make_ctx(mock_db)
+
+        with patch(
+            "backend.app.worker.send_notification_message", new_callable=AsyncMock
+        ) as mock_notify:
+            await cancel_unpaid_orders(ctx)
+
+        mock_notify.assert_called_once()
+        call_kwargs = mock_notify.call_args
+        assert call_kwargs.kwargs["recipient_wa_id"] == "27831234567"
+        assert call_kwargs.kwargs["phone_number_id"] == "111222333"
+        assert call_kwargs.kwargs["db"] is not None
+        assert call_kwargs.kwargs["business"] is not None
+        mock_db.get.assert_any_call(Business, order.business_id)
 
 
 # ── WorkerSettings ────────────────────────────────────────────────────────────
