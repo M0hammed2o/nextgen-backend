@@ -111,6 +111,13 @@ class Settings(BaseSettings):
     # Empty = credentials stored as-is (development only; production startup
     # validation requires this to be set).
     CREDENTIALS_ENCRYPTION_KEY: str = ""
+    # Optional comma-separated list of PREVIOUSLY-used Fernet keys — decrypt
+    # only, never used to encrypt new values. Set this to the old primary key
+    # when rotating CREDENTIALS_ENCRYPTION_KEY so already-encrypted rows
+    # (payment credentials, and — Wave 0A/Milestone C — per-business WhatsApp
+    # tokens on whatsapp_connections) keep decrypting. See
+    # backend/app/core/crypto.py module docstring for the rotation model.
+    CREDENTIALS_ENCRYPTION_KEYS_OLD: str = ""
 
     # ── Meta / WhatsApp (Model 1: single WABA, platform token) ───────────
     META_API_BASE_URL: str = "https://graph.facebook.com"
@@ -119,6 +126,16 @@ class Settings(BaseSettings):
     META_APP_SECRET: str = "CHANGE-ME"
     WHATSAPP_DEFAULT_ACCESS_TOKEN: str = "CHANGE-ME"
     WHATSAPP_WEBHOOK_PATH: str = "/v1/webhook/meta"
+
+    # ── Meta / WhatsApp Embedded Signup (Wave 0A / Milestone C /
+    #    DECISION-0022: customer-owned WhatsApp, additive to Model 1 above) ──
+    # Both OPTIONAL — when either is unset, GET /business/whatsapp/connection/config
+    # reports {"available": false, ...} rather than crashing boot. Public
+    # identifiers only (safe to send to the frontend to launch FB.login);
+    # the actual secret exchanged for a token is META_APP_SECRET above,
+    # which never leaves the backend.
+    META_APP_ID: str = ""
+    META_ES_CONFIG_ID: str = ""
 
     # ── SaaS billing provider selection ──────────────────────────────────
     # Which BillingProvider (backend/app/billing/provider_base.py) actively
