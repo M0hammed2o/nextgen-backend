@@ -251,7 +251,13 @@ class StitchProvider(PaymentProvider):
         # completeness, though see refund_payment: it can't actually be used
         # to reverse an instant bank-to-bank payment via this API.
         reference = data.get("id")
-        return {"paid": paid, "order_id": order_id, "reference": reference}
+        # KNOWN GAP (documented, not silently skipped — see KNOWN_BUGS.md):
+        # the Stitch payment_initiation_request.complete event shape this
+        # integration was implemented against does not carry the paid amount,
+        # so it cannot be verified against order.total_cents here. Confirm
+        # against Stitch's current event schema (a live account was not
+        # available this session) before assuming this is a permanent gap.
+        return {"paid": paid, "order_id": order_id, "reference": reference, "amount_cents": None, "currency": None}
 
     async def refund_payment(self, order, business, amount_cents: int) -> RefundResult:
         """

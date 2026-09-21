@@ -34,12 +34,48 @@ router = APIRouter(prefix="/payments/webhooks", tags=["payment-webhooks"])
 
 # ── Shared helper ─────────────────────────────────────────────────────────────
 
+def _amount_currency_ok(
+    order: Order, amount_cents: int | None, currency: str | None, provider_name: str,
+) -> bool:
+    """
+    Verify a provider-reported paid amount/currency against the order before
+    it's trusted. No partial-payment flow exists anywhere in this platform —
+    any mismatch means the payment must NOT be marked PAID.
+
+    Both amount_cents and currency are optional: not every provider's
+    webhook payload actually carries them (see the KNOWN GAP comments in
+    backend/app/payments/ikhoka.py and stitch.py) — when a provider
+    genuinely doesn't send one, that check is skipped rather than invented,
+    which is a real, disclosed limitation, not silently ignored.
+    """
+    if amount_cents is not None:
+        if int(amount_cents) != int(order.total_cents):
+            logger.warning(
+                "%s webhook: AMOUNT MISMATCH for order %s — expected %d cents, provider reported %d cents. "
+                "NOT marking paid.",
+                provider_name, order.order_number, order.total_cents, amount_cents,
+            )
+            return False
+    if currency:
+        expected_currency = (order.currency or "ZAR").upper()
+        if str(currency).upper() != expected_currency:
+            logger.warning(
+                "%s webhook: CURRENCY MISMATCH for order %s — expected %s, provider reported %s. "
+                "NOT marking paid.",
+                provider_name, order.order_number, expected_currency, str(currency).upper(),
+            )
+            return False
+    return True
+
+
 async def _mark_order_paid(
     db: AsyncSession,
     order_id_str: str,
     business_id: uuid.UUID,
     provider_name: str,
     provider_reference: str | None = None,
+    amount_cents: int | None = None,
+    currency: str | None = None,
 ) -> None:
     """
     Mark an order PAID and send WhatsApp confirmation.
@@ -50,6 +86,12 @@ async def _mark_order_paid(
     so a later refund_payment() call has something real to target — without
     this, a refund could only ever act on our own order UUID, which none of
     these providers' refund APIs accept.
+
+    amount_cents/currency (when the provider's payload actually carries
+    them — see _amount_currency_ok) are verified against the order BEFORE
+    it is marked paid, so a provider confirming payment for the wrong amount
+    (e.g. a stale/reused payment link after the order total changed) cannot
+    silently mark the order paid.
     """
     try:
         parsed_id = uuid.UUID(str(order_id_str))
@@ -67,6 +109,9 @@ async def _mark_order_paid(
 
     if order.payment_status == "PAID":
         logger.info("%s webhook: order %s already PAID — skipping", provider_name, parsed_id)
+        return
+
+    if not _amount_currency_ok(order, amount_cents, currency, provider_name):
         return
 
     was_unpaid = order.payment_status in ("UNPAID", "PENDING")
@@ -161,7 +206,10 @@ async def yoco_webhook(
     result = await provider.handle_webhook(payload)
 
     if result.get("paid") and result.get("order_id"):
-        await _mark_order_paid(db, result["order_id"], business_id, "Yoco", result.get("reference"))
+        await _mark_order_paid(
+            db, result["order_id"], business_id, "Yoco", result.get("reference"),
+            amount_cents=result.get("amount_cents"), currency=result.get("currency"),
+        )
 
     return {"received": True}
 
@@ -205,7 +253,10 @@ async def payfast_webhook(
     result = await provider.handle_webhook(params)
 
     if result.get("paid") and result.get("order_id"):
-        await _mark_order_paid(db, result["order_id"], business_id, "PayFast", result.get("reference"))
+        await _mark_order_paid(
+            db, result["order_id"], business_id, "PayFast", result.get("reference"),
+            amount_cents=result.get("amount_cents"), currency=result.get("currency"),
+        )
 
     # PayFast expects a 200 OK with no body
     return {"received": True}
@@ -253,7 +304,14 @@ async def ikhoka_webhook(
     result = await provider.handle_webhook(payload)
 
     if result.get("paid") and result.get("order_id"):
-        await _mark_order_paid(db, result["order_id"], business_id, "iKhoka", result.get("reference"))
+        # KNOWN GAP: iKhoka's callback payload carries no amount/currency —
+        # see backend/app/payments/ikhoka.py's handle_webhook docstring.
+        # amount_cents/currency will be None here; _mark_order_paid skips
+        # that check rather than inventing a value to compare against.
+        await _mark_order_paid(
+            db, result["order_id"], business_id, "iKhoka", result.get("reference"),
+            amount_cents=result.get("amount_cents"), currency=result.get("currency"),
+        )
 
     return {"received": True}
 
@@ -296,6 +354,12 @@ async def stitch_webhook(
     result = await provider.handle_webhook(payload)
 
     if result.get("paid") and result.get("order_id"):
-        await _mark_order_paid(db, result["order_id"], business_id, "Stitch", result.get("reference"))
+        # KNOWN GAP: Stitch's payment_initiation_request.complete payload as
+        # implemented here carries no amount — see
+        # backend/app/payments/stitch.py's handle_webhook docstring.
+        await _mark_order_paid(
+            db, result["order_id"], business_id, "Stitch", result.get("reference"),
+            amount_cents=result.get("amount_cents"), currency=result.get("currency"),
+        )
 
     return {"received": True}

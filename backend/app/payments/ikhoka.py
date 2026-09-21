@@ -150,7 +150,13 @@ class IKhokaProvider(PaymentProvider):
         # paylinkID is iKhoka's own transaction reference — captured so a
         # later refund can target the real provider transaction.
         reference = payload.get("paylinkID")
-        return {"paid": paid, "order_id": order_id, "reference": reference}
+        # KNOWN GAP (documented, not silently skipped — see KNOWN_BUGS.md):
+        # iKhoka's payment-link callback does not include the paid amount or
+        # currency at all — only paylinkID/status/externalTransactionID/
+        # responseCode. There is nothing here to verify against order.total_cents,
+        # so amount/currency validation is not possible for this provider
+        # without a follow-up call to iKhoka's payment-status API.
+        return {"paid": paid, "order_id": order_id, "reference": reference, "amount_cents": None, "currency": None}
 
     async def refund_payment(self, order, business, amount_cents: int) -> RefundResult:
         """

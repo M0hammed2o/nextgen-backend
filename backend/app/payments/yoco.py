@@ -113,7 +113,21 @@ class YocoProvider(PaymentProvider):
         # so a later refund can reference the actual provider transaction,
         # not just our own order UUID.
         reference = inner.get("id")
-        return {"paid": paid, "order_id": order_id, "reference": reference}
+        # Yoco's checkout/payment resource carries amount (integer cents,
+        # matching what create_payment_link sends) and currency directly on
+        # the same object this webhook reports — used by the caller to
+        # verify the paid amount actually matches the order before marking
+        # it PAID. Best-effort: not present on every Yoco event type, so a
+        # missing value here means "could not verify," not "verified zero."
+        amount_cents = inner.get("amount")
+        currency = inner.get("currency")
+        return {
+            "paid": paid,
+            "order_id": order_id,
+            "reference": reference,
+            "amount_cents": amount_cents if isinstance(amount_cents, int) else None,
+            "currency": currency,
+        }
 
     async def refund_payment(self, order, business, amount_cents: int) -> RefundResult:
         """
