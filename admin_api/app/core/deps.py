@@ -125,3 +125,31 @@ async def get_business_scoped(business_id: uuid.UUID, admin: AuthUser, db: Async
             raise NotFoundError("Business", str(business_id))
 
     return biz
+
+
+async def get_business_commercial_scoped(business_id: uuid.UUID, admin: AuthUser, db: AsyncSession) -> Business:
+    """
+    The COMMERCIAL counterpart of `get_business_scoped` above — deliberately
+    a second, separate helper rather than a parameter bolted onto the first,
+    so the two scopes can never be silently merged or weakened into each
+    other (see this task's design note and DECISIONS.md DOC NOTE).
+
+    Used by every trial/invoice/commercial-status/dashboard route. SUPER_ADMIN:
+    unrestricted, same as get_business_scoped. ONBOARDER: only a business they
+    personally created (`onboarded_by_admin_id == admin.user_id`) — but,
+    UNLIKE get_business_scoped, access does NOT end at
+    `onboarding_completed_at`. A sales partner must keep starting/extending
+    trials, issuing invoices and recording payments for their own clients
+    after go-live/handover; only the CONFIGURATION routes gated by
+    get_business_scoped lose access at that point. Same non-revealing 404
+    (never 403) for out-of-scope access.
+    """
+    biz = await db.get(Business, business_id)
+    if not biz:
+        raise NotFoundError("Business", str(business_id))
+
+    if admin.role == AdminRole.ONBOARDER:
+        if biz.onboarded_by_admin_id != admin.user_id:
+            raise NotFoundError("Business", str(business_id))
+
+    return biz

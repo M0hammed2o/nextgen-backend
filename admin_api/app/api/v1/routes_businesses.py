@@ -20,9 +20,15 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from admin_api.app.core.deps import get_business_scoped, require_onboarding_role, require_super_admin
+from admin_api.app.core.deps import (
+    get_business_commercial_scoped,
+    get_business_scoped,
+    require_onboarding_role,
+    require_super_admin,
+)
 from admin_api.app.services.onboarding import GoLiveResult, compute_go_live_checks
 from backend.app.api.v1.routes_setup import SetupProgress, compute_setup_progress
+from backend.app.billing.trials import extend_trial, start_trial
 from backend.app.core.errors import AppError, DuplicateError, NotFoundError
 from backend.app.core.rbac import AuthUser
 from backend.app.core.security import hash_password
@@ -79,6 +85,12 @@ class BusinessCreate(BaseModel):
     # must set a real one via POST /auth/set-password before they can log in.
     owner_email: EmailStr | None = None
     owner_full_name: str | None = Field(default=None, max_length=255)
+    start_trial: bool = Field(
+        default=True,
+        description="Start a commercial trial (TRIAL_DEFAULT_DAYS, config) immediately. "
+                     "When false, the business is created as ACTIVE with no trial — for "
+                     "a client invoiced/paying from day one with no trial period.",
+    )
 
 
 class BusinessUpdate(BaseModel):
@@ -338,12 +350,21 @@ async def create_business(
         raise AppError("CODE_GENERATION_FAILED", "Could not generate unique business code", 500)
 
     # Create business
-    biz_data = body.model_dump(exclude={"owner_email", "owner_full_name", "slug"})
+    biz_data = body.model_dump(exclude={"owner_email", "owner_full_name", "slug", "start_trial"})
     biz = Business(
         business_code=code, slug=body_slug,
         onboarded_by_admin_id=user.user_id if user.role == AdminRole.ONBOARDER else None,
         **biz_data,
     )
+    if body.start_trial:
+        start_trial(biz)
+    else:
+        # No trial period — e.g. a client already invoiced/paying from day
+        # one. Explicit ACTIVE rather than leaving the model's default
+        # billing_status="TRIAL" with no trial_ends_at set, which would
+        # otherwise read as an immediately-EXPIRED trial via
+        # compute_account_status (see backend/app/billing/account_status.py).
+        biz.billing_status = "ACTIVE"
     db.add(biz)
     await db.flush()  # Get biz.id before creating user
 
@@ -899,6 +920,153 @@ async def complete_onboarding(
         forced=bool(body.force and not go_live.ready),
         deactivated_onboarding_accounts=len(onboarding_accounts),
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# NEW: Wave 0A — trial start/extend, manual go-live confirmations
+#
+# All three routes use get_business_commercial_scoped, NOT get_business_scoped
+# — a sales partner keeps managing trials/payments for their own clients
+# after handover (onboarding_completed_at set); only the CONFIGURATION
+# routes above (which use get_business_scoped) lose ONBOARDER access then.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TrialStartResponse(BaseModel):
+    business_id: uuid.UUID
+    billing_status: str
+    trial_started_at: datetime | None
+    trial_ends_at: datetime | None
+
+
+@router.post(
+    "/{business_id}/trial/start",
+    response_model=TrialStartResponse,
+    summary="Start (or restart) a commercial trial for an existing business",
+)
+async def start_business_trial(
+    business_id: uuid.UUID,
+    user: AuthUser = Depends(require_onboarding_role),
+    db: AsyncSession = Depends(get_db),
+):
+    biz = await get_business_commercial_scoped(business_id, user, db)
+    start_trial(biz)
+    db.add(AuditEvent(
+        scope=AuditScope.PLATFORM.value,
+        business_id=biz.id,
+        actor_user_id=user.user_id,
+        action="admin.business.trial_started",
+        target_type="business",
+        target_id=biz.id,
+        diff_json={"trial_ends_at": biz.trial_ends_at.isoformat() if biz.trial_ends_at else None},
+    ))
+    await db.commit()
+    await db.refresh(biz)
+    return TrialStartResponse(
+        business_id=biz.id, billing_status=biz.billing_status,
+        trial_started_at=biz.trial_started_at, trial_ends_at=biz.trial_ends_at,
+    )
+
+
+class TrialExtendRequest(BaseModel):
+    days: int = Field(gt=0, le=365)
+    reason: str = Field(min_length=1, max_length=512)
+
+
+class TrialExtendResponse(BaseModel):
+    business_id: uuid.UUID
+    billing_status: str
+    trial_ends_at: datetime | None
+    trial_extension_days_total: int
+
+
+@router.post(
+    "/{business_id}/trial/extend",
+    response_model=TrialExtendResponse,
+    summary="Extend a business's trial (ONBOARDER capped, SUPER_ADMIN unlimited)",
+)
+async def extend_business_trial(
+    business_id: uuid.UUID,
+    body: TrialExtendRequest,
+    user: AuthUser = Depends(require_onboarding_role),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Extending an already-EXPIRED trial reactivates it (its derived status
+    reads TRIAL again the moment trial_ends_at moves back into the future)
+    and, if the hourly cron had already suspended it for TRIAL_EXPIRED,
+    unsuspends it too — see backend/app/billing/trials.py::extend_trial.
+    """
+    biz = await get_business_commercial_scoped(business_id, user, db)
+    extend_trial(biz, body.days, is_onboarder=(user.role == AdminRole.ONBOARDER))
+    db.add(AuditEvent(
+        scope=AuditScope.PLATFORM.value,
+        business_id=biz.id,
+        actor_user_id=user.user_id,
+        action="admin.business.trial_extended",
+        target_type="business",
+        target_id=biz.id,
+        diff_json={
+            "days": body.days, "reason": body.reason,
+            "new_trial_ends_at": biz.trial_ends_at.isoformat() if biz.trial_ends_at else None,
+            "trial_extension_days_total": biz.trial_extension_days_total,
+        },
+    ))
+    await db.commit()
+    await db.refresh(biz)
+    return TrialExtendResponse(
+        business_id=biz.id, billing_status=biz.billing_status,
+        trial_ends_at=biz.trial_ends_at, trial_extension_days_total=biz.trial_extension_days_total,
+    )
+
+
+class OnboardingConfirmRequest(BaseModel):
+    item: str = Field(pattern=r"^(modules|receipt_print|whatsapp_test)$")
+    note: str | None = Field(default=None, max_length=512)
+
+
+class OnboardingConfirmResponse(BaseModel):
+    business_id: uuid.UUID
+    onboarding_confirmations: dict
+
+
+@router.post(
+    "/{business_id}/onboarding/confirm",
+    response_model=OnboardingConfirmResponse,
+    summary="Manually confirm a go-live item the system cannot observe automatically",
+)
+async def confirm_onboarding_item(
+    business_id: uuid.UUID,
+    body: OnboardingConfirmRequest,
+    user: AuthUser = Depends(require_onboarding_role),
+    db: AsyncSession = Depends(get_db),
+):
+    """Uses get_business_commercial_scoped (not get_business_scoped) — same
+    "keeps commercial access after handover" rule as trial start/extend,
+    since a sales partner may still need to confirm a go-live item shortly
+    after handover completes."""
+    biz = await get_business_commercial_scoped(business_id, user, db)
+
+    now = datetime.now(timezone.utc)
+    confirmations = dict(biz.onboarding_confirmations or {})
+    confirmations[body.item] = {
+        "confirmed_by": user.user_id.hex if hasattr(user.user_id, "hex") else str(user.user_id),
+        "confirmed_at": now.isoformat(),
+        "note": body.note,
+    }
+    biz.onboarding_confirmations = confirmations  # reassign — JSONB mutation must be a new object to be tracked
+
+    db.add(AuditEvent(
+        scope=AuditScope.PLATFORM.value,
+        business_id=biz.id,
+        actor_user_id=user.user_id,
+        action="admin.business.onboarding_item_confirmed",
+        target_type="business",
+        target_id=biz.id,
+        diff_json={"item": body.item, "note": body.note},
+    ))
+    await db.commit()
+    await db.refresh(biz)
+    return OnboardingConfirmResponse(business_id=biz.id, onboarding_confirmations=biz.onboarding_confirmations)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

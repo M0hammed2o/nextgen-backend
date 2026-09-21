@@ -26,6 +26,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from shared.enums import OrderSource
+from shared.models.audit import MessageOutbox
 from shared.models.business import Business
 from shared.models.inventory import Ingredient
 from shared.models.menu import MenuCategory, MenuItem
@@ -48,12 +49,20 @@ class GoLiveCheck(BaseModel):
     detail: str
 
 
+class ReadinessSummary(BaseModel):
+    passed: int
+    total: int
+    percent: int
+    label: str
+
+
 class GoLiveResult(BaseModel):
     ready: bool
     passed: int
     failed: int
     warned: int
     checks: list[GoLiveCheck]
+    readiness: ReadinessSummary
 
 
 async def compute_go_live_checks(db: AsyncSession, business: Business) -> GoLiveResult:
@@ -255,9 +264,111 @@ async def compute_go_live_checks(db: AsyncSession, business: Business) -> GoLive
         detail=f"Billing status is {business.billing_status}",
     ))
 
+    # ── Restaurant details (Wave 0A commercial push) ────────────────────────
+    details_ok = bool(business.name) and bool(business.address or business.phone)
+    checks.append(GoLiveCheck(
+        key="restaurant_details", label="Restaurant details",
+        status=STATUS_PASS if details_ok else STATUS_FAIL,
+        detail="Name and at least one of address/phone are recorded" if details_ok
+               else "Missing a restaurant name and/or both address and phone",
+    ))
+
+    # ── Manual confirmations the system cannot observe automatically ───────
+    confirmations = business.onboarding_confirmations or {}
+    modules_confirmed = "modules" in confirmations
+    checks.append(GoLiveCheck(
+        key="modules_confirmed", label="Purchased modules confirmed",
+        status=STATUS_PASS if modules_confirmed else STATUS_FAIL,
+        detail=(
+            f"Confirmed by {confirmations['modules'].get('confirmed_by', 'an admin')} "
+            f"on {confirmations['modules'].get('confirmed_at', 'unknown date')}"
+        ) if modules_confirmed else
+        "No admin has confirmed which modules this client purchased yet — "
+        "the system cannot infer this, see POST .../onboarding/confirm",
+    ))
+
+    # ── Receipt test: a real receipt renders AND a human confirmed the ─────
+    # physical print (the print itself happens in a browser — invisible to
+    # the server — so this check is deliberately BOTH a real-data check
+    # (pos_test_order, above) AND a manual confirmation, not either alone.
+    receipt_print_confirmed = "receipt_print" in confirmations
+    receipt_renders = any(c.key == "pos_test_order" and c.status == STATUS_PASS for c in checks)
+    if receipt_renders and receipt_print_confirmed:
+        checks.append(GoLiveCheck(
+            key="receipt_test", label="Receipt print test",
+            status=STATUS_PASS,
+            detail="A receipt renders correctly and a human confirmed the physical print",
+        ))
+    elif receipt_renders:
+        checks.append(GoLiveCheck(
+            key="receipt_test", label="Receipt print test",
+            status=STATUS_WARN,
+            detail="A receipt renders correctly, but no one has confirmed the physical print test",
+        ))
+    else:
+        checks.append(GoLiveCheck(
+            key="receipt_test", label="Receipt print test",
+            status=STATUS_FAIL, detail="No receipt has been built from a real POS order yet",
+        ))
+
+    # ── Cashup test: at least one CLOSED till session (distinct from the ───
+    # existing till_session check above, which only requires one ever opened)
+    closed_till_count = int((await db.execute(
+        select(func.count()).select_from(TillSession).where(
+            TillSession.business_id == business_id, TillSession.status == "CLOSED",
+        )
+    )).scalar() or 0)
+    checks.append(GoLiveCheck(
+        key="cashup_test", label="Cash-up test",
+        status=STATUS_PASS if closed_till_count else STATUS_FAIL,
+        detail=f"{closed_till_count} closed till session(s)" if closed_till_count
+               else "No till session has been closed (cashed up) yet",
+    ))
+
+    # ── WhatsApp test: a real outbound message reached SENT, or a human ────
+    # confirmed a manual test send (the test-send endpoint has no DB
+    # persistence, see routes_businesses.py::send_whatsapp_test, so a
+    # confirmation is the only server-observable record of it happening).
+    if business.is_whatsapp_enabled:
+        whatsapp_confirmed = "whatsapp_test" in confirmations
+        sent_message_count = int((await db.execute(
+            select(func.count()).select_from(MessageOutbox).where(
+                MessageOutbox.business_id == business_id, MessageOutbox.status == "SENT",
+            )
+        )).scalar() or 0)
+        whatsapp_ok = whatsapp_confirmed or sent_message_count > 0
+        checks.append(GoLiveCheck(
+            key="whatsapp_test", label="WhatsApp test message",
+            status=STATUS_PASS if whatsapp_ok else STATUS_FAIL,
+            detail=(
+                f"{sent_message_count} outbound message(s) reached SENT" if sent_message_count
+                else "Confirmed by an admin" if whatsapp_confirmed
+                else "No outbound WhatsApp message has been sent yet, and no test-send has been confirmed"
+            ),
+        ))
+    else:
+        checks.append(GoLiveCheck(
+            key="whatsapp_test", label="WhatsApp test message",
+            status=STATUS_NA, detail="WhatsApp is off for this business",
+        ))
+
+    # ── Payment methods — already covered by pos_payment_method above; not ──
+    # duplicated here (see this function's module docstring / task DOC NOTE).
+
     passed = sum(1 for c in checks if c.status == STATUS_PASS)
     failed = sum(1 for c in checks if c.status == STATUS_FAIL)
     warned = sum(1 for c in checks if c.status == STATUS_WARN)
     ready = failed == 0 and all(c.status in (STATUS_PASS, STATUS_WARN, STATUS_NA) for c in checks)
 
-    return GoLiveResult(ready=ready, passed=passed, failed=failed, warned=warned, checks=checks)
+    applicable = [c for c in checks if c.status != STATUS_NA]
+    readiness_total = len(applicable)
+    readiness_passed = sum(1 for c in applicable if c.status == STATUS_PASS)
+    readiness_percent = round(100 * readiness_passed / readiness_total) if readiness_total else 100
+    readiness = ReadinessSummary(
+        passed=readiness_passed, total=readiness_total, percent=readiness_percent,
+        label=f"Restaurant Ready — {readiness_passed}/{readiness_total} checks complete",
+    )
+
+    return GoLiveResult(
+        ready=ready, passed=passed, failed=failed, warned=warned, checks=checks, readiness=readiness,
+    )

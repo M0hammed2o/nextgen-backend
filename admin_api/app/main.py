@@ -106,12 +106,14 @@ from admin_api.app.api.v1.routes_admin_users import router as admin_admin_users_
 from admin_api.app.api.v1.routes_ai_emails import router as admin_ai_emails_router
 from admin_api.app.api.v1.routes_auth import router as admin_auth_router
 from admin_api.app.api.v1.routes_businesses import router as admin_biz_router
+from admin_api.app.api.v1.routes_commercial import router as admin_commercial_router
 from admin_api.app.api.v1.routes_usage import router as admin_usage_router
 
 PREFIX = settings.API_V1_PREFIX  # e.g. "/v1/admin"
 
 app.include_router(admin_auth_router, prefix=PREFIX)
 app.include_router(admin_biz_router, prefix=PREFIX)
+app.include_router(admin_commercial_router, prefix=PREFIX)
 app.include_router(admin_usage_router, prefix=PREFIX)
 app.include_router(admin_ai_emails_router, prefix=PREFIX)
 app.include_router(admin_admin_users_router, prefix=PREFIX)
