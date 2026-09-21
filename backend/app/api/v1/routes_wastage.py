@@ -51,6 +51,25 @@ _MOVEMENT_TYPE_FOR_REASON = {
 _REASON_PATTERN = "^(" + "|".join(r.value for r in WastageReason) + ")$"
 
 
+async def _require_inventory_enabled(db: AsyncSession, business_id: uuid.UUID) -> None:
+    """
+    Same entitlement gate record_wastage already applies inline — factored
+    out here only for the two routes below that were missing it (list and
+    approve), without touching record_wastage's own body.
+    """
+    business = (
+        await db.execute(select(Business).where(Business.id == business_id))
+    ).scalar_one_or_none()
+    if not business:
+        raise NotFoundError("Business")
+    if not business.inventory_enabled:
+        raise AppError(
+            "INVENTORY_NOT_ENABLED",
+            "The inventory module is not enabled for this business",
+            409,
+        )
+
+
 class WastageCreateRequest(BaseModel):
     ingredient_id: uuid.UUID
     quantity: str = Field(description="Positive magnitude wasted")
@@ -239,6 +258,7 @@ async def list_wastage(
     db: AsyncSession = Depends(get_db),
 ):
     """Recent wastage, newest first."""
+    await _require_inventory_enabled(db, user.business_id)
     stmt = (
         select(WastageEntry, Ingredient)
         .join(Ingredient, Ingredient.id == WastageEntry.ingredient_id)
@@ -284,6 +304,7 @@ async def approve_wastage(
     recorded when it happened. Approval is a control record, not a second
     deduction; treating it as one would double-count the loss.
     """
+    await _require_inventory_enabled(db, user.business_id)
     row = (
         await db.execute(
             select(WastageEntry, Ingredient)

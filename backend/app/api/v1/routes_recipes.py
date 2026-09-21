@@ -9,6 +9,7 @@ corrupts a variance report.
 """
 
 import uuid
+from decimal import Decimal, ROUND_HALF_UP
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
@@ -105,17 +106,33 @@ class RecipeResponse(BaseModel):
     max_food_cost_cents: int
 
 
+def _per_portion_quantity_milli(quantity_milli: int, yield_qty: int) -> int:
+    """
+    Recipe lines are stored per BATCH (e.g. one dough batch yields 4 pizzas),
+    so cost must scale down by yield exactly the way a sale's consumption
+    does (backend/app/inventory/consumption.py's _scale at multiplier=1) —
+    otherwise a batch recipe's displayed cost is N times what one portion
+    actually costs. Decimal, rounded half-up once, same rule as _scale.
+    """
+    if yield_qty <= 0:
+        yield_qty = 1
+    exact = Decimal(int(quantity_milli)) / Decimal(int(yield_qty))
+    return int(exact.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
 def _build_response(recipe: Recipe, ingredients: dict[uuid.UUID, Ingredient]) -> RecipeResponse:
     items: list[RecipeItemResponse] = []
     base_cost = 0
     option_costs: dict[str, int] = {}
+    yield_qty = int(recipe.yield_qty or 1)
 
     for line in sorted(recipe.items or [], key=lambda x: (x.sort_order or 0)):
         ingredient = ingredients.get(line.ingredient_id)
         unit = ingredient.canonical_unit if ingredient else CanonicalUnit.UNIT.value
         label = ingredient.unit_label if ingredient else None
+        per_portion_milli = _per_portion_quantity_milli(int(line.quantity_milli), yield_qty)
         cost = value_cents(
-            int(line.quantity_milli),
+            per_portion_milli,
             int(ingredient.cost_per_canonical_micro_cents or 0) if ingredient else 0,
         )
         if line.option_id:
