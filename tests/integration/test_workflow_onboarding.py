@@ -189,8 +189,11 @@ async def test_onboarder_scoping_and_sensitive_field_reduction(_db_or_skip):
 async def test_onboarding_progress_reflects_real_data_and_completion_revokes_access(_db_or_skip):
     from backend.app.api.v1.routes_menu import CategoryCreate, ItemCreate, create_category, create_item
     from backend.app.api.v1.routes_pos import (
-        POSOrderCreateRequest, POSOrderItemRequest, TillOpenRequest, create_pos_order, open_till,
+        POSOrderCreateRequest, POSOrderItemRequest, TillCloseRequest, TillOpenRequest,
+        close_till, create_pos_order, open_till,
     )
+    from admin_api.app.api.v1.routes_businesses import OnboardingConfirmRequest, confirm_onboarding_item
+    from shared.models.business import Business
 
     db = _db_or_skip
     unique = uuid.uuid4().hex[:8]
@@ -236,7 +239,7 @@ async def test_onboarding_progress_reflects_real_data_and_completion_revokes_acc
         item = await create_item(
             body=ItemCreate(category_id=category.id, name="Burger", price_cents=6000), user=owner_auth, db=db,
         )
-        await open_till(body=TillOpenRequest(opening_float_cents=0), user=owner_auth, db=db)
+        till = await open_till(body=TillOpenRequest(opening_float_cents=0), user=owner_auth, db=db)
         await create_pos_order(
             body=POSOrderCreateRequest(
                 items=[POSOrderItemRequest(menu_item_id=item.id, quantity=1)],
@@ -245,6 +248,22 @@ async def test_onboarding_progress_reflects_real_data_and_completion_revokes_acc
             ),
             user=owner_auth, db=db,
         )
+
+        # Checks added by the commercial go-live extension (migration 0036):
+        # restaurant details, a completed cash-up, and the two items only a
+        # person can confirm (which modules were purchased; slip printed OK).
+        biz_row = await db.get(Business, created.id)
+        biz_row.address = "1 Test Street, Durban"
+        await db.commit()
+        await close_till(
+            session_id=till.id, body=TillCloseRequest(counted_cash_cents=6000),
+            user=owner_auth, db=db,
+        )
+        for item_key in ("modules", "receipt_print"):
+            await confirm_onboarding_item(
+                business_id=created.id, body=OnboardingConfirmRequest(item=item_key),
+                user=auth, db=db,
+            )
 
         # ── After real setup: menu check now passes, business is ready ──────
         status_after = await get_onboarding_status(business_id=created.id, user=auth, db=db)
