@@ -1,0 +1,56 @@
+{
+  "id": "conv_315",
+  "title": "Order notes — Delivery with a real note alongside a real address",
+  "category": "delivery",
+  "tags": ["deterministic", "delivery", "order_notes"],
+
+  "notes": "General coverage for the order-level special-instructions question (commit 71afecb) reaching the created (PENDING_DELIVERY_FEE) order without clobbering the delivery_address captured in the previous turn.",
+
+  "business": {
+    "delivery_enabled": true,
+    "require_customer_name": false,
+    "require_phone_number": false,
+    "require_delivery_address": false
+  },
+
+  "turns": [
+    {
+      "message": "Can I get a Still Water",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Still Water", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Delivery",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "12 Long Street, Cape Town",
+      "expect": {
+        "state": "COLLECTING_DETAILS",
+        "response_contains": ["special instructions"],
+        "context_has": {"delivery_address": "12 Long Street, Cape Town"}
+      }
+    },
+    {
+      "message": "leave at gate, do not ring the bell",
+      "expect": {
+        "state": "WAITING_DELIVERY_FEE_APPROVAL",
+        "cart": []
+      }
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Still Water", "quantity": 1}],
+    "subtotal_cents": 1500,
+    "order_mode": "DELIVERY",
+    "delivery_address": "12 Long Street, Cape Town",
+    "special_instructions": "leave at gate, do not ring the bell"
+  }
+}

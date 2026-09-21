@@ -1,0 +1,47 @@
+{
+  "id": "conv_316",
+  "title": "Order notes — Item with a paid add-on plus a real order note",
+  "category": "confirmation",
+  "tags": ["deterministic", "pickup", "order_notes", "det_addon"],
+
+  "notes": "General coverage for the order-level special-instructions question (commit 71afecb) alongside a DET-resolved paid add-on (see det_ao_001.json), confirming the two mechanisms (item add-ons vs order-level notes) don't collide.",
+
+  "business": {
+    "delivery_enabled": false,
+    "require_customer_name": false,
+    "require_phone_number": false
+  },
+
+  "turns": [
+    {
+      "message": "Can I get a Classic Smash Burger with extra cheese",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}],
+        "response_contains": ["extra cheese"]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {
+        "state": "COLLECTING_DETAILS",
+        "response_contains": ["special instructions"]
+      }
+    },
+    {
+      "message": "well done please, no pickles",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Classic Smash Burger", "quantity": 1}],
+    "subtotal_cents": 8500,
+    "total_cents": 8500,
+    "order_mode": "PICKUP",
+    "special_instructions": "well done please, no pickles"
+  }
+}

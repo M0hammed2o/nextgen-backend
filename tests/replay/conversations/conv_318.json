@@ -1,0 +1,65 @@
+{
+  "id": "conv_318",
+  "title": "Order notes — Multi-item cart still gets a single order-level note",
+  "category": "basic_ordering",
+  "tags": ["deterministic", "multi_item", "multi_category", "order_notes"],
+
+  "notes": "General coverage for the order-level special-instructions question (commit 71afecb) confirming the note is order-level (not per-item) on a 3-item, 2-category cart — mirrors conv_025.json's cart shape.",
+
+  "turns": [
+    {
+      "message": "Can I get a Classic Smash Burger, a Coca-Cola (330ml) and Chips",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Classic Smash Burger", "quantity": 1},
+          {"name": "Coca-Cola (330ml)", "quantity": 1},
+          {"name": "Chips", "quantity": 1}
+        ],
+        "confirmed_cart": [
+          {"name": "Classic Smash Burger", "quantity": 1},
+          {"name": "Coca-Cola (330ml)", "quantity": 1},
+          {"name": "Chips", "quantity": 1}
+        ]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Sipho",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0710000001",
+      "expect": {
+        "state": "COLLECTING_DETAILS",
+        "response_contains": ["special instructions"]
+      }
+    },
+    {
+      "message": "no ice in the coke please",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+
+  "final_order": {
+    "items": [
+      {"name": "Classic Smash Burger", "quantity": 1},
+      {"name": "Coca-Cola (330ml)", "quantity": 1},
+      {"name": "Chips", "quantity": 1}
+    ],
+    "subtotal_cents": 13000,
+    "total_cents": 13000,
+    "order_mode": "PICKUP",
+    "special_instructions": "no ice in the coke please"
+  }
+}

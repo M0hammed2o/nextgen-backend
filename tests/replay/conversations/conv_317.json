@@ -1,0 +1,96 @@
+{
+  "id": "conv_317",
+  "title": "Order notes — Two order cycles (delivery rejected, then pickup) each get their own note",
+  "category": "delivery",
+  "tags": ["deterministic", "delivery", "pickup", "recovery", "order_notes"],
+
+  "notes": "General coverage for the order-level special-instructions question (commit 71afecb) across two separate order cycles in one conversation, mirroring conv_089.json's cancel-then-restart shape.",
+
+  "business": {
+    "delivery_enabled": true,
+    "require_customer_name": false,
+    "require_phone_number": false,
+    "require_delivery_address": false
+  },
+
+  "turns": [
+    {
+      "message": "Can I get a Still Water",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Still Water", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Delivery",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "9 Baker Street",
+      "expect": {
+        "state": "COLLECTING_DETAILS",
+        "response_contains": ["special instructions"]
+      }
+    },
+    {
+      "message": "fragile, please knock",
+      "expect": {
+        "state": "WAITING_DELIVERY_FEE_APPROVAL",
+        "cart": []
+      }
+    },
+    {
+      "_type": "staff_action",
+      "description": "Staff sets delivery fee R40",
+      "context_updates": {
+        "delivery_fee_cents": 4000,
+        "delivery_fee_status": "FEE_SENT"
+      }
+    },
+    {
+      "message": "No",
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_contains": ["cancelled", "pickup"]
+      }
+    },
+    {
+      "message": "Can I get a Sprite",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Sprite (330ml)", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS",
+        "response_contains": ["special instructions"]
+      }
+    },
+    {
+      "message": "birthday candle please",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Sprite (330ml)", "quantity": 1}],
+    "subtotal_cents": 2000,
+    "total_cents": 2000,
+    "order_mode": "PICKUP",
+    "special_instructions": "birthday candle please"
+  }
+}

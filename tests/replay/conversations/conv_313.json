@@ -1,0 +1,54 @@
+{
+  "id": "conv_313",
+  "title": "Recovery — Cancelling a REALLY PLACED order still redirects to call the store",
+  "category": "recovery",
+  "tags": ["deterministic", "recovery", "cancel", "regression"],
+
+  "notes": "Companion to conv_094.json (commit 8d78473): once a real Order row exists (state ORDER_PLACED, non-terminal status), ORDER_CANCEL must still redirect the customer to call the store — only an unconfirmed draft cart is now self-service. Preserves the coverage conv_094 used to give before its expectation was corrected.",
+
+  "business": {
+    "delivery_enabled": false,
+    "require_customer_name": false,
+    "require_phone_number": false,
+    "require_delivery_address": false
+  },
+
+  "turns": [
+    {
+      "message": "Can I get a Classic Smash Burger",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Classic Smash Burger", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {
+        "state": "COLLECTING_DETAILS",
+        "response_contains": ["special instructions"]
+      }
+    },
+    {
+      "message": "skip",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    },
+    {
+      "message": "cancel",
+      "expect": {
+        "state": "IDLE",
+        "cart": [],
+        "response_contains": ["call", "store"]
+      }
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Classic Smash Burger", "quantity": 1}],
+    "subtotal_cents": 7500,
+    "total_cents": 7500,
+    "order_mode": "PICKUP"
+  }
+}

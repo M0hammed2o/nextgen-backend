@@ -1,0 +1,53 @@
+{
+  "id": "conv_314",
+  "title": "Order notes — Pickup with a real note reaches special_instructions",
+  "category": "confirmation",
+  "tags": ["deterministic", "pickup", "order_notes"],
+
+  "notes": "General coverage for the order-level special-instructions question (commit 71afecb) reaching the created order on a plain pickup flow with name+phone required (FakeBusiness defaults).",
+
+  "business": {
+    "delivery_enabled": false
+  },
+
+  "turns": [
+    {
+      "message": "Can I get a Chips",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [{"name": "Chips", "quantity": 1}]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Mohammed",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0837866021",
+      "expect": {
+        "state": "COLLECTING_DETAILS",
+        "response_contains": ["special instructions"]
+      }
+    },
+    {
+      "message": "extra crispy please, and cut in half",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+
+  "final_order": {
+    "items": [{"name": "Chips", "quantity": 1}],
+    "subtotal_cents": 3500,
+    "total_cents": 3500,
+    "order_mode": "PICKUP",
+    "customer_name": "Mohammed",
+    "special_instructions": "extra crispy please, and cut in half"
+  }
+}
