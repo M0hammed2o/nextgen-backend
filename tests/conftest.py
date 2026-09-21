@@ -20,8 +20,11 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 # ── Provide minimal env vars so pydantic-settings doesn't need .env.backend ──
-# All of these have defaults already, but setting them explicitly avoids any
-# validation surprise from a missing file.
+# Most of these have defaults already, but setting them explicitly avoids any
+# validation surprise from a missing file. ENVIRONMENT has NO default (see
+# backend/app/core/config.py) — it MUST be set here or every test importing
+# Settings/AdminSettings fails at collection time.
+os.environ.setdefault("ENVIRONMENT", "test")
 os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost/nextgen")
 os.environ.setdefault("REDIS_URL", "redis://localhost:6379/0")
 os.environ.setdefault("JWT_SECRET_KEY", "test-secret-key-for-unit-tests")

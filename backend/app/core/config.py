@@ -9,7 +9,60 @@ Model 1 Architecture:
 
 from functools import lru_cache
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# ── Environment allow-list ───────────────────────────────────────────────────
+# ENVIRONMENT has NO default (see the Settings field below) — a deployment
+# that forgets to set it must fail at boot, not silently fall back to
+# "development" and skip every secret/signature check (this exact gap let a
+# production deploy run unvalidated once — see KNOWN_BUGS.md BUG-0014).
+# "test" exists only so the pytest suite (tests/conftest.py) can declare an
+# explicit, intentional non-production value distinct from "development" —
+# it is treated identically to "development" for secret-validation purposes.
+VALID_ENVIRONMENTS = {"development", "staging", "production", "test"}
+
+
+def _validate_environment_value(value: str) -> str:
+    if value not in VALID_ENVIRONMENTS:
+        raise ValueError(
+            f"ENVIRONMENT must be one of {sorted(VALID_ENVIRONMENTS)}, got {value!r}. "
+            "Every deployed service (backend, admin_api, worker) must set "
+            "ENVIRONMENT explicitly — there is no default."
+        )
+    return value
+
+
+def _looks_like_placeholder(value: str) -> bool:
+    """
+    Broader placeholder detection than an exact-string match.
+
+    A real incident showed the gap in exact matching: JWT_SECRET_KEY was set
+    to "CHANGE-ME-generate-a-strong-random-string" in production — clearly a
+    never-rotated placeholder, but not equal to the one literal string this
+    check used to look for ("CHANGE-ME-IN-PRODUCTION"), so it silently passed.
+    Catch anything placeholder-shaped by substring/length instead of relying
+    on one exact value.
+
+    Shared by backend/app/main.py and admin_api/app/main.py so both planes
+    apply the exact same placeholder-detection logic — see DECISIONS.md.
+    """
+    if not value:
+        return True
+    lowered = value.lower()
+    if any(marker in lowered for marker in ("change-me", "change_me", "your-", "your_", "example", "replace-me")):
+        return True
+    # A real secrets.token_urlsafe(64)/Fernet key is comfortably over 32 chars;
+    # anything shorter is suspicious for a value that's supposed to be a
+    # high-entropy signing key.
+    if len(value) < 32:
+        return True
+    return False
+
+
+# Redis key the ARQ worker heartbeats to (see backend/app/worker.py) and that
+# GET /ready reads to detect a hung/crashed worker process.
+WORKER_HEARTBEAT_REDIS_KEY = "worker:heartbeat"
 
 
 class Settings(BaseSettings):
@@ -26,7 +79,8 @@ class Settings(BaseSettings):
     APP_NAME: str = "NextGen Backend"
     APP_VERSION: str = "1.0.0"
     DEBUG: bool = False
-    ENVIRONMENT: str = "development"  # development | staging | production
+    # REQUIRED — no default. See VALID_ENVIRONMENTS above for why.
+    ENVIRONMENT: str
     API_V1_PREFIX: str = "/v1"
     ALLOWED_ORIGINS: str = "https://nextgenintelligence.co.za,https://app.nextgenintelligence.co.za,https://staff.nextgenintelligence.co.za,https://admin.nextgenintelligence.co.za,http://localhost:3000,http://localhost:3001,http://localhost:5173,http://localhost:5174,http://localhost:5175"
 
@@ -151,6 +205,20 @@ class Settings(BaseSettings):
     ACCOUNT_LOCKOUT_ATTEMPTS: int = 5
     ACCOUNT_LOCKOUT_MINUTES: int = 30
     CUSTOMER_MESSAGE_RATE_PER_MINUTE: int = 10
+
+    # ── Readiness ────────────────────────────────────────────────────────
+    # GET /ready reports the ARQ worker's heartbeat as "stale" whenever it's
+    # missing/expired. Whether that alone should flip the whole endpoint to
+    # 503 is configurable: a deployment that truly has no worker process
+    # (e.g. a POS-only install with WhatsApp processing intentionally not
+    # running) can set this false. Default true — the worker is required by
+    # every deployment today.
+    READY_REQUIRES_WORKER: bool = True
+
+    @field_validator("ENVIRONMENT")
+    @classmethod
+    def _check_environment(cls, value: str) -> str:
+        return _validate_environment_value(value)
 
 
 @lru_cache

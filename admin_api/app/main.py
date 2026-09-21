@@ -10,8 +10,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from admin_api.app.core.config import get_admin_settings
+from backend.app.core.config import _looks_like_placeholder
 from backend.app.core.errors import register_error_handlers
-from backend.app.core.middleware import CorrelationIDMiddleware, RequestLoggingMiddleware
+from backend.app.core.middleware import CorrelationIDMiddleware, RequestLoggingMiddleware, setup_logging
 from backend.app.db.session import close_db, close_redis
 
 settings = get_admin_settings()
@@ -20,33 +21,38 @@ logging.basicConfig(
     level=logging.DEBUG if settings.DEBUG else logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
 )
+setup_logging(settings.ENVIRONMENT)
 logger = logging.getLogger("nextgen.admin")
 
 
 def _validate_production_secrets() -> None:
     """
-    Crash immediately if placeholder secrets are present in production.
-    Admin tokens are signed by backend.app.core.security using the BACKEND
-    settings object, so those are the values that must be validated here.
+    Crash immediately if placeholder secrets are present in a real
+    deployment. Admin tokens are signed by backend.app.core.security using
+    the BACKEND settings object, so those are the values that must be
+    validated here.
+
+    Runs for every ENVIRONMENT except explicit "development"/"test" — staging
+    is validated exactly like production, matching backend/app/main.py.
     """
     from backend.app.core.config import get_settings as get_backend_settings
 
     backend_settings = get_backend_settings()
-    if backend_settings.ENVIRONMENT != "production":
+    if backend_settings.ENVIRONMENT in ("development", "test"):
         return
 
-    _PLACEHOLDER_JWT = "CHANGE-ME-IN-PRODUCTION"
     errors: list[str] = []
-    if backend_settings.JWT_SECRET_KEY == _PLACEHOLDER_JWT:
-        errors.append("JWT_SECRET_KEY is set to the default placeholder — all JWTs are forgeable")
-    if backend_settings.JWT_ADMIN_SECRET_KEY == _PLACEHOLDER_JWT:
-        errors.append("JWT_ADMIN_SECRET_KEY is set to the default placeholder — admin JWTs are forgeable")
+    if _looks_like_placeholder(backend_settings.JWT_SECRET_KEY):
+        errors.append("JWT_SECRET_KEY looks like a placeholder — all JWTs are forgeable")
+    if _looks_like_placeholder(backend_settings.JWT_ADMIN_SECRET_KEY):
+        errors.append("JWT_ADMIN_SECRET_KEY looks like a placeholder — admin JWTs are forgeable")
     if backend_settings.JWT_ADMIN_SECRET_KEY == backend_settings.JWT_SECRET_KEY:
         errors.append("JWT_ADMIN_SECRET_KEY must differ from JWT_SECRET_KEY — planes must not share a signing key")
 
     if errors:
-        msg = "FATAL: Admin API production deployment with unconfigured secrets:\n" + "\n".join(
-            f"  • {e}" for e in errors
+        msg = (
+            f"FATAL: Admin API {backend_settings.ENVIRONMENT} deployment with unconfigured secrets:\n"
+            + "\n".join(f"  • {e}" for e in errors)
         )
         logger.critical(msg)
         raise RuntimeError(msg)
