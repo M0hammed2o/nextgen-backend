@@ -755,11 +755,21 @@ async def _require_open_till_for_cash_reversal(db: AsyncSession, business_id: uu
     """
     if order.payment_method != POSPaymentMethod.CASH.value:
         return
+    # Locked FOR UPDATE — same row/lock close_till() takes on this session.
+    # Without this, a cash refund committing just after close_till has
+    # already computed its expected-cash totals (but before this refund
+    # existed) would land in no till session at all: this SELECT would
+    # still see status="OPEN" (read before close_till's commit) and pass,
+    # then the refund's own commit races close_till's — whichever commits
+    # last silently wins, and the loser's cash movement is reconciled
+    # against nothing (F4 fix, Wave 0A verifier).
     result = await db.execute(
-        select(TillSession).where(
+        select(TillSession)
+        .where(
             TillSession.business_id == business_id,
             TillSession.status == "OPEN",
         )
+        .with_for_update()
     )
     if not result.scalar_one_or_none():
         raise AppError(

@@ -250,6 +250,39 @@ async def test_card_void_does_not_require_open_till():
     assert result.payment_status == "VOIDED"
 
 
+async def test_cash_reversal_till_lookup_is_locked_for_update():
+    """
+    F4 fix (Wave 0A verifier): the "is a till open?" SELECT in
+    _require_open_till_for_cash_reversal must take the same FOR UPDATE lock
+    close_till() takes on the same row, so a cash refund/void committing
+    just after close_till has computed its totals can't land in no session.
+    A real concurrent-commit race isn't practical to assert deterministically
+    without a live DB (see tests/test_wave0a_pos_concurrency.py for the
+    pattern used elsewhere), so this asserts the lock is actually requested.
+    """
+    from backend.app.api.v1.routes_pos import _require_open_till_for_cash_reversal
+
+    class CapturingDB:
+        def __init__(self, result):
+            self.captured_stmt = None
+            self._result = result
+
+        async def execute(self, stmt):
+            self.captured_stmt = stmt
+            return self._result
+
+    business_id = uuid.uuid4()
+    order = make_pos_order(business_id, total_cents=5000, payment_method="CASH")
+    db = CapturingDB(_open_till_result())
+
+    await _require_open_till_for_cash_reversal(db, business_id, order)
+
+    assert db.captured_stmt is not None
+    assert db.captured_stmt._for_update_arg is not None, (
+        "till lookup must use .with_for_update() — see close_till()'s matching lock"
+    )
+
+
 # ── Staff-readable POS settings ──────────────────────────────────────────────
 
 async def test_pos_settings_reflects_business_config():
