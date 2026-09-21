@@ -342,6 +342,37 @@ class Business(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         DateTime(timezone=True), nullable=True
     )
 
+    # ── Commercial trials & invoicing (Wave 0A) ───────────────────────────
+    # billing_status="TRIAL"/trial_ends_at (above) remain the single stored
+    # facts about trial state — these are ADDITIONAL, purely additive fields
+    # that don't duplicate or risk disagreeing with them. See
+    # backend/app/billing/account_status.py for the one function that
+    # derives a displayed commercial status from all of these together.
+    trial_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+        comment="When the current/most recent trial began.",
+    )
+    converted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+        comment="When this business first paid (billing_status flipped to "
+                "ACTIVE via a paid invoice/subscription charge). Set once, "
+                "never cleared.",
+    )
+    trial_extension_days_total: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False,
+        comment="Cumulative days this trial has been extended by. Caps an "
+                "ONBOARDER's own extensions at ONBOARDER_MAX_TRIAL_EXTENSION_DAYS "
+                "(config) — SUPER_ADMIN is unlimited.",
+    )
+    onboarding_confirmations: Mapped[dict] = mapped_column(
+        JSONB, default=dict, server_default="{}", nullable=False,
+        comment="Manual go-live confirmations an admin recorded because the "
+                "system cannot observe them automatically (e.g. "
+                "{'modules': {'confirmed_by': <admin_id>, 'confirmed_at': "
+                "<iso8601>, 'note': ...}}) — see POST "
+                "/admin/businesses/{id}/onboarding/confirm.",
+    )
+
     # ── Relationships (lazy loaded by default) ───────────────────────────
     users = relationship("BusinessUser", back_populates="business", lazy="selectin")
     menu_categories = relationship("MenuCategory", back_populates="business", lazy="noload")

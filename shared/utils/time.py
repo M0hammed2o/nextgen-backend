@@ -3,7 +3,7 @@ Time & timezone utilities.
 All DB timestamps are UTC. Business hours interpreted in business timezone.
 """
 
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timedelta, timezone
 
 import zoneinfo
 
@@ -84,3 +84,18 @@ def local_midnight_to_utc(local_date, tz_name: str) -> datetime:
         tzinfo=zoneinfo.ZoneInfo(tz_name),
     )
     return local_midnight.astimezone(timezone.utc)
+
+
+def end_of_local_day_utc(local_date, tz_name: str) -> datetime:
+    """
+    The last instant (23:59:59.999999) of `local_date` in the business's own
+    timezone, expressed as a UTC datetime — used for "trial ends at the end
+    of the local day N days from now" (commercial trials/invoices, Wave 0A).
+
+    Computed as (start of next local day) minus 1 microsecond rather than
+    constructing 23:59:59.999999 directly, so it inherits the same
+    correct-DST-and-offset handling as `local_midnight_to_utc` instead of
+    re-implementing it.
+    """
+    start_of_next_day = local_midnight_to_utc(local_date + timedelta(days=1), tz_name)
+    return start_of_next_day - timedelta(microseconds=1)
