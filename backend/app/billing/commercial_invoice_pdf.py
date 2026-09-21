@@ -16,6 +16,7 @@ either plane importing the other — `admin_api` already depends on
 All money is formatted directly from integer cents — never a float.
 """
 
+import unicodedata
 from datetime import datetime, timezone
 
 from fpdf import FPDF
@@ -23,6 +24,43 @@ from fpdf import FPDF
 from backend.app.core.config import get_settings
 from shared.models.business import Business
 from shared.models.commercial_invoice import CommercialInvoice
+
+# fpdf2's core "helvetica" font is Latin-1 only and raises
+# `FPDFUnicodeEncodingException` on anything outside it — including the
+# admin suite's own default subscription-line text, which contains an em
+# dash (BUG-0067). Rather than pull in a bundled TrueType font (none exists
+# in this repo/venv today), every string written into this PDF is sanitised
+# to ASCII at the boundary: common "smart" Unicode punctuation is mapped to
+# its ASCII equivalent first (so "—" becomes "-", not dropped), then
+# anything left is NFKD-normalised and transliterated to its closest ASCII
+# form (e.g. "é" -> "e", "Café Élan" -> "Cafe Elan"). Only a character with
+# truly no ASCII equivalent is dropped, and only as the last resort — this
+# never silently removes digits, currency symbols already handled by
+# `_rands`, or ordinary Latin letters.
+_UNICODE_PUNCTUATION_MAP = {
+    "—": "-",    # em dash —
+    "–": "-",    # en dash –
+    "‘": "'",    # left single quotation mark '
+    "’": "'",    # right single quotation mark / apostrophe '
+    "‚": ",",    # single low-9 quotation mark ‚
+    "“": '"',    # left double quotation mark "
+    "”": '"',    # right double quotation mark "
+    "„": '"',    # double low-9 quotation mark „
+    "…": "...",  # horizontal ellipsis …
+    " ": " ",    # non-breaking space
+    "•": "*",    # bullet •
+}
+
+
+def _ascii_safe(value) -> str:
+    """Sanitise text for fpdf2's Latin-1-only core font. See module docstring."""
+    if value is None:
+        return ""
+    text = str(value)
+    for src, dst in _UNICODE_PUNCTUATION_MAP.items():
+        text = text.replace(src, dst)
+    normalized = unicodedata.normalize("NFKD", text)
+    return normalized.encode("ascii", "ignore").decode("ascii")
 
 
 def _rands(cents: int) -> str:
@@ -79,20 +117,20 @@ def build_commercial_invoice_pdf(invoice: CommercialInvoice, business: Business)
 
     pdf.set_font("Helvetica", "B", 18)
     pdf.set_text_color(30, 64, 175)
-    pdf.cell(0, 10, supplier.get("trading_name") or supplier.get("legal_name") or "NextGen", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 10, _ascii_safe(supplier.get("trading_name") or supplier.get("legal_name") or "NextGen"), new_x="LMARGIN", new_y="NEXT")
     pdf.set_font("Helvetica", "", 9)
     pdf.set_text_color(90, 90, 90)
     if supplier.get("legal_name"):
-        pdf.cell(0, 5, str(supplier["legal_name"]), new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(0, 5, _ascii_safe(supplier["legal_name"]), new_x="LMARGIN", new_y="NEXT")
     if supplier.get("address"):
-        pdf.multi_cell(0, 5, str(supplier["address"]))
-    contact_bits = [b for b in (supplier.get("contact_email"), supplier.get("contact_phone")) if b]
+        pdf.multi_cell(0, 5, _ascii_safe(supplier["address"]))
+    contact_bits = [_ascii_safe(b) for b in (supplier.get("contact_email"), supplier.get("contact_phone")) if b]
     if contact_bits:
         pdf.cell(0, 5, " | ".join(contact_bits), new_x="LMARGIN", new_y="NEXT")
     if supplier.get("vat_registered") and supplier.get("vat_number"):
-        pdf.cell(0, 5, f"VAT No: {supplier['vat_number']}", new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(0, 5, _ascii_safe(f"VAT No: {supplier['vat_number']}"), new_x="LMARGIN", new_y="NEXT")
     if supplier.get("registration_number"):
-        pdf.cell(0, 5, f"Reg No: {supplier['registration_number']}", new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(0, 5, _ascii_safe(f"Reg No: {supplier['registration_number']}"), new_x="LMARGIN", new_y="NEXT")
     pdf.ln(4)
 
     pdf.set_draw_color(200, 200, 200)
@@ -103,7 +141,7 @@ def build_commercial_invoice_pdf(invoice: CommercialInvoice, business: Business)
     pdf.set_text_color(30, 30, 30)
     pdf.cell(0, 9, title, new_x="LMARGIN", new_y="NEXT")
     pdf.set_font("Helvetica", "", 10)
-    pdf.cell(0, 6, f"Invoice No: {invoice.invoice_number or '(not yet issued)'}", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 6, _ascii_safe(f"Invoice No: {invoice.invoice_number or '(not yet issued)'}"), new_x="LMARGIN", new_y="NEXT")
     if invoice.invoice_date:
         pdf.cell(0, 6, f"Invoice Date: {invoice.invoice_date.isoformat()}", new_x="LMARGIN", new_y="NEXT")
     if invoice.due_date:
@@ -113,13 +151,13 @@ def build_commercial_invoice_pdf(invoice: CommercialInvoice, business: Business)
     pdf.set_font("Helvetica", "B", 11)
     pdf.cell(0, 6, "Bill To:", new_x="LMARGIN", new_y="NEXT")
     pdf.set_font("Helvetica", "", 10)
-    pdf.cell(0, 6, str(customer.get("name") or ""), new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 6, _ascii_safe(customer.get("name") or ""), new_x="LMARGIN", new_y="NEXT")
     if customer.get("address"):
-        pdf.multi_cell(0, 5, str(customer["address"]))
+        pdf.multi_cell(0, 5, _ascii_safe(customer["address"]))
     if customer.get("phone"):
-        pdf.cell(0, 5, str(customer["phone"]), new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(0, 5, _ascii_safe(customer["phone"]), new_x="LMARGIN", new_y="NEXT")
     if customer.get("vat_registered") and customer.get("vat_number"):
-        pdf.cell(0, 5, f"VAT No: {customer['vat_number']}", new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(0, 5, _ascii_safe(f"VAT No: {customer['vat_number']}"), new_x="LMARGIN", new_y="NEXT")
     pdf.ln(6)
 
     # ── Line items ───────────────────────────────────────────────────────
@@ -132,7 +170,7 @@ def build_commercial_invoice_pdf(invoice: CommercialInvoice, business: Business)
 
     pdf.set_font("Helvetica", "", 9)
     for line in invoice.lines:
-        pdf.cell(90, 7, str(line.description)[:60], border=1)
+        pdf.cell(90, 7, _ascii_safe(line.description)[:60], border=1)
         pdf.cell(20, 7, str(line.quantity), border=1, align="R")
         pdf.cell(35, 7, _rands(line.unit_amount_cents), border=1, align="R")
         pdf.cell(35, 7, _rands(line.line_total_cents), border=1, align="R", new_x="LMARGIN", new_y="NEXT")
@@ -154,14 +192,14 @@ def build_commercial_invoice_pdf(invoice: CommercialInvoice, business: Business)
     pdf.set_text_color(30, 30, 30)
     pdf.cell(0, 7, "Payment Instructions (EFT)", new_x="LMARGIN", new_y="NEXT")
     pdf.set_font("Helvetica", "", 9)
-    pdf.cell(0, 5, f"Bank: {supplier.get('bank_name')}", new_x="LMARGIN", new_y="NEXT")
-    pdf.cell(0, 5, f"Account Name: {supplier.get('bank_account_name')}", new_x="LMARGIN", new_y="NEXT")
-    pdf.cell(0, 5, f"Account Number: {supplier.get('bank_account_number')}", new_x="LMARGIN", new_y="NEXT")
-    pdf.cell(0, 5, f"Branch Code: {supplier.get('bank_branch_code')}", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 5, _ascii_safe(f"Bank: {supplier.get('bank_name')}"), new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 5, _ascii_safe(f"Account Name: {supplier.get('bank_account_name')}"), new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 5, _ascii_safe(f"Account Number: {supplier.get('bank_account_number')}"), new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 5, _ascii_safe(f"Branch Code: {supplier.get('bank_branch_code')}"), new_x="LMARGIN", new_y="NEXT")
     if supplier.get("bank_account_type"):
-        pdf.cell(0, 5, f"Account Type: {supplier['bank_account_type']}", new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(0, 5, _ascii_safe(f"Account Type: {supplier['bank_account_type']}"), new_x="LMARGIN", new_y="NEXT")
     pdf.set_font("Helvetica", "B", 9)
-    pdf.cell(0, 6, f"Please use invoice number {invoice.invoice_number or ''} as your payment reference.", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 6, _ascii_safe(f"Please use invoice number {invoice.invoice_number or ''} as your payment reference."), new_x="LMARGIN", new_y="NEXT")
 
     # ── Status stamps ────────────────────────────────────────────────────
     if is_paid:
