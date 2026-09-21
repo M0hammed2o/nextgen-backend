@@ -33,6 +33,13 @@
     {
       "message": "15 Oak Street, Bellville",
       "expect": {
+        "state": "COLLECTING_DETAILS",
+        "response_contains": ["special instructions"]
+      }
+    },
+    {
+      "message": "skip",
+      "expect": {
         "state": "WAITING_DELIVERY_FEE_APPROVAL",
         "cart": [],
         "response_contains": ["delivery fee", "location"]

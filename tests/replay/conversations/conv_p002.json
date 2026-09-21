@@ -47,6 +47,15 @@
     {
       "message": "0829876543",
       "expect": {
+        "state": "COLLECTING_DETAILS",
+        "response_contains": [
+          "special instructions"
+        ]
+      }
+    },
+    {
+      "message": "skip",
+      "expect": {
         "state": "ORDER_PLACED",
         "cart": []
       }

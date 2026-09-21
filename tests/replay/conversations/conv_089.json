@@ -32,6 +32,13 @@
     {
       "message": "5 Pine Avenue, Claremont",
       "expect": {
+        "state": "COLLECTING_DETAILS",
+        "response_contains": ["special instructions"]
+      }
+    },
+    {
+      "message": "skip",
+      "expect": {
         "state": "WAITING_DELIVERY_FEE_APPROVAL",
         "cart": []
       }
@@ -65,6 +72,13 @@
     },
     {
       "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS",
+        "response_contains": ["special instructions"]
+      }
+    },
+    {
+      "message": "skip",
       "expect": {"state": "ORDER_PLACED", "cart": []}
     }
   ],

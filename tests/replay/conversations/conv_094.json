@@ -4,6 +4,8 @@
   "category": "recovery",
   "tags": ["deterministic", "recovery", "restart"],
 
+  "notes": "Updated 2026-09-21 for commit 8d78473 ('fix ORDER_CANCEL giving contradictory \"call the store\" messaging for an unconfirmed draft cart'): a draft cart that was never confirmed (state CONFIRMING_ORDER, no Order row) is now cancelled self-service by the bot, not redirected to a phone call. See conv_313.json for the companion case — cancelling a REALLY PLACED order still redirects to the store.",
+
   "turns": [
     {
       "message": "Can I get 2 Classic Smash Burgers",
@@ -17,7 +19,8 @@
       "expect": {
         "state": "IDLE",
         "cart": [],
-        "response_contains": ["call", "store"]
+        "response_contains": ["cancelled"],
+        "response_not_contains": ["call", "store"]
       }
     },
     {
@@ -41,6 +44,13 @@
     },
     {
       "message": "0811000006",
+      "expect": {
+        "state": "COLLECTING_DETAILS",
+        "response_contains": ["special instructions"]
+      }
+    },
+    {
+      "message": "skip",
       "expect": {"state": "ORDER_PLACED"}
     }
   ],

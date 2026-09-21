@@ -51,6 +51,15 @@
     {
       "message": "5 Jan Smuts Avenue Joburg",
       "expect": {
+        "state": "COLLECTING_DETAILS",
+        "response_contains": [
+          "special instructions"
+        ]
+      }
+    },
+    {
+      "message": "skip",
+      "expect": {
         "state": "WAITING_DELIVERY_FEE_APPROVAL",
         "cart": []
       }

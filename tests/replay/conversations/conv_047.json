@@ -29,6 +29,13 @@
     {
       "message": "5 Rivonia Road, Sandton",
       "expect": {
+        "state": "COLLECTING_DETAILS",
+        "response_contains": ["special instructions"]
+      }
+    },
+    {
+      "message": "skip",
+      "expect": {
         "state": "WAITING_DELIVERY_FEE_APPROVAL",
         "cart": [],
         "context_has": {"pending_order_id": true}

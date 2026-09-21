@@ -40,6 +40,13 @@
     {
       "message": "0711000022",
       "expect": {
+        "state": "COLLECTING_DETAILS",
+        "response_contains": ["special instructions"]
+      }
+    },
+    {
+      "message": "skip",
+      "expect": {
         "state": "ORDER_PLACED",
         "cart": []
       }

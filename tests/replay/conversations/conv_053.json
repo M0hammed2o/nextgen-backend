@@ -43,6 +43,13 @@
     },
     {
       "message": "0730000006",
+      "expect": {
+        "state": "COLLECTING_DETAILS",
+        "response_contains": ["special instructions"]
+      }
+    },
+    {
+      "message": "skip",
       "expect": {"state": "ORDER_PLACED"}
     }
   ],

@@ -41,6 +41,15 @@
     {
       "message": "0840000001",
       "expect": {
+        "state": "COLLECTING_DETAILS",
+        "response_contains": [
+          "special instructions"
+        ]
+      }
+    },
+    {
+      "message": "skip",
+      "expect": {
         "state": "ORDER_PLACED",
         "cart": []
       }
