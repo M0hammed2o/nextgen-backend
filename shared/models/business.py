@@ -10,7 +10,7 @@ Model 1: whatsapp_access_token_encrypted REMOVED.
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -321,6 +321,25 @@ class Business(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     payment_webhook_secret: Mapped[str | None] = mapped_column(
         String(512), nullable=True,
         comment="Webhook signing secret for verifying inbound payment webhooks"
+    )
+
+    # ── Sales-partner onboarding (Milestone B) ───────────────────────────
+    # Set once, at creation, when an ONBOARDER (not SUPER_ADMIN) admin
+    # created this business — see admin_api/app/core/deps.py::get_business_scoped.
+    # NULL for every business created directly by a SUPER_ADMIN. ON DELETE
+    # SET NULL rather than CASCADE/RESTRICT: removing the admin account that
+    # onboarded a tenant must never delete or block deleting real
+    # restaurant data over an admin-plane housekeeping action.
+    onboarded_by_admin_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("admin_users.id", ondelete="SET NULL"),
+        nullable=True, index=True,
+    )
+    # Stamped by POST /admin/businesses/{id}/onboarding/complete. Once set,
+    # the ONBOARDER who created this business loses all access to it
+    # (get_business_scoped denies with 404) — SUPER_ADMIN access is
+    # unaffected either way.
+    onboarding_completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
 
     # ── Relationships (lazy loaded by default) ───────────────────────────
