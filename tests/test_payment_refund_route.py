@@ -149,6 +149,121 @@ async def test_refund_unknown_order_is_404():
         await refund_order_payment(order_id=uuid.uuid4(), body=RefundRequest(), user=user, db=db)
 
 
+# ── Manual refund confirmation (F3 fix, Wave 0A verifier) ──────────────────
+# For MANUAL_REQUIRED providers (Direct EFT, Stitch), refund_payment() never
+# sets REFUNDED and PATCH .../payment intentionally rejects it — this is the
+# ONLY way staff can record that a manual refund actually happened.
+
+async def test_manual_refund_confirm_records_full_refund():
+    user = make_user()
+    order = make_order(user.business_id, payment_status="PAID", total_cents=9000)
+    db = FakeDB([FakeResult(scalar=order)])  # no provider/business lookup at all
+
+    result = await refund_order_payment(
+        order_id=order.id,
+        body=RefundRequest(confirm_manual=True, reference="EFT-POP-123", note="Confirmed by owner"),
+        user=user, db=db,
+    )
+
+    assert result.success is True
+    assert result.status == "REFUNDED"
+    assert order.payment_status == "REFUNDED"
+    assert order.refund_amount_cents == 9000
+    assert order.refund_reference == "EFT-POP-123"
+    assert order.refunded_at is not None
+    assert db.commits == 1
+    audit_events = [o for o in db.added if isinstance(o, AuditEvent)]
+    assert len(audit_events) == 1
+    assert audit_events[0].action == "order.payment.manual_refund_confirmed"
+    assert audit_events[0].diff_json["reference"] == "EFT-POP-123"
+
+
+async def test_manual_refund_confirm_partial_amount_sets_partially_refunded():
+    user = make_user()
+    order = make_order(user.business_id, payment_status="PAID", total_cents=9000)
+    db = FakeDB([FakeResult(scalar=order)])
+
+    result = await refund_order_payment(
+        order_id=order.id,
+        body=RefundRequest(confirm_manual=True, amount_cents=3000, reference="EFT-POP-456"),
+        user=user, db=db,
+    )
+
+    assert result.status == "PARTIALLY_REFUNDED"
+    assert order.payment_status == "PARTIALLY_REFUNDED"
+    assert order.refund_amount_cents == 3000
+
+
+async def test_manual_refund_confirm_rejects_amount_exceeding_total():
+    user = make_user()
+    order = make_order(user.business_id, payment_status="PAID", total_cents=5000)
+    db = FakeDB([FakeResult(scalar=order)])
+
+    with pytest.raises(AppError) as exc:
+        await refund_order_payment(
+            order_id=order.id,
+            body=RefundRequest(confirm_manual=True, amount_cents=9999, reference="ref"),
+            user=user, db=db,
+        )
+    assert exc.value.code == "REFUND_EXCEEDS_TOTAL"
+
+
+async def test_manual_refund_confirm_rejects_unpaid_order():
+    user = make_user()
+    order = make_order(user.business_id, payment_status="PENDING")
+    db = FakeDB([FakeResult(scalar=order)])
+
+    with pytest.raises(AppError) as exc:
+        await refund_order_payment(
+            order_id=order.id,
+            body=RefundRequest(confirm_manual=True, reference="ref"),
+            user=user, db=db,
+        )
+    assert exc.value.code == "ORDER_NOT_PAID"
+
+
+async def test_manual_refund_confirm_is_idempotent_second_call_is_409():
+    user = make_user()
+    order = make_order(user.business_id, payment_status="REFUNDED")
+    db = FakeDB([FakeResult(scalar=order)])
+
+    with pytest.raises(AppError) as exc:
+        await refund_order_payment(
+            order_id=order.id,
+            body=RefundRequest(confirm_manual=True, reference="second-attempt"),
+            user=user, db=db,
+        )
+    assert exc.value.code == "REFUND_ALREADY_RECORDED"
+    assert exc.value.status_code == 409
+    assert db.commits == 0
+
+
+async def test_manual_refund_confirm_partially_refunded_also_rejects_second_call():
+    user = make_user()
+    order = make_order(user.business_id, payment_status="PARTIALLY_REFUNDED")
+    db = FakeDB([FakeResult(scalar=order)])
+
+    with pytest.raises(AppError) as exc:
+        await refund_order_payment(
+            order_id=order.id,
+            body=RefundRequest(confirm_manual=True, reference="second-attempt"),
+            user=user, db=db,
+        )
+    assert exc.value.code == "REFUND_ALREADY_RECORDED"
+    assert exc.value.status_code == 409
+
+
+def test_refund_request_confirm_manual_requires_reference():
+    with pytest.raises(Exception):
+        RefundRequest(confirm_manual=True)
+
+
+def test_refund_request_confirm_manual_with_reference_is_valid():
+    body = RefundRequest(confirm_manual=True, reference="EFT-1")
+    assert body.confirm_manual is True
+    assert body.reference == "EFT-1"
+
+
 # ── Payment provider health route ───────────────────────────────────────────
 
 async def test_health_no_provider_configured():

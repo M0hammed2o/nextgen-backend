@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import select, func, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -877,6 +877,35 @@ class RefundRequest(BaseModel):
     amount_cents: int | None = Field(default=None, ge=1, description="Defaults to a full refund of total_cents")
     reason: str | None = Field(default=None, max_length=255)
 
+    # ── Manual refund confirmation (F3 fix, Wave 0A verifier) ─────────────
+    # For providers whose refund is MANUAL_REQUIRED (Direct EFT, Stitch),
+    # this endpoint's provider path above never sets REFUNDED — there is no
+    # provider call to confirm it. OWNER/MANAGER set confirm_manual=true
+    # (with a reference for the manual transfer they already completed
+    # outside NextGen) to record that fact directly. Never calls a payment
+    # provider. Mutually the ONLY way left to record such a refund — the
+    # PATCH .../payment endpoint intentionally rejects REFUNDED/
+    # PARTIALLY_REFUNDED (see update_payment_status's USE_REFUND_ENDPOINT).
+    confirm_manual: bool = Field(
+        default=False,
+        description="Set true to record a refund already completed manually "
+                     "outside NextGen (e.g. a MANUAL_REQUIRED provider like "
+                     "Direct EFT/Stitch) — requires `reference`. Never calls "
+                     "the payment provider.",
+    )
+    reference: str | None = Field(
+        default=None, max_length=255,
+        description="Required when confirm_manual=true — proof/reference for "
+                     "the manual transfer (EFT proof-of-payment number, etc).",
+    )
+    note: str | None = Field(default=None, max_length=1000)
+
+    @model_validator(mode="after")
+    def _confirm_manual_requires_reference(self) -> "RefundRequest":
+        if self.confirm_manual and not self.reference:
+            raise ValueError("reference is required when confirm_manual is true")
+        return self
+
 
 class RefundResponse(BaseModel):
     success: bool
@@ -904,9 +933,12 @@ async def refund_order_payment(
 
     A MANUAL_REQUIRED or FAILED result does NOT change payment_status —
     only a provider-confirmed COMPLETED refund does. For MANUAL_REQUIRED
-    providers (Direct EFT, Stitch), staff still use the existing
-    `PATCH /{order_id}/payment` endpoint to mark REFUNDED once they've
-    completed the manual transfer themselves.
+    providers (Direct EFT, Stitch), where there is no provider call left to
+    confirm, staff record the refund by calling this same endpoint again
+    with `confirm_manual=true` and a `reference` — see RefundRequest.
+    (`PATCH /{order_id}/payment` intentionally rejects REFUNDED/
+    PARTIALLY_REFUNDED and always has — it only records HOW and WHEN a
+    payment was taken, not a refund.)
     """
     # Locked FOR UPDATE before any provider call — two concurrent refund
     # requests on the same order must not both read payment_status=PAID and
@@ -921,6 +953,68 @@ async def refund_order_payment(
     order = result.scalar_one_or_none()
     if not order:
         raise NotFoundError("Order", str(order_id))
+
+    if body.confirm_manual:
+        if order.payment_status in ("REFUNDED", "PARTIALLY_REFUNDED"):
+            raise AppError(
+                "REFUND_ALREADY_RECORDED",
+                f"This order's payment is already {order.payment_status} — "
+                "a manual refund confirmation cannot be recorded twice.",
+                409,
+            )
+        if order.payment_status != "PAID":
+            raise AppError(
+                "ORDER_NOT_PAID",
+                f"Cannot refund an order with payment_status={order.payment_status!r} — only PAID orders can be refunded",
+                422,
+            )
+
+        amount_cents = body.amount_cents or order.total_cents
+        if amount_cents > order.total_cents:
+            raise AppError("REFUND_EXCEEDS_TOTAL", "Refund amount cannot exceed the order total", 422)
+
+        order.payment_status = "REFUNDED" if amount_cents == order.total_cents else "PARTIALLY_REFUNDED"
+        order.refund_amount_cents = amount_cents
+        order.refund_reference = body.reference
+        order.refunded_at = datetime.now(timezone.utc)
+
+        db.add(OrderEvent(
+            order_id=order.id,
+            business_id=user.business_id,
+            old_status=order.status,
+            new_status=order.status,
+            changed_by_user_id=user.user_id,
+            reason=(
+                f"Manual refund confirmed by staff — R{amount_cents / 100:.2f} "
+                f"(reference={body.reference!r})"
+                + (f" — {body.note}" if body.note else "")
+            ),
+        ))
+        db.add(AuditEvent(
+            scope=AuditScope.BUSINESS.value,
+            business_id=user.business_id,
+            actor_user_id=user.user_id,
+            action="order.payment.manual_refund_confirmed",
+            target_type="order",
+            target_id=order.id,
+            diff_json={
+                "amount_cents": amount_cents,
+                "reference": body.reference,
+                "note": body.note,
+                "resulting_status": order.payment_status,
+            },
+        ))
+
+        await db.commit()
+        await db.refresh(order)
+
+        return RefundResponse(
+            success=True,
+            status=order.payment_status,
+            provider_reference=body.reference,
+            error=None,
+            order=OrderResponse.model_validate(order),
+        )
 
     if order.payment_status != "PAID":
         raise AppError(
