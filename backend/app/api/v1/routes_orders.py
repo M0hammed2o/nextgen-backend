@@ -15,6 +15,7 @@ from backend.app.core.errors import AppError, InvalidTransitionError, NotFoundEr
 from backend.app.core.pagination import CursorParams, PaginatedResponse, PaginationMeta, encode_cursor
 from backend.app.core.rbac import AuthUser, require_owner_or_manager, require_staff_or_above
 from backend.app.db.session import get_db
+from backend.app.pos.pricing import POSAddOnSelection, POSItemInput, resolve_pos_items
 from shared.enums import ORDER_STATUS_TRANSITIONS, AuditScope, OrderSource, OrderStatus
 from backend.app.payments.registry import get_provider
 from shared.models.audit import AuditEvent
@@ -30,6 +31,7 @@ router = APIRouter(prefix="/business/orders", tags=["orders"])
 
 class OrderItemResponse(BaseModel):
     id: uuid.UUID
+    menu_item_id: uuid.UUID | None = None
     name_snapshot: str
     unit_price_cents: int
     quantity: int
@@ -39,6 +41,11 @@ class OrderItemResponse(BaseModel):
     selected_options_snapshot: list | None = None
     removed_ingredients_snapshot: list | None = None
     special_instructions: str | None
+    # BUG-0016 fix — True for a manually-typed name+price_cents line with no
+    # catalog backing (unverified, caller-asserted price); False for every
+    # other line, which was resolved and priced server-side from the live
+    # menu catalog (POS orders, and dashboard orders that set menu_item_id).
+    is_ad_hoc_price: bool = False
     model_config = {"from_attributes": True}
 
 
@@ -100,13 +107,61 @@ class OrderListParams(BaseModel):
 
 # ── Create Order (manual / dashboard) ────────────────────────────────────────
 
+class OrderItemAddOnSelection(BaseModel):
+    add_on_id: uuid.UUID
+    quantity: int = Field(default=1, ge=1, le=99)
+
+
 class OrderItemCreate(BaseModel):
-    """Single line item in a manually created order."""
-    name: str = Field(max_length=255)
+    """
+    Single line item in a manually created (dashboard) order.
+
+    Two mutually exclusive ways to price a line (BUG-0016 fix):
+
+      * Catalog (preferred) — set `menu_item_id` (+ optionally
+        `selected_option_ids` / `add_on_selections` / `removed_ingredient_ids`).
+        The item, its options and add-ons are resolved and priced
+        server-side from this business's live menu catalog, via the exact
+        same `backend/app/pos/pricing.py` path POS checkout uses — any
+        `price_cents`/`name` the client also sends is ignored. A
+        `menu_item_id` belonging to another business, or a disabled/deleted
+        item, is rejected (404/422) — see `resolve_pos_items`.
+
+      * Ad hoc (fallback, unchanged legacy behaviour) — omit `menu_item_id`
+        and set `name` + `price_cents` for a genuinely one-off line with no
+        catalog equivalent (e.g. a hand-typed "delivery surcharge"). This
+        price is caller-asserted, not catalog-verified — the resulting
+        OrderItem is flagged `is_ad_hoc_price=True` in the response so it
+        stays visibly distinct from a catalog-priced line.
+
+    `menu_item_id` is additive/optional specifically so the current
+    manager-dashboard "Create Order" form (which only ever sends
+    name+price_cents today — no menu picker) keeps working unchanged.
+    """
+    menu_item_id: uuid.UUID | None = None
+    selected_option_ids: dict[str, str] = Field(default_factory=dict)
+    add_on_selections: list[OrderItemAddOnSelection] = Field(default_factory=list)
+    removed_ingredient_ids: list[str] = Field(default_factory=list)
+
+    name: str | None = Field(default=None, max_length=255)
+    price_cents: int | None = Field(
+        default=None, ge=0,
+        description="Unit price in cents — ad hoc lines only (no menu_item_id); "
+                     "ignored when menu_item_id is set",
+    )
+
     qty: int = Field(ge=1, le=999)
-    price_cents: int = Field(ge=0, description="Unit price in cents")
     options: dict | None = None
     special_instructions: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_pricing_shape(self) -> "OrderItemCreate":
+        if self.menu_item_id is None and (not self.name or self.price_cents is None):
+            raise ValueError(
+                "Each item needs either menu_item_id (catalog-priced) or "
+                "both name and price_cents (ad hoc)"
+            )
+        return self
 
 
 # Sources this dashboard endpoint may be asked to record an order under.
@@ -154,26 +209,123 @@ async def create_order(
     """
     Create a manual order from the dashboard.
     Calculates totals, assigns order number, creates items.
+
+    BUG-0016 fix: catalog-priced items (menu_item_id set) are resolved and
+    priced server-side against the live menu, via the same
+    `backend/app/pos/pricing.py::resolve_pos_items` POS checkout uses — the
+    client's price_cents is never trusted for those lines. Ad hoc lines
+    (no menu_item_id) keep the legacy caller-priced behaviour but are
+    flagged `is_ad_hoc_price=True`. The order total is run through the same
+    VAT engine as POS (`shared/pricing/engine.py::apply_vat_to_total`) so a
+    VAT-registered business's manually-created orders carry real tax_cents
+    instead of always 0.
     """
     from sqlalchemy import update as sa_update
 
-    # Atomic increment of business order_number_sequence
+    # ── Resolve every catalog-priced item against the live menu BEFORE any
+    #    mutation — an invalid menu_item_id/option/add-on must never consume
+    #    an order number or leave a partial order behind (same rule as POS
+    #    checkout). Ad hoc items (no menu_item_id) skip this entirely, so an
+    #    all-ad-hoc order (today's only real caller) triggers no extra query.
+    catalog_entries = [
+        (idx, item) for idx, item in enumerate(body.items) if item.menu_item_id is not None
+    ]
+    resolved_by_index: dict[int, object] = {}
+    if catalog_entries:
+        item_inputs = [
+            POSItemInput(
+                menu_item_id=item.menu_item_id,
+                quantity=item.qty,
+                selected_option_ids=item.selected_option_ids,
+                add_on_selections=[
+                    POSAddOnSelection(add_on_id=sel.add_on_id, quantity=sel.quantity)
+                    for sel in item.add_on_selections
+                ],
+                removed_ingredient_ids=item.removed_ingredient_ids,
+                special_instructions=item.special_instructions,
+            )
+            for _, item in catalog_entries
+        ]
+        resolved_items = await resolve_pos_items(db, user.business_id, item_inputs)
+        resolved_by_index = {
+            idx: resolved for (idx, _), resolved in zip(catalog_entries, resolved_items)
+        }
+
+    # Atomic increment of business order_number_sequence — also pulls the
+    # VAT configuration needed below in the same round trip.
     result = await db.execute(
         sa_update(Business)
         .where(Business.id == user.business_id)
         .values(order_number_sequence=Business.order_number_sequence + 1)
-        .returning(Business.order_number_sequence, Business.currency, Business.delivery_fee_cents)
+        .returning(
+            Business.order_number_sequence,
+            Business.currency,
+            Business.delivery_fee_cents,
+            Business.vat_registered,
+            Business.vat_rate_basis_points,
+            Business.vat_inclusive_pricing,
+        )
     )
     row = result.one_or_none()
     if not row:
         raise NotFoundError("Business")
 
-    seq, currency, biz_delivery_fee = row
+    (
+        seq, currency, biz_delivery_fee,
+        vat_registered, vat_rate_basis_points, vat_inclusive_pricing,
+    ) = row
 
-    # Calculate totals
-    subtotal_cents = sum(item.qty * item.price_cents for item in body.items)
+    # ── Build order item rows (preserving submitted order) and totals ─────
+    subtotal_cents = 0
+    item_rows: list[dict] = []
+    for idx, item in enumerate(body.items):
+        resolved = resolved_by_index.get(idx)
+        if resolved is not None:
+            subtotal_cents += resolved.breakdown.line_total_cents
+            item_rows.append(dict(
+                menu_item_id=resolved.menu_item_id,
+                name_snapshot=resolved.name,
+                base_price_cents=resolved.breakdown.base_price_cents,
+                option_adjustment_cents=resolved.breakdown.option_adjustment_cents,
+                add_on_total_cents=resolved.breakdown.add_on_total_cents,
+                unit_price_cents=resolved.breakdown.unit_price_cents,
+                quantity=resolved.breakdown.quantity,
+                line_total_cents=resolved.breakdown.line_total_cents,
+                selected_options_snapshot=resolved.selected_options_snapshot or None,
+                add_ons_snapshot=resolved.add_ons_snapshot or None,
+                removed_ingredients_snapshot=resolved.removed_ingredients_snapshot or None,
+                special_instructions=resolved.special_instructions or body.notes,
+                is_ad_hoc_price=False,
+            ))
+        else:
+            line_total = item.qty * item.price_cents
+            subtotal_cents += line_total
+            item_rows.append(dict(
+                menu_item_id=None,
+                name_snapshot=item.name,
+                base_price_cents=item.price_cents,
+                option_adjustment_cents=0,
+                add_on_total_cents=0,
+                unit_price_cents=item.price_cents,
+                quantity=item.qty,
+                line_total_cents=line_total,
+                options_snapshot=item.options,
+                special_instructions=item.special_instructions or body.notes,
+                is_ad_hoc_price=True,
+            ))
+
     delivery_fee = biz_delivery_fee if body.order_mode == "DELIVERY" else 0
-    total_cents = subtotal_cents + delivery_fee
+    net_total_cents = max(0, subtotal_cents + delivery_fee)
+
+    # ── VAT — same engine and same inclusive/exclusive semantics as POS
+    #    checkout (shared/pricing/engine.py::apply_vat_to_total). Previously
+    #    this endpoint hardcoded tax_cents=0 regardless of VAT registration.
+    if vat_registered:
+        total_cents, tax_cents = apply_vat_to_total(
+            net_total_cents, vat_rate_basis_points, vat_inclusive_pricing,
+        )
+    else:
+        total_cents, tax_cents = net_total_cents, 0
 
     order = Order(
         business_id=user.business_id,
@@ -183,6 +335,7 @@ async def create_order(
         source=body.source,
         subtotal_cents=subtotal_cents,
         delivery_fee_cents=delivery_fee,
+        tax_cents=tax_cents,
         total_cents=total_cents,
         currency=currency,
         customer_name=body.customer_name,
@@ -194,18 +347,12 @@ async def create_order(
     await db.flush()
 
     # Create order items
-    for item in body.items:
-        oi = OrderItem(
+    for row_kwargs in item_rows:
+        db.add(OrderItem(
             order_id=order.id,
             business_id=user.business_id,
-            name_snapshot=item.name,
-            unit_price_cents=item.price_cents,
-            quantity=item.qty,
-            line_total_cents=item.qty * item.price_cents,
-            options_snapshot=item.options,
-            special_instructions=item.special_instructions or body.notes,
-        )
-        db.add(oi)
+            **row_kwargs,
+        ))
 
     # Create initial event
     event = OrderEvent(

@@ -190,7 +190,9 @@ class TestManualOrderUsageCommit:
         body = OrderCreate(items=[OrderItemCreate(name="Burger", qty=1, price_cents=5000)])
 
         db = FakeDBOrders([
-            FakeResultOrders(row=(1, "ZAR", 0)),   # order-number-sequence increment
+            # order-number-sequence increment + VAT config (BUG-0016 fix
+            # widened this RETURNING to include vat_registered/rate/inclusive)
+            FakeResultOrders(row=(1, "ZAR", 0, False, 0, True)),
             FakeResultOrders(scalar="Africa/Johannesburg"),  # business timezone lookup
         ])
 
@@ -211,7 +213,7 @@ class TestManualOrderUsageCommit:
         body = OrderCreate(items=[OrderItemCreate(name="Burger", qty=1, price_cents=5000)])
 
         db = FakeDBOrders([
-            FakeResultOrders(row=(1, "ZAR", 0)),
+            FakeResultOrders(row=(1, "ZAR", 0, False, 0, True)),
             FakeResultOrders(scalar="Africa/Johannesburg"),
         ])
 

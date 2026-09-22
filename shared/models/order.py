@@ -263,6 +263,16 @@ class OrderItem(Base, UUIDPrimaryKeyMixin):
     )
     special_instructions: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # BUG-0016 fix (migration 0038): True only for a dashboard-typed
+    # name+price_cents line with no menu_item_id — a caller-asserted price
+    # never checked against the live catalog. False (the default) for every
+    # other line: POS orders, WhatsApp bot orders, and dashboard orders that
+    # supplied menu_item_id, all of which are resolved and priced
+    # server-side via backend/app/pos/pricing.py::resolve_pos_items.
+    is_ad_hoc_price: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false",
+    )
+
     # ── Relationships ────────────────────────────────────────────────────
     order = relationship("Order", back_populates="items")
 
