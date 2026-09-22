@@ -31,14 +31,21 @@ async def test_send_template_message_uses_business_connection_when_business_and_
     ) as mock_biz, patch.object(
         whatsapp_sender, "_send_via_meta_api", new=AsyncMock(return_value=("should-not-be-used", None))
     ) as mock_platform:
-        result = await whatsapp_sender.send_template_message(
+        wamid, error_info = await whatsapp_sender.send_template_message(
             phone_number_id="platform-phone-id",
             recipient_wa_id="27821234567",
             template_name="hello_world",
             db=fake_db,
             business=fake_business,
         )
-    assert result == "wamid.1"
+    # send_template_message returns (wamid, MetaErrorInfo | None) — matured
+    # alongside send_text_message's contract by the same-day Digital
+    # Receipts work (backend/app/receipts/whatsapp_receipt.py is the one
+    # real caller, and needs to know WHY a send failed, not just that it
+    # did). This test still proves the thing it was written to prove: the
+    # resolver-routing decision, not the return shape.
+    assert wamid == "wamid.1"
+    assert error_info is None
     mock_biz.assert_awaited_once()
     mock_platform.assert_not_awaited()
 
@@ -50,12 +57,13 @@ async def test_send_template_message_uses_platform_token_when_business_omitted()
     ) as mock_platform, patch.object(
         whatsapp_sender, "_send_via_business_connection", new=AsyncMock()
     ) as mock_biz:
-        result = await whatsapp_sender.send_template_message(
+        wamid, error_info = await whatsapp_sender.send_template_message(
             phone_number_id="platform-phone-id",
             recipient_wa_id="27821234567",
             template_name="hello_world",
         )
-    assert result == "wamid.platform"
+    assert wamid == "wamid.platform"
+    assert error_info is None
     mock_platform.assert_awaited_once()
     mock_biz.assert_not_awaited()
 
