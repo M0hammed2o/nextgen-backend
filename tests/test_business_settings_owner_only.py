@@ -84,7 +84,8 @@ def make_business(business_id, **overrides):
         receipt_paper_width_mm=80, receipt_auto_print=True, receipt_copies=1,
         print_kitchen_receipt=False, receipt_config_json=None,
         receipt_reference_asset_id=None, menu_reference_asset_id=None,
-        inventory_enabled=False, is_whatsapp_enabled=True, wastage_approval_threshold_cents=0,
+        inventory_enabled=False, digital_receipts_enabled=False,
+        is_whatsapp_enabled=True, wastage_approval_threshold_cents=0,
         staff_live_orders_tab_enabled=True, staff_wastage_tab_enabled=True,
         staff_stocktake_tab_enabled=False, stocktake_frequency="DAILY_1", stocktake_times_json=None,
         payment_api_key=None, payment_api_secret=None, payment_webhook_secret=None,
@@ -188,6 +189,26 @@ async def test_get_settings_returns_is_whatsapp_enabled():
 
 def test_is_whatsapp_enabled_not_settable_via_update_schema():
     assert "is_whatsapp_enabled" not in BusinessSettingsUpdate.model_fields
+
+
+# ── digital_receipts_enabled (BUG-0072 follow-up) ───────────────────────────
+# Same platform-admin-only rule as inventory_enabled/is_whatsapp_enabled:
+# admin_api gained this field tonight (BusinessUpdate/BusinessAdminResponse/
+# BusinessOnboarderResponse), but the business plane never had it at all —
+# the manager dashboard could not show real Digital Receipts entitlement
+# status without this.
+
+async def test_get_settings_returns_digital_receipts_enabled():
+    owner = make_user(role="OWNER")
+    business = make_business(owner.business_id, digital_receipts_enabled=True)
+    db = FakeDB([FakeResult(business), FakeResult(0)])
+
+    result = await get_business_settings(user=owner, db=db)
+    assert result.digital_receipts_enabled is True
+
+
+def test_digital_receipts_enabled_not_settable_via_update_schema():
+    assert "digital_receipts_enabled" not in BusinessSettingsUpdate.model_fields
 
 
 # ── VAT rate validation (real-browser fix) ──────────────────────────────────

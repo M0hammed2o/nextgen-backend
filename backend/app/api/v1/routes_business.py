@@ -108,6 +108,11 @@ class BusinessSettingsResponse(BaseModel):
     receipt_reference_asset_id: uuid.UUID | None = None
     menu_reference_asset_id: uuid.UUID | None = None
     inventory_enabled: bool = False
+    # Same platform-admin-only rule as inventory_enabled above — read-only
+    # here (BUG-0072 follow-up: admin_api itself only gained this field
+    # tonight; the business plane never had it at all, so the manager
+    # dashboard could not show real Digital Receipts entitlement status).
+    digital_receipts_enabled: bool = False
     # Platform-admin kill switch (Business.is_whatsapp_enabled) — read-only
     # here so the manager dashboard can hide WhatsApp sections for a
     # POS-only client. Not settable via BusinessSettingsUpdate: enabling/
@@ -174,6 +179,7 @@ class BusinessSettingsResponse(BaseModel):
             receipt_reference_asset_id=b.receipt_reference_asset_id,
             menu_reference_asset_id=b.menu_reference_asset_id,
             inventory_enabled=b.inventory_enabled,
+            digital_receipts_enabled=b.digital_receipts_enabled,
             is_whatsapp_enabled=b.is_whatsapp_enabled,
             wastage_approval_threshold_cents=b.wastage_approval_threshold_cents,
             staff_live_orders_tab_enabled=b.staff_live_orders_tab_enabled,
