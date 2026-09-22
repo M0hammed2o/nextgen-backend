@@ -510,6 +510,14 @@ async def send_template_message(
         connection resolver (_send_via_business_connection) exactly like
         send_text_message — omitted, this sends on the platform token as
         before, so any caller not updated for Milestone C is unaffected.
+        (Found during the same-day WhatsApp connect hardening sweep to have
+        been unconditionally using the platform token regardless of
+        `business` before this fix — a latent bypass of the "no
+        platform-token fallback for a customer-owned number" rule in
+        token_resolver.py. There were no live callers of this function yet,
+        so nothing was actually exploitable, but it would have silently
+        reactivated the gap the moment a caller was wired up without also
+        threading `business`/`db` through.)
       - Never raises — every failure is classified via meta_errors and
         returned as a MetaErrorInfo, not thrown into the caller.
       - Returns (wamid, MetaErrorInfo) instead of a bare wamid, so a caller
@@ -579,10 +587,17 @@ async def send_interactive_buttons(
     recipient_wa_id: str,
     body_text: str,
     buttons: list[dict],  # [{"id": "btn_1", "title": "Yes"}, ...]
+    db: AsyncSession | None = None,
+    business=None,
 ) -> str | None:
     """
     Send an interactive button message (max 3 buttons).
     Useful for order confirmation: [Confirm] [Edit] [Cancel]
+
+    `db` + `business` (optional, gate hardening pass, 2026-09-22): same
+    resolver-routing addition as send_template_message above, for the same
+    reason (found unconditionally using the platform token; no live callers
+    today).
     """
     payload = {
         "messaging_product": "whatsapp",
@@ -601,9 +616,12 @@ async def send_interactive_buttons(
         },
     }
 
-    wa_message_id, _error_info = await _send_via_meta_api(
-        phone_number_id=phone_number_id,
-        recipient_wa_id=recipient_wa_id,
-        payload=payload,
-    )
+    if db is not None and business is not None:
+        wa_message_id, _error_info = await _send_via_business_connection(db, business, payload)
+    else:
+        wa_message_id, _error_info = await _send_via_meta_api(
+            phone_number_id=phone_number_id,
+            recipient_wa_id=recipient_wa_id,
+            payload=payload,
+        )
     return wa_message_id
