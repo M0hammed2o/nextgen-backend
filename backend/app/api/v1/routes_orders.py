@@ -18,7 +18,11 @@ from backend.app.core.pagination import CursorParams, PaginatedResponse, Paginat
 from backend.app.core.rbac import AuthUser, require_owner_or_manager, require_staff_or_above
 from backend.app.db.session import get_db
 from backend.app.pos.pricing import POSAddOnSelection, POSItemInput, resolve_pos_items
-from backend.app.receipts.whatsapp_receipt import resolve_receipt_customer_and_phone, send_digital_receipt
+from backend.app.receipts.whatsapp_receipt import (
+    ReceiptDestinationUnavailable,
+    resolve_receipt_customer_and_phone,
+    send_digital_receipt,
+)
 from backend.app.utils.phone import normalize_sa_mobile
 from shared.enums import ORDER_STATUS_TRANSITIONS, AuditScope, OrderSource, OrderStatus
 from backend.app.payments.registry import get_provider
@@ -1336,14 +1340,24 @@ async def resend_order_receipt(
         db, order, user.business_id, explicit_phone,
     )
 
-    receipt = await send_digital_receipt(
-        db, order, business,
-        channels={"WHATSAPP"},
-        phone_number_e164=phone_number_e164,
-        customer=customer,
-        requested_by_user_id=user.user_id,
-        force_resend=True,
-    )
+    try:
+        receipt = await send_digital_receipt(
+            db, order, business,
+            channels={"WHATSAPP"},
+            phone_number_e164=phone_number_e164,
+            customer=customer,
+            requested_by_user_id=user.user_id,
+            force_resend=True,
+        )
+    except ReceiptDestinationUnavailable:
+        # BUG-0073: the already-successful delivery record was left exactly
+        # as it was rather than being downgraded to FAILED. Tell the caller
+        # to supply a number instead of returning a misleading 200.
+        raise AppError(
+            "RECEIPT_NO_DESTINATION",
+            "No phone number available to resend this receipt to — enter one to resend.",
+            422,
+        )
 
     receipt_url = f"{settings.BACKEND_PUBLIC_URL}{settings.API_V1_PREFIX}/r/{receipt.token}"
     return ReceiptResendResponse(

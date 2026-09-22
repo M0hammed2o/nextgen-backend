@@ -64,6 +64,20 @@ FORCE_RESEND_ROLES = frozenset({"OWNER", "MANAGER"})
 _DONE_STATUSES = frozenset({"SENT", "DELIVERED"})
 
 
+class ReceiptDestinationUnavailable(Exception):
+    """
+    A forced resend could not resolve ANY destination for a receipt that is
+    already SENT/DELIVERED (BUG-0073).
+
+    Raised instead of writing FAILED over a successful delivery record: no
+    send was attempted, so nothing about the previous, genuinely successful
+    delivery has changed and the durable record must not claim otherwise.
+    The caller (POS / manager-dashboard receipt routes) turns this into a
+    4xx the operator can act on — "re-enter the number" — rather than a
+    silent 200 reporting a delivery failure that never happened.
+    """
+
+
 def _to_wa_id(e164: str) -> str:
     """
     Meta's Cloud API 'to' field is expected in the same digits-only format
@@ -77,7 +91,10 @@ def _to_wa_id(e164: str) -> str:
 
 
 def _resolve_whatsapp_destination(
-    *, phone_number_e164: str | None, customer: Customer | None,
+    *,
+    phone_number_e164: str | None,
+    customer: Customer | None,
+    stored_phone_e164: str | None = None,
 ) -> tuple[str | None, str | None]:
     """
     Decide who to send to and what (if anything) to record on
@@ -89,7 +106,18 @@ def _resolve_whatsapp_destination(
     normalisation possible or needed) > customer.phone_number (normalised
     here as a last resort, since a POS-linked Customer may only ever have
     been given a raw typed phone_number — see
-    backend/app/loyalty/engine.py::get_or_create_customer_by_phone).
+    backend/app/loyalty/engine.py::get_or_create_customer_by_phone) >
+    stored_phone_e164, the number THIS receipt row was already successfully
+    delivered to.
+
+    That last fallback (BUG-0073) is what makes a resend work at all for a
+    walk-in POS sale: there is no Customer and no Order.phone_number, so a
+    resend that does not re-type the number (the manager dashboard's Resend
+    button posts `{}`) previously resolved to nothing and the caller wrote
+    FAILED over a perfectly good SENT row. It is deliberately LAST: an
+    explicitly supplied number, or a linked customer's own identity, must
+    still win over a historical value so correcting a mistyped number keeps
+    working.
 
     Returns (wa_id_to_send_to, phone_number_e164_to_persist) — either may
     be None. wa_id_to_send_to is None when nothing resolvable.
@@ -106,6 +134,10 @@ def _resolve_whatsapp_destination(
             normalised = normalize_sa_mobile(raw_phone)
             if normalised:
                 return _to_wa_id(normalised), normalised
+
+    if stored_phone_e164:
+        # Already persisted on the row — nothing new to write back.
+        return _to_wa_id(stored_phone_e164), None
 
     return None, None
 
@@ -226,14 +258,23 @@ async def send_digital_receipt(
         retryable by calling this again (with or without force_resend,
         since FAILED never counts as "already done").
 
-    Never raises for any EXPECTED failure mode (disabled entitlement, no
-    resolvable phone, no phone_number_id configured, a classified Meta
-    error) — each sets whatsapp_status=FAILED with a safe reason instead.
-    A genuinely unexpected error (e.g. a DB failure) is allowed to
-    propagate; both fire-and-forget call sites (_mark_order_paid,
-    update_order_status) already wrap their notification block in a broad
-    try/except, and the staff-facing routes surface it as a real error
-    rather than silently swallowing it.
+    Raises ReceiptDestinationUnavailable in exactly ONE case: a forced
+    resend of an already-SENT/DELIVERED receipt for which no destination at
+    all could be resolved (BUG-0073). That is a caller error, not a
+    delivery failure, and overwriting the successful record with FAILED
+    would corrupt it — so the row is left exactly as it was and the caller
+    is told. Unreachable from the two fire-and-forget trigger points
+    (_mark_order_paid, update_order_status): they never pass
+    force_resend=True, so an already-delivered receipt returns early above.
+
+    Otherwise never raises for an EXPECTED failure mode (disabled
+    entitlement, no resolvable phone on a not-yet-delivered receipt, no
+    phone_number_id configured, a classified Meta error) — each sets
+    whatsapp_status=FAILED with a safe reason instead. A genuinely
+    unexpected error (e.g. a DB failure) is allowed to propagate; both
+    fire-and-forget call sites already wrap their notification block in a
+    broad try/except, and the staff-facing routes surface it as a real
+    error rather than silently swallowing it.
 
     SINGLE COMMIT POINT: this function commits exactly once, at the very
     end (see the `return await _finish()` calls below) — never earlier.
@@ -275,12 +316,38 @@ async def send_digital_receipt(
             return await _finish()
 
         destination_wa_id, resolved_phone = _resolve_whatsapp_destination(
-            phone_number_e164=phone_number_e164, customer=customer,
+            phone_number_e164=phone_number_e164,
+            customer=customer,
+            stored_phone_e164=receipt.phone_number_e164,
         )
         if resolved_phone and not receipt.phone_number_e164:
             receipt.phone_number_e164 = resolved_phone
 
         if destination_wa_id is None:
+            # BUG-0073 safeguard, independent of the stored-number fallback
+            # above: an unresolvable destination is a CALLER error, not a
+            # delivery failure, so it must never downgrade a record that
+            # already says the receipt was genuinely delivered.
+            #
+            # Nothing has been written to the DB at this point (autoflush is
+            # off — see async_session_factory — and the only flush in this
+            # function is the QUEUED one further down, which is never
+            # reached), so the row is already byte-for-byte intact. refresh()
+            # additionally discards this call's own in-flight in-memory edits
+            # (whatsapp_requested/customer_id/requested_by_user_id) so a
+            # later commit by anyone else on this session cannot leak them.
+            #
+            # Deliberately refresh(receipt) and NOT db.rollback(): a
+            # session-wide rollback expires EVERY instance in the identity
+            # map, including the caller's own `business`/`order`, and the
+            # next attribute read on one of those then raises MissingGreenlet
+            # — exactly the failure shape of BUG-0074. Keep the undo scoped
+            # to the one object this function actually mutated.
+            if receipt.whatsapp_status in _DONE_STATUSES:
+                await db.refresh(receipt)
+                raise ReceiptDestinationUnavailable(
+                    "No phone number available to resend this receipt to."
+                )
             receipt.whatsapp_status = "FAILED"
             receipt.whatsapp_failure_reason = "no phone number available"
             return await _finish()
