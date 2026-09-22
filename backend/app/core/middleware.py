@@ -94,6 +94,24 @@ _RECEIPT_PATH_PATTERN = re.compile(r"(/r/)([A-Za-z0-9_\-]{20,})")
 # uvicorn.access is declared by uvicorn's own LOGGING_CONFIG with
 # propagate=False and its own handler, which is exactly why a filter on the
 # ROOT logger's handlers never saw one of its records.
+#
+# DELIVERY MODULE (Uber Eats) — no separate attachment needed. httpx emits
+# ALL of its "HTTP Request: %s %s ..." summary lines through exactly one
+# process-wide logger named "httpx" (confirmed against the installed httpx
+# 0.28.1: `logging.getLogger("httpx")` in `httpx/_client.py`), regardless of
+# which `httpx.AsyncClient` instance made the call — so the shared client in
+# `backend/app/delivery/uber/adapter.py` is already covered by the "httpx"
+# entry below, the same as every payment-provider/Meta httpx call. Two
+# things keep Uber's own credentials out of this specific logger's output
+# even before masking: (1) `uber/auth.py` sends `client_secret` as POST
+# BODY form data, never a URL query parameter, and httpx's summary line
+# logs only the method + URL, never the body; (2) every Uber API call
+# authenticates via an `Authorization: Bearer <token>` HEADER, also never
+# logged by httpx's summary line. `_SECRET_PARAM_PATTERN`'s existing
+# `client_secret` name and `_BEARER_PATTERN` above are still applied to
+# every record from this logger regardless, as defence in depth against a
+# future call shape (or a raised exception whose message embeds a URL) that
+# does put one of these in a URL or an application log line.
 _THIRD_PARTY_CREDENTIAL_LOGGERS = ("httpx", "uvicorn.access")
 
 

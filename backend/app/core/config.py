@@ -309,6 +309,57 @@ class Settings(BaseSettings):
     # only protection.
     RECEIPT_PUBLIC_RATE_LIMIT_PER_MINUTE: int = 30
 
+    # ── Delivery marketplace integrations (Uber Eats live API) ────────────
+    # Platform-wide app credentials (Uber issues ONE client_id/secret per
+    # NextGen app registration, not per restaurant) — distinct from each
+    # tenant's own DeliveryConnection.provisioning_token_encrypted, which is
+    # a per-merchant authorization_code-grant token wiped after activation.
+    UBER_EATS_CLIENT_ID: str = ""
+    UBER_EATS_CLIENT_SECRET: str = ""
+    # Sandbox hosts, confirmed from Uber's docs: test-api.uber.com /
+    # sandbox-auth.uber.com. UBER_EATS_ENVIRONMENT controls which of these
+    # is the correct default — override the base URLs directly if a
+    # deployment ever needs a mix that doesn't match the simple prod/sandbox
+    # split (not expected today).
+    UBER_EATS_API_BASE_URL: str = "https://api.uber.com"
+    UBER_EATS_AUTH_BASE_URL: str = "https://auth.uber.com"
+    # production | sandbox — must match the incoming webhook's own
+    # X-Environment header before any event from it is trusted (one of the
+    # seven ordered trust-boundary gates — see
+    # backend/app/delivery/intake.py).
+    UBER_EATS_ENVIRONMENT: str = "production"
+    # Platform-wide kill switch, independent of any tenant's own
+    # uber_eats_enabled entitlement — lets ops pull the plug on ALL Uber
+    # Eats webhook processing (e.g. during an incident) without a DB change.
+    UBER_EATS_WEBHOOK_ENABLED: bool = True
+    # Per-IP rate limit on POST /v1/webhook/delivery/{provider} — fixed
+    # scope regardless of {provider} value, see BUG-0077 and
+    # routes_delivery_webhook.py's module docstring. Generous relative to
+    # the auth-endpoint limits above since this is provider-server traffic,
+    # not end-user traffic, but still bounded.
+    DELIVERY_WEBHOOK_RATE_LIMIT_PER_MINUTE: int = 120
+
+    # How long staff have to accept/deny a delivery order before the
+    # watchdog cron auto-denies it. Deliberately UNDER Uber's real 11.5-
+    # minute (690s) deadline, so our own denial (with a clear reason code
+    # and audit trail) always wins the race against Uber's silent
+    # auto-cancel — see backend/app/worker.py::delivery_accept_deadline_watchdog.
+    DELIVERY_ACCEPT_DEADLINE_SECONDS: int = 600
+    # Extra buffer the watchdog waits past accept_deadline_at before acting,
+    # so a delivery order that's genuinely mid-processing (worker briefly
+    # slow, not stuck) isn't denied on the very first cron tick after its
+    # deadline technically passed.
+    DELIVERY_DEADLINE_GRACE_SECONDS: int = 90
+
+    # Retention (design doc §3 — the first table on this platform with a
+    # defined retention policy): delivery_webhook_events.raw_payload_json is
+    # redacted (cleared, payload_redacted_at stamped) after this many days,
+    # and the row itself is deleted after the second, longer window. No
+    # cron wiring these values into an actual sweep job exists in this
+    # change — see TODO.md.
+    DELIVERY_WEBHOOK_EVENT_REDACT_AFTER_DAYS: int = 30
+    DELIVERY_WEBHOOK_EVENT_DELETE_AFTER_DAYS: int = 400
+
     @field_validator("ENVIRONMENT")
     @classmethod
     def _check_environment(cls, value: str) -> str:
