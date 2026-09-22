@@ -376,11 +376,16 @@ class TestWorkerSettings:
         suspend_past_due_businesses), and (added in the gate hardening pass,
         2026-09-22 — WhatsApp Embedded Signup §2 failure-mode sweep) the
         stale-WhatsApp-connection observability sweep,
-        log_stale_whatsapp_connections — cron jobs must be registered.
-        Count was 6 before this pass; bumped deliberately, not a weakened
-        assertion (this test still enumerates every job by name below).
+        log_stale_whatsapp_connections — and (added 2026-09-22, delivery
+        marketplace module) the delivery accept-deadline watchdog,
+        delivery_accept_deadline_watchdog (see
+        backend/app/delivery/order_service.py's own docstring — auto-DENIES,
+        never auto-accepts, anything past its accept/deny deadline) — cron
+        jobs must be registered. Count was 6, then 7, now 8; bumped
+        deliberately each time, not a weakened assertion (this test still
+        enumerates every job by name below).
         """
-        assert len(WorkerSettings.cron_jobs) == 7
+        assert len(WorkerSettings.cron_jobs) == 8
         names = {c.name for c in WorkerSettings.cron_jobs}
         assert "cron:run_outbox_batch" in names
         assert "cron:cancel_stale_delivery_fee_orders" in names
@@ -389,6 +394,7 @@ class TestWorkerSettings:
         assert "cron:sweep_trial_and_invoice_expiry" in names
         assert "cron:write_worker_heartbeat" in names
         assert "cron:log_stale_whatsapp_connections" in names
+        assert "cron:delivery_accept_deadline_watchdog" in names
 
     def test_max_tries_is_positive(self):
         """max_tries must be > 0 so infrastructure failures can be retried."""

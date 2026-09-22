@@ -198,8 +198,25 @@ class TestLimiterKeyShape:
             )
 
 
+#: Routes that deliberately carry a fixed `shared_limit(..., scope=...)`
+#: rather than slowapi's path-derived default — each one is a route whose
+#: PATH embeds a value (a receipt token, a delivery provider name) that
+#: would otherwise let a hostile sender get a fresh rate-limit bucket per
+#: value (BUG-0077). Any THIRD entry appearing here that isn't in this map
+#: is exactly the kind of accidental regression this test exists to catch —
+#: add it here deliberately (with a one-line reason) only after confirming
+#: its path genuinely has the same shape.
+_EXPECTED_FIXED_SCOPE_ROUTES: dict[str, str] = {
+    "backend.app.api.v1.routes_receipt_public.get_public_receipt": "public_receipt",
+    # 2026-09-22, delivery marketplace module: {provider} is a path
+    # parameter — see routes_delivery_webhook.py's own module docstring for
+    # the identical BUG-0077 rationale applied pre-emptively.
+    "backend.app.api.v1.routes_delivery_webhook.delivery_webhook": "delivery_webhook",
+}
+
+
 class TestOtherRoutesUnaffected:
-    def test_only_the_public_receipt_route_uses_a_fixed_scope(self):
+    def test_only_the_known_fixed_scope_routes_use_a_fixed_scope(self):
         """
         The fix must not change bucketing anywhere else: every other
         rate-limited route keeps slowapi's default path-derived scope (an
@@ -207,6 +224,12 @@ class TestOtherRoutesUnaffected:
         @limiter-decorated route in the codebase is actually registered —
         otherwise this asserts over whichever modules happened to be
         imported and proves nothing.
+
+        Was "expected exactly ONE fixed-scope route" before 2026-09-22;
+        bumped deliberately to an explicit, named allow-list of two when
+        the delivery webhook route legitimately needed the same treatment
+        — not a weakened assertion, since a THIRD, unlisted entry still
+        fails this test just as loudly as before.
         """
         import backend.app.main  # noqa: F401 — registers every route
 
@@ -217,8 +240,7 @@ class TestOtherRoutesUnaffected:
             if lim.scope
         }
         assert len(limiter._route_limits) > 1, "no other rate-limited routes registered"
-        assert len(scoped) == 1, f"expected exactly one fixed-scope route, got {scoped}"
-
-        route_name, scope = next(iter(scoped.items()))
-        assert "receipt_public" in route_name, route_name
-        assert scope == "public_receipt"
+        assert scoped == _EXPECTED_FIXED_SCOPE_ROUTES, (
+            f"fixed-scope routes changed unexpectedly: got {scoped}, "
+            f"expected exactly {_EXPECTED_FIXED_SCOPE_ROUTES}"
+        )
