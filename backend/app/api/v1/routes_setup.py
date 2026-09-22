@@ -31,6 +31,7 @@ from backend.app.core.errors import AppError, NotFoundError
 from backend.app.core.rbac import AuthUser, require_owner_or_manager, require_staff_or_above
 from backend.app.db.session import get_db
 from backend.app.inventory.ledger import movement_totals_by_type, stock_on_hand
+from backend.app.inventory.stocktake_schedule import is_stocktake_overdue
 from backend.app.inventory.units import format_quantity, value_cents
 from backend.app.inventory.variance import (
     DEFAULT_VARIANCE_ALERT_BASIS_POINTS,
@@ -85,6 +86,12 @@ class SetupProgress(BaseModel):
     ready_to_trade: bool
     percent_complete: int
     steps: list[SetupStep]
+    # Stocktake cadence (see backend/app/inventory/stocktake_schedule.py).
+    # Both None when inventory tracking isn't switched on — "overdue" isn't
+    # a meaningful concept for a business with no stock module, so this is
+    # the field's "n/a" rather than a misleading False.
+    stocktake_overdue: bool | None = None
+    last_stocktake_at: datetime | None = None
 
 
 @router.get("/progress", response_model=SetupProgress)
@@ -279,6 +286,21 @@ async def compute_setup_progress(db: AsyncSession, business: Business) -> SetupP
             href="/stocktake",
         ))
 
+        # -- Stocktake cadence (BUG "stocktake overdue" read-only surfacing) --
+        last_stocktake_at = (await db.execute(
+            select(StocktakeSession.completed_at)
+            .where(
+                StocktakeSession.business_id == business_id,
+                StocktakeSession.status == "APPROVED",
+            )
+            .order_by(StocktakeSession.completed_at.desc())
+            .limit(1)
+        )).scalar_one_or_none()
+        stocktake_overdue = is_stocktake_overdue(business, last_stocktake_at)
+    else:
+        last_stocktake_at = None
+        stocktake_overdue = None
+
     required = [s for s in steps if s.required_to_trade]
     done = sum(1 for s in required if s.status == "done")
     percent = int(round(100 * done / len(required))) if required else 0
@@ -289,6 +311,8 @@ async def compute_setup_progress(db: AsyncSession, business: Business) -> SetupP
         ready_to_trade=all(s.status == "done" for s in required),
         percent_complete=percent,
         steps=steps,
+        stocktake_overdue=stocktake_overdue,
+        last_stocktake_at=last_stocktake_at,
     )
 
 
