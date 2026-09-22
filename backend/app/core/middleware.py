@@ -3,7 +3,11 @@ Middleware — correlation IDs, request logging, timing, token masking.
 Every request gets a correlation_id (from header or generated).
 Propagated through logs and into audit_events.
 
-Model 1 addition: TokenMaskingFilter masks access tokens in log output.
+Model 1 addition: TokenMaskingFilter masks access tokens and other
+credentials in log output. It is attached not only to this app's own
+loggers but to the third-party loggers that actually emit
+credential-bearing URLs (httpx, uvicorn.access) — see
+_THIRD_PARTY_CREDENTIAL_LOGGERS and setup_logging() below.
 """
 
 import logging
@@ -38,6 +42,16 @@ _GENERIC_TOKEN_PATTERN = re.compile(
 # and followed by "?" rather than a quote/colon/space/equals in
 # "access_token?client_id=".
 #
+# The value class excludes "%" deliberately. A LogRecord's msg is usually a
+# %-format TEMPLATE, and this codebase has four real call sites shaped like
+# "... has_token=%s ..." / "... token=%s" (routes_webhook.py,
+# whatsapp_sender.py, admin routes). Letting the value class eat the "%s"
+# would delete a placeholder while record.args still held its argument, and
+# logging would then raise "not all arguments converted during string
+# formatting" at render time — a masking filter must never be able to break
+# logging itself. Real credential values never contain "%" unless they are
+# percent-encoded, and _mask_record_msg below is a second guard.
+#
 # Masked COMPLETELY rather than in the partial first6...last4 style used for
 # bearer tokens above: META_APP_SECRET is also the HMAC key for Meta webhook
 # signature verification, so revealing any part of it is a platform-wide
@@ -45,8 +59,8 @@ _GENERIC_TOKEN_PATTERN = re.compile(
 # that is not useful to see partially. The parameter NAME is kept so the log
 # line stays diagnostic.
 _SECRET_PARAM_PATTERN = re.compile(
-    r"\b(client_secret|access_token|refresh_token|api_key|apikey|password)="
-    r'([^&\s"\']+)',
+    r"\b(client_secret|api_key|apikey|password|[A-Za-z0-9_]*token)="
+    r'([^&\s%"\']+)',
     re.IGNORECASE,
 )
 
@@ -61,13 +75,38 @@ _OAUTH_CODE_PATTERN = re.compile(
 
 _REDACTED = "***"
 
-# Third-party loggers that emit credential-bearing URLs — the ACTUAL emitter
-# of the leak in BUG-0075 is httpx, not any call site in this codebase.
-_THIRD_PARTY_CREDENTIAL_LOGGERS = ("httpx",)
+# BUG-0076. The public receipt token travels in the URL PATH, not a query
+# parameter — `GET /v1/r/<token>` — so no name=value pattern can ever catch
+# it, and stripping query strings from the access-log format would not help
+# either. That token is the ENTIRE authorization for a real customer's order
+# data (bearer-equivalent, see routes_receipt_public.py), so the path segment
+# itself is redacted. Length-gated so ordinary short paths are untouched;
+# real tokens are ~43 url-safe base64 characters (secrets.token_urlsafe(32)).
+_RECEIPT_PATH_PATTERN = re.compile(r"(/r/)([A-Za-z0-9_\-]{20,})")
+
+
+# Third-party loggers that emit credential-bearing URLs. These are the ACTUAL
+# emitters of both leaks — no call site in this codebase logs them:
+#   httpx         — BUG-0075, logs the full request URL (client_secret, code)
+#   uvicorn.access — BUG-0076, logs the full request line (receipt token in
+#                    the path, SSE ?token= in the query string)
+#
+# uvicorn.access is declared by uvicorn's own LOGGING_CONFIG with
+# propagate=False and its own handler, which is exactly why a filter on the
+# ROOT logger's handlers never saw one of its records.
+_THIRD_PARTY_CREDENTIAL_LOGGERS = ("httpx", "uvicorn.access")
 
 
 def _mask_string(s: str) -> str:
-    """Mask every credential pattern this filter knows about."""
+    """
+    Mask every credential pattern this filter knows about.
+
+    Full redactions run FIRST, so a value that matches both a full and a
+    partial rule ends up fully redacted rather than partially revealed.
+    """
+    s = _SECRET_PARAM_PATTERN.sub(lambda m: f"{m.group(1)}={_REDACTED}", s)
+    s = _OAUTH_CODE_PATTERN.sub(lambda m: f"{m.group(1)}={_REDACTED}", s)
+    s = _RECEIPT_PATH_PATTERN.sub(lambda m: f"{m.group(1)}{_REDACTED}", s)
     s = _BEARER_PATTERN.sub(
         lambda m: f"{m.group(1)}{m.group(2)[:6]}...{m.group(2)[-4:]}",
         s,
@@ -76,9 +115,25 @@ def _mask_string(s: str) -> str:
         lambda m: f"{m.group(1)}{m.group(2)[:6]}...{m.group(2)[-4:]}",
         s,
     )
-    s = _SECRET_PARAM_PATTERN.sub(lambda m: f"{m.group(1)}={_REDACTED}", s)
-    s = _OAUTH_CODE_PATTERN.sub(lambda m: f"{m.group(1)}={_REDACTED}", s)
     return s
+
+
+def _mask_record_msg(msg: str, has_args: bool) -> str:
+    """
+    Mask a LogRecord's msg, refusing to do so if that would break %-format
+    rendering.
+
+    When record.args is non-empty, record.msg is a %-format template and the
+    number of "%" characters in it is load-bearing: drop one and
+    `msg % args` raises TypeError at render time. The patterns above are all
+    written not to match a placeholder, but a masking filter that can crash
+    logging is worse than one that occasionally under-masks, so this verifies
+    the invariant instead of trusting it.
+    """
+    masked = _mask_string(msg)
+    if has_args and masked.count("%") != msg.count("%"):
+        return msg
+    return masked
 
 
 def _mask_arg(a):
@@ -124,7 +179,7 @@ class TokenMaskingFilter(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:
         if isinstance(record.msg, str):
-            record.msg = _mask_string(record.msg)
+            record.msg = _mask_record_msg(record.msg, bool(record.args))
         # Also check args (for %-style formatting)
         if record.args:
             if isinstance(record.args, dict):

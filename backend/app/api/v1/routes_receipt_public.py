@@ -36,6 +36,13 @@ is ever logged with the raw token value, to avoid the token leaking into
 log aggregation as if it were a low-sensitivity value — it is the entire
 authorization for a real customer's order data, equivalent to a bearer
 credential.
+
+That guarantee used to stop at this module's own boundary: because the
+token travels in the URL path, uvicorn's access logger wrote every real
+token verbatim (`"GET /v1/r/<token> HTTP/1.1" 200 OK`) and
+TokenMaskingFilter was never attached to it (BUG-0076). It now is, and the
+filter redacts the `/r/<token>` path segment itself — see
+backend/app/core/middleware.py::_RECEIPT_PATH_PATTERN.
 """
 
 from __future__ import annotations
