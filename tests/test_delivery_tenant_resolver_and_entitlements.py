@@ -54,11 +54,11 @@ class TestCrossTenantResolution:
         business_b = uuid.uuid4()
         conn_a = DeliveryConnection(
             id=uuid.uuid4(), business_id=business_a, provider="UBER_EATS",
-            external_store_id="store-A", status="ACTIVE", environment="production",
+            external_store_id="store-A", status="CONNECTED", environment="production",
         )
         conn_b = DeliveryConnection(
             id=uuid.uuid4(), business_id=business_b, provider="UBER_EATS",
-            external_store_id="store-B", status="ACTIVE", environment="production",
+            external_store_id="store-B", status="CONNECTED", environment="production",
         )
         db = FakeDB([conn_a, conn_b])
 
@@ -129,8 +129,26 @@ class TestEntitlements:
         assert is_provider_entitled(b, "UBER_EATS") is False
 
     def test_connection_liveness(self):
-        active = DeliveryConnection(status="ACTIVE")
-        paused = DeliveryConnection(status="PAUSED")
-        assert is_connection_live(active) is True
-        assert is_connection_live(paused) is False
+        connected = DeliveryConnection(status="CONNECTED")
+        not_connected = DeliveryConnection(status="NOT_CONNECTED")
+        attention_required = DeliveryConnection(status="ATTENTION_REQUIRED")
+        disabled = DeliveryConnection(status="DISABLED")
+        assert is_connection_live(connected) is True
+        assert is_connection_live(not_connected) is False
+        assert is_connection_live(attention_required) is False
+        assert is_connection_live(disabled) is False
         assert is_connection_live(None) is False
+
+    def test_sandbox_and_awaiting_approval_are_never_treated_as_live(self):
+        """
+        Commercial-correctness requirement (not a style choice): Uber Eats
+        production access requires Uber's own written approval. A restaurant
+        can be wired up to Uber's SANDBOX environment, or waiting on Uber's
+        own AWAITING_APPROVAL review, while unable to take a single real
+        order — the UI must never show "Live Integration - Connected" for
+        either of these, so neither may ever satisfy is_connection_live().
+        """
+        sandbox = DeliveryConnection(status="SANDBOX")
+        awaiting_approval = DeliveryConnection(status="AWAITING_APPROVAL")
+        assert is_connection_live(sandbox) is False
+        assert is_connection_live(awaiting_approval) is False

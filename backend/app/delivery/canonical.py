@@ -82,11 +82,35 @@ class DeliveryOrderStatus(str, enum.Enum):
 
 
 class DeliveryConnectionStatus(str, enum.Enum):
-    PENDING = "PENDING"
-    ACTIVE = "ACTIVE"
-    PAUSED = "PAUSED"
-    DISCONNECTED = "DISCONNECTED"
-    ERROR = "ERROR"
+    """
+    Commercial-correctness vocabulary — deliberately NOT a generic
+    PENDING/ACTIVE/PAUSED/DISCONNECTED/ERROR set. Uber Eats production
+    access requires Uber's own written approval, so a restaurant can be
+    wired up to a SANDBOX environment or waiting on Uber's own review
+    (AWAITING_APPROVAL) while unable to take a single real order. The
+    product requirement is that the UI must never show "Live Integration -
+    Connected" unless the integration genuinely is live and approved — only
+    CONNECTED means that (see `entitlements.py::is_connection_live`).
+
+    NOT_CONNECTED      - no live connection (initial state; also default)
+    SANDBOX            - wired up against Uber's sandbox only, no real orders
+    AWAITING_APPROVAL  - production credentials in place, awaiting Uber's
+                         own written go-live approval
+    CONNECTED          - genuinely live and approved; the ONLY status that
+                         may process a real order or read "Connected" in
+                         any UI
+    ATTENTION_REQUIRED - degraded/error (repeated auto-denies, Uber itself
+                         pausing the store, a fetch/deny failure, etc.)
+    DISABLED           - an explicit NextGen-operator switch-off, distinct
+                         from a provider-side disconnect/pause (which
+                         surfaces as ATTENTION_REQUIRED, not this)
+    """
+    NOT_CONNECTED = "NOT_CONNECTED"
+    SANDBOX = "SANDBOX"
+    AWAITING_APPROVAL = "AWAITING_APPROVAL"
+    CONNECTED = "CONNECTED"
+    ATTENTION_REQUIRED = "ATTENTION_REQUIRED"
+    DISABLED = "DISABLED"
 
 
 @dataclass(frozen=True)

@@ -27,5 +27,14 @@ def is_provider_entitled(business: Business | None, provider: str) -> bool:
 
 
 def is_connection_live(connection) -> bool:
-    """A connection is "live" only when ACTIVE — PENDING/PAUSED/DISCONNECTED/ERROR are not."""
-    return bool(connection) and connection.status == "ACTIVE"
+    """
+    A connection is "live" (may process a real order) only when CONNECTED.
+
+    Commercial-correctness requirement, not a simplification target: Uber
+    Eats production access requires Uber's own written approval, so a
+    connection can genuinely be SANDBOX or AWAITING_APPROVAL — wired up,
+    but unable to take a single real order — and must be treated exactly
+    like NOT_CONNECTED/ATTENTION_REQUIRED/DISABLED here: not live. Only
+    CONNECTED may ever be treated as live for real order processing.
+    """
+    return bool(connection) and connection.status == "CONNECTED"

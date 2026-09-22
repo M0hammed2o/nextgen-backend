@@ -251,7 +251,7 @@ class TestKnownStoreEnqueue:
         event_row = DeliveryWebhookEvent(id=uuid.uuid4())
         connection = DeliveryConnection(
             id=connection_id, business_id=business_id, provider="UBER_EATS",
-            external_store_id="store-1", status="ACTIVE", environment="production",
+            external_store_id="store-1", status="CONNECTED", environment="production",
         )
         db = FakeDB(
             execute_results=[
@@ -282,7 +282,7 @@ class TestKnownStoreEnqueue:
         business_id = uuid.uuid4()
         connection = DeliveryConnection(
             id=uuid.uuid4(), business_id=business_id, provider="UBER_EATS",
-            external_store_id="store-1", status="ACTIVE", environment="production",
+            external_store_id="store-1", status="CONNECTED", environment="production",
         )
         db = FakeDB(
             execute_results=[
@@ -308,7 +308,7 @@ class TestKnownStoreEnqueue:
         business_id = uuid.uuid4()
         connection = DeliveryConnection(
             id=uuid.uuid4(), business_id=business_id, provider="UBER_EATS",
-            external_store_id="store-1", status="ACTIVE", environment="production",
+            external_store_id="store-1", status="CONNECTED", environment="production",
         )
         db = FakeDB(
             execute_results=[

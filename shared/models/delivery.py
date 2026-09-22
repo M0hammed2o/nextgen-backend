@@ -84,9 +84,9 @@ class DeliveryConnection(Base, UUIDPrimaryKeyMixin, TimestampMixin):
             "business_id", "provider",
             name="uq_delivery_connections_business_provider",
         ),
-        # THE trust-boundary constraint. Partial because a PENDING connection
-        # (provisioning started, store not yet activated) has no store id
-        # yet — modelled directly on migration 0037's WABA-uniqueness fix.
+        # THE trust-boundary constraint. Partial because a NOT_CONNECTED
+        # connection (provisioning started, store not yet activated) has no
+        # store id yet — modelled directly on migration 0037's WABA-uniqueness fix.
         Index(
             "uq_delivery_connections_provider_external_store_id",
             "provider", "external_store_id",
@@ -110,8 +110,20 @@ class DeliveryConnection(Base, UUIDPrimaryKeyMixin, TimestampMixin):
                 "NULL until activation completes.",
     )
     status: Mapped[str] = mapped_column(
-        String(16), default="PENDING", nullable=False,
-        comment="PENDING / ACTIVE / PAUSED / DISCONNECTED / ERROR",
+        String(24), default="NOT_CONNECTED", nullable=False,
+        comment="NOT_CONNECTED / SANDBOX / AWAITING_APPROVAL / CONNECTED / "
+                "ATTENTION_REQUIRED / DISABLED. Commercial-correctness "
+                "vocabulary (not a generic PENDING/ACTIVE/PAUSED set): Uber "
+                "Eats production access requires Uber's own written "
+                "approval, so a restaurant can be wired up (SANDBOX) or "
+                "waiting on Uber (AWAITING_APPROVAL) while unable to take a "
+                "single real order — the UI must never say 'Live "
+                "Integration - Connected' unless status == CONNECTED. "
+                "ATTENTION_REQUIRED is the error/degraded state (repeated "
+                "auto-denies, Uber-side pause, etc). DISABLED is an "
+                "operator switch-off, distinct from a provider-side "
+                "disconnect (which surfaces as ATTENTION_REQUIRED). Only "
+                "CONNECTED counts as live — see entitlements.py::is_connection_live.",
     )
     environment: Mapped[str] = mapped_column(
         String(16), default="production", nullable=False,
@@ -236,7 +248,24 @@ class DeliveryOrder(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         ),
         Index("ix_delivery_orders_business_id", "business_id"),
         Index("ix_delivery_orders_status", "status"),
-        Index("ix_delivery_orders_accept_deadline_at", "accept_deadline_at"),
+        # Partial: the watchdog only ever scans open/live rows, so this stays
+        # small permanently instead of growing with the full order history.
+        Index(
+            "ix_delivery_orders_accept_deadline_at",
+            "accept_deadline_at",
+            postgresql_where=text(
+                "status IN ('RECEIVED', 'FETCHING', 'NEEDS_MAPPING', 'READY_TO_ACCEPT')"
+            ),
+        ),
+        # One delivery order maps to at most one canonical Order. Partial
+        # because most rows never reach mapping (NEEDS_MAPPING/DENIED/FAILED
+        # never get an order_id at all, by design).
+        Index(
+            "uq_delivery_orders_order_id",
+            "order_id",
+            unique=True,
+            postgresql_where=text("order_id IS NOT NULL"),
+        ),
     )
 
     business_id: Mapped[uuid.UUID] = mapped_column(

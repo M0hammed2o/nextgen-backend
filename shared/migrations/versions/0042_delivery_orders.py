@@ -26,6 +26,27 @@ Idempotency: UniqueConstraint(business_id, provider, external_order_id) is
 BUSINESS-scoped, not global — the same Uber order id must remain
 independently importable by a different restaurant, same rule as the
 pre-existing uq_orders_business_source_external_id.
+
+AMENDMENT (2026-09-22, post-independent-verification, same day as original
+authorship): three omissions found against the signed-off design were
+added in place rather than stacked as a new migration:
+1. A partial UNIQUE index on `order_id WHERE order_id IS NOT NULL` — one
+   delivery order must map to at most one canonical Order; not partial on
+   NULL, a bare unique index would have rejected the (overwhelmingly
+   common) case of two NULL-order_id rows that never reached mapping.
+2. A CHECK constraint on `provider`, matching `delivery_connections`'
+   existing one — this table had no equivalent, so an unvalidated provider
+   string could otherwise reach this column.
+3. `ix_delivery_orders_accept_deadline_at` made partial
+   (`WHERE status IN ('RECEIVED','FETCHING','NEEDS_MAPPING',
+   'READY_TO_ACCEPT')`) so the accept-deadline watchdog's own query (which
+   only ever looks at those four statuses — see order_service.py) scans an
+   index that stays small permanently, instead of growing with the entire
+   order history including terminal rows the watchdog never reads.
+Verified safe to amend in place for the same reason given in migration
+0040's own amendment note: this chain has been applied to exactly one
+disposable Docker Postgres container (destroyed immediately after) and
+nowhere else. See WORKLOG.md's 2026-09-22 correction entry.
 """
 from alembic import op
 import sqlalchemy as sa
@@ -96,13 +117,40 @@ def upgrade() -> None:
             "status IN (" + ", ".join(f"'{v}'" for v in _STATUS_VALUES) + ")",
             name="ck_delivery_orders_status_known",
         ),
+        sa.CheckConstraint(
+            "provider IN ('UBER_EATS', 'MR_D')",
+            name="ck_delivery_orders_provider_known",
+        ),
     )
     op.create_index("ix_delivery_orders_business_id", _TABLE, ["business_id"])
     op.create_index("ix_delivery_orders_status", _TABLE, ["status"])
-    op.create_index("ix_delivery_orders_accept_deadline_at", _TABLE, ["accept_deadline_at"])
+    # Partial — the accept-deadline watchdog only ever queries these four
+    # open statuses (order_service.py::delivery_accept_deadline_watchdog),
+    # so the index stays small permanently instead of growing with the full
+    # order history.
+    op.create_index(
+        "ix_delivery_orders_accept_deadline_at",
+        _TABLE,
+        ["accept_deadline_at"],
+        postgresql_where=sa.text(
+            "status IN ('RECEIVED', 'FETCHING', 'NEEDS_MAPPING', 'READY_TO_ACCEPT')"
+        ),
+    )
+    # One delivery order maps to at most one canonical Order. Partial on
+    # NOT NULL — most rows (NEEDS_MAPPING/DENIED/FAILED) never get an
+    # order_id at all, by design, and a bare unique index would incorrectly
+    # reject more than one such NULL row.
+    op.create_index(
+        "uq_delivery_orders_order_id",
+        _TABLE,
+        ["order_id"],
+        unique=True,
+        postgresql_where=sa.text("order_id IS NOT NULL"),
+    )
 
 
 def downgrade() -> None:
+    op.drop_index("uq_delivery_orders_order_id", table_name=_TABLE)
     op.drop_index("ix_delivery_orders_accept_deadline_at", table_name=_TABLE)
     op.drop_index("ix_delivery_orders_status", table_name=_TABLE)
     op.drop_index("ix_delivery_orders_business_id", table_name=_TABLE)

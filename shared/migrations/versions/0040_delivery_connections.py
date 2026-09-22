@@ -26,6 +26,28 @@ migration and add the FK constraint in a later one, this chain is simply
 ordered connections (0040) -> webhook_events (0041) -> orders (0042), so
 every FK in every migration always targets an already-existing table. No
 in-place ALTER ... ADD CONSTRAINT step is needed anywhere in this chain.
+
+AMENDMENT (2026-09-22, post-independent-verification, same day as original
+authorship): `status`'s vocabulary and column width were corrected in place
+rather than stacked as a new migration. Original: PENDING/ACTIVE/PAUSED/
+DISCONNECTED/ERROR, String(16). Corrected: NOT_CONNECTED/SANDBOX/
+AWAITING_APPROVAL/CONNECTED/ATTENTION_REQUIRED/DISABLED, String(24) (the
+original String(16) could not even hold "ATTENTION_REQUIRED", 18 chars).
+This is a commercial-correctness requirement, not a style change: Uber Eats
+production access requires Uber's own written approval, so a restaurant can
+be wired up to a SANDBOX environment or waiting on Uber's AWAITING_APPROVAL
+review while unable to take a single real order — a plain ACTIVE/PAUSED
+vocabulary cannot represent that distinction, and the UI would have to
+either lie ("Connected") or fall back to a vaguer, less honest label. This
+amendment was verified safe because this migration chain has been applied
+to exactly one disposable Docker Postgres container (destroyed immediately
+after, per the verifying session's own report) and nowhere else — not the
+local staging stack (which was and remains at 0039 as of this amendment),
+not any shared or production database. Per this repo's own migration
+discipline ("never edit a migration already applied elsewhere"), amending
+is the correct move specifically because it was never applied *elsewhere*;
+had this chain reached a shared database, a new corrective migration would
+have been required instead. See WORKLOG.md's 2026-09-22 correction entry.
 """
 from alembic import op
 import sqlalchemy as sa
@@ -50,7 +72,7 @@ def upgrade() -> None:
         ),
         sa.Column("provider", sa.String(24), nullable=False),
         sa.Column("external_store_id", sa.String(128), nullable=True),
-        sa.Column("status", sa.String(16), nullable=False, server_default="PENDING"),
+        sa.Column("status", sa.String(24), nullable=False, server_default="NOT_CONNECTED"),
         sa.Column("environment", sa.String(16), nullable=False, server_default="production"),
         sa.Column("provisioning_token_encrypted", sa.Text, nullable=True),
         sa.Column("store_status", sa.String(16), nullable=True),
@@ -70,7 +92,8 @@ def upgrade() -> None:
             name="ck_delivery_connections_provider_known",
         ),
         sa.CheckConstraint(
-            "status IN ('PENDING', 'ACTIVE', 'PAUSED', 'DISCONNECTED', 'ERROR')",
+            "status IN ('NOT_CONNECTED', 'SANDBOX', 'AWAITING_APPROVAL', "
+            "'CONNECTED', 'ATTENTION_REQUIRED', 'DISABLED')",
             name="ck_delivery_connections_status_known",
         ),
         sa.CheckConstraint(

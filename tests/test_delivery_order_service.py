@@ -123,7 +123,7 @@ def _business(**overrides) -> Business:
 def _connection(business_id, **overrides) -> DeliveryConnection:
     c = DeliveryConnection(
         id=uuid.uuid4(), business_id=business_id, provider="UBER_EATS",
-        external_store_id="store-1", status="ACTIVE", environment="production",
+        external_store_id="store-1", status="CONNECTED", environment="production",
     )
     for k, v in overrides.items():
         setattr(c, k, v)
@@ -194,7 +194,26 @@ class TestFindMisconfiguration:
         ) == "ENTITLEMENT_OFF"
 
     def test_connection_not_live(self):
-        connection = _connection(uuid.uuid4(), status="PAUSED")
+        connection = _connection(uuid.uuid4(), status="ATTENTION_REQUIRED")
+        assert _find_misconfiguration(
+            connection=connection, business=_business(), webhook_event=None, provider="UBER_EATS",
+        ) == "CONNECTION_NOT_LIVE"
+
+    def test_sandbox_connection_is_not_treated_as_live(self):
+        """
+        Commercial-correctness requirement: Uber Eats production access
+        needs Uber's own written approval, so a SANDBOX connection must
+        never be allowed to process a real order, even though it is
+        genuinely "connected" in a loose sense.
+        """
+        connection = _connection(uuid.uuid4(), status="SANDBOX")
+        assert _find_misconfiguration(
+            connection=connection, business=_business(), webhook_event=None, provider="UBER_EATS",
+        ) == "CONNECTION_NOT_LIVE"
+
+    def test_awaiting_approval_connection_is_not_treated_as_live(self):
+        """Same requirement as SANDBOX — waiting on Uber's own approval is not live."""
+        connection = _connection(uuid.uuid4(), status="AWAITING_APPROVAL")
         assert _find_misconfiguration(
             connection=connection, business=_business(), webhook_event=None, provider="UBER_EATS",
         ) == "CONNECTION_NOT_LIVE"
@@ -343,7 +362,7 @@ class TestHandleOrderMisconfiguration:
 
     async def test_connection_not_live_denies(self):
         business_id = uuid.uuid4()
-        connection = _connection(business_id, status="PAUSED")
+        connection = _connection(business_id, status="ATTENTION_REQUIRED")
         business = _business()
         row = _delivery_order(business_id, connection.id)
 
@@ -365,7 +384,7 @@ class TestHandleOrderMisconfiguration:
     async def test_deny_call_failure_still_marks_row_denied_locally(self):
         """A provider-communication failure on the deny call must never leave the row stuck."""
         business_id = uuid.uuid4()
-        connection = _connection(business_id, status="DISCONNECTED")
+        connection = _connection(business_id, status="NOT_CONNECTED")
         business = _business()
         row = _delivery_order(business_id, connection.id)
 
