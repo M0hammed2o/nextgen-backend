@@ -35,3 +35,6 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Local staging-equivalent compose overlay (contains throwaway dev secrets, never commit)
+docker-compose.staging.yml
