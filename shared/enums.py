@@ -150,11 +150,20 @@ class ExternalImportStatus(str, enum.Enum):
 
 class ExternalMappingKind(str, enum.Enum):
     """
-    ITEM     - an external product name -> a NextGen menu item (+ size option)
-    MODIFIER - an external modifier -> an add-on, an option, or a removal
+    ITEM           - an external product name -> a NextGen menu item (+ size option)
+    MODIFIER       - an external modifier -> an add-on, an option, or a removal
+    MODIFIER_GROUP - (delivery API menu sync, migration 0043) an external
+                     modifier GROUP id -> a NextGen option group. Added
+                     alongside the live-connection columns rather than as a
+                     new table so a restaurant moving from CSV import to an
+                     API connection keeps one mapping table.
+    CATEGORY       - (delivery API menu sync, migration 0043) an external
+                     menu category id -> a NextGen menu category.
     """
     ITEM = "ITEM"
     MODIFIER = "MODIFIER"
+    MODIFIER_GROUP = "MODIFIER_GROUP"
+    CATEGORY = "CATEGORY"
 
 
 class PaymentStatus(str, enum.Enum):

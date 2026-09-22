@@ -34,6 +34,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -114,6 +115,24 @@ class ExternalProductMapping(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     ``external_key`` is the normalised lookup form of ``external_text``
     (lower-cased, whitespace collapsed) so trivial formatting differences in
     the export do not produce a second unresolved item every day.
+
+    EXTENDED FOR LIVE DELIVERY-API CONNECTIONS (migration 0043)
+    -------------------------------------------------------------
+    Rather than a fifth, parallel mapping table for live Uber Eats menu
+    mappings, this table was extended in place — see
+    `docs/DELIVERY_PLATFORM_ARCHITECTURE.md` §3/§9 and DECISIONS.md — so a
+    restaurant moving from CSV import to a live API connection keeps its
+    existing item mappings, and the two importers can never disagree about
+    what "Large Margherita" means. The CSV importer (`external_orders/`)
+    keeps working completely unchanged: it never reads or writes any of the
+    new columns below, and its existing text-keyed unique constraint and
+    lookup path (`load_mappings()` in `external_orders/service.py`) are
+    untouched.
+
+    New columns are all NULLable/defaulted so every existing CSV-created row
+    is valid with no backfill required beyond `status` (see migration 0043's
+    data-migration step, which sets `status='IGNORED'` for rows that already
+    had `is_ignored=True` and `'MAPPED'` for everything else).
     """
 
     __tablename__ = "external_product_mappings"
@@ -124,6 +143,17 @@ class ExternalProductMapping(Base, UUIDPrimaryKeyMixin, TimestampMixin):
             "kind",
             "external_key",
             name="uq_external_product_mappings_business_platform_kind_key",
+        ),
+        # Live-connection mappings key off the provider's STABLE id, not a
+        # normalised text string (a CSV row has only text — external_id is
+        # NULL for those, hence the partial index). Modelled on migration
+        # 0037's WABA-uniqueness fix / delivery_connections' own partial
+        # unique index.
+        Index(
+            "uq_external_product_mappings_business_platform_kind_external_id",
+            "business_id", "platform", "kind", "external_id",
+            unique=True,
+            postgresql_where=text("external_id IS NOT NULL"),
         ),
         Index("ix_external_product_mappings_business_platform", "business_id", "platform"),
     )
@@ -171,6 +201,40 @@ class ExternalProductMapping(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     times_used: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # -- Live delivery-API connection columns (migration 0043; NULL for --
+    # -- every CSV-import-created mapping) -----------------------------------
+    external_id: Mapped[str | None] = mapped_column(
+        String(128), nullable=True,
+        comment="Provider's stable id for this item/modifier/group/category "
+                "(e.g. Uber's cart item external_data / menu entity id). "
+                "NULL for CSV-import rows, which only ever have text.",
+    )
+    status: Mapped[str] = mapped_column(
+        String(16), default="MAPPED", nullable=False,
+        comment="MAPPED / UNMAPPED / CHANGED / INVALID / IGNORED — live-"
+                "connection mapping health. A CSV-only row is 'MAPPED' (or "
+                "'IGNORED' if is_ignored) by construction, since a saved "
+                "mapping row already means something was resolved.",
+    )
+    status_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    delivery_connection_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("delivery_connections.id", ondelete="SET NULL"),
+        nullable=True,
+        comment="Which live connection last saw this mapping. NULL for a "
+                "CSV-only mapping.",
+    )
+    provider_snapshot_json: Mapped[dict | None] = mapped_column(
+        JSONB, nullable=True,
+        comment="Allow-listed snapshot of the provider's menu entity, used "
+                "for change detection (kind='CHANGED' when the provider's "
+                "current entity no longer matches this snapshot).",
+    )
+    last_seen_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+        comment="Last time a live menu sync or order saw this external_id.",
+    )
 
     def __repr__(self) -> str:
         return f"<ExternalProductMapping {self.platform}:{self.external_text!r}>"

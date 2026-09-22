@@ -264,6 +264,35 @@ class Business(Base, UUIDPrimaryKeyMixin, TimestampMixin):
                 "— a Meta template language code, e.g. 'en_US'."
     )
 
+    # ── Delivery marketplace integrations (migration 0044) ───────────────
+    # NOT the same thing as `delivery_enabled` above, which governs whether
+    # the WhatsApp bot offers the restaurant's OWN-driver delivery — kept
+    # deliberately separate names to avoid colliding with it (see
+    # docs/DELIVERY_PLATFORM_ARCHITECTURE.md §0.3). Platform-admin-writable,
+    # business-plane READ-ONLY: recommended SUPER_ADMIN-only for v1 (not
+    # added to the ONBOARDER business-patch allow-list) since flipping a
+    # live delivery integration on carries real contractual weight with the
+    # provider that a sales partner shouldn't be able to trigger unilaterally.
+    # No admin-suite toggle route was added in this change — see TODO.md.
+    delivery_platforms_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False,
+        comment="Master switch for the delivery marketplace module as a "
+                "whole (same pattern as inventory_enabled). Both this AND "
+                "the specific provider flag below must be true for that "
+                "provider's webhook to be actioned rather than denied.",
+    )
+    uber_eats_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False,
+        comment="This tenant's Uber Eats connection is entitled to go live.",
+    )
+    mrd_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False,
+        comment="Reserved. MrDAdapter is a disabled stub in this release — "
+                "no live Mr D API integration exists yet (see "
+                "backend/app/delivery/mrd/adapter.py) — this flag has no "
+                "effect today beyond being readable/settable.",
+    )
+
     # ── Inventory module (Ciao Pizza P0) ─────────────────────────────────
     inventory_enabled: Mapped[bool] = mapped_column(
         Boolean, default=False, nullable=False,

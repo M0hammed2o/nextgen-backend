@@ -13,6 +13,7 @@ from shared.models.billing_invoice import BillingInvoice
 from shared.models.business import Business
 from shared.models.commercial_invoice import CommercialInvoice, CommercialInvoiceLine
 from shared.models.customer import ConversationSession, Customer
+from shared.models.delivery import DeliveryConnection, DeliveryOrder, DeliveryWebhookEvent
 from shared.models.digital_receipt import DigitalReceipt
 from shared.models.external_orders import ExternalImportBatch, ExternalProductMapping
 from shared.models.inventory import (
@@ -52,6 +53,9 @@ __all__ = [
     "ConversationSession",
     "Customer",
     "DailyUsage",
+    "DeliveryConnection",
+    "DeliveryOrder",
+    "DeliveryWebhookEvent",
     "DigitalReceipt",
     "ExternalImportBatch",
     "ExternalProductMapping",
