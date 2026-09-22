@@ -277,6 +277,28 @@ class Settings(BaseSettings):
     # every deployment today.
     READY_REQUIRES_WORKER: bool = True
 
+    # ── Digital receipts (Commercial V1 gate, 2026-09-22) ─────────────────
+    # See backend/app/receipts/whatsapp_receipt.py::send_digital_receipt()
+    # and backend/app/api/v1/routes_receipt_public.py.
+    #
+    # RECEIPT_WHATSAPP_TEMPLATE_NAME/_LANGUAGE are PLATFORM DEFAULTS, used
+    # unless Business.whatsapp_receipt_template_name/_language overrides
+    # them. "nextgen_receipt_ready" is a PLACEHOLDER name — it must be
+    # replaced with a template name that is ACTUALLY approved by Meta for
+    # whichever WABA is actually sending (the platform WABA, or a specific
+    # business's own customer-owned connection) before any real send using
+    # it can succeed. Configure per business via the two Business columns
+    # above when a tenant's own WABA needs a differently-named/localised one.
+    RECEIPT_WHATSAPP_TEMPLATE_NAME: str = "nextgen_receipt_ready"
+    RECEIPT_WHATSAPP_TEMPLATE_LANGUAGE: str = "en_US"
+    # Per-IP rate limit on the public, unauthenticated GET /v1/r/{token}
+    # receipt page (backend/app/core/ratelimit.py). Generous enough for a
+    # real customer refreshing the page a few times; the primary defence
+    # against token-guessing is the token's own ~256 bits of entropy (see
+    # backend/app/receipts/token.py) — this is defence in depth, not the
+    # only protection.
+    RECEIPT_PUBLIC_RATE_LIMIT_PER_MINUTE: int = 30
+
     @field_validator("ENVIRONMENT")
     @classmethod
     def _check_environment(cls, value: str) -> str:
