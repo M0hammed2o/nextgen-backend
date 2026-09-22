@@ -14,6 +14,8 @@ All API errors follow this format:
 import logging
 
 from fastapi import FastAPI, Request, status
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -203,6 +205,49 @@ def register_error_handlers(app: FastAPI) -> None:
                 }
             },
         )
+
+    async def _redis_unavailable_handler(request: Request, exc: Exception) -> JSONResponse:
+        """
+        BUG-0078. A Redis AVAILABILITY failure is a 503, not a 500.
+
+        The specific case this exists for: the slowapi rate limiter's own
+        Redis storage is consulted by the @limiter decorator BEFORE the route
+        body runs, so a route that deliberately handles Redis being down
+        (routes_whatsapp_connect.py's /start and /exchange translate
+        StateServiceUnavailable into a 503) never got the chance — the
+        limiter's raw redis.exceptions.ConnectionError escaped first as an
+        unhandled 500. The fail-CLOSED behaviour was always correct (no Graph
+        call, no DB mutation); only the status code was wrong.
+
+        Deliberately narrow: ONLY ConnectionError/TimeoutError, which mean
+        "the dependency is unreachable". Every other redis.exceptions.*
+        (ResponseError, DataError, ...) indicates a malformed command — our
+        bug, not an outage — and must keep surfacing as a 500 rather than
+        being dressed up as a transient outage a client should retry.
+
+        The exception text is deliberately NOT echoed: it embeds the Redis
+        host/port, and a REDIS_URL can carry a password.
+        """
+        logger.error(
+            "Redis unavailable (%s) on %s %s — returning 503",
+            exc.__class__.__name__, request.method, request.url.path,
+        )
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                "error": {
+                    "code": "SERVICE_TEMPORARILY_UNAVAILABLE",
+                    "message": (
+                        "This service is temporarily unavailable — please try again "
+                        "shortly."
+                    ),
+                    "details": None,
+                }
+            },
+        )
+
+    app.add_exception_handler(RedisConnectionError, _redis_unavailable_handler)
+    app.add_exception_handler(RedisTimeoutError, _redis_unavailable_handler)
 
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
