@@ -37,6 +37,9 @@ def settings():
         "PAYFAST_BILLING_MERCHANT_ID": s.PAYFAST_BILLING_MERCHANT_ID,
         "PAYFAST_BILLING_MERCHANT_KEY": s.PAYFAST_BILLING_MERCHANT_KEY,
         "PAYFAST_BILLING_PASSPHRASE": s.PAYFAST_BILLING_PASSPHRASE,
+        "UBER_EATS_WEBHOOK_ENABLED": s.UBER_EATS_WEBHOOK_ENABLED,
+        "UBER_EATS_CLIENT_ID": s.UBER_EATS_CLIENT_ID,
+        "UBER_EATS_CLIENT_SECRET": s.UBER_EATS_CLIENT_SECRET,
     }
     # Start every test from a fully-valid baseline, then break one field at a time.
     s.ENVIRONMENT = "production"
@@ -52,6 +55,9 @@ def settings():
     s.PAYFAST_BILLING_MERCHANT_ID = "10000100"
     s.PAYFAST_BILLING_MERCHANT_KEY = "46f0cd694581a"
     s.PAYFAST_BILLING_PASSPHRASE = _valid_secret("d4")
+    s.UBER_EATS_WEBHOOK_ENABLED = True
+    s.UBER_EATS_CLIENT_ID = _valid_secret("e5")
+    s.UBER_EATS_CLIENT_SECRET = _valid_secret("f6")
     yield s
     for key, value in original.items():
         setattr(s, key, value)
@@ -180,3 +186,44 @@ def test_billing_disabled_still_enforces_every_other_secret(settings):
     settings.JWT_SECRET_KEY = "CHANGE-ME-IN-PRODUCTION"
     with pytest.raises(RuntimeError, match="JWT_SECRET_KEY"):
         main_module._validate_production_secrets()
+
+
+# ── BUG-0089: UBER_EATS_CLIENT_SECRET/CLIENT_ID must be required when the ──
+# ── Uber Eats webhook is enabled — the exact BUG-0001 class of gap, on a ───
+# ── new webhook, recurring because it wasn't generalised the first time. ──
+
+def test_missing_uber_client_secret_caught_when_webhook_enabled(settings):
+    """
+    The real-world consequence: verify_signature() fails closed on an empty
+    secret, so every genuine, correctly-signed Uber order is logged
+    BAD_SIGNATURE and acked HTTP 200 — Uber never retries, and the order is
+    permanently, silently lost. This must be a hard boot failure, not a
+    silent runtime discard.
+    """
+    settings.UBER_EATS_CLIENT_SECRET = ""
+    with pytest.raises(RuntimeError, match="UBER_EATS_CLIENT_SECRET"):
+        main_module._validate_production_secrets()
+
+
+def test_placeholder_uber_client_secret_caught_when_webhook_enabled(settings):
+    settings.UBER_EATS_CLIENT_SECRET = "CHANGE-ME"
+    with pytest.raises(RuntimeError, match="UBER_EATS_CLIENT_SECRET"):
+        main_module._validate_production_secrets()
+
+
+def test_missing_uber_client_id_caught_when_webhook_enabled(settings):
+    settings.UBER_EATS_CLIENT_ID = ""
+    with pytest.raises(RuntimeError, match="UBER_EATS_CLIENT_ID"):
+        main_module._validate_production_secrets()
+
+
+def test_missing_uber_secrets_ignored_when_webhook_disabled(settings):
+    """The platform-wide Uber Eats kill switch legitimately means 'not configured yet'."""
+    settings.UBER_EATS_WEBHOOK_ENABLED = False
+    settings.UBER_EATS_CLIENT_ID = ""
+    settings.UBER_EATS_CLIENT_SECRET = ""
+    main_module._validate_production_secrets()  # must not raise
+
+
+def test_valid_uber_production_config_passes(settings):
+    main_module._validate_production_secrets()  # must not raise (fixture baseline)

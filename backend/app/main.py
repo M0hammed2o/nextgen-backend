@@ -95,6 +95,42 @@ def _validate_production_secrets() -> None:
                     "billing webhook would accept unverified requests"
                 )
 
+    # Every OTHER webhook-dependent integration, generalised (BUG-0089): this
+    # is the exact class of gap BUG-0001 exists to catch, and it recurred on
+    # the Uber Eats webhook because the lesson wasn't generalised the first
+    # time — UBER_EATS_CLIENT_SECRET/UBER_EATS_CLIENT_ID defaulted to "" and
+    # were never added here. verify_signature() fails CLOSED on an empty
+    # client secret (nothing forged is ever accepted), but that failure is
+    # SILENT: every genuine, correctly-signed order is then logged as
+    # BAD_SIGNATURE and acked HTTP 200 (Uber never retries), so a production
+    # deploy missing this secret permanently discards every real paid order
+    # with no boot-time signal at all. Add a new (enabled_flag, secret_value,
+    # secret_name, consequence) tuple here for any FUTURE webhook-dependent
+    # integration rather than writing a new bespoke if-block — that is the
+    # actual fix for the "keeps recurring" problem, not just adding one more
+    # line for Uber.
+    _webhook_secret_requirements = (
+        (
+            settings.UBER_EATS_WEBHOOK_ENABLED,
+            settings.UBER_EATS_CLIENT_SECRET,
+            "UBER_EATS_CLIENT_SECRET",
+            "Uber Eats webhook signatures cannot be verified — every genuine, "
+            "correctly-signed order would be logged as BAD_SIGNATURE and "
+            "silently discarded (200-acked, so Uber never retries, and no "
+            "delivery_orders row is ever created for the watchdog to rescue)",
+        ),
+        (
+            settings.UBER_EATS_WEBHOOK_ENABLED,
+            settings.UBER_EATS_CLIENT_ID,
+            "UBER_EATS_CLIENT_ID",
+            "the platform-wide Uber Eats operational token cannot be minted — "
+            "every accepted order's fetch/accept/deny call would fail",
+        ),
+    )
+    for enabled, secret_value, secret_name, consequence in _webhook_secret_requirements:
+        if enabled and _looks_like_placeholder(secret_value):
+            errors.append(f"{secret_name} is not configured but its webhook is enabled — {consequence}")
+
     if errors:
         msg = (
             f"FATAL: {settings.ENVIRONMENT} deployment with unconfigured secrets:\n"
