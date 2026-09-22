@@ -208,7 +208,8 @@ from backend.app.api.v1.routes_import import router as import_router
 from backend.app.api.v1.routes_setup import router as setup_router
 from backend.app.api.v1.routes_inventory import router as inventory_router
 from backend.app.api.v1.routes_recipes import router as recipes_router
-from backend.app.api.v1.routes_receipts import router as receipts_router
+from backend.app.api.v1.routes_receipts import digital_receipts_usage_router, router as receipts_router
+from backend.app.api.v1.routes_receipt_public import router as receipt_public_router
 from backend.app.api.v1.routes_stocktake import router as stocktake_router
 from backend.app.api.v1.routes_wastage import router as wastage_router
 from backend.app.api.v1.routes_billing import router as billing_settings_router
@@ -243,6 +244,12 @@ app.include_router(recipes_router, prefix=PREFIX)
 app.include_router(wastage_router, prefix=PREFIX)
 app.include_router(stocktake_router, prefix=PREFIX)
 app.include_router(receipts_router, prefix=PREFIX)
+app.include_router(digital_receipts_usage_router, prefix=PREFIX)
+# Public, UNAUTHENTICATED digital receipt page — GET /v1/r/{token}. Token
+# alone is the entire lookup key (see routes_receipt_public.py's module
+# docstring for why this is mounted under the standard /v1 prefix rather
+# than an unprecedented un-prefixed route).
+app.include_router(receipt_public_router, prefix=PREFIX)
 app.include_router(billing_settings_router, prefix=PREFIX)
 app.include_router(loyalty_router, prefix=PREFIX)
 app.include_router(specials_router, prefix=PREFIX)
