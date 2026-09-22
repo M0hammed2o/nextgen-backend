@@ -124,6 +124,12 @@ def _connection(business_id, **overrides) -> DeliveryConnection:
     c = DeliveryConnection(
         id=uuid.uuid4(), business_id=business_id, provider="UBER_EATS",
         external_store_id="store-1", status="CONNECTED", environment="production",
+        # Pre-existing tests in this file were written before migration 0046
+        # (auto_accept_enabled) existed and assume the old zero-touch
+        # behaviour — default it True here so they're unaffected; the
+        # dedicated TestAutoAcceptGate class below explicitly exercises
+        # auto_accept_enabled=False.
+        auto_accept_enabled=True,
     )
     for k, v in overrides.items():
         setattr(c, k, v)
@@ -596,6 +602,327 @@ class TestHandleOrderHappyPath:
         assert db.commits == 1
 
 
+# ── _handle_order — BUG-0091: a fetch failure must actively deny, never FAIL forever ──
+
+class TestFetchErrorIsActivelyDenied:
+    async def test_provider_error_on_fetch_issues_an_active_deny_not_a_dead_failed_state(self):
+        """
+        Previously a DeliveryProviderError (e.g. OperationalTokenUnavailable
+        during a Redis outage) left the row status=FAILED with no deny ever
+        issued, and FAILED is outside the watchdog's scanned status list —
+        so it was stuck FOREVER. Must now behave like every other
+        misconfiguration: an active deny, not silence.
+        """
+        business_id = uuid.uuid4()
+        connection = _connection(business_id)
+        business = _business()
+        row = _delivery_order(business_id, connection.id)
+
+        db = TypedFakeDB()
+        db.register_select(DeliveryOrder, ScalarResult(scalar=row))
+        db.register_get(DeliveryConnection, connection)
+        db.register_get(Business, business)
+
+        fake_adapter = MagicMock()
+        fake_adapter.fetch_order = AsyncMock(
+            side_effect=DeliveryProviderError("UBER_EATS", "Redis unavailable — cannot mint token")
+        )
+        fake_adapter.deny_order = AsyncMock()
+
+        with patch("backend.app.delivery.order_service.registry.get_provider", return_value=fake_adapter):
+            await _handle_order(
+                db, provider="UBER_EATS", business_id=business_id,
+                external_order_id="order-1", event_type=None,
+            )
+
+        fake_adapter.deny_order.assert_awaited_once()
+        _, kwargs = fake_adapter.deny_order.call_args
+        assert kwargs["reason_code"] == "POS_NOT_READY"
+        assert row.status == "DENIED", "must never be left in a dead FAILED state"
+        assert row.failure_reason and "fetch_order failed" in row.failure_reason
+        assert db.commits == 1
+
+    async def test_provider_error_on_fetch_still_denies_locally_even_if_the_deny_call_also_fails(self):
+        """Same 'marked DENIED locally regardless' honesty as every other deny path."""
+        business_id = uuid.uuid4()
+        connection = _connection(business_id)
+        business = _business()
+        row = _delivery_order(business_id, connection.id)
+
+        db = TypedFakeDB()
+        db.register_select(DeliveryOrder, ScalarResult(scalar=row))
+        db.register_get(DeliveryConnection, connection)
+        db.register_get(Business, business)
+
+        fake_adapter = MagicMock()
+        fake_adapter.fetch_order = AsyncMock(side_effect=DeliveryProviderError("UBER_EATS", "5xx"))
+        fake_adapter.deny_order = AsyncMock(side_effect=DeliveryProviderError("UBER_EATS", "deny also failed"))
+
+        with patch("backend.app.delivery.order_service.registry.get_provider", return_value=fake_adapter):
+            await _handle_order(
+                db, provider="UBER_EATS", business_id=business_id,
+                external_order_id="order-1", event_type=None,
+            )
+        assert row.status == "DENIED"
+
+
+# ── _handle_order — BUG-0092: an unpriceable order must never book a sale ───
+
+class TestUnpriceableOrderIsDenied:
+    async def test_none_total_cents_denies_rather_than_booking_a_zero_value_sale(self):
+        business_id = uuid.uuid4()
+        connection = _connection(business_id)
+        business = _business(inventory_enabled=True)
+        row = _delivery_order(business_id, connection.id)
+        menu_item = _menu_item(business_id)
+
+        db = TypedFakeDB()
+        db.register_select(DeliveryOrder, ScalarResult(scalar=row))
+        db.register_get(DeliveryConnection, connection)
+        db.register_get(Business, business)
+        # Deliberately NO ExternalProductMapping/MenuItem/MenuAddOn registered
+        # — if the code wrongly proceeds to _resolve_delivery_lines, this
+        # test fails loudly rather than silently passing.
+
+        canonical = CanonicalDeliveryOrder(
+            provider="UBER_EATS", external_order_id="order-1", external_store_id="store-1",
+            lines=[CanonicalDeliveryLine(
+                external_item_id="uber-item-1", title=menu_item.name, quantity=1, unit_price_cents=7500,
+            )],
+            placed_at=datetime.now(timezone.utc),
+            total_cents=None, subtotal_cents=None, tax_cents=0, fee_cents=1000,
+        )
+        fake_adapter = MagicMock()
+        fake_adapter.fetch_order = AsyncMock(return_value=canonical)
+        fake_adapter.accept_order = AsyncMock()
+        fake_adapter.deny_order = AsyncMock()
+
+        with patch("backend.app.delivery.order_service.registry.get_provider", return_value=fake_adapter), \
+             patch("backend.app.delivery.order_service.post_sale_consumption", new=AsyncMock()) as mock_consumption:
+            await _handle_order(
+                db, provider="UBER_EATS", business_id=business_id,
+                external_order_id="order-1", event_type=None,
+            )
+
+        fake_adapter.deny_order.assert_awaited_once()
+        _, kwargs = fake_adapter.deny_order.call_args
+        assert kwargs["reason_code"] == "PRICING"
+        assert row.status == "DENIED"
+        fake_adapter.accept_order.assert_not_awaited()
+        mock_consumption.assert_not_awaited()
+        assert not any(isinstance(o, Order) for o in db.added), "no sale may be booked for an unpriceable order"
+
+    async def test_zero_total_cents_denies_rather_than_booking_a_zero_value_sale(self):
+        business_id = uuid.uuid4()
+        connection = _connection(business_id)
+        business = _business()
+        row = _delivery_order(business_id, connection.id)
+
+        db = TypedFakeDB()
+        db.register_select(DeliveryOrder, ScalarResult(scalar=row))
+        db.register_get(DeliveryConnection, connection)
+        db.register_get(Business, business)
+
+        canonical = _canonical_order(lines=[])
+        canonical.total_cents = 0
+        fake_adapter = MagicMock()
+        fake_adapter.fetch_order = AsyncMock(return_value=canonical)
+        fake_adapter.deny_order = AsyncMock()
+
+        with patch("backend.app.delivery.order_service.registry.get_provider", return_value=fake_adapter):
+            await _handle_order(
+                db, provider="UBER_EATS", business_id=business_id,
+                external_order_id="order-1", event_type=None,
+            )
+        assert row.status == "DENIED"
+        assert not any(isinstance(o, Order) for o in db.added)
+
+    async def test_negative_total_cents_denies_rather_than_booking_a_negative_sale(self):
+        business_id = uuid.uuid4()
+        connection = _connection(business_id)
+        business = _business()
+        row = _delivery_order(business_id, connection.id)
+
+        db = TypedFakeDB()
+        db.register_select(DeliveryOrder, ScalarResult(scalar=row))
+        db.register_get(DeliveryConnection, connection)
+        db.register_get(Business, business)
+
+        canonical = _canonical_order(lines=[])
+        canonical.total_cents = -500
+        fake_adapter = MagicMock()
+        fake_adapter.fetch_order = AsyncMock(return_value=canonical)
+        fake_adapter.deny_order = AsyncMock()
+
+        with patch("backend.app.delivery.order_service.registry.get_provider", return_value=fake_adapter):
+            await _handle_order(
+                db, provider="UBER_EATS", business_id=business_id,
+                external_order_id="order-1", event_type=None,
+            )
+        assert row.status == "DENIED"
+        assert not any(isinstance(o, Order) for o in db.added)
+
+    async def test_positive_total_cents_still_creates_the_sale_normally(self):
+        """Regression guard: the new pricing gate must not block a normal, well-priced order."""
+        business_id = uuid.uuid4()
+        connection = _connection(business_id)
+        business = _business(inventory_enabled=False)
+        row = _delivery_order(business_id, connection.id)
+        menu_item = _menu_item(business_id)
+
+        db = TypedFakeDB()
+        db.register_select(DeliveryOrder, ScalarResult(scalar=row))
+        db.register_get(DeliveryConnection, connection)
+        db.register_get(Business, business)
+        db.register_select(
+            ExternalProductMapping,
+            ScalarResult(rows=[ExternalProductMapping(
+                id=uuid.uuid4(), business_id=business_id, platform="UBER_EATS", kind="ITEM",
+                external_text=menu_item.name, external_key=menu_item.name.lower(),
+                external_id="uber-item-1", menu_item_id=menu_item.id, status="MAPPED",
+            )]),
+        )
+        db.register_select(MenuItem, ScalarResult(rows=[menu_item]))
+        db.register_select(MenuAddOn, ScalarResult(rows=[]))
+
+        canonical = _canonical_order(lines=[
+            CanonicalDeliveryLine(external_item_id="uber-item-1", title=menu_item.name, quantity=1, unit_price_cents=7500)
+        ])
+        fake_adapter = MagicMock()
+        fake_adapter.fetch_order = AsyncMock(return_value=canonical)
+        fake_adapter.accept_order = AsyncMock()
+
+        with patch("backend.app.delivery.order_service.registry.get_provider", return_value=fake_adapter), \
+             patch("backend.app.delivery.order_service.post_sale_consumption", new=AsyncMock()), \
+             patch("backend.app.delivery.order_service._publish_alert", new=AsyncMock()):
+            await _handle_order(
+                db, provider="UBER_EATS", business_id=business_id,
+                external_order_id="order-1", event_type=None,
+            )
+        assert row.status == "ACCEPTED"
+        created_orders = [o for o in db.added if isinstance(o, Order)]
+        assert len(created_orders) == 1
+        assert created_orders[0].total_cents == 15000
+
+
+# ── _handle_order — migration 0046: auto_accept_enabled gate ────────────────
+
+class TestAutoAcceptGate:
+    async def test_auto_accept_disabled_stops_at_ready_to_accept_no_sale_created(self):
+        """
+        Design-gap fix: a fully-mapped order on a connection with
+        auto_accept_enabled=False (the new default) must NOT auto-commit to
+        the kitchen — it must wait for an explicit staff accept.
+        """
+        business_id = uuid.uuid4()
+        connection = _connection(business_id, auto_accept_enabled=False)
+        business = _business(inventory_enabled=True)
+        row = _delivery_order(business_id, connection.id)
+        menu_item = _menu_item(business_id)
+
+        db = TypedFakeDB()
+        db.register_select(DeliveryOrder, ScalarResult(scalar=row))
+        db.register_get(DeliveryConnection, connection)
+        db.register_get(Business, business)
+        db.register_select(
+            ExternalProductMapping,
+            ScalarResult(rows=[ExternalProductMapping(
+                id=uuid.uuid4(), business_id=business_id, platform="UBER_EATS", kind="ITEM",
+                external_text=menu_item.name, external_key=menu_item.name.lower(),
+                external_id="uber-item-1", menu_item_id=menu_item.id, status="MAPPED",
+            )]),
+        )
+        db.register_select(MenuItem, ScalarResult(rows=[menu_item]))
+        db.register_select(MenuAddOn, ScalarResult(rows=[]))
+
+        canonical = _canonical_order(lines=[
+            CanonicalDeliveryLine(external_item_id="uber-item-1", title=menu_item.name, quantity=1, unit_price_cents=7500)
+        ])
+        fake_adapter = MagicMock()
+        fake_adapter.fetch_order = AsyncMock(return_value=canonical)
+        fake_adapter.accept_order = AsyncMock()
+
+        with patch("backend.app.delivery.order_service.registry.get_provider", return_value=fake_adapter), \
+             patch("backend.app.delivery.order_service.post_sale_consumption", new=AsyncMock()) as mock_consumption, \
+             patch("backend.app.delivery.order_service._publish_alert", new=AsyncMock()) as mock_alert:
+            await _handle_order(
+                db, provider="UBER_EATS", business_id=business_id,
+                external_order_id="order-1", event_type=None,
+            )
+
+        assert row.status == "READY_TO_ACCEPT"
+        assert row.order_id is None
+        fake_adapter.accept_order.assert_not_awaited()
+        mock_consumption.assert_not_awaited()
+        assert not any(isinstance(o, Order) for o in db.added), "no sale until staff explicitly accepts"
+        mock_alert.assert_awaited_once()
+        assert mock_alert.call_args[0][1] == "delivery_ready_to_accept"
+
+    async def test_force_accept_bypasses_the_gate_for_a_ready_to_accept_order(self):
+        """
+        The staff-confirm path: routes_delivery.py's manual accept endpoint
+        re-enqueues with force_accept=True for a READY_TO_ACCEPT row — this
+        must create the sale even though auto_accept_enabled is False.
+        """
+        business_id = uuid.uuid4()
+        connection = _connection(business_id, auto_accept_enabled=False)
+        business = _business(inventory_enabled=False)
+        row = _delivery_order(business_id, connection.id, status="RECEIVED")
+        menu_item = _menu_item(business_id)
+
+        db = TypedFakeDB()
+        db.register_select(DeliveryOrder, ScalarResult(scalar=row))
+        db.register_get(DeliveryConnection, connection)
+        db.register_get(Business, business)
+        db.register_select(
+            ExternalProductMapping,
+            ScalarResult(rows=[ExternalProductMapping(
+                id=uuid.uuid4(), business_id=business_id, platform="UBER_EATS", kind="ITEM",
+                external_text=menu_item.name, external_key=menu_item.name.lower(),
+                external_id="uber-item-1", menu_item_id=menu_item.id, status="MAPPED",
+            )]),
+        )
+        db.register_select(MenuItem, ScalarResult(rows=[menu_item]))
+        db.register_select(MenuAddOn, ScalarResult(rows=[]))
+
+        canonical = _canonical_order(lines=[
+            CanonicalDeliveryLine(external_item_id="uber-item-1", title=menu_item.name, quantity=1, unit_price_cents=7500)
+        ])
+        fake_adapter = MagicMock()
+        fake_adapter.fetch_order = AsyncMock(return_value=canonical)
+        fake_adapter.accept_order = AsyncMock()
+
+        with patch("backend.app.delivery.order_service.registry.get_provider", return_value=fake_adapter), \
+             patch("backend.app.delivery.order_service.post_sale_consumption", new=AsyncMock()), \
+             patch("backend.app.delivery.order_service._publish_alert", new=AsyncMock()):
+            await _handle_order(
+                db, provider="UBER_EATS", business_id=business_id,
+                external_order_id="order-1", event_type=None, force_accept=True,
+            )
+
+        assert row.status == "ACCEPTED"
+        fake_adapter.accept_order.assert_awaited_once()
+        created_orders = [o for o in db.added if isinstance(o, Order)]
+        assert len(created_orders) == 1
+        assert row.order_id == created_orders[0].id
+
+    async def test_process_delivery_order_job_forwards_force_accept(self):
+        session = AsyncMock()
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(return_value=session)
+        cm.__aexit__ = AsyncMock(return_value=False)
+        ctx = {"session_factory": MagicMock(return_value=cm)}
+
+        with patch(
+            "backend.app.delivery.order_service._handle_order", new=AsyncMock()
+        ) as mock_handle:
+            await process_delivery_order(
+                ctx, "UBER_EATS", str(uuid.uuid4()), "order-1", None, True,
+            )
+        _, kwargs = mock_handle.call_args
+        assert kwargs["force_accept"] is True
+
+
 # ── _handle_order — provider timeout is retryable, not a permanent failure ──
 
 class TestFetchTimeoutIsRetryable:
@@ -738,6 +1065,109 @@ class TestAcceptDeadlineWatchdog:
         from backend.app.delivery import order_service
         source = inspect.getsource(order_service.delivery_accept_deadline_watchdog)
         assert "accept_order" not in source
+
+    async def test_query_has_sql_side_deadline_predicate_and_a_limit(self):
+        """
+        BUG-0093: previously the SELECT had no deadline comparison at all
+        (filtering happened only in Python afterwards) and no LIMIT, so
+        EVERY open delivery order platform-wide was loaded and row-locked
+        on every tick. Both must now be in the SQL itself.
+        """
+        from sqlalchemy.dialects import postgresql
+        from backend.app.delivery import order_service
+
+        captured_stmt = {}
+
+        class CapturingDB(TypedFakeDB):
+            async def execute(self, stmt):
+                captured_stmt["stmt"] = stmt
+                return await super().execute(stmt)
+
+        db = CapturingDB()
+        db.register_select(DeliveryOrder, ScalarResult(rows=[]))
+
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(return_value=db)
+        cm.__aexit__ = AsyncMock(return_value=False)
+        ctx = {"session_factory": MagicMock(return_value=cm)}
+
+        await delivery_accept_deadline_watchdog(ctx)
+
+        compiled = str(captured_stmt["stmt"].compile(dialect=postgresql.dialect()))
+        assert "LIMIT" in compiled
+        assert "accept_deadline_at <=" in compiled
+        assert order_service._WATCHDOG_BATCH_LIMIT <= 500
+
+    async def test_network_deny_call_happens_only_after_the_local_claim_is_committed(self):
+        """
+        BUG-0093: the outbound deny_pos_order network call must happen
+        OUTSIDE the row-locked transaction — a slow/hung call for one row
+        must never hold the lock (and a worker DB connection) for another.
+        Proven here by asserting the claim's own commit has already
+        happened by the time the (mocked) network call fires.
+        """
+        business_id = uuid.uuid4()
+        connection = _connection(business_id)
+        overdue = _delivery_order(
+            business_id, connection.id, status="NEEDS_MAPPING",
+            accept_deadline_at=datetime.now(timezone.utc) - timedelta(seconds=700),
+        )
+        session = TypedFakeDB()
+        session.register_select(DeliveryOrder, ScalarResult(rows=[overdue]))
+        session.register_get(DeliveryConnection, connection)
+
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(return_value=session)
+        cm.__aexit__ = AsyncMock(return_value=False)
+        ctx = {"session_factory": MagicMock(return_value=cm)}
+
+        commits_seen_at_call_time = []
+
+        async def _deny(*a, **k):
+            commits_seen_at_call_time.append(session.commits)
+
+        fake_adapter = MagicMock()
+        fake_adapter.deny_order = AsyncMock(side_effect=_deny)
+        with patch("backend.app.delivery.order_service.registry.get_provider", return_value=fake_adapter):
+            await delivery_accept_deadline_watchdog(ctx)
+
+        assert commits_seen_at_call_time == [1], (
+            "the local DENIED claim must already be committed before the network call is made"
+        )
+        assert overdue.status == "DENIED"
+        assert overdue.deny_reason_code == "OTHER"
+
+    async def test_one_rows_deny_call_failure_does_not_affect_another_rows_local_claim(self):
+        """Each claimed row is already terminal in the DB regardless of its own network call's outcome."""
+        business_id = uuid.uuid4()
+        connection = _connection(business_id)
+        overdue_1 = _delivery_order(
+            business_id, connection.id, status="NEEDS_MAPPING", external_order_id="order-1",
+            accept_deadline_at=datetime.now(timezone.utc) - timedelta(seconds=700),
+        )
+        overdue_2 = _delivery_order(
+            business_id, connection.id, status="RECEIVED", external_order_id="order-2",
+            accept_deadline_at=datetime.now(timezone.utc) - timedelta(seconds=700),
+        )
+        session = TypedFakeDB()
+        session.register_select(DeliveryOrder, ScalarResult(rows=[overdue_1, overdue_2]))
+        session.register_get(DeliveryConnection, connection, connection)
+
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(return_value=session)
+        cm.__aexit__ = AsyncMock(return_value=False)
+        ctx = {"session_factory": MagicMock(return_value=cm)}
+
+        fake_adapter = MagicMock()
+        fake_adapter.deny_order = AsyncMock(
+            side_effect=[DeliveryProviderError("UBER_EATS", "network blip"), None]
+        )
+        with patch("backend.app.delivery.order_service.registry.get_provider", return_value=fake_adapter):
+            await delivery_accept_deadline_watchdog(ctx)
+
+        assert overdue_1.status == "DENIED"
+        assert overdue_2.status == "DENIED"
+        assert session.commits == 1, "the claim commit happens once, before any network call"
 
     async def test_orders_still_within_grace_are_left_alone(self):
         business_id = uuid.uuid4()

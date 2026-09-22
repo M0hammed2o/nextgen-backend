@@ -44,22 +44,29 @@ flow) — decides whether it is genuinely still live, not a business-plane
 API call. This is a deliberate design decision, not an oversight; see this
 module's own docstring above each endpoint for the exact reasoning.
 
-WHAT "MANUAL ACCEPT" ACTUALLY DOES, GIVEN THE SHIPPED WORKER PLANE
+WHAT "MANUAL ACCEPT" ACTUALLY DOES (migration 0046, `auto_accept_enabled`)
 ------------------------------------------------------------------------
-`order_service.py::_handle_order` auto-accepts any delivery order whose
-lines fully resolve against `external_product_mappings` — there is no
-`auto_accept_enabled` column/setting anywhere in this codebase, and no
-staff gate exists for an already-resolved order (it goes straight from
-FETCHING to ACCEPTED). The only state where a human decision is actually
-pending today is `NEEDS_MAPPING` (unresolved items). "Accept" here therefore
-means: reset the row to `RECEIVED` and re-enqueue the SAME
+`order_service.py::_handle_order` now gates on the connection's
+`auto_accept_enabled` (default FALSE): a fully-resolved order stops at
+`READY_TO_ACCEPT` instead of auto-committing to the kitchen. "Accept" here
+means one of two things depending on the row's CURRENT status, but always by
+resetting the row to `RECEIVED` and re-enqueuing the SAME
 `process_delivery_order` ARQ job the webhook plane uses — reusing the exact
 worker pipeline rather than re-implementing fetch/resolve/create-order/
-accept logic in this route. If mappings still don't resolve, the order goes
-back to `NEEDS_MAPPING` exactly as it would on first pass. This is flagged
-as an implementation decision in this task's final report, not a literal
-`auto_accept_enabled` toggle (building one would be a worker-plane/schema
-change beyond this task's two declared gaps).
+accept logic in this route:
+  - `NEEDS_MAPPING` — staff just fixed a mapping; re-attempt resolution.
+    If it resolves AND `auto_accept_enabled` is still False, the order lands
+    in `READY_TO_ACCEPT` (a SECOND explicit accept, same as any other order
+    on that connection) rather than the kitchen — this is intentional, not
+    a bug: fixing a mapping is a different decision from confirming the
+    kitchen can make the food right now.
+  - `READY_TO_ACCEPT` — staff explicitly confirming an already-resolved
+    order into the kitchen. The re-enqueued job carries `force_accept=True`,
+    which bypasses the `auto_accept_enabled` gate for THIS one order only —
+    it never touches the connection's own setting.
+`auto_accept_enabled` itself is toggled via
+`POST /connections/{provider}/auto-accept` below, and is read-only elsewhere
+(surfaced on `DeliveryConnectionResponse`).
 """
 
 from __future__ import annotations
@@ -135,6 +142,7 @@ class DeliveryConnectionResponse(BaseModel):
     provider_label: str
     status: str
     environment: str
+    auto_accept_enabled: bool
     external_store_id: str | None
     store_status: str | None
     last_status_synced_at: datetime | None
@@ -155,6 +163,7 @@ def _synthesised_connection(provider: str) -> DeliveryConnectionResponse:
         provider_label=PROVIDER_LABELS.get(provider, provider),
         status="NOT_CONNECTED",
         environment="production",
+        auto_accept_enabled=False,
         external_store_id=None,
         store_status=None,
         last_status_synced_at=None,
@@ -194,6 +203,7 @@ async def _connection_response(
         provider_label=PROVIDER_LABELS.get(connection.provider, connection.provider),
         status=connection.status,
         environment=connection.environment,
+        auto_accept_enabled=connection.auto_accept_enabled,
         external_store_id=connection.external_store_id,
         store_status=connection.store_status,
         last_status_synced_at=connection.last_status_synced_at,
@@ -261,6 +271,10 @@ class DeliveryOrderListResponse(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+class AutoAcceptRequest(BaseModel):
+    enabled: bool
 
 
 class DenyOrderRequest(BaseModel):
@@ -449,6 +463,45 @@ async def enable_connection(
     return await _connection_response(db, user.business_id, connection)
 
 
+@router.post("/connections/{provider}/auto-accept", response_model=DeliveryConnectionResponse)
+async def set_auto_accept(
+    provider: str,
+    body: AutoAcceptRequest,
+    user: AuthUser = Depends(require_owner_or_manager),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Deliberately opt in (or back out of) zero-touch kitchen commitment
+    (migration 0046). Defaults FALSE for every connection — a manager must
+    turn this on explicitly. When False, a fully-mapped order stops at
+    READY_TO_ACCEPT and needs an explicit staff accept
+    (POST .../orders/{id}/accept) before it reaches the kitchen; see
+    order_service.py::_handle_order.
+    """
+    await _require_delivery_module_enabled(db, user.business_id)
+    connection = (
+        await db.execute(
+            select(DeliveryConnection).where(
+                DeliveryConnection.business_id == user.business_id,
+                DeliveryConnection.provider == provider,
+            )
+        )
+    ).scalar_one_or_none()
+    if connection is None:
+        raise NotFoundError("Delivery connection", provider)
+
+    previous = connection.auto_accept_enabled
+    connection.auto_accept_enabled = body.enabled
+    db.add(AuditEvent(
+        scope=AuditScope.BUSINESS.value, business_id=user.business_id, actor_user_id=user.user_id,
+        action="delivery.connection.auto_accept_changed", target_type="delivery_connection",
+        target_id=connection.id,
+        diff_json={"provider": provider, "previous": previous, "new": body.enabled},
+    ))
+    await db.commit()
+    return await _connection_response(db, user.business_id, connection)
+
+
 # ── Orders ───────────────────────────────────────────────────────────────────
 
 async def _load_order_or_404(
@@ -517,18 +570,22 @@ async def accept_order(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    See module docstring: only meaningful for NEEDS_MAPPING today. Resets
-    the row to RECEIVED and re-enqueues the SAME process_delivery_order ARQ
-    job the webhook plane uses — no parallel accept logic in this route.
+    See module docstring. Valid from NEEDS_MAPPING (re-attempt resolution)
+    or READY_TO_ACCEPT (staff explicitly confirming an already-resolved
+    order into the kitchen — `auto_accept_enabled=False` path, migration
+    0046). Resets the row to RECEIVED and re-enqueues the SAME
+    process_delivery_order ARQ job the webhook plane uses — no parallel
+    accept logic in this route.
     """
     await _require_delivery_module_enabled(db, user.business_id)
     row = await _load_order_or_404(
         db, business_id=user.business_id, order_id=order_id, for_update=True
     )
-    if row.status != "NEEDS_MAPPING":
+    if row.status not in ("NEEDS_MAPPING", "READY_TO_ACCEPT"):
         raise AppError(
             "DELIVERY_ORDER_NOT_ACCEPTABLE",
-            f"This order is {row.status}, not NEEDS_MAPPING — nothing to manually accept.",
+            f"This order is {row.status}, not NEEDS_MAPPING or READY_TO_ACCEPT — "
+            "nothing to manually accept.",
             409,
         )
 
@@ -540,19 +597,29 @@ async def accept_order(
             503,
         )
 
+    # force_accept=True ONLY for a staff-confirmed READY_TO_ACCEPT order —
+    # bypasses the auto_accept_enabled gate for this one order, never the
+    # connection's own setting. A NEEDS_MAPPING re-attempt gets no such
+    # bypass: resolving a mapping is a different decision from confirming
+    # the kitchen can make the food right now (see module docstring).
+    force_accept = row.status == "READY_TO_ACCEPT"
+
     row.status = "RECEIVED"
     db.add(AuditEvent(
         scope=AuditScope.BUSINESS.value, business_id=user.business_id, actor_user_id=user.user_id,
         action="delivery.order.manual_accept_requested", target_type="delivery_order",
         target_id=row.id,
-        diff_json={"provider": row.provider, "external_order_id": row.external_order_id},
+        diff_json={
+            "provider": row.provider, "external_order_id": row.external_order_id,
+            "force_accept": force_accept,
+        },
     ))
     await db.commit()
 
     try:
         await arq_pool.enqueue_job(
             "process_delivery_order", row.provider, str(row.business_id),
-            row.external_order_id, None,
+            row.external_order_id, None, force_accept,
         )
     except Exception:
         logger.exception(

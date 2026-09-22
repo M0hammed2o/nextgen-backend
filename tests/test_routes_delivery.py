@@ -106,6 +106,7 @@ def make_connection(business_id, provider="UBER_EATS", status="CONNECTED", **ove
     conn = DeliveryConnection(
         id=uuid.uuid4(), business_id=business_id, provider=provider,
         status=status, environment="production", external_store_id="store-1",
+        auto_accept_enabled=False,
         created_at=datetime.now(timezone.utc), updated_at=datetime.now(timezone.utc),
     )
     for k, v in overrides.items():
@@ -268,6 +269,61 @@ async def test_enable_connection_rejects_non_disabled_source_status():
     assert exc.value.code == "DELIVERY_CONNECTION_NOT_DISABLED"
 
 
+async def test_set_auto_accept_enables_and_is_reflected_in_the_response():
+    user = make_user(role="OWNER")
+    business = make_business(user.business_id)
+    connection = make_connection(user.business_id, status="CONNECTED", auto_accept_enabled=False)
+    db = FakeDB([
+        FakeScalarResult(business),
+        FakeScalarResult(connection),
+        FakeScalarResult(None),  # last_webhook_at
+        FakeScalarResult(None),  # last_order_at
+    ])
+    result = await routes.set_auto_accept(
+        provider="UBER_EATS", body=routes.AutoAcceptRequest(enabled=True), user=user, db=db,
+    )
+    assert result.auto_accept_enabled is True
+    assert connection.auto_accept_enabled is True
+    assert db.commits == 1
+    assert db.added[0].action == "delivery.connection.auto_accept_changed"
+    assert db.added[0].diff_json == {"provider": "UBER_EATS", "previous": False, "new": True}
+
+
+async def test_set_auto_accept_disables():
+    user = make_user(role="OWNER")
+    business = make_business(user.business_id)
+    connection = make_connection(user.business_id, status="CONNECTED", auto_accept_enabled=True)
+    db = FakeDB([
+        FakeScalarResult(business),
+        FakeScalarResult(connection),
+        FakeScalarResult(None),
+        FakeScalarResult(None),
+    ])
+    result = await routes.set_auto_accept(
+        provider="UBER_EATS", body=routes.AutoAcceptRequest(enabled=False), user=user, db=db,
+    )
+    assert result.auto_accept_enabled is False
+    assert connection.auto_accept_enabled is False
+
+
+async def test_set_auto_accept_missing_connection_is_404():
+    user = make_user(role="OWNER")
+    business = make_business(user.business_id)
+    db = FakeDB([FakeScalarResult(business), FakeScalarResult(None)])
+    with pytest.raises(NotFoundError):
+        await routes.set_auto_accept(
+            provider="UBER_EATS", body=routes.AutoAcceptRequest(enabled=True), user=user, db=db,
+        )
+
+
+async def test_synthesised_connection_defaults_auto_accept_to_false():
+    user = make_user(role="OWNER")
+    business = make_business(user.business_id)
+    db = FakeDB([FakeScalarResult(business), FakeScalarResult(None)])
+    result = await routes.get_connection(provider="UBER_EATS", user=user, db=db)
+    assert result.auto_accept_enabled is False
+
+
 def test_no_route_handler_source_ever_assigns_connected_literal():
     """Static guard: 'CONNECTED' must never appear as an assignment target
     value anywhere in this router's source (it may appear in comparisons/
@@ -343,9 +399,32 @@ async def test_accept_resets_status_and_enqueues_same_worker_job():
 
     assert order.status == "RECEIVED"
     pool.enqueue_job.assert_awaited_once_with(
-        "process_delivery_order", "UBER_EATS", str(user.business_id), "ext-1", None,
+        "process_delivery_order", "UBER_EATS", str(user.business_id), "ext-1", None, False,
     )
     assert db.commits == 1
+    assert result.id == order.id
+
+
+async def test_accept_from_ready_to_accept_forces_the_gate_bypass():
+    """
+    Migration 0046: accepting a READY_TO_ACCEPT order (the auto_accept_
+    enabled=False path) must re-enqueue with force_accept=True so the
+    worker actually creates the sale this time, rather than looping back to
+    READY_TO_ACCEPT forever.
+    """
+    user = make_user(role="STAFF")
+    business = make_business(user.business_id)
+    order = make_order(user.business_id, status="READY_TO_ACCEPT")
+    db = FakeDB([FakeScalarResult(business), FakeScalarResult(order)])
+    pool = AsyncMock()
+    request = FakeRequest(arq_pool=pool)
+
+    result = await routes.accept_order(order_id=order.id, request=request, user=user, db=db)
+
+    assert order.status == "RECEIVED"
+    pool.enqueue_job.assert_awaited_once_with(
+        "process_delivery_order", "UBER_EATS", str(user.business_id), "ext-1", None, True,
+    )
     assert result.id == order.id
 
 
@@ -497,6 +576,7 @@ class TestRoleGating:
             ("/business/delivery/connections/{provider}", "GET"),
             ("/business/delivery/connections/{provider}/disable", "POST"),
             ("/business/delivery/connections/{provider}/enable", "POST"),
+            ("/business/delivery/connections/{provider}/auto-accept", "POST"),
             ("/business/delivery/orders", "GET"),
             ("/business/delivery/orders/{order_id}", "GET"),
             ("/business/delivery/menu-mappings", "GET"),

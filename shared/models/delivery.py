@@ -130,6 +130,15 @@ class DeliveryConnection(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         comment="production / sandbox — must match the webhook's own "
                 "X-Environment header before any event from it is trusted.",
     )
+    auto_accept_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False,
+        comment="Defaults FALSE. When false, a fully-mapped delivery order "
+                "stops at READY_TO_ACCEPT and waits for an explicit staff "
+                "accept (POST .../orders/{id}/accept) instead of "
+                "auto-committing to the kitchen — see migration 0046. When "
+                "true, order_service._handle_order auto-accepts any fully-"
+                "resolved order exactly as it always has.",
+    )
 
     provisioning_token_encrypted: Mapped[str | None] = mapped_column(
         Text, nullable=True,
@@ -293,7 +302,9 @@ class DeliveryOrder(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     status: Mapped[str] = mapped_column(
         String(24), default="RECEIVED", nullable=False,
         comment="RECEIVED / FETCHING / NEEDS_MAPPING / READY_TO_ACCEPT / "
-                "ACCEPTED / DENIED / FULFILLED / CANCELLED / FAILED",
+                "ACCEPTED / DENIED / FULFILLED / CANCELLED / FAILED / UNKNOWN "
+                "(UNKNOWN added to the CHECK constraint in migration 0045 — "
+                "BUG-0094 item 4)",
     )
     # The real canonical sale, once (and only if/when) it exists. Nullable —
     # a NEEDS_MAPPING / DENIED / FAILED order never gets one, by design: an

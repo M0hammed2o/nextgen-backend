@@ -317,16 +317,26 @@ class Settings(BaseSettings):
     UBER_EATS_CLIENT_ID: str = ""
     UBER_EATS_CLIENT_SECRET: str = ""
     # Sandbox hosts, confirmed from Uber's docs: test-api.uber.com /
-    # sandbox-auth.uber.com. UBER_EATS_ENVIRONMENT controls which of these
-    # is the correct default — override the base URLs directly if a
-    # deployment ever needs a mix that doesn't match the simple prod/sandbox
-    # split (not expected today).
+    # sandbox-auth.uber.com. BUG-0094 (KNOWN_BUGS.md): UBER_EATS_ENVIRONMENT
+    # is NOT actually wired to these defaults — grep-confirmed it is read by
+    # nothing anywhere in this codebase. A staging/sandbox deployment MUST
+    # set these two URLs explicitly; leaving only UBER_EATS_ENVIRONMENT set
+    # to "sandbox" silently keeps talking to PRODUCTION Uber.
     UBER_EATS_API_BASE_URL: str = "https://api.uber.com"
     UBER_EATS_AUTH_BASE_URL: str = "https://auth.uber.com"
-    # production | sandbox — must match the incoming webhook's own
-    # X-Environment header before any event from it is trusted (one of the
-    # seven ordered trust-boundary gates — see
-    # backend/app/delivery/intake.py).
+    # production | sandbox. NOT itself read by the webhook's environment
+    # gate (BUG-0094) — the REAL gate is `_find_misconfiguration()` in
+    # order_service.py, which compares the inbound webhook's own reported
+    # `X-Environment` header against `DeliveryConnection.environment` (a
+    # per-connection DB value, not this global setting) and — also per
+    # BUG-0094 — currently passes when that header is absent rather than
+    # failing closed. That specific change was evaluated and NOT made in
+    # the 2026-09-23 remediation pass: Uber's own docs do not confirm this
+    # header is reliably sent on every delivery, so flipping it to fail-
+    # closed risks silently denying every genuine production order instead
+    # of closing a narrow gap — a materially worse outcome. Revisit only
+    # once the header's real-world presence is confirmed against live
+    # traffic or Uber's own webhook reference.
     UBER_EATS_ENVIRONMENT: str = "production"
     # Platform-wide kill switch, independent of any tenant's own
     # uber_eats_enabled entitlement — lets ops pull the plug on ALL Uber

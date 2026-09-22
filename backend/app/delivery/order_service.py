@@ -49,7 +49,7 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -90,19 +90,28 @@ _CANCEL_EVENT_TYPES = frozenset({"orders.cancel", "orders.failure"})
 
 
 async def process_delivery_order(
-    ctx: dict, provider: str, business_id: str, external_order_id: str, event_type: str | None = None,
+    ctx: dict, provider: str, business_id: str, external_order_id: str,
+    event_type: str | None = None, force_accept: bool = False,
 ) -> None:
     """
     ARQ job. Opens its own session — no FastAPI dependency injection. Never
     raises for a business-logic outcome (misconfiguration, unmapped items,
     provider error) — only an infrastructure failure propagates, so ARQ's
     own retry (`max_tries`) applies to THAT, not to a normal denial.
+
+    `force_accept` (default False, backward-compatible with the webhook
+    plane's job_args, which never pass it): set only by
+    `routes_delivery.py::accept_order` when staff explicitly confirm a
+    READY_TO_ACCEPT order (the `auto_accept_enabled=False` path, migration
+    0046) — bypasses the auto-accept gate for THIS one already-resolved
+    order without touching the connection's own setting.
     """
     async with ctx["session_factory"]() as db:
         try:
             await _handle_order(
                 db, provider=provider, business_id=uuid.UUID(business_id),
                 external_order_id=external_order_id, event_type=event_type,
+                force_accept=force_accept,
             )
         except (DeliveryProviderTimeout,):
             await db.rollback()
@@ -198,7 +207,7 @@ async def _issue_deny(
 
 async def _handle_order(
     db: AsyncSession, *, provider: str, business_id: uuid.UUID, external_order_id: str,
-    event_type: str | None,
+    event_type: str | None, force_accept: bool = False,
 ) -> None:
     if event_type in _CANCEL_EVENT_TYPES:
         await _handle_cancellation(
@@ -263,10 +272,23 @@ async def _handle_order(
         await db.commit()
         raise
     except DeliveryProviderError as exc:
-        row.status = "FAILED"
+        # BUG-0091 fix: previously this only set FAILED and returned —
+        # FAILED is not in the watchdog's scanned status list
+        # (RECEIVED/FETCHING/NEEDS_MAPPING/READY_TO_ACCEPT), so a known
+        # store's order was stuck here FOREVER with no deny ever issued
+        # (this includes `OperationalTokenUnavailable`, which subclasses
+        # DeliveryProviderError and fires on any Redis outage — a brief
+        # Redis blip could silently strand every in-flight order). The
+        # design's own rule is "a known store gets an active deny, never
+        # silence" — apply it here exactly as the misconfiguration branch
+        # above already does, instead of leaving a dead terminal state.
         row.failure_reason = f"fetch_order failed: {exc}"
-        await db.commit()
         logger.exception("DELIVERY_ORDER_FETCH_FAILED: business=%s external_order_id=%s", business_id, external_order_id)
+        await _issue_deny(
+            db, row=row, connection=connection, reason_code="POS_NOT_READY",
+            explanation=f"NextGen could not fetch this order's details: {exc}",
+        )
+        await db.commit()
         return
 
     row.placed_at = canonical.placed_at
@@ -274,6 +296,36 @@ async def _handle_order(
     row.fee_cents = canonical.fee_cents
     row.currency = canonical.currency or row.currency
     row.fetched_order_snapshot_json = _build_snapshot(canonical)
+
+    # BUG-0092 fix: refuse to book a sale the platform could not price.
+    # `canonical.total_cents` comes from `_cents(charges.get("total"))`,
+    # which returns None for any provider payload shape other than a bare
+    # int or an `amount`-keyed dict (uber/mapping.py's own docstring admits
+    # this shape was never confirmed against a real captured payload).
+    # Previously `gross = canonical.total_cents or 0` silently turned an
+    # unparseable/absent total into a R0.00 sale while stock was still fully
+    # deducted below — a wrong number in the books is worse than a declined
+    # order, so this must be an active deny (same "known store -> active
+    # deny, never silence" rule as every other misconfiguration gate),
+    # never a guess. A non-positive total is treated the same way — `_cents`
+    # accepts negative integers unchallenged, and zero is never a genuine
+    # price for a real paid order.
+    if canonical.total_cents is None or canonical.total_cents <= 0:
+        row.failure_reason = (
+            f"Order total could not be priced (total_cents={canonical.total_cents!r}) "
+            "— refusing to book a sale the platform cannot price."
+        )
+        logger.warning(
+            "DELIVERY_ORDER_UNPRICEABLE: business=%s external_order_id=%s total_cents=%r — "
+            "denying rather than booking a zero/unparseable-value sale.",
+            business_id, external_order_id, canonical.total_cents,
+        )
+        await _issue_deny(
+            db, row=row, connection=connection, reason_code="PRICING",
+            explanation="NextGen could not determine this order's total from the provider response.",
+        )
+        await db.commit()
+        return
 
     resolution = await _resolve_delivery_lines(
         db, business_id=business_id, provider=provider, canonical=canonical
@@ -288,6 +340,27 @@ async def _handle_order(
             business_id, external_order_id, resolution.unresolved_names,
         )
         await _publish_alert(business_id, "delivery_needs_mapping", row, external_order_id)
+        return
+
+    # Design gap fix (migration 0046, KNOWN_BUGS.md BUG-0094 follow-up):
+    # every fully-resolved order previously auto-accepted straight into the
+    # kitchen (Order created, stock deducted, accept_pos_order called) with
+    # NO staff confirmation step and no way for a business to opt out — a
+    # restaurant had orders committed to its kitchen with nobody confirming
+    # they could actually make them right now. `auto_accept_enabled`
+    # defaults FALSE: stop at READY_TO_ACCEPT (an enum value that already
+    # existed for exactly this) and wait for an explicit staff accept via
+    # POST .../orders/{id}/accept, which re-enqueues this SAME job with
+    # `force_accept=True` — never a second, parallel accept implementation.
+    if not force_accept and not getattr(connection, "auto_accept_enabled", False):
+        row.status = "READY_TO_ACCEPT"
+        await db.commit()
+        logger.info(
+            "DELIVERY_ORDER_READY_TO_ACCEPT: business=%s external_order_id=%s — fully mapped, "
+            "auto_accept_enabled=False, awaiting explicit staff accept.",
+            business_id, external_order_id,
+        )
+        await _publish_alert(business_id, "delivery_ready_to_accept", row, external_order_id)
         return
 
     order = await _create_order_from_canonical(
@@ -646,6 +719,16 @@ async def _create_order_from_canonical(
 
 # ── Accept-deadline watchdog (design §5, 30s cron) ───────────────────────────
 
+#: BUG-0093: bound how many rows one tick claims, so a large backlog drains
+#: over several 30s ticks instead of one tick holding row locks (and a
+#: worker DB connection) for the entire backlog at once.
+_WATCHDOG_BATCH_LIMIT = 100
+
+_WATCHDOG_DENY_REASON_CODE = "OTHER"
+_WATCHDOG_DENY_EXPLANATION = (
+    "Accept/deny deadline missed — auto-denied by the accept-deadline watchdog."
+)
+
 
 async def delivery_accept_deadline_watchdog(ctx: dict) -> None:
     """
@@ -654,21 +737,51 @@ async def delivery_accept_deadline_watchdog(ctx: dict) -> None:
     auto-accepts, NEVER silently drops — always an active `deny_pos_order`
     call with a clear reason code, honest to both the customer (they get a
     real denial, not indefinite silence) and the books (no phantom sale).
+
+    BUG-0093 fix — TWO PHASES, claim-then-notify:
+    Phase 1 (below, inside the row lock/transaction): push the deadline
+    comparison into SQL (previously Python-only, so EVERY open order
+    platform-wide was loaded and row-locked every tick regardless of
+    whether it was actually due), cap the batch with a LIMIT so a large
+    backlog drains over several ticks, and — the part that actually closes
+    the incident shape in the bug report — CLAIM each due row (flip it to
+    DENIED, no network call) and commit BEFORE any outbound provider call is
+    made. A slow/hung/timed-out `deny_pos_order` call for one tenant can
+    therefore never hold another tenant's row lock or this worker's DB
+    connection hostage, and a normal `process_delivery_order` job for a
+    locked row (`_load_locked_row`'s plain `FOR UPDATE`) is blocked for at
+    most the claim transaction's lifetime, not the full network round trip.
+    Phase 2 (after the `async with` block closes, so no DB transaction is
+    open): the actual `deny_pos_order` network calls, best-effort — a
+    failure here is logged and otherwise ignored, exactly the same "marked
+    DENIED locally regardless; Uber's own 11.5-minute timeout is the
+    backstop" honesty `_issue_deny` already uses for every other deny path.
+    The Python-side deadline re-check is kept alongside the new SQL
+    predicate as a belt-and-suspenders guard (also lets a test double that
+    doesn't evaluate SQL WHERE clauses exercise this function correctly).
     """
     settings = get_settings()
     grace = settings.DELIVERY_DEADLINE_GRACE_SECONDS
     cutoff = datetime.now(timezone.utc)
+    deadline_threshold = cutoff - timedelta(seconds=grace)
+
+    claimed: list[dict] = []
 
     async with ctx["session_factory"]() as db:
         try:
             rows = (
                 await db.execute(
-                    select(DeliveryOrder).where(
+                    select(DeliveryOrder)
+                    .where(
                         DeliveryOrder.status.in_(
                             ["RECEIVED", "FETCHING", "NEEDS_MAPPING", "READY_TO_ACCEPT"]
                         ),
                         DeliveryOrder.accept_deadline_at.isnot(None),
-                    ).with_for_update(skip_locked=True)
+                        DeliveryOrder.accept_deadline_at <= deadline_threshold,
+                    )
+                    .order_by(DeliveryOrder.accept_deadline_at.asc())
+                    .limit(_WATCHDOG_BATCH_LIMIT)
+                    .with_for_update(skip_locked=True)
                 )
             ).scalars().all()
 
@@ -691,11 +804,53 @@ async def delivery_accept_deadline_watchdog(ctx: dict) -> None:
                     row.business_id, row.provider, row.external_order_id,
                     row.status, row.accept_deadline_at,
                 )
-                await _issue_deny(
-                    db, row=row, connection=connection, reason_code="OTHER",
-                    explanation="Accept/deny deadline missed — auto-denied by the accept-deadline watchdog.",
-                )
+                # Claim locally FIRST — no network call while the row lock /
+                # transaction is open. Mirrors _issue_deny's own local
+                # write, just without the (deferred) adapter call.
+                row.status = "DENIED"
+                row.denied_at = datetime.now(timezone.utc)
+                row.deny_reason_code = _WATCHDOG_DENY_REASON_CODE
+                row.deny_reason_text = _WATCHDOG_DENY_EXPLANATION
+                claimed.append({
+                    "provider": row.provider,
+                    "business_id": row.business_id,
+                    "external_order_id": row.external_order_id,
+                    "external_store_id": row.external_store_id,
+                    "connection_id": connection.id if connection else None,
+                    "environment": connection.environment if connection else "production",
+                })
             await db.commit()
         except Exception:
             await db.rollback()
             logger.exception("DELIVERY_ACCEPT_DEADLINE_WATCHDOG_FAILED")
+            return
+
+    # Phase 2 — network calls OUTSIDE the lock/transaction (BUG-0093). Each
+    # row is already terminal (DENIED) in the database regardless of whether
+    # this call succeeds.
+    for item in claimed:
+        adapter = registry.get_provider(item["provider"])
+        context = DeliveryOrderContext(
+            business_id=item["business_id"],
+            connection_id=item["connection_id"] or uuid.uuid4(),
+            external_store_id=item["external_store_id"],
+            environment=item["environment"],
+        )
+        try:
+            if adapter is not None:
+                await adapter.deny_order(
+                    external_order_id=item["external_order_id"], context=context,
+                    reason_code=_WATCHDOG_DENY_REASON_CODE,
+                    explanation=_WATCHDOG_DENY_EXPLANATION,
+                )
+        except (DeliveryProviderNotImplemented, DeliveryProviderError, DeliveryProviderTimeout):
+            logger.exception(
+                "DELIVERY_DENY_CALL_FAILED (watchdog): business=%s external_order_id=%s — "
+                "already marked DENIED locally; Uber's own 11.5-minute timeout is the backstop.",
+                item["business_id"], item["external_order_id"],
+            )
+        except Exception:
+            logger.exception(
+                "DELIVERY_DENY_CALL_UNEXPECTED_ERROR (watchdog): business=%s external_order_id=%s",
+                item["business_id"], item["external_order_id"],
+            )
