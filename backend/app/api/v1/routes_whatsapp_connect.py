@@ -21,7 +21,7 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import inspect as sa_inspect, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.config import get_settings
@@ -293,6 +293,18 @@ async def exchange_code(
             401,
         )
 
+    # BUG-0074: capture the caller's identity into a PLAIN LOCAL before
+    # run_exchange runs. On a cross-tenant waba_id/phone_number_id collision
+    # run_exchange handles the IntegrityError with `await db.rollback()`,
+    # and a rollback expires EVERY instance in the session's identity map —
+    # including this `business`, which the route still holds. Reading
+    # `business.id` afterwards then triggers a lazy attribute reload outside
+    # greenlet context (sqlalchemy.exc.MissingGreenlet), which is precisely
+    # what turned the documented 409 below into an unhandled 500 AND
+    # destroyed the audit write for the rejected attempt — the audit write
+    # was the statement that crashed. A plain int/UUID local cannot expire.
+    business_id = business.id
+
     outcome = await connection_service.run_exchange(
         db, business,
         code=body.code,
@@ -301,9 +313,14 @@ async def exchange_code(
         connected_by_user_id=user.user_id,
     )
 
+    # The audit row is written (and committed) BEFORE the 409 is raised, so a
+    # rejected cross-tenant claim — the attacker-shaped case — always leaves a
+    # trail: who attempted it, which waba_id/phone_number_id was already
+    # taken, which step rejected it, and (via AuditEvent.created_at) when.
+    # Never any token, secret or PIN.
     db.add(AuditEvent(
         scope=AuditScope.BUSINESS.value,
-        business_id=business.id,
+        business_id=business_id,
         actor_user_id=user.user_id,
         action="whatsapp.connection.connected" if outcome.success else "whatsapp.connection.connect_failed",
         target_type="whatsapp_connection",
@@ -317,19 +334,27 @@ async def exchange_code(
     ))
     await db.commit()
 
-    response = ExchangeResponse(
-        success=outcome.success,
-        failed_step=outcome.failed_step,
-        message=outcome.message,
-        connection=_status_response(business, outcome.connection),
-    )
-
     if not outcome.success and outcome.failed_step == "claim_routing_number":
         raise AppError(
             "WHATSAPP_NUMBER_ALREADY_CONNECTED", outcome.message, 409,
             details={"failed_step": outcome.failed_step},
         )
-    return response
+
+    # Only reached on a path where nothing rolled back, but re-load `business`
+    # if it is expired anyway: _status_response reads three more of its
+    # columns, and relying on "no surviving path can have rolled back by here"
+    # is exactly the implicit coupling that produced BUG-0074 in the first
+    # place. Costs nothing on the normal path (an unexpired instance is not
+    # re-selected).
+    if sa_inspect(business).expired:
+        await db.refresh(business)
+
+    return ExchangeResponse(
+        success=outcome.success,
+        failed_step=outcome.failed_step,
+        message=outcome.message,
+        connection=_status_response(business, outcome.connection),
+    )
 
 
 # ── POST /health-check ──────────────────────────────────────────────────────
