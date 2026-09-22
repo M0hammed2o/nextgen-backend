@@ -29,8 +29,13 @@ from backend.app.core.crypto import CredentialDecryptionError, decrypt_credentia
 from backend.app.core.errors import AppError, NotFoundError
 from backend.app.core.ratelimit import limiter
 from backend.app.core.rbac import AuthUser, require_owner, require_owner_or_manager
-from backend.app.db.session import get_db
+from backend.app.db.session import get_db, get_redis
 from backend.app.whatsapp import connection_service
+from backend.app.whatsapp.connect_state import (
+    StateServiceUnavailable,
+    consume_connect_state,
+    mint_connect_state,
+)
 from backend.app.whatsapp.graph_client import GraphAPIError, MetaGraphClient
 from shared.enums import AuditScope
 from shared.models.audit import AuditEvent
@@ -138,7 +143,17 @@ class WhatsAppConnectConfig(BaseModel):
     graph_version: str | None = None
 
 
+class WhatsAppConnectStartResponse(BaseModel):
+    state: str
+    expires_in: int
+
+
 class ExchangeRequest(BaseModel):
+    # Anti-CSRF/replay state minted by POST /start — see connect_state.py.
+    # REQUIRED: a request with no state (or an unrecognised one) must never
+    # be processed as if it were the legitimate signup attempt it claims to
+    # be, even though the caller is already JWT-authenticated.
+    state: str = Field(min_length=1, max_length=256)
     code: str = Field(min_length=1, max_length=2048)
     waba_id: str = Field(min_length=1, max_length=64)
     phone_number_id: str = Field(min_length=1, max_length=64)
@@ -199,6 +214,50 @@ async def get_connection_status(
     return _status_response(business, connection)
 
 
+# ── POST /start — mint a single-use anti-CSRF state for the popup flow ─────
+# Deliberately a SEPARATE endpoint from GET /config, not folded into it:
+# /config is safe to call on ordinary page load (no side effect, cacheable),
+# while minting a state starts a real, short (10 min) countdown — folding it
+# into /config would mint (and start expiring) a token every time the
+# settings page loads, whether or not the owner ever actually launches the
+# Meta popup, wasting Redis writes and risking the token expiring before a
+# slow owner gets to it. The frontend should call this right before
+# launching FB.login(), matching standard OAuth "mint state, then redirect"
+# timing.
+
+@router.post("/start", response_model=WhatsAppConnectStartResponse)
+@limiter.limit(f"{settings.WHATSAPP_CONNECT_RATE_LIMIT_PER_MINUTE}/minute")
+async def start_connect(
+    request: Request,
+    user: AuthUser = Depends(require_owner),
+    db: AsyncSession = Depends(get_db),
+):
+    business = await _require_whatsapp_module_enabled(db, user.business_id)
+
+    redis = await get_redis()
+    try:
+        minted = await mint_connect_state(redis, business.id, user.user_id)
+    except StateServiceUnavailable:
+        raise AppError(
+            "WHATSAPP_STATE_SERVICE_UNAVAILABLE",
+            "Could not start the WhatsApp connect flow right now — please try again shortly.",
+            503,
+        )
+
+    db.add(AuditEvent(
+        scope=AuditScope.BUSINESS.value,
+        business_id=business.id,
+        actor_user_id=user.user_id,
+        action="whatsapp.connection.connect_started",
+        target_type="whatsapp_connection",
+        target_id=None,
+        diff_json={"expires_in": minted.expires_in},
+    ))
+    await db.commit()
+
+    return WhatsAppConnectStartResponse(state=minted.token, expires_in=minted.expires_in)
+
+
 # ── POST /exchange — run the Embedded Signup connect flow ──────────────────
 
 @router.post("/exchange", response_model=ExchangeResponse)
@@ -210,6 +269,29 @@ async def exchange_code(
     db: AsyncSession = Depends(get_db),
 ):
     business = await _require_whatsapp_module_enabled(db, user.business_id)
+
+    # ── Anti-CSRF/replay state check (gate hardening pass) ─────────────────
+    # Must happen BEFORE run_exchange touches Meta/the DB at all — a request
+    # with a missing/expired/foreign state is never a legitimate continuation
+    # of a signup attempt this backend itself started, regardless of how
+    # valid the caller's JWT is. See connect_state.py's module docstring for
+    # the full reasoning.
+    redis = await get_redis()
+    try:
+        state_valid = await consume_connect_state(redis, body.state, business.id)
+    except StateServiceUnavailable:
+        raise AppError(
+            "WHATSAPP_STATE_SERVICE_UNAVAILABLE",
+            "Could not verify the WhatsApp connect flow right now — please try again shortly.",
+            503,
+        )
+    if not state_valid:
+        raise AppError(
+            "INVALID_OR_EXPIRED_STATE",
+            "This connect attempt could not be verified (missing, expired, already-used, "
+            "or started from a different account) — please restart the WhatsApp connect flow.",
+            401,
+        )
 
     outcome = await connection_service.run_exchange(
         db, business,

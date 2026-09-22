@@ -228,6 +228,16 @@ class Settings(BaseSettings):
     WHATSAPP_CONNECT_RATE_LIMIT_PER_MINUTE: int = 5
     WHATSAPP_TEST_MESSAGE_RATE_LIMIT_PER_MINUTE: int = 5
 
+    # ── WhatsApp Embedded Signup connect-flow anti-CSRF state (gate hardening
+    #    pass, 2026-09-22 — see backend/app/whatsapp/connect_state.py) ──────
+    # How long a POST /start-minted state token remains valid/single-use in
+    # Redis before POST /exchange must be called with it. 10 minutes is
+    # generous for a user completing Meta's own Embedded Signup popup
+    # (Business verification selection, WABA/number picking, permissions
+    # screen) without leaving the window open so long a stale tab could
+    # replay it long after the attempt was abandoned.
+    WHATSAPP_CONNECT_STATE_TTL_SECONDS: int = 600
+
     # ── Commercial / sales-onboarding (Wave 0A) ───────────────────────────
     # Trial policy. `trial_ends_at` is computed at trial-start time from
     # TRIAL_DEFAULT_DAYS and never recomputed on read — see
