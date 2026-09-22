@@ -13,6 +13,13 @@ httpx (see tests/test_whatsapp_graph_client.py).
 NEVER log an access token, app secret, or authorization code — every method
 here takes a token as a plain string and passes it straight into an
 Authorization header; callers must not log payloads/headers.
+
+That invariant is enforced at two levels, because this file alone cannot
+hold it: no call site here logs a URL or params (the only logger call below
+reports `path`, never the query string), AND TokenMaskingFilter is attached
+to the "httpx" logger itself, since httpx logs the FULL request URL at INFO
+underneath this class — which is how META_APP_SECRET and the OAuth code
+previously reached production logs (BUG-0075).
 """
 
 import logging
@@ -126,6 +133,22 @@ class MetaGraphClient:
             "client_secret": settings.META_APP_SECRET,
             "code": code,
         }
+        # BUG-0075. Log ONLY the path — never `params`, never the built URL.
+        # Meta's /oauth/access_token really is a GET with client_id/
+        # client_secret/code as query parameters, so the request shape above
+        # is fixed and correct; what must never happen is that query string
+        # reaching log output. This module makes no such log call (verified:
+        # the only other logger call here reports `path` alone), but httpx's
+        # own logger emits `HTTP Request: GET <full url> "HTTP/1.1 200 OK"`
+        # at INFO for every request it makes, which is where the secret
+        # actually leaked. TokenMaskingFilter is attached directly to the
+        # "httpx" logger by setup_logging() and redacts client_secret=/code=
+        # there; this line exists so the exchange is still observable from
+        # our own logs without depending on that.
+        logger.debug(
+            "Meta code exchange: GET %s (client_secret and code redacted)",
+            self._url("oauth/access_token"),
+        )
         return await self._request("GET", "oauth/access_token", params=params)
 
     # ── Step: confirm the token really has access to the claimed assets ─

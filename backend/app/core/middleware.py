@@ -32,44 +32,108 @@ _GENERIC_TOKEN_PATTERN = re.compile(
 )
 
 
-class TokenMaskingFilter(logging.Filter):
-    """
-    Log filter that masks access tokens before they reach log output.
-    Prevents accidental token leakage in production logs.
-    """
+# BUG-0075. Credential-bearing QUERY PARAMETERS, which neither pattern above
+# matches: _BEARER_PATTERN needs a literal "Bearer ", and _GENERIC_TOKEN_
+# PATTERN needs the substring "token" — absent from "client_secret=" entirely,
+# and followed by "?" rather than a quote/colon/space/equals in
+# "access_token?client_id=".
+#
+# Masked COMPLETELY rather than in the partial first6...last4 style used for
+# bearer tokens above: META_APP_SECRET is also the HMAC key for Meta webhook
+# signature verification, so revealing any part of it is a platform-wide
+# forgery risk, and an OAuth authorization code is a single-use credential
+# that is not useful to see partially. The parameter NAME is kept so the log
+# line stays diagnostic.
+_SECRET_PARAM_PATTERN = re.compile(
+    r"\b(client_secret|access_token|refresh_token|api_key|apikey|password)="
+    r'([^&\s"\']+)',
+    re.IGNORECASE,
+)
 
-    def filter(self, record: logging.LogRecord) -> bool:
-        if isinstance(record.msg, str):
-            record.msg = _BEARER_PATTERN.sub(
-                lambda m: f"{m.group(1)}{m.group(2)[:6]}...{m.group(2)[-4:]}",
-                record.msg,
-            )
-            record.msg = _GENERIC_TOKEN_PATTERN.sub(
-                lambda m: f"{m.group(1)}{m.group(2)[:6]}...{m.group(2)[-4:]}",
-                record.msg,
-            )
-        # Also check args (for %-style formatting)
-        if record.args:
-            if isinstance(record.args, dict):
-                record.args = {
-                    k: _mask_string(v) if isinstance(v, str) else v
-                    for k, v in record.args.items()
-                }
-            elif isinstance(record.args, tuple):
-                record.args = tuple(
-                    _mask_string(a) if isinstance(a, str) else a
-                    for a in record.args
-                )
-        return True
+# An OAuth authorization code. Length-gated, and deliberately does NOT match
+# "error_code="/"error_subcode="/"status_code=" (no word boundary before
+# "code" there), so Meta's short numeric diagnostic codes — code=190,
+# code=100 — stay readable, since in those messages they are the whole point.
+_OAUTH_CODE_PATTERN = re.compile(
+    r"\b(code)=([A-Za-z0-9_\-\.]{20,})",
+    re.IGNORECASE,
+)
+
+_REDACTED = "***"
+
+# Third-party loggers that emit credential-bearing URLs — the ACTUAL emitter
+# of the leak in BUG-0075 is httpx, not any call site in this codebase.
+_THIRD_PARTY_CREDENTIAL_LOGGERS = ("httpx",)
 
 
 def _mask_string(s: str) -> str:
-    """Mask any token patterns found in a string."""
+    """Mask every credential pattern this filter knows about."""
     s = _BEARER_PATTERN.sub(
         lambda m: f"{m.group(1)}{m.group(2)[:6]}...{m.group(2)[-4:]}",
         s,
     )
+    s = _GENERIC_TOKEN_PATTERN.sub(
+        lambda m: f"{m.group(1)}{m.group(2)[:6]}...{m.group(2)[-4:]}",
+        s,
+    )
+    s = _SECRET_PARAM_PATTERN.sub(lambda m: f"{m.group(1)}={_REDACTED}", s)
+    s = _OAUTH_CODE_PATTERN.sub(lambda m: f"{m.group(1)}={_REDACTED}", s)
     return s
+
+
+def _mask_arg(a):
+    """
+    Mask one %-style log argument.
+
+    Non-`str` arguments used to be skipped outright, which made this filter a
+    complete no-op against the leak it most needed to catch: httpx logs
+    `HTTP Request: %s %s ...` with `request.url` as an `httpx.URL` OBJECT, so
+    the full code-exchange query string — client_secret and all — sailed
+    straight through (BUG-0075).
+
+    A non-str arg is therefore stringified and masked, but the result is only
+    substituted back when masking ACTUALLY changed something. That keeps
+    %d/%f/%03d formatting working for ordinary ints/floats, which would
+    otherwise raise at render time.
+    """
+    if isinstance(a, str):
+        return _mask_string(a)
+    if a is None or isinstance(a, (int, float, bool)):
+        return a
+    try:
+        text = str(a)
+    except Exception:  # noqa: BLE001 — never let logging raise
+        return a
+    masked = _mask_string(text)
+    return masked if masked != text else a
+
+
+class TokenMaskingFilter(logging.Filter):
+    """
+    Log filter that masks access tokens and other credentials before they
+    reach log output. Prevents accidental credential leakage in production
+    logs.
+
+    Attached in setup_logging() to the root logger's handlers, to this app's
+    own loggers, and to third-party loggers known to emit credential-bearing
+    URLs (httpx, uvicorn.access). The latter matter because those loggers are
+    the actual emitters, and a filter attached to a LOGGER runs inside
+    Logger.handle() for every record logged through it, regardless of where
+    the handlers live.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str):
+            record.msg = _mask_string(record.msg)
+        # Also check args (for %-style formatting)
+        if record.args:
+            if isinstance(record.args, dict):
+                record.args = {k: _mask_arg(v) for k, v in record.args.items()}
+            elif isinstance(record.args, tuple):
+                record.args = tuple(_mask_arg(a) for a in record.args)
+            else:
+                record.args = _mask_arg(record.args)
+        return True
 
 
 class CorrelationIDMiddleware(BaseHTTPMiddleware):
@@ -140,3 +204,18 @@ def setup_logging(environment: str = "development") -> None:
     # Also apply to our app loggers
     for name in ("nextgen", "nextgen.webhook", "nextgen.bot", "nextgen.outbox"):
         logging.getLogger(name).addFilter(mask_filter)
+
+    # BUG-0075: httpx logs every request as
+    # `HTTP Request: GET <full url> "HTTP/1.1 200 OK"` at INFO, and the Meta
+    # code-exchange URL legitimately carries client_secret/code as query
+    # parameters (that is how Meta's /oauth/access_token endpoint works, so
+    # the request shape itself cannot change). Attach the filter to the
+    # EMITTING logger rather than relying on a root handler being configured.
+    for name in _THIRD_PARTY_CREDENTIAL_LOGGERS:
+        logger_obj = logging.getLogger(name)
+        if not any(isinstance(f, TokenMaskingFilter) for f in logger_obj.filters):
+            logger_obj.addFilter(mask_filter)
+        # These loggers commonly set propagate=False and carry their own
+        # handlers, which a root-handler filter would never reach.
+        for handler in logger_obj.handlers:
+            handler.addFilter(mask_filter)
