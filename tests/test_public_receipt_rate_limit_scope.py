@@ -105,10 +105,15 @@ def _token() -> str:
 @pytest.fixture
 def rate_limited():
     """Enable the limiter (conftest sets RATE_LIMIT_ENABLED=false) and restore after."""
+    # limits' storage.check() RETURNS False when the backend is unreachable
+    # (it does not raise), so it must be tested as a value — an earlier draft
+    # that only wrapped it in try/except never skipped and failed instead.
+    reachable = False
     try:
-        limiter.limiter  # touches the storage; raises if Redis is unreachable
-        limiter._storage.check()
+        reachable = bool(limiter._storage.check())
     except Exception:
+        reachable = False
+    if not reachable:
         pytest.skip("Real Redis not reachable at REDIS_URL — the limiter's real storage.")
     previous = limiter.enabled
     limiter.enabled = True
