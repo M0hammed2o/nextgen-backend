@@ -33,6 +33,11 @@ from backend.app.bot.pipeline import process_inbound_message
 from backend.app.bot.whatsapp_sender import send_notification_message
 from backend.app.core.config import WORKER_HEARTBEAT_REDIS_KEY, get_settings
 from backend.app.db.session import DATABASE_URL
+from backend.app.delivery.order_service import (
+    delivery_accept_deadline_watchdog,
+    process_delivery_cancellation,
+    process_delivery_order,
+)
 from shared.models.business import Business
 from shared.models.customer import Customer
 from shared.models.order import Order, OrderEvent
@@ -616,7 +621,11 @@ class WorkerSettings:
     Cron jobs reschedule automatically regardless of success/failure.
     """
 
-    functions = [process_whatsapp_message]
+    functions = [
+        process_whatsapp_message,
+        process_delivery_order,
+        process_delivery_cancellation,
+    ]
     on_startup = startup
     on_shutdown = shutdown
     max_tries = 3
@@ -675,6 +684,15 @@ class WorkerSettings:
             minute=0,
             second=0,
             run_at_startup=False,
+        ),
+        # Delivery-marketplace accept/deny deadline watchdog — every 30s.
+        # Auto-DENIES (never auto-accepts, never silently drops) anything
+        # still open past DELIVERY_ACCEPT_DEADLINE_SECONDS + grace — see
+        # backend/app/delivery/order_service.py::delivery_accept_deadline_watchdog.
+        cron(
+            delivery_accept_deadline_watchdog,
+            second={0, 30},
+            run_at_startup=True,
         ),
     ]
 

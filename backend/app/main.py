@@ -199,6 +199,7 @@ register_error_handlers(app)
 
 from backend.app.api.v1.routes_auth import router as auth_router
 from backend.app.api.v1.routes_webhook import router as webhook_router
+from backend.app.api.v1.routes_delivery_webhook import router as delivery_webhook_router
 from backend.app.api.v1.routes_business import router as business_router
 from backend.app.api.v1.routes_menu import router as menu_router
 from backend.app.api.v1.routes_orders import router as orders_router
@@ -229,6 +230,10 @@ PREFIX = settings.API_V1_PREFIX
 
 app.include_router(auth_router, prefix=PREFIX)
 app.include_router(webhook_router, prefix=PREFIX)
+# Public, unauthenticated, no tenant component in the path — see
+# routes_delivery_webhook.py's module docstring for the trust-boundary
+# rationale (mirrors webhook_router's own public-router pattern above).
+app.include_router(delivery_webhook_router, prefix=PREFIX)
 app.include_router(business_router, prefix=PREFIX)
 app.include_router(menu_router, prefix=PREFIX)
 app.include_router(orders_router, prefix=PREFIX)
