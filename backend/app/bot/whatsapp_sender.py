@@ -492,10 +492,41 @@ async def send_template_message(
     template_name: str,
     language_code: str = "en_US",
     components: list[dict] | None = None,
-) -> str | None:
+    db: AsyncSession | None = None,
+    business=None,
+    business_id: uuid.UUID | None = None,
+    customer_id: uuid.UUID | None = None,
+    intent: str | None = None,
+) -> "tuple[str | None, MetaErrorInfo | None]":
     """
-    Send a template message (e.g., hello_world).
-    Only use when explicitly requested — Meta compliance.
+    Send a template message. Only use when explicitly requested — Meta only
+    allows a template send outside an active 24-hour customer-service
+    window, and Meta compliance requires it be pre-approved content.
+
+    Brought up to send_text_message's maturity level (Digital Receipts,
+    Commercial V1 gate, 2026-09-22):
+      - `db=`/`business=` (both optional, both required together to take
+        effect) route the send through the Milestone-C per-business
+        connection resolver (_send_via_business_connection) exactly like
+        send_text_message — omitted, this sends on the platform token as
+        before, so any caller not updated for Milestone C is unaffected.
+      - Never raises — every failure is classified via meta_errors and
+        returned as a MetaErrorInfo, not thrown into the caller.
+      - Returns (wamid, MetaErrorInfo) instead of a bare wamid, so a caller
+        can distinguish and record WHY a send failed, not just that it did.
+
+    Deliberately does NOT write to message_outbox — there is no automatic
+    background retry for a template send. The one caller that exists today
+    (backend/app/receipts/whatsapp_receipt.py::send_digital_receipt) has
+    its own durable, always-one-row-per-order record on DigitalReceipt
+    itself (whatsapp_status/whatsapp_failure_reason), which both survives a
+    FAILED attempt and is what a staff-triggered resend re-reads — adding a
+    second retry-tracking mechanism on top of that would just be two
+    parallel systems recording the same fact. When `db` is provided, this
+    still writes a `messages` table row (conversation-history audit, same
+    table every other outbound send uses) — that is a lightweight log
+    entry, not a retry queue, and a failure to write it never blocks the
+    return value below.
     """
     payload = {
         "messaging_product": "whatsapp",
@@ -509,12 +540,36 @@ async def send_template_message(
     if components:
         payload["template"]["components"] = components
 
-    wa_message_id, _error_info = await _send_via_meta_api(
-        phone_number_id=phone_number_id,
-        recipient_wa_id=recipient_wa_id,
-        payload=payload,
-    )
-    return wa_message_id
+    if db is not None and business is not None:
+        wa_message_id, error_info = await _send_via_business_connection(db, business, payload)
+    else:
+        wa_message_id, error_info = await _send_via_meta_api(
+            phone_number_id=phone_number_id,
+            recipient_wa_id=recipient_wa_id,
+            payload=payload,
+        )
+
+    if db is not None:
+        resolved_business_id = business_id or getattr(business, "id", None)
+        if resolved_business_id is not None:
+            try:
+                db.add(Message(
+                    business_id=resolved_business_id,
+                    customer_id=customer_id,
+                    direction="OUTBOUND",
+                    text=f"[Template: {template_name}]",
+                    wa_message_id=wa_message_id,
+                    intent=intent,
+                ))
+                await db.flush()
+            except Exception:
+                logger.exception(
+                    "Failed to persist message-history row for template send "
+                    "(send result itself is unaffected): business=%s, template=%s",
+                    resolved_business_id, template_name,
+                )
+
+    return wa_message_id, error_info
 
 
 # ── Interactive buttons ──────────────────────────────────────────────────────
