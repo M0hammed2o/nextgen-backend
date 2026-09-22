@@ -365,17 +365,22 @@ class TestWorkerSettings:
         names = [f.__name__ for f in WorkerSettings.functions]
         assert "process_whatsapp_message" in names
 
-    def test_six_cron_jobs_registered(self):
+    def test_seven_cron_jobs_registered(self):
         """
         Outbox, delivery fee, payment timeout, billing grace-period
         suspension, (added for wave0a/sec — GET /ready worker-heartbeat
-        check) the worker heartbeat, and (added for the Wave 0A commercial/
+        check) the worker heartbeat, (added for the Wave 0A commercial/
         sales-onboarding push — trial-expiry + commercial-invoice-overdue
         sweep, see worker.py::sweep_trial_and_invoice_expiry's own docstring
         for why this is a separate cron job rather than folded into
-        suspend_past_due_businesses) cron jobs must be registered.
+        suspend_past_due_businesses), and (added in the gate hardening pass,
+        2026-09-22 — WhatsApp Embedded Signup §2 failure-mode sweep) the
+        stale-WhatsApp-connection observability sweep,
+        log_stale_whatsapp_connections — cron jobs must be registered.
+        Count was 6 before this pass; bumped deliberately, not a weakened
+        assertion (this test still enumerates every job by name below).
         """
-        assert len(WorkerSettings.cron_jobs) == 6
+        assert len(WorkerSettings.cron_jobs) == 7
         names = {c.name for c in WorkerSettings.cron_jobs}
         assert "cron:run_outbox_batch" in names
         assert "cron:cancel_stale_delivery_fee_orders" in names
@@ -383,6 +388,7 @@ class TestWorkerSettings:
         assert "cron:suspend_past_due_businesses" in names
         assert "cron:sweep_trial_and_invoice_expiry" in names
         assert "cron:write_worker_heartbeat" in names
+        assert "cron:log_stale_whatsapp_connections" in names
 
     def test_max_tries_is_positive(self):
         """max_tries must be > 0 so infrastructure failures can be retried."""

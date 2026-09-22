@@ -25,7 +25,7 @@ from datetime import datetime, timedelta, timezone
 
 from arq import cron
 from arq.connections import RedisSettings
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from backend.app.bot.outbox_worker import _process_batch
@@ -36,6 +36,7 @@ from backend.app.db.session import DATABASE_URL
 from shared.models.business import Business
 from shared.models.customer import Customer
 from shared.models.order import Order, OrderEvent
+from shared.models.whatsapp_connection import WhatsAppConnection
 
 logger = logging.getLogger("nextgen.worker")
 
@@ -538,6 +539,64 @@ async def sweep_trial_and_invoice_expiry(ctx: dict) -> None:
             logger.exception("Trial/invoice expiry sweep failed — rolled back.")
 
 
+# ── Cron: Stale WhatsApp connection observability sweep (gate hardening
+#    pass, 2026-09-22) ─────────────────────────────────────────────────────
+
+STALE_WHATSAPP_WEBHOOK_DAYS = 3
+
+
+async def log_stale_whatsapp_connections(ctx: dict) -> None:
+    """
+    Observability-only sweep: log a WARNING for every CONNECTED
+    whatsapp_connections row that hasn't heard from Meta (an inbound
+    message OR an account_update event — see
+    routes_webhook.py::_stamp_last_webhook) in over
+    STALE_WHATSAPP_WEBHOOK_DAYS days. Runs once daily.
+
+    Deliberately does NOT mutate `status`/`status_reason`. A quiet WABA (no
+    customer messages that day) is completely normal and is not itself
+    evidence of a lost webhook subscription — auto-flipping `status` to
+    NEEDS_ATTENTION on staleness alone would risk a false positive with a
+    real cost (an owner scared into an unnecessary reconnect), and nothing
+    in the existing lifecycle would automatically clear a staleness-caused
+    flip the next time a customer messages in (health_check() only clears
+    NEEDS_ATTENTION -> CONNECTED on a successful manual/explicit check;
+    ordinary inbound-message webhooks never touch `status`, only
+    `last_webhook_at`). So this deliberately stays a read-only signal in
+    the worker's own logs (matching the WARNING-level "always visible"
+    logging convention already used throughout routes_webhook.py) rather
+    than inventing an unreviewed auto-suspend-style policy. `last_webhook_at`
+    is already exposed per-business via GET /business/whatsapp/connection
+    for the owner's own dashboard to build on; a fuller version (dashboard
+    surfacing, or a real re-subscribe/notify policy) is a deliberate
+    follow-up — see TODO.md.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=STALE_WHATSAPP_WEBHOOK_DAYS)
+    async with ctx["session_factory"]() as db:
+        try:
+            result = await db.execute(
+                select(WhatsAppConnection).where(
+                    WhatsAppConnection.status == "CONNECTED",
+                    or_(
+                        WhatsAppConnection.last_webhook_at.is_(None),
+                        WhatsAppConnection.last_webhook_at < cutoff,
+                    ),
+                )
+            )
+            stale = result.scalars().all()
+            for connection in stale:
+                logger.warning(
+                    "WHATSAPP_CONNECTION_STALE: business=%s connection=%s "
+                    "last_webhook_at=%s (no Meta activity in over %d days) — "
+                    "webhook subscription may have been lost; a manual "
+                    "health-check is recommended.",
+                    connection.business_id, connection.id,
+                    connection.last_webhook_at, STALE_WHATSAPP_WEBHOOK_DAYS,
+                )
+        except Exception:
+            logger.exception("Stale WhatsApp connection sweep failed.")
+
+
 # ── Worker Settings ───────────────────────────────────────────────────────────
 
 _settings = get_settings()
@@ -605,6 +664,17 @@ class WorkerSettings:
             write_worker_heartbeat,
             second={0, 30},
             run_at_startup=True,
+        ),
+        # Log (read-only) any CONNECTED WhatsApp connection that's gone
+        # quiet for too long — once daily, off-peak. Gate hardening pass,
+        # 2026-09-22 — see log_stale_whatsapp_connections docstring for why
+        # this stays observability-only rather than mutating status.
+        cron(
+            log_stale_whatsapp_connections,
+            hour=3,
+            minute=0,
+            second=0,
+            run_at_startup=False,
         ),
     ]
 
