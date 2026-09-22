@@ -26,12 +26,16 @@ from sqlalchemy.exc import IntegrityError, MultipleResultsFound
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.api.v1.routes_orders import OrderResponse
+from backend.app.core.config import get_settings
 from backend.app.core.errors import AppError, NotFoundError
+from backend.app.core.ownership import require_owned
 from backend.app.core.rbac import AuthUser, require_owner_or_manager, require_staff_or_above
 from backend.app.db.session import get_db
 from backend.app.inventory.ledger import post_sale_consumption, reverse_sale_consumption
 from backend.app.pos.pricing import POSAddOnSelection, POSItemInput, resolve_pos_items
 from backend.app.pos.till import compute_expected_cash_cents, compute_variance_cents
+from backend.app.receipts.whatsapp_receipt import resolve_receipt_customer_and_phone, send_digital_receipt
+from backend.app.utils.phone import normalize_sa_mobile
 from shared.enums import AuditScope, OrderSource, OrderStatus, POSPaymentMethod
 from shared.pricing.engine import apply_vat_to_total
 from shared.models.audit import AuditEvent
@@ -42,6 +46,7 @@ from shared.models.user import BusinessUser
 from shared.utils import format_order_number
 
 router = APIRouter(prefix="/business/pos", tags=["pos"])
+settings = get_settings()
 
 
 # ── Schemas ──────────────────────────────────────────────────────────────────
@@ -148,6 +153,34 @@ class POSRefundRequest(BaseModel):
 
 class POSVoidRequest(BaseModel):
     reason: str = Field(max_length=255)
+
+
+_RECEIPT_CHANNELS = {"PRINT", "WHATSAPP"}
+
+
+class POSReceiptRequest(BaseModel):
+    channels: list[str] = Field(min_length=1, max_length=2)
+    phone_number: str | None = Field(default=None, max_length=32)
+    force_resend: bool = False
+
+    @model_validator(mode="after")
+    def _validate_channels(self) -> "POSReceiptRequest":
+        cleaned = [c.upper() for c in self.channels]
+        unknown = sorted(set(cleaned) - _RECEIPT_CHANNELS)
+        if unknown:
+            raise ValueError(f"Unknown receipt channel(s): {unknown}")
+        self.channels = cleaned
+        return self
+
+
+class POSReceiptResponse(BaseModel):
+    id: uuid.UUID
+    order_id: uuid.UUID
+    receipt_url: str
+    print_requested: bool
+    whatsapp_requested: bool
+    whatsapp_status: str
+    whatsapp_failure_reason: str | None = None
 
 
 class POSSettingsResponse(BaseModel):
@@ -902,6 +935,77 @@ async def void_pos_order(
     await db.commit()
     await db.refresh(order)
     return OrderResponse.model_validate(order)
+
+
+# ── Digital receipt ──────────────────────────────────────────────────────────
+
+@router.post("/orders/{order_id}/receipt", response_model=POSReceiptResponse)
+async def request_pos_receipt(
+    order_id: uuid.UUID,
+    body: POSReceiptRequest,
+    user: AuthUser = Depends(require_staff_or_above),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Request a receipt for a POS sale — print (audit only, till printing
+    itself is unchanged/client-side) and/or WhatsApp (template-based, see
+    backend/app/receipts/whatsapp_receipt.py::send_digital_receipt).
+
+    STAFF may request a receipt for the first time; only OWNER/MANAGER may
+    set force_resend=True to re-trigger a WhatsApp send that already shows
+    SENT/DELIVERED (checked here at the route layer — send_digital_receipt
+    itself does not know or enforce roles).
+    """
+    order = await require_owned(db, Order, order_id, user.business_id, label="Order")
+
+    biz_result = await db.execute(select(Business).where(Business.id == user.business_id))
+    business = biz_result.scalar_one_or_none()
+    if not business:
+        raise NotFoundError("Business")
+
+    if body.force_resend and user.role not in ("OWNER", "MANAGER"):
+        raise AppError(
+            "FORBIDDEN",
+            "Only an owner or manager can force a receipt resend",
+            403,
+        )
+
+    explicit_phone = None
+    if body.phone_number:
+        explicit_phone = normalize_sa_mobile(body.phone_number)
+        if explicit_phone is None:
+            raise AppError(
+                "INVALID_PHONE_NUMBER",
+                "Enter a valid South African mobile number",
+                422,
+            )
+
+    customer = None
+    phone_number_e164 = explicit_phone
+    if "WHATSAPP" in body.channels:
+        customer, phone_number_e164 = await resolve_receipt_customer_and_phone(
+            db, order, user.business_id, explicit_phone,
+        )
+
+    receipt = await send_digital_receipt(
+        db, order, business,
+        channels=set(body.channels),
+        phone_number_e164=phone_number_e164,
+        customer=customer,
+        requested_by_user_id=user.user_id,
+        force_resend=body.force_resend,
+    )
+
+    receipt_url = f"{settings.BACKEND_PUBLIC_URL}{settings.API_V1_PREFIX}/r/{receipt.token}"
+    return POSReceiptResponse(
+        id=receipt.id,
+        order_id=receipt.order_id,
+        receipt_url=receipt_url,
+        print_requested=receipt.print_requested,
+        whatsapp_requested=receipt.whatsapp_requested,
+        whatsapp_status=receipt.whatsapp_status,
+        whatsapp_failure_reason=receipt.whatsapp_failure_reason,
+    )
 
 
 # ── Till (cash-up) ───────────────────────────────────────────────────────────
