@@ -571,3 +571,82 @@ async def test_digital_receipts_enabled_round_trips_through_patch_and_get(_db_or
         assert toggled_off.digital_receipts_enabled is False
     finally:
         await _cleanup(db, business_ids=business_ids, admin_ids=[super_admin.id, onboarder.id])
+
+
+async def test_delivery_entitlement_flags_round_trip_super_admin_only(_db_or_skip):
+    """
+    delivery_platforms_enabled/uber_eats_enabled/mrd_enabled (migration 0044)
+    — same class of gap as BUG-0072, closed in the same commit as the
+    migration/model per this repo's own discipline. UNLIKE
+    digital_receipts_enabled, these are deliberately NOT in
+    ONBOARDER_PATCH_ALLOWED_FIELDS — enabling a live delivery integration
+    carries real contractual weight with Uber, so only SUPER_ADMIN may set
+    them. Proves: SUPER_ADMIN can set them and they round-trip on every GET
+    response shape (including the reduced ONBOARDER response, read-only);
+    ONBOARDER is rejected outright (403, field named) when attempting to set
+    them, and the row is left unchanged by the rejected attempt.
+    """
+    db = _db_or_skip
+    unique = uuid.uuid4().hex[:8]
+    super_admin = await _make_admin(db, AdminRole.SUPER_ADMIN, f"super-{unique}@test.co.za")
+    onboarder = await _make_admin(db, AdminRole.ONBOARDER, f"onboarder-{unique}@test.co.za")
+    auth_super = _admin_auth(super_admin.id, AdminRole.SUPER_ADMIN)
+    auth_onboarder = _admin_auth(onboarder.id, AdminRole.ONBOARDER)
+
+    business_ids = []
+    try:
+        created = await create_business(
+            body=BusinessCreate(name=f"Delivery Flag Biz {unique}"), user=auth_onboarder, db=db,
+        )
+        business_ids.append(created.id)
+        assert created.delivery_platforms_enabled is False  # model default
+        assert created.uber_eats_enabled is False
+        assert created.mrd_enabled is False
+
+        # ONBOARDER may NOT set these — not in ONBOARDER_PATCH_ALLOWED_FIELDS.
+        with pytest.raises(AppError) as exc:
+            await update_business(
+                business_id=created.id,
+                body=BusinessUpdate(delivery_platforms_enabled=True, uber_eats_enabled=True),
+                user=auth_onboarder, db=db,
+            )
+        assert exc.value.code == "FIELD_NOT_ALLOWED"
+        unchanged = await get_business(business_id=created.id, user=auth_onboarder, db=db)
+        assert unchanged.delivery_platforms_enabled is False
+        assert unchanged.uber_eats_enabled is False
+
+        # SUPER_ADMIN may set them.
+        updated = await update_business(
+            business_id=created.id,
+            body=BusinessUpdate(delivery_platforms_enabled=True, uber_eats_enabled=True),
+            user=auth_super, db=db,
+        )
+        assert updated.delivery_platforms_enabled is True
+        assert updated.uber_eats_enabled is True
+        assert updated.mrd_enabled is False
+
+        # Round-trips on every GET response shape, including the reduced
+        # ONBOARDER response (visible, read-only — see BusinessOnboarderResponse).
+        fetched_onboarder = await get_business(business_id=created.id, user=auth_onboarder, db=db)
+        assert isinstance(fetched_onboarder, BusinessOnboarderResponse)
+        assert fetched_onboarder.delivery_platforms_enabled is True
+        assert fetched_onboarder.uber_eats_enabled is True
+
+        fetched_super = await get_business(business_id=created.id, user=auth_super, db=db)
+        assert fetched_super.delivery_platforms_enabled is True
+
+        listed = await list_businesses(is_active=None, page=1, per_page=100, user=auth_super, db=db)
+        this_one = next(b for b in listed if b.id == created.id)
+        assert this_one.delivery_platforms_enabled is True
+        assert this_one.uber_eats_enabled is True
+
+        # SUPER_ADMIN can toggle back off too.
+        toggled_off = await update_business(
+            business_id=created.id,
+            body=BusinessUpdate(delivery_platforms_enabled=False, uber_eats_enabled=False),
+            user=auth_super, db=db,
+        )
+        assert toggled_off.delivery_platforms_enabled is False
+        assert toggled_off.uber_eats_enabled is False
+    finally:
+        await _cleanup(db, business_ids=business_ids, admin_ids=[super_admin.id, onboarder.id])

@@ -85,6 +85,7 @@ def make_business(business_id, **overrides):
         print_kitchen_receipt=False, receipt_config_json=None,
         receipt_reference_asset_id=None, menu_reference_asset_id=None,
         inventory_enabled=False, digital_receipts_enabled=False,
+        delivery_platforms_enabled=False, uber_eats_enabled=False, mrd_enabled=False,
         is_whatsapp_enabled=True, wastage_approval_threshold_cents=0,
         staff_live_orders_tab_enabled=True, staff_wastage_tab_enabled=True,
         staff_stocktake_tab_enabled=False, stocktake_frequency="DAILY_1", stocktake_times_json=None,
@@ -205,6 +206,54 @@ async def test_get_settings_returns_digital_receipts_enabled():
 
     result = await get_business_settings(user=owner, db=db)
     assert result.digital_receipts_enabled is True
+
+
+# ── delivery marketplace entitlement flags (migration 0044) ────────────────
+# Same platform-admin-only rule as inventory_enabled/digital_receipts_enabled
+# above — exposed read-only here so the manager dashboard can show real
+# Uber Eats/delivery-marketplace entitlement status without this being the
+# third instance of a Business column existing with no schema exposing it
+# (BUG-0072 and its predecessor).
+
+async def test_get_settings_returns_delivery_entitlement_flags():
+    owner = make_user(role="OWNER")
+    business = make_business(
+        owner.business_id,
+        delivery_platforms_enabled=True, uber_eats_enabled=True, mrd_enabled=False,
+    )
+    db = FakeDB([FakeResult(business), FakeResult(0)])
+
+    result = await get_business_settings(user=owner, db=db)
+    assert result.delivery_platforms_enabled is True
+    assert result.uber_eats_enabled is True
+    assert result.mrd_enabled is False
+
+
+def test_delivery_entitlement_flags_not_settable_via_update_schema():
+    assert "delivery_platforms_enabled" not in BusinessSettingsUpdate.model_fields
+    assert "uber_eats_enabled" not in BusinessSettingsUpdate.model_fields
+    assert "mrd_enabled" not in BusinessSettingsUpdate.model_fields
+
+
+async def test_delivery_entitlement_flags_distinct_from_own_driver_delivery_enabled():
+    """
+    delivery_enabled (WhatsApp own-driver delivery) and the new
+    delivery_platforms_enabled/uber_eats_enabled/mrd_enabled entitlement
+    flags are deliberately different columns with different meanings —
+    flipping one must never move the other.
+    """
+    owner = make_user(role="OWNER")
+    business = make_business(
+        owner.business_id,
+        delivery_enabled=True,
+        delivery_platforms_enabled=False, uber_eats_enabled=False, mrd_enabled=False,
+    )
+    db = FakeDB([FakeResult(business), FakeResult(0)])
+
+    result = await get_business_settings(user=owner, db=db)
+    assert result.delivery_enabled is True
+    assert result.delivery_platforms_enabled is False
+    assert result.uber_eats_enabled is False
 
 
 def test_digital_receipts_enabled_not_settable_via_update_schema():

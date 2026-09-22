@@ -112,6 +112,14 @@ class BusinessUpdate(BaseModel):
     is_whatsapp_enabled: bool | None = None
     inventory_enabled: bool | None = None
     digital_receipts_enabled: bool | None = None
+    # Delivery marketplace (migration 0044) — deliberately NOT added to
+    # ONBOARDER_PATCH_ALLOWED_FIELDS below: enabling a live delivery
+    # integration carries real contractual weight with Uber that a sales
+    # partner shouldn't be able to flip unilaterally, so this stays
+    # SUPER_ADMIN-only for v1 (see docs/DELIVERY_PLATFORM_ARCHITECTURE.md §7).
+    delivery_platforms_enabled: bool | None = None
+    uber_eats_enabled: bool | None = None
+    mrd_enabled: bool | None = None
     # Staff app navigation — set during onboarding so a new tenant's till
     # app matches their workflow on day one. Also settable by the owner via
     # the business plane; these hide tabs only, never features.
@@ -163,6 +171,13 @@ class BusinessAdminResponse(BaseModel):
     # without the admin_api schema being updated in the same change. Fixed
     # here (BUG-0072) rather than repeating the mistake a third time.
     digital_receipts_enabled: bool
+    # Delivery marketplace entitlement flags (migration 0044) — exposed here
+    # in the SAME commit as the migration/model, deliberately, per this
+    # repo's own BUG-0003/BUG-0072 discipline (a Business column existing
+    # with no schema exposing it has bitten this platform twice already).
+    delivery_platforms_enabled: bool
+    uber_eats_enabled: bool
+    mrd_enabled: bool
     staff_live_orders_tab_enabled: bool
     staff_wastage_tab_enabled: bool
     staff_stocktake_tab_enabled: bool
@@ -200,6 +215,17 @@ class BusinessOnboarderResponse(BaseModel):
     is_whatsapp_enabled: bool
     inventory_enabled: bool
     digital_receipts_enabled: bool
+    # Read-only here even though ONBOARDER can never set these (they are
+    # deliberately absent from ONBOARDER_PATCH_ALLOWED_FIELDS above): an
+    # onboarder setting up a restaurant that wants Uber Eats still needs to
+    # see current entitlement status to know whether to escalate to a
+    # SUPER_ADMIN, same as is_active/suspended_reason below (visible,
+    # read-only, not onboarder-actionable) — this is operational module
+    # status, not the Stripe/billing "commercial data" this reduced schema
+    # otherwise excludes.
+    delivery_platforms_enabled: bool
+    uber_eats_enabled: bool
+    mrd_enabled: bool
     staff_live_orders_tab_enabled: bool
     staff_wastage_tab_enabled: bool
     staff_stocktake_tab_enabled: bool

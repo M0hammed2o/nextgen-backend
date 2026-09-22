@@ -113,6 +113,15 @@ class BusinessSettingsResponse(BaseModel):
     # tonight; the business plane never had it at all, so the manager
     # dashboard could not show real Digital Receipts entitlement status).
     digital_receipts_enabled: bool = False
+    # Delivery marketplace entitlement flags (migration 0044) — platform-
+    # admin-writable (SUPER_ADMIN only, see admin_api routes_businesses.py),
+    # business-plane READ-ONLY here, same pattern as inventory_enabled/
+    # digital_receipts_enabled above. NOT the same thing as delivery_enabled
+    # below (WhatsApp bot own-driver delivery) — kept deliberately separate,
+    # see docs/DELIVERY_PLATFORM_ARCHITECTURE.md §0.3.
+    delivery_platforms_enabled: bool = False
+    uber_eats_enabled: bool = False
+    mrd_enabled: bool = False
     # Platform-admin kill switch (Business.is_whatsapp_enabled) — read-only
     # here so the manager dashboard can hide WhatsApp sections for a
     # POS-only client. Not settable via BusinessSettingsUpdate: enabling/
@@ -180,6 +189,9 @@ class BusinessSettingsResponse(BaseModel):
             menu_reference_asset_id=b.menu_reference_asset_id,
             inventory_enabled=b.inventory_enabled,
             digital_receipts_enabled=b.digital_receipts_enabled,
+            delivery_platforms_enabled=b.delivery_platforms_enabled,
+            uber_eats_enabled=b.uber_eats_enabled,
+            mrd_enabled=b.mrd_enabled,
             is_whatsapp_enabled=b.is_whatsapp_enabled,
             wastage_approval_threshold_cents=b.wastage_approval_threshold_cents,
             staff_live_orders_tab_enabled=b.staff_live_orders_tab_enabled,
