@@ -514,3 +514,60 @@ async def test_business_plane_token_cannot_reach_admin_dependency(_db_or_skip):
         assert exc.value.status_code == 403
     finally:
         await _cleanup(db, business_ids=[business.id])
+
+
+async def test_digital_receipts_enabled_round_trips_through_patch_and_get(_db_or_skip):
+    """
+    BUG-0072: digital_receipts_enabled (migration 0039) was added to
+    Business but never added to BusinessUpdate / ONBOARDER_PATCH_ALLOWED_FIELDS
+    / BusinessAdminResponse / BusinessOnboarderResponse — so a PATCH setting
+    it returned 200 and silently changed nothing (BusinessUpdate has no
+    `extra="forbid"`, so the unknown field was just ignored), and no GET
+    response could ever show its real state. Proves the fix: both SUPER_ADMIN
+    and ONBOARDER can set it, and it comes back correctly on every response
+    shape.
+    """
+    db = _db_or_skip
+    unique = uuid.uuid4().hex[:8]
+    super_admin = await _make_admin(db, AdminRole.SUPER_ADMIN, f"super-{unique}@test.co.za")
+    onboarder = await _make_admin(db, AdminRole.ONBOARDER, f"onboarder-{unique}@test.co.za")
+    auth_super = _admin_auth(super_admin.id, AdminRole.SUPER_ADMIN)
+    auth_onboarder = _admin_auth(onboarder.id, AdminRole.ONBOARDER)
+
+    business_ids = []
+    try:
+        created = await create_business(
+            body=BusinessCreate(name=f"Receipts Flag Biz {unique}"), user=auth_onboarder, db=db,
+        )
+        business_ids.append(created.id)
+        assert created.digital_receipts_enabled is False  # model default
+
+        # ONBOARDER may set it — it's in ONBOARDER_PATCH_ALLOWED_FIELDS now.
+        updated = await update_business(
+            business_id=created.id,
+            body=BusinessUpdate(digital_receipts_enabled=True),
+            user=auth_onboarder, db=db,
+        )
+        assert updated.digital_receipts_enabled is True
+
+        # Round-trips on every GET response shape.
+        fetched_onboarder = await get_business(business_id=created.id, user=auth_onboarder, db=db)
+        assert isinstance(fetched_onboarder, BusinessOnboarderResponse)
+        assert fetched_onboarder.digital_receipts_enabled is True
+
+        fetched_super = await get_business(business_id=created.id, user=auth_super, db=db)
+        assert fetched_super.digital_receipts_enabled is True
+
+        listed = await list_businesses(is_active=None, page=1, per_page=100, user=auth_super, db=db)
+        this_one = next(b for b in listed if b.id == created.id)
+        assert this_one.digital_receipts_enabled is True
+
+        # SUPER_ADMIN can toggle it back off too.
+        toggled_off = await update_business(
+            business_id=created.id,
+            body=BusinessUpdate(digital_receipts_enabled=False),
+            user=auth_super, db=db,
+        )
+        assert toggled_off.digital_receipts_enabled is False
+    finally:
+        await _cleanup(db, business_ids=business_ids, admin_ids=[super_admin.id, onboarder.id])

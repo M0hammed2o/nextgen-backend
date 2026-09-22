@@ -57,7 +57,7 @@ ONBOARDING_ACCOUNT_STAFF_NAME = "NextGen Onboarding"
 # that role — SUPER_ADMIN is unaffected by this list.
 ONBOARDER_PATCH_ALLOWED_FIELDS = {
     "name", "timezone", "plan", "whatsapp_phone_number_id",
-    "is_whatsapp_enabled", "inventory_enabled",
+    "is_whatsapp_enabled", "inventory_enabled", "digital_receipts_enabled",
     "staff_live_orders_tab_enabled", "staff_wastage_tab_enabled", "staff_stocktake_tab_enabled",
 }
 
@@ -111,6 +111,7 @@ class BusinessUpdate(BaseModel):
     # keeps WhatsApp on — without either affecting the other.
     is_whatsapp_enabled: bool | None = None
     inventory_enabled: bool | None = None
+    digital_receipts_enabled: bool | None = None
     # Staff app navigation — set during onboarding so a new tenant's till
     # app matches their workflow on day one. Also settable by the owner via
     # the business plane; these hide tabs only, never features.
@@ -157,6 +158,11 @@ class BusinessAdminResponse(BaseModel):
     # onboarding go-live checks — see this task's DOC NOTE for KNOWN_BUGS.md).
     is_whatsapp_enabled: bool
     inventory_enabled: bool
+    # digital_receipts_enabled (migration 0039) had the exact same gap the
+    # comment above describes, for the same reason: a model column added
+    # without the admin_api schema being updated in the same change. Fixed
+    # here (BUG-0072) rather than repeating the mistake a third time.
+    digital_receipts_enabled: bool
     staff_live_orders_tab_enabled: bool
     staff_wastage_tab_enabled: bool
     staff_stocktake_tab_enabled: bool
@@ -193,6 +199,7 @@ class BusinessOnboarderResponse(BaseModel):
     created_at: datetime
     is_whatsapp_enabled: bool
     inventory_enabled: bool
+    digital_receipts_enabled: bool
     staff_live_orders_tab_enabled: bool
     staff_wastage_tab_enabled: bool
     staff_stocktake_tab_enabled: bool
