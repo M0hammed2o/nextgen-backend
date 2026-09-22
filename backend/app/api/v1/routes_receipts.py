@@ -20,23 +20,30 @@ is never mistaken for a second sale.
 import uuid
 
 from fastapi import APIRouter, Depends, Query, Response
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 
 from backend.app.core.errors import NotFoundError
-from backend.app.core.rbac import AuthUser, require_staff_or_above
+from backend.app.core.rbac import AuthUser, require_owner_or_manager, require_staff_or_above
 from backend.app.db.session import get_db
 from backend.app.receipts.document import build_receipt_document
 from backend.app.receipts.escpos import PrinterCapabilities, render_escpos, render_text
 from shared.enums import AuditScope
 from shared.models.audit import AuditEvent
 from shared.models.business import Business
+from shared.models.digital_receipt import DigitalReceipt
 from shared.models.order import Order
 from shared.models.user import BusinessUser
 from shared.utils.time import utc_now
 from sqlalchemy.ext.asyncio import AsyncSession
 
 router = APIRouter(prefix="/business/receipts", tags=["receipts"])
+
+# Separate router/prefix so the path is /v1/business/digital-receipts/usage
+# rather than nested under /v1/business/receipts — matches the task's own
+# named path; kept in this module since it is the same receipts feature
+# area and the two routers share no state beyond the import list above.
+digital_receipts_usage_router = APIRouter(prefix="/business/digital-receipts", tags=["receipts"])
 
 
 async def _load(db: AsyncSession, business_id: uuid.UUID, order_id: uuid.UUID):
@@ -242,3 +249,35 @@ async def reprint_receipt(
     await db.commit()
 
     return document.to_dict()
+
+
+@digital_receipts_usage_router.get("/usage")
+async def get_digital_receipts_usage(
+    user: AuthUser = Depends(require_owner_or_manager),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Metering visibility only — simple business-scoped COUNT(*) aggregates
+    over digital_receipts. No pricing/limits are hard-coded here; this is
+    purely for an owner/manager to see how the feature is being used.
+
+    Disabling business.digital_receipts_enabled later never deletes or
+    otherwise touches existing digital_receipts rows (see
+    backend/app/api/v1/routes_receipt_public.py) — historical totals here
+    remain accurate regardless of the tenant's CURRENT entitlement state.
+    """
+    result = await db.execute(
+        select(
+            func.count(DigitalReceipt.id),
+            func.count(DigitalReceipt.id).filter(
+                DigitalReceipt.whatsapp_status.in_(("SENT", "DELIVERED"))
+            ),
+            func.count(DigitalReceipt.id).filter(DigitalReceipt.whatsapp_status == "FAILED"),
+        ).where(DigitalReceipt.business_id == user.business_id)
+    )
+    total, whatsapp_sent, whatsapp_failed = result.one()
+    return {
+        "receipts_requested": total or 0,
+        "whatsapp_sent": whatsapp_sent or 0,
+        "whatsapp_failed": whatsapp_failed or 0,
+    }
