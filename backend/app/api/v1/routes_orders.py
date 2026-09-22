@@ -11,11 +11,15 @@ from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import select, func, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.app.core.config import get_settings
 from backend.app.core.errors import AppError, InvalidTransitionError, NotFoundError
+from backend.app.core.ownership import require_owned
 from backend.app.core.pagination import CursorParams, PaginatedResponse, PaginationMeta, encode_cursor
 from backend.app.core.rbac import AuthUser, require_owner_or_manager, require_staff_or_above
 from backend.app.db.session import get_db
 from backend.app.pos.pricing import POSAddOnSelection, POSItemInput, resolve_pos_items
+from backend.app.receipts.whatsapp_receipt import resolve_receipt_customer_and_phone, send_digital_receipt
+from backend.app.utils.phone import normalize_sa_mobile
 from shared.enums import ORDER_STATUS_TRANSITIONS, AuditScope, OrderSource, OrderStatus
 from backend.app.payments.registry import get_provider
 from shared.models.audit import AuditEvent
@@ -23,6 +27,8 @@ from shared.models.business import Business
 from shared.models.order import Order, OrderEvent, OrderItem
 from shared.pricing.engine import apply_vat_to_total
 from shared.utils import format_order_number
+
+settings = get_settings()
 
 router = APIRouter(prefix="/business/orders", tags=["orders"])
 
@@ -678,6 +684,59 @@ async def update_order_status(
             "Failed to send customer WhatsApp notification for order %s", order.id
         )
 
+    # ── Digital receipt for a cash-on-collection WhatsApp order (fire and
+    #    forget) ────────────────────────────────────────────────────────
+    #
+    # A CASH_ON_COLLECTION order's payment_status never becomes PAID (see
+    # backend/app/api/v1/routes_payments.py — that path is exclusively for
+    # online-payment-provider orders); the genuine "this sale is now final"
+    # moment for a cash-on-collection order IS this exact status transition
+    # into COLLECTED/DELIVERED. Triggered only on the specific transition
+    # INTO one of those two states (never on a repeat/duplicate update) —
+    # `old_status not in (...)` here is defence in depth: ORDER_STATUS_
+    # TRANSITIONS above already makes COLLECTED/DELIVERED terminal (no
+    # outbound transitions at all), so a genuine duplicate call would have
+    # already raised InvalidTransitionError before this line is ever
+    # reached; this check guards against that invariant changing later
+    # without this trigger being re-audited.
+    #
+    # Idempotency beyond that: send_digital_receipt() itself is idempotent
+    # per order_id (get-or-create + already-SENT short-circuit), so even a
+    # hypothetical second call here could never double-send.
+    if (
+        requested in (OrderStatus.COLLECTED, OrderStatus.DELIVERED)
+        and old_status not in (OrderStatus.COLLECTED.value, OrderStatus.DELIVERED.value)
+        and order.payment_status == "CASH_ON_COLLECTION"
+    ):
+        try:
+            from shared.models.customer import Customer
+            from backend.app.receipts.whatsapp_receipt import send_digital_receipt
+
+            biz_row = await db.execute(select(Business).where(Business.id == order.business_id))
+            business_obj = biz_row.scalar_one_or_none()
+
+            customer_obj = None
+            if order.customer_id:
+                cust_row = await db.execute(
+                    select(Customer).where(
+                        Customer.id == order.customer_id, Customer.business_id == order.business_id,
+                    )
+                )
+                customer_obj = cust_row.scalar_one_or_none()
+
+            if business_obj is not None:
+                # No phone re-entry needed — this is a WhatsApp-originated
+                # order, so the identity is already known via the linked
+                # Customer's wa_id (send_digital_receipt resolves it).
+                await send_digital_receipt(
+                    db, order, business_obj, channels={"WHATSAPP"}, customer=customer_obj,
+                )
+        except Exception:
+            import logging
+            logging.getLogger("nextgen").warning(
+                "Failed to send digital receipt for cash-on-collection order %s", order.id
+            )
+
     return OrderResponse.model_validate(order)
 
 
@@ -1220,4 +1279,77 @@ async def refund_order_payment(
         provider_reference=refund_result.provider_reference,
         error=refund_result.error,
         order=OrderResponse.model_validate(order),
+    )
+
+
+# ── Digital receipt resend (manager dashboard) ──────────────────────────────
+
+class ReceiptResendRequest(BaseModel):
+    phone_number: str | None = Field(default=None, max_length=32)
+
+
+class ReceiptResendResponse(BaseModel):
+    id: uuid.UUID
+    order_id: uuid.UUID
+    receipt_url: str
+    whatsapp_status: str
+    whatsapp_failure_reason: str | None = None
+
+
+@router.post("/{order_id}/receipt/resend", response_model=ReceiptResendResponse)
+async def resend_order_receipt(
+    order_id: uuid.UUID,
+    body: ReceiptResendRequest,
+    user: AuthUser = Depends(require_owner_or_manager),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Resend an order's digital receipt over WhatsApp — any order type/source
+    (not just POS), for after-the-fact recovery (customer says they never
+    got it, staff wants to re-trigger after fixing a phone number, etc.).
+    OWNER/MANAGER only, since this always forces a resend even if the
+    receipt already shows SENT/DELIVERED — see
+    backend/app/receipts/whatsapp_receipt.py::FORCE_RESEND_ROLES, enforced
+    here at the route layer (STAFF cannot reach this endpoint at all).
+
+    Reuses the exact same underlying function every other trigger point
+    uses — no second implementation of "build and send a digital receipt".
+    """
+    order = await require_owned(db, Order, order_id, user.business_id, label="Order")
+
+    biz_result = await db.execute(select(Business).where(Business.id == user.business_id))
+    business = biz_result.scalar_one_or_none()
+    if not business:
+        raise NotFoundError("Business")
+
+    explicit_phone = None
+    if body.phone_number:
+        explicit_phone = normalize_sa_mobile(body.phone_number)
+        if explicit_phone is None:
+            raise AppError(
+                "INVALID_PHONE_NUMBER",
+                "Enter a valid South African mobile number",
+                422,
+            )
+
+    customer, phone_number_e164 = await resolve_receipt_customer_and_phone(
+        db, order, user.business_id, explicit_phone,
+    )
+
+    receipt = await send_digital_receipt(
+        db, order, business,
+        channels={"WHATSAPP"},
+        phone_number_e164=phone_number_e164,
+        customer=customer,
+        requested_by_user_id=user.user_id,
+        force_resend=True,
+    )
+
+    receipt_url = f"{settings.BACKEND_PUBLIC_URL}{settings.API_V1_PREFIX}/r/{receipt.token}"
+    return ReceiptResendResponse(
+        id=receipt.id,
+        order_id=receipt.order_id,
+        receipt_url=receipt_url,
+        whatsapp_status=receipt.whatsapp_status,
+        whatsapp_failure_reason=receipt.whatsapp_failure_reason,
     )
