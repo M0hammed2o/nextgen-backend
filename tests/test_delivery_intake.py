@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from backend.app.delivery.intake import (
+    _bounded_payload,
     _insert_delivery_order_idempotent,
     _insert_event_idempotent,
     ingest_delivery_webhook,
@@ -239,6 +240,148 @@ class TestDuplicateAndUnknownStore:
         assert event_row.error_category == "UNKNOWN_STORE"
         assert event_row.business_id is None
         assert pool.enqueued == []
+
+
+class TestBugFixRegressions:
+    """
+    Regression coverage for the 2026-09-22 independent adversarial review
+    findings BUG-0087/0088/0090/0094(item 3) — see KNOWN_BUGS.md.
+    """
+
+    def test_bounded_payload_survives_deeply_nested_json_without_crashing(self):
+        """BUG-0090: a RecursionError from json.loads must never escape this helper."""
+        hostile = b"[" * 60_000
+        result = _bounded_payload(hostile)
+        assert result == {"_unparsed": True}
+
+    async def test_deeply_nested_unsigned_body_is_acked_200_not_500(self, monkeypatch):
+        """
+        BUG-0090's exact repro: an unauthenticated caller (no signature at
+        all) posts a ~60KB body of open brackets. Must never 500 — this is
+        the reachable-with-no-auth path that made it a real bug.
+        """
+        _settings_with_webhook_enabled(monkeypatch)
+        hostile = b"[" * 60_000
+        db = FakeDB(
+            execute_results=[FakeResult(scalar=uuid.uuid4())],
+            get_results=[DeliveryWebhookEvent(id=uuid.uuid4())],
+        )
+        pool = FakeArqPool()
+        result = await ingest_delivery_webhook(
+            db, provider="UBER_EATS", raw_body=hostile, headers={}, arq_pool=pool,
+        )
+        assert result.http_status == 200
+        assert result.error_category == "BAD_SIGNATURE"
+
+    async def test_bad_signature_never_reuses_the_payloads_own_event_id(self, monkeypatch):
+        """
+        BUG-0088: an attacker who guesses/predicts a real event_id and sends
+        it with NO valid signature must never be able to pre-claim that
+        event_id in the idempotency namespace — the genuine signed delivery
+        of the same event_id must still be able to insert (and be
+        processed) afterwards.
+        """
+        _settings_with_webhook_enabled(monkeypatch)
+        import backend.app.delivery.intake as intake_module
+
+        body = _body(event_id="evt-guessed-by-attacker")
+        db = FakeDB(
+            execute_results=[FakeResult(scalar=uuid.uuid4())],
+            get_results=[DeliveryWebhookEvent(id=uuid.uuid4())],
+        )
+        pool = FakeArqPool()
+
+        captured_kwargs = {}
+        real_insert = intake_module._insert_event_idempotent
+
+        async def _spy(db_arg, **kwargs):
+            captured_kwargs.update(kwargs)
+            return await real_insert(db_arg, **kwargs)
+
+        monkeypatch.setattr(intake_module, "_insert_event_idempotent", _spy)
+
+        result = await ingest_delivery_webhook(
+            db, provider="UBER_EATS", raw_body=body,
+            headers={"X-Uber-Signature": "0" * 64}, arq_pool=pool,
+        )
+        assert result.error_category == "BAD_SIGNATURE"
+        # The attacker's chosen event_id must NEVER become the dedupe key.
+        assert captured_kwargs["event_id"] != "evt-guessed-by-attacker"
+        assert captured_kwargs["event_id"].startswith("unverified:")
+        assert captured_kwargs["signature_valid"] is False
+
+    async def test_enqueue_failure_rolls_back_instead_of_leaving_a_dead_row(self, monkeypatch):
+        """
+        BUG-0087: previously the event/order rows were committed BEFORE the
+        enqueue attempt, so an enqueue failure's 503-retry could never
+        actually succeed (the retry always hit the already-committed row and
+        was deduped away as a no-op). Now nothing must be persisted on an
+        enqueue failure, so a retried delivery of the SAME event_id gets a
+        genuinely fresh attempt.
+        """
+        _settings_with_webhook_enabled(monkeypatch)
+        body = _body()
+        sig = _signed(body)
+        business_id = uuid.uuid4()
+        connection = DeliveryConnection(
+            id=uuid.uuid4(), business_id=business_id, provider="UBER_EATS",
+            external_store_id="store-1", status="CONNECTED", environment="production",
+        )
+        db = FakeDB(
+            execute_results=[
+                FakeResult(scalar=uuid.uuid4()),
+                FakeResult(scalar=connection),
+                FakeResult(scalar=None),
+            ],
+            get_results=[DeliveryWebhookEvent(id=uuid.uuid4())],
+        )
+        pool = FakeArqPool(raise_on_enqueue=True)
+        result = await ingest_delivery_webhook(
+            db, provider="UBER_EATS", raw_body=body, headers={"X-Uber-Signature": sig}, arq_pool=pool,
+        )
+        assert result.accepted is False
+        assert result.http_status == 503
+        assert result.error_category == "ENQUEUE_FAILED"
+        assert db.commits == 0, "nothing may be committed on enqueue failure"
+        assert db.rollbacks == 1, "the failed attempt must be rolled back so a retry starts clean"
+
+    async def test_non_order_event_is_acked_and_committed_without_enqueueing(self, monkeypatch):
+        """
+        BUG-0094 (item 3): an event with no resource_id (e.g.
+        store.status.changed) must never enqueue a worker job — there is
+        nothing for the worker to fetch/map, and doing so previously
+        produced a false DELIVERY_ORDER_ROW_MISSING ERROR log on every
+        occurrence.
+        """
+        _settings_with_webhook_enabled(monkeypatch)
+        import json
+        body = json.dumps({
+            "event_id": "evt-store-status",
+            "event_type": "store.status.changed",
+            "meta": {"user_id": "store-1", "status": "online"},
+        }).encode()
+        sig = _signed(body)
+        business_id = uuid.uuid4()
+        connection = DeliveryConnection(
+            id=uuid.uuid4(), business_id=business_id, provider="UBER_EATS",
+            external_store_id="store-1", status="CONNECTED", environment="production",
+        )
+        db = FakeDB(
+            execute_results=[
+                FakeResult(scalar=uuid.uuid4()),  # event insert
+                FakeResult(scalar=connection),     # connection resolved
+                # No third result: _insert_delivery_order_idempotent must NOT be called.
+            ],
+            get_results=[DeliveryWebhookEvent(id=uuid.uuid4())],
+        )
+        pool = FakeArqPool()
+        result = await ingest_delivery_webhook(
+            db, provider="UBER_EATS", raw_body=body, headers={"X-Uber-Signature": sig}, arq_pool=pool,
+        )
+        assert result.accepted is True
+        assert result.error_category == "OK"
+        assert pool.enqueued == [], "a non-order event must never enqueue process_delivery_order"
+        assert db.commits == 1
 
 
 class TestKnownStoreEnqueue:

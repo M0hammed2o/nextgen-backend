@@ -8,12 +8,17 @@ No real Mr D endpoint, header, or auth scheme is publicly documented (see
 `docs/MRD_API_ACCESS_2026-10.md`), so `MrDAdapter` is a disabled stub whose
 own capability flags are all False and whose network methods all raise —
 but that alone would still let a malicious or mistaken caller reach
-`get_provider("MR_D")` and get back a real (if inert) adapter object. The
-webhook route (`routes_delivery_webhook.py`) checks path membership in
-`_WEBHOOK_ENABLED_PROVIDERS` BEFORE calling `get_provider()` at all, so no
-request shaped like a Mr D webhook can reach adapter code, database lookups,
-or logging of any kind beyond a flat 200/`error_category=UNSUPPORTED_PROVIDER`
-ack. `MR_D` is deliberately absent from this set — do not add it without an
+`get_provider("MR_D")` and get back a real (if inert) adapter object.
+`intake.py::ingest_delivery_webhook` calls `is_webhook_enabled()` (below)
+BEFORE calling `get_provider()` at all, so no request shaped like a Mr D
+webhook can reach adapter code, database lookups, or logging of any kind
+beyond a flat 200/`error_category=UNSUPPORTED_PROVIDER` ack. (BUG-0094,
+KNOWN_BUGS.md: `intake.py` previously used its own hardcoded, case-sensitive
+`provider != "UBER_EATS"` check instead of calling this function — behaviour
+was equivalent today since UBER_EATS is this set's only member, but it meant
+`is_webhook_enabled()` was dead code that could silently drift from this
+set. Fixed 2026-09-23: `intake.py` now calls this function directly.)
+`MR_D` is deliberately absent from this set — do not add it without an
 explicit `DECISIONS.md` entry once a real, documented Mr D integration
 exists to justify it.
 """

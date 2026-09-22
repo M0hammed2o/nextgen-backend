@@ -93,7 +93,14 @@ def _bounded_payload(raw_body: bytes) -> dict:
     try:
         payload = json.loads(raw_body[:_RAW_PAYLOAD_MAX_BYTES] or b"{}")
         return payload if isinstance(payload, dict) else {"_unparsed": True}
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, RecursionError):
+        # RecursionError (BUG-0090): a deeply-nested body (e.g. tens of
+        # thousands of unclosed `[`) can blow CPython's json decoder's
+        # recursion depth well under the 64KB truncation bound above, and
+        # this is reachable with NO valid signature (bad-signature events
+        # still get logged, via this same helper). Must degrade to the same
+        # sentinel as any other unparseable body, never escape and 500 the
+        # always-200 webhook contract.
         return {"_unparsed": True}
 
 
@@ -114,12 +121,16 @@ async def ingest_delivery_webhook(
     """
     settings = get_settings()
 
-    if provider != "UBER_EATS" or not settings.UBER_EATS_WEBHOOK_ENABLED:
+    if not registry.is_webhook_enabled(provider) or not settings.UBER_EATS_WEBHOOK_ENABLED:
         # Covers both "not a provider we ever act on webhooks for" (MR_D —
-        # see registry.py) AND the platform-wide kill switch. No DB write
-        # at all — logging an attempted webhook for an unsupported provider
-        # string adds nothing an access log doesn't already have, and
-        # avoids ever writing an unvalidated provider string into a column.
+        # see registry.py) AND the platform-wide kill switch. registry.py's
+        # own _WEBHOOK_ENABLED_PROVIDERS is the single source of truth for
+        # provider membership (previously this was a hardcoded, case-
+        # sensitive `provider != "UBER_EATS"` string check that could
+        # silently drift from registry.py — BUG-0094). No DB write at all —
+        # logging an attempted webhook for an unsupported provider string
+        # adds nothing an access log doesn't already have, and avoids ever
+        # writing an unvalidated provider string into a column.
         logger.warning(
             "DELIVERY_WEBHOOK_REJECTED: provider=%r not webhook-enabled "
             "(unsupported provider or platform kill switch).", provider,
@@ -145,15 +156,27 @@ async def ingest_delivery_webhook(
     reported_environment = headers.get("x-environment") or headers.get("X-Environment")
 
     if not sig_valid:
-        # A bad-signature request may still carry a real (replayed/guessed)
-        # event_id, or none at all — either way this goes through the SAME
-        # idempotent insert path as a valid event, so a flood of identical
-        # bad-signature retries can never raise an unhandled IntegrityError
-        # here (which would turn a hostile probe into a 500).
+        # BUG-0088 fix: an unverified request must NEVER be able to occupy
+        # the (provider, event_id) namespace that gates whether a later
+        # VERIFIED delivery of the same event_id gets processed. Previously
+        # this branch inserted under the attacker-supplied `envelope.
+        # event_id` whenever the body happened to parse — an attacker who
+        # could predict/guess a real Uber event_id could pre-claim it with
+        # zero authentication, and the genuine signed delivery would then
+        # hit ON CONFLICT DO NOTHING and be silently swallowed as
+        # "duplicate_event" with no delivery_orders row for the watchdog to
+        # rescue. Always synthesize a fresh id here instead — the attacker-
+        # supplied event_id (if any) is still fully preserved for audit
+        # inside raw_payload_json (the JSON body's own `event_id` field), it
+        # just never becomes the DEDUPE KEY. This also means a genuine sender
+        # whose signature only failed due to OUR OWN misconfiguration (e.g.
+        # BUG-0089 — a missing UBER_EATS_CLIENT_SECRET) self-heals cleanly
+        # once fixed: the real event_id was never consumed by the bad-
+        # signature row, so the next (retried) delivery inserts cleanly.
         await _insert_event_idempotent(
             db,
             provider=provider,
-            event_id=(envelope.event_id if envelope else str(uuid.uuid4())),
+            event_id=f"unverified:{uuid.uuid4()}",
             external_store_id=envelope.external_store_id if envelope else None,
             event_type=envelope.event_type if envelope else None,
             raw_body=raw_body, signature_valid=False,
@@ -208,15 +231,77 @@ async def ingest_delivery_webhook(
     event_row.business_id = connection.business_id
     event_row.error_category = "OK"
 
-    if envelope.external_order_id:
-        await _insert_delivery_order_idempotent(
-            db,
+    # BUG-0094 item 3: a non-order event (e.g. `store.status.changed`) has
+    # no `resource_id` — there is nothing to fetch, map, or enqueue a worker
+    # job for. Previously this unconditionally enqueued `process_delivery_
+    # order` with `external_order_id=None`, and the worker then logged a
+    # false DELIVERY_ORDER_ROW_MISSING ERROR on every such event (its own
+    # message claims "intake.py should have created this row", which is
+    # simply not true for this event class). Commit the event-log row (audit
+    # trail preserved) and ack — nothing else to do.
+    if not envelope.external_order_id:
+        try:
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            logger.exception("DELIVERY_WEBHOOK_DB_COMMIT_FAILED: provider=%s", provider)
+            return WebhookGateResult(accepted=False, http_status=503, error_category="DB_ERROR")
+        return WebhookGateResult(
+            accepted=True, error_category="OK",
+            business_id=connection.business_id, delivery_connection_id=connection.id,
+        )
+
+    await _insert_delivery_order_idempotent(
+        db,
+        business_id=connection.business_id,
+        provider=provider,
+        connection_id=connection.id,
+        external_order_id=envelope.external_order_id,
+        external_store_id=envelope.external_store_id,
+        raw_event_id=event_row.id,
+    )
+
+    # BUG-0087 fix: the event-log/delivery-order rows are deliberately NOT
+    # committed until the enqueue itself has succeeded. Previously this
+    # committed FIRST, then attempted the enqueue — so an enqueue failure
+    # (a transient Redis blip) returned 503 "so the provider retries
+    # delivery", but the retry (same event_id) always hit the ALREADY-
+    # COMMITTED row and short-circuited as `duplicate_event` at the ON
+    # CONFLICT check above, silently dropping a real paid order forever. By
+    # flushing (not committing) here, holding this transaction open across
+    # the enqueue call, and rolling back on enqueue failure, a genuinely
+    # failed attempt leaves NOTHING behind: the (provider, event_id) row was
+    # never actually persisted, so an identical retry inserts cleanly and
+    # gets a fresh chance to enqueue. A concurrent duplicate delivery
+    # arriving while this transaction is still open blocks briefly on the
+    # same unique-index row lock (standard Postgres behaviour) rather than
+    # racing past it — it does not weaken the dedupe guarantee.
+    job_name = "process_delivery_cancellation" if envelope.event_type in _CANCEL_EVENT_TYPES else "process_delivery_order"
+    job_args = (
+        (provider, str(connection.business_id), envelope.external_order_id)
+        if job_name == "process_delivery_cancellation"
+        else (provider, str(connection.business_id), envelope.external_order_id, envelope.event_type)
+    )
+    try:
+        await db.flush()
+    except Exception:
+        await db.rollback()
+        logger.exception("DELIVERY_WEBHOOK_DB_FLUSH_FAILED: provider=%s", provider)
+        return WebhookGateResult(accepted=False, http_status=503, error_category="DB_ERROR")
+
+    try:
+        await arq_pool.enqueue_job(job_name, *job_args)
+    except Exception:
+        await db.rollback()
+        logger.exception(
+            "DELIVERY_WEBHOOK_ENQUEUE_FAILED: provider=%s business_id=%s external_order_id=%s — "
+            "rolled back (nothing committed) so a retried delivery of the SAME event_id can "
+            "insert cleanly and try again; returning 503 so the provider retries delivery.",
+            provider, connection.business_id, envelope.external_order_id,
+        )
+        return WebhookGateResult(
+            accepted=False, http_status=503, error_category="ENQUEUE_FAILED",
             business_id=connection.business_id,
-            provider=provider,
-            connection_id=connection.id,
-            external_order_id=envelope.external_order_id,
-            external_store_id=envelope.external_store_id,
-            raw_event_id=event_row.id,
         )
 
     try:
@@ -225,25 +310,6 @@ async def ingest_delivery_webhook(
         await db.rollback()
         logger.exception("DELIVERY_WEBHOOK_DB_COMMIT_FAILED: provider=%s", provider)
         return WebhookGateResult(accepted=False, http_status=503, error_category="DB_ERROR")
-
-    job_name = "process_delivery_cancellation" if envelope.event_type in _CANCEL_EVENT_TYPES else "process_delivery_order"
-    job_args = (
-        (provider, str(connection.business_id), envelope.external_order_id)
-        if job_name == "process_delivery_cancellation"
-        else (provider, str(connection.business_id), envelope.external_order_id, envelope.event_type)
-    )
-    try:
-        await arq_pool.enqueue_job(job_name, *job_args)
-    except Exception:
-        logger.exception(
-            "DELIVERY_WEBHOOK_ENQUEUE_FAILED: provider=%s business_id=%s external_order_id=%s — "
-            "a real order may not be processed; returning 503 so the provider retries delivery.",
-            provider, connection.business_id, envelope.external_order_id,
-        )
-        return WebhookGateResult(
-            accepted=False, http_status=503, error_category="ENQUEUE_FAILED",
-            business_id=connection.business_id,
-        )
 
     return WebhookGateResult(
         accepted=True, error_category="OK",
