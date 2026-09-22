@@ -65,6 +65,25 @@ from shared.models.digital_receipt import DigitalReceipt
 from shared.models.order import Order
 
 router = APIRouter(tags=["public-receipt"])
+
+# BUG-0077. A FIXED rate-limit scope, so every /v1/r/* request from one IP
+# shares ONE bucket.
+#
+# slowapi derives a limit's scope from `request["path"]` unless the limit
+# carries an explicit one (Limiter._check_request_limit -> __evaluate_limits:
+# `limit_scope = lim.scope or endpoint`). Because the token IS the path here,
+# the configured 30/minute was enforced per (IP, token): one IP could walk
+# unlimited different tokens, never tripping the limit, which is precisely
+# the traffic shape of a token-enumeration sweep or a cheap DB-load DoS. The
+# limit contributed nothing as an enumeration defence; only the token's 256
+# bits of entropy did.
+#
+# `shared_limit(..., scope=...)` rather than `limit(..., key_func=...)`:
+# slowapi's `limit()` accepts no scope argument at all, so no key function
+# could have fixed this — the scope would stay path-derived. Nothing about
+# any OTHER rate-limited route changes; this is the only route in the
+# codebase whose path carries a parameter.
+RATE_LIMIT_SCOPE = "public_receipt"
 settings = get_settings()
 logger = logging.getLogger("nextgen.receipts.public")
 
@@ -81,7 +100,10 @@ def _not_found() -> Response:
 
 
 @router.get("/r/{token}", response_class=Response)
-@limiter.limit(f"{settings.RECEIPT_PUBLIC_RATE_LIMIT_PER_MINUTE}/minute")
+@limiter.shared_limit(
+    f"{settings.RECEIPT_PUBLIC_RATE_LIMIT_PER_MINUTE}/minute",
+    scope=RATE_LIMIT_SCOPE,
+)
 async def get_public_receipt(
     token: str,
     request: Request,
