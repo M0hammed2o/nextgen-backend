@@ -243,6 +243,27 @@ class Business(Base, UUIDPrimaryKeyMixin, TimestampMixin):
                 "always rendered from receipt_config_json."
     )
 
+    # ── Digital receipts (Commercial V1 gate, migration 0039) ────────────
+    # Master switch, same pattern as inventory_enabled. Gates the WhatsApp
+    # delivery channel of a digital receipt ONLY — printing (POS till slip)
+    # is never gated by this. See backend/app/receipts/whatsapp_receipt.py.
+    digital_receipts_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False,
+        comment="Master switch for the WhatsApp channel of digital receipts. "
+                "Printing is always available regardless of this flag."
+    )
+    whatsapp_receipt_template_name: Mapped[str | None] = mapped_column(
+        String(512), nullable=True,
+        comment="Per-business override of settings.RECEIPT_WHATSAPP_TEMPLATE_NAME "
+                "— must match an ACTUALLY Meta-approved template name for the "
+                "sending WABA (platform token or this business's own connection)."
+    )
+    whatsapp_receipt_template_language: Mapped[str | None] = mapped_column(
+        String(16), nullable=True,
+        comment="Per-business override of settings.RECEIPT_WHATSAPP_TEMPLATE_LANGUAGE "
+                "— a Meta template language code, e.g. 'en_US'."
+    )
+
     # ── Inventory module (Ciao Pizza P0) ─────────────────────────────────
     inventory_enabled: Mapped[bool] = mapped_column(
         Boolean, default=False, nullable=False,
