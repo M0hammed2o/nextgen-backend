@@ -138,27 +138,28 @@ async def _mark_order_paid(
     from backend.app.loyalty.engine import award_loyalty_points_if_enabled
     await award_loyalty_points_if_enabled(db, business_id, order)
 
-    # Fire-and-forget WhatsApp notification + full digital receipt.
+    # Fire-and-forget WhatsApp notification + digital receipt (template).
     #
-    # Both are sent here (not just the confirmation) so the customer gets
-    # instant feedback (short confirmation text) AND a durable itemised
-    # record (the receipt, persisted via the outbox like any other
-    # WhatsApp text — see backend/app/receipts/whatsapp_receipt.py). This
+    # Both are sent here so the customer gets instant feedback (short
+    # confirmation text, unchanged) AND a durable, template-based digital
+    # receipt pointing at the public receipt page — see
+    # backend/app/receipts/whatsapp_receipt.py::send_digital_receipt(). This
     # single call site is shared by all four payment-provider webhook
     # handlers (Yoco/PayFast/Stitch/iKhoka), so wiring the receipt in here
     # covers every provider without duplicating the send at each route.
     #
-    # Idempotency: the `order.payment_status == "PAID"` early-return above
-    # already prevents this whole block (confirmation + receipt) from
-    # running twice for the same order on a duplicate webhook delivery —
-    # no separate dedup guard is needed.
+    # Idempotency (two layers): the `order.payment_status == "PAID"` early-
+    # return above already prevents this whole block from running twice for
+    # the same order on a duplicate webhook delivery; send_digital_receipt
+    # itself is separately idempotent per order_id (get-or-create + already-
+    # SENT short-circuit) regardless.
     if was_unpaid and order.payment_required and order.customer_id:
         try:
             from sqlalchemy import select as sa_select
             from shared.models.customer import Customer
             from backend.app.bot.whatsapp_sender import send_notification_message
             from backend.app.payments.messages import build_payment_confirmed_message
-            from backend.app.receipts.whatsapp_receipt import send_whatsapp_receipt
+            from backend.app.receipts.whatsapp_receipt import send_digital_receipt
 
             cust = await db.execute(sa_select(Customer).where(Customer.id == order.customer_id))
             cust_obj = cust.scalar_one_or_none()
@@ -179,7 +180,7 @@ async def _mark_order_paid(
                 )
 
             if biz_obj is not None:
-                await send_whatsapp_receipt(db, order, biz_obj, customer=cust_obj)
+                await send_digital_receipt(db, order, biz_obj, channels={"WHATSAPP"}, customer=cust_obj)
         except Exception:
             logger.exception("Failed to send payment confirmation WhatsApp for order %s", order.order_number)
 

@@ -1,9 +1,15 @@
 """
 _mark_order_paid() (routes_payments.py) receipt trigger — the digital
-WhatsApp receipt (backend/app/receipts/whatsapp_receipt.py) must be sent
-exactly once per order transition to PAID, and NOT again on a duplicate
-webhook delivery (order already PAID). Uses the same FakeDB/FakeRequest
-pattern as tests/test_payment_webhook_amount_validation.py.
+WhatsApp receipt (backend/app/receipts/whatsapp_receipt.py::
+send_digital_receipt, template-based since the Commercial V1 gate pass)
+must be requested exactly once per order transition to PAID, and NOT again
+on a duplicate webhook delivery (order already PAID). Uses the same
+FakeDB/FakeRequest pattern as tests/test_payment_webhook_amount_validation.py.
+
+send_digital_receipt itself (idempotency, template sending, entitlement
+gating) is covered by tests/integration/test_digital_receipts_realdb.py
+against a real DB — this file only proves the ONE call site wiring: called
+once, with channels={"WHATSAPP"}, not called again on a duplicate delivery.
 """
 import urllib.parse
 import uuid
@@ -107,9 +113,9 @@ async def test_receipt_sent_exactly_once_on_paid_transition_not_on_duplicate():
     body = _payfast_body(order.id)
 
     with patch("backend.app.api.v1.routes_payments.decrypt_credential", return_value="secret"), \
-         patch("backend.app.receipts.whatsapp_receipt.send_whatsapp_receipt", new_callable=AsyncMock) as mock_receipt, \
+         patch("backend.app.receipts.whatsapp_receipt.send_digital_receipt", new_callable=AsyncMock) as mock_receipt, \
          patch("backend.app.bot.whatsapp_sender.send_notification_message", new_callable=AsyncMock):
-        mock_receipt.return_value = True
+        mock_receipt.return_value = None
 
         # First delivery: UNPAID -> PAID.
         db1 = FakeDB([
@@ -127,6 +133,7 @@ async def test_receipt_sent_exactly_once_on_paid_transition_not_on_duplicate():
         args, kwargs = mock_receipt.call_args
         assert args[1] is order
         assert args[2] is business
+        assert kwargs.get("channels") == {"WHATSAPP"}
         assert kwargs.get("customer") is customer
 
         # Second delivery of the SAME webhook (order already PAID): the
