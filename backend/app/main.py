@@ -205,6 +205,7 @@ from backend.app.api.v1.routes_menu import router as menu_router
 from backend.app.api.v1.routes_orders import router as orders_router
 from backend.app.api.v1.routes_pos import router as pos_router
 from backend.app.api.v1.routes_external_orders import router as external_orders_router
+from backend.app.api.v1.routes_delivery import router as delivery_router
 from backend.app.api.v1.routes_import import router as import_router
 from backend.app.api.v1.routes_setup import router as setup_router
 from backend.app.api.v1.routes_inventory import router as inventory_router
@@ -245,6 +246,11 @@ app.include_router(inventory_router, prefix=PREFIX)
 app.include_router(import_router, prefix=PREFIX)
 app.include_router(setup_router, prefix=PREFIX)
 app.include_router(external_orders_router, prefix=PREFIX)
+# Delivery marketplace business-plane API (list/manage connections, list
+# delivery orders, menu mappings, manual accept/deny) — every route further
+# gated per tenant by Business.delivery_platforms_enabled, same pattern as
+# the inventory module above.
+app.include_router(delivery_router, prefix=PREFIX)
 app.include_router(recipes_router, prefix=PREFIX)
 app.include_router(wastage_router, prefix=PREFIX)
 app.include_router(stocktake_router, prefix=PREFIX)

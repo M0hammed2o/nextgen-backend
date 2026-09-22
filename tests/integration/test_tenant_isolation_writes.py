@@ -538,3 +538,248 @@ async def test_export_csv_orderitem_subquery_filters_by_business_id(db, two_busi
 
     assert "Real Pizza" in body
     assert "Leaked Item" not in body
+
+
+# ── Delivery marketplace: connections / orders / mappings ──────────────────
+# A mocked FakeDB (tests/test_routes_delivery.py) cannot honestly prove a
+# WHERE-clause tenant filter — same reasoning as the rest of this module.
+# These run against the REAL throwaway Postgres and construct the
+# DeliveryConnection/DeliveryOrder/ExternalProductMapping rows directly
+# (no provisioning-flow route exists yet to create a connection — see
+# docs/DELIVERY_PLATFORM_ARCHITECTURE.md's "NOT yet built" list), then prove
+# cross-tenant access to routes_delivery.py is refused (404, matching the
+# rest of this suite's pattern of a 404 rather than a 403 for a
+# not-owned-by-me resource, since the row is scoped out of the query
+# entirely rather than visible-but-forbidden).
+
+from backend.app.api.v1.routes_delivery import (  # noqa: E402
+    DenyOrderRequest,
+    MappingUpsertRequest,
+    accept_order,
+    deny_order,
+    disable_connection,
+    enable_connection,
+    get_connection,
+    get_order,
+    list_connections,
+    list_menu_mappings,
+    list_orders,
+    upsert_menu_mapping,
+)
+from shared.models.delivery import DeliveryConnection, DeliveryOrder  # noqa: E402
+from shared.models.external_orders import ExternalProductMapping  # noqa: E402
+
+
+async def _make_connection(db: AsyncSession, business_id: uuid.UUID, **overrides) -> DeliveryConnection:
+    defaults = dict(
+        provider="UBER_EATS", status="CONNECTED",
+        environment="production", external_store_id=f"store-{uuid.uuid4().hex[:10]}",
+    )
+    defaults.update(overrides)
+    conn = DeliveryConnection(business_id=business_id, **defaults)
+    db.add(conn)
+    await db.commit()
+    await db.refresh(conn)
+    return conn
+
+
+async def _make_delivery_order(db: AsyncSession, business_id: uuid.UUID, **overrides) -> DeliveryOrder:
+    defaults = dict(
+        provider="UBER_EATS", external_order_id=f"ext-{uuid.uuid4().hex[:10]}",
+        external_store_id="store-x", status="NEEDS_MAPPING",
+    )
+    defaults.update(overrides)
+    row = DeliveryOrder(business_id=business_id, **defaults)
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+    return row
+
+
+@pytest.fixture
+async def delivery_entitled_businesses(db: AsyncSession):
+    biz_a = await _make_business(db, delivery_platforms_enabled=True, uber_eats_enabled=True)
+    biz_b = await _make_business(db, delivery_platforms_enabled=True, uber_eats_enabled=True)
+    try:
+        yield biz_a, biz_b
+    finally:
+        try:
+            await _cleanup_business(db, biz_a.id)
+            await _cleanup_business(db, biz_b.id)
+        except Exception:
+            await db.rollback()
+            await _cleanup_business(db, biz_a.id)
+            await _cleanup_business(db, biz_b.id)
+
+
+async def test_get_connection_cross_tenant_returns_not_connected_not_the_other_tenants_row(
+    db, delivery_entitled_businesses,
+):
+    """
+    biz_b's real CONNECTED row must never be visible to biz_a — a cross-
+    tenant GET synthesises a fresh NOT_CONNECTED default rather than 404ing
+    OR leaking biz_b's row, since the endpoint is keyed by provider, not id.
+    """
+    biz_a, biz_b = delivery_entitled_businesses
+    owner_a, owner_b = _owner(biz_a.id), _owner(biz_b.id)
+    await _make_connection(db, biz_b.id, status="CONNECTED", external_store_id="secret-store-b")
+
+    result_a = await get_connection(provider="UBER_EATS", user=owner_a, db=db)
+    assert result_a.status == "NOT_CONNECTED"
+    assert result_a.external_store_id is None
+
+    result_b = await get_connection(provider="UBER_EATS", user=owner_b, db=db)
+    assert result_b.status == "CONNECTED"
+    assert result_b.external_store_id == "secret-store-b"
+
+
+async def test_list_connections_never_cross_tenant_leaks(db, delivery_entitled_businesses):
+    biz_a, biz_b = delivery_entitled_businesses
+    owner_a, owner_b = _owner(biz_a.id), _owner(biz_b.id)
+    await _make_connection(db, biz_a.id)
+    await _make_connection(db, biz_b.id)
+
+    listed_a = await list_connections(user=owner_a, db=db)
+    listed_b = await list_connections(user=owner_b, db=db)
+    assert len(listed_a) == 1
+    assert len(listed_b) == 1
+    assert listed_a[0].id != listed_b[0].id
+
+
+async def test_disable_connection_rejects_cross_tenant_and_leaves_target_unchanged(
+    db, delivery_entitled_businesses,
+):
+    biz_a, biz_b = delivery_entitled_businesses
+    owner_a = _owner(biz_a.id)
+    conn_b = await _make_connection(db, biz_b.id, status="CONNECTED")
+
+    with pytest.raises(NotFoundError):
+        await disable_connection(provider="UBER_EATS", user=owner_a, db=db)
+
+    fresh = await db.get(DeliveryConnection, conn_b.id)
+    assert fresh.status == "CONNECTED"  # biz_a's failed attempt never touched biz_b's row
+
+
+async def test_enable_connection_never_writes_connected_against_real_db(
+    db, delivery_entitled_businesses,
+):
+    biz_a, _biz_b = delivery_entitled_businesses
+    owner_a = _owner(biz_a.id)
+    await _make_connection(db, biz_a.id, status="DISABLED")
+
+    result = await enable_connection(provider="UBER_EATS", user=owner_a, db=db)
+    assert result.status == "ATTENTION_REQUIRED"
+    assert result.status != "CONNECTED"
+
+
+async def test_get_order_cross_tenant_is_404(db, delivery_entitled_businesses):
+    biz_a, biz_b = delivery_entitled_businesses
+    owner_a = _owner(biz_a.id)
+    order_b = await _make_delivery_order(db, biz_b.id)
+
+    with pytest.raises(NotFoundError):
+        await get_order(order_id=order_b.id, user=owner_a, db=db)
+
+
+async def test_list_orders_never_cross_tenant_leaks(db, delivery_entitled_businesses):
+    biz_a, biz_b = delivery_entitled_businesses
+    owner_a, owner_b = _owner(biz_a.id), _owner(biz_b.id)
+    await _make_delivery_order(db, biz_a.id)
+    await _make_delivery_order(db, biz_b.id)
+
+    listed_a = await list_orders(status=None, limit=50, offset=0, user=owner_a, db=db)
+    listed_b = await list_orders(status=None, limit=50, offset=0, user=owner_b, db=db)
+    assert listed_a.total == 1
+    assert listed_b.total == 1
+    assert listed_a.orders[0].id != listed_b.orders[0].id
+
+
+async def test_accept_order_cross_tenant_is_404_and_leaves_target_unchanged(
+    db, delivery_entitled_businesses,
+):
+    biz_a, biz_b = delivery_entitled_businesses
+    staff_a = _staff(biz_a.id)
+    order_b = await _make_delivery_order(db, biz_b.id, status="NEEDS_MAPPING")
+
+    class _FakeAppState:
+        arq_pool = None
+
+    class _FakeApp:
+        state = _FakeAppState()
+
+    class _FakeRequest:
+        app = _FakeApp()
+
+    with pytest.raises(NotFoundError):
+        await accept_order(order_id=order_b.id, request=_FakeRequest(), user=staff_a, db=db)
+
+    fresh = await db.get(DeliveryOrder, order_b.id)
+    assert fresh.status == "NEEDS_MAPPING"
+
+
+async def test_deny_order_cross_tenant_is_404_and_leaves_target_unchanged(
+    db, delivery_entitled_businesses,
+):
+    biz_a, biz_b = delivery_entitled_businesses
+    staff_a = _staff(biz_a.id)
+    order_b = await _make_delivery_order(db, biz_b.id, status="NEEDS_MAPPING")
+
+    with pytest.raises(NotFoundError):
+        await deny_order(
+            order_id=order_b.id, body=DenyOrderRequest(reason_code="OTHER"), user=staff_a, db=db,
+        )
+
+    fresh = await db.get(DeliveryOrder, order_b.id)
+    assert fresh.status == "NEEDS_MAPPING"
+    assert fresh.denied_at is None
+
+
+async def test_menu_mapping_list_never_cross_tenant_leaks(db, delivery_entitled_businesses):
+    biz_a, biz_b = delivery_entitled_businesses
+    owner_a, owner_b = _owner(biz_a.id), _owner(biz_b.id)
+
+    mapping_a = ExternalProductMapping(
+        business_id=biz_a.id, platform="UBER_EATS", kind="ITEM",
+        external_text="Biz A Pizza", external_key="biz a pizza",
+        external_id="ext-a-1", status="UNMAPPED",
+    )
+    mapping_b = ExternalProductMapping(
+        business_id=biz_b.id, platform="UBER_EATS", kind="ITEM",
+        external_text="Biz B Pizza", external_key="biz b pizza",
+        external_id="ext-b-1", status="UNMAPPED",
+    )
+    db.add_all([mapping_a, mapping_b])
+    await db.commit()
+
+    listed_a = await list_menu_mappings(provider=None, status=None, user=owner_a, db=db)
+    listed_b = await list_menu_mappings(provider=None, status=None, user=owner_b, db=db)
+    assert [m.external_text for m in listed_a] == ["Biz A Pizza"]
+    assert [m.external_text for m in listed_b] == ["Biz B Pizza"]
+
+
+async def test_menu_mapping_upsert_rejects_cross_tenant_menu_item_target(
+    db, delivery_entitled_businesses,
+):
+    """The mapping target (menu_item_id) must belong to THE CALLER's tenant
+    — never trust an id alone, same rule as routes_external_orders.py's
+    upsert_mapping."""
+    biz_a, biz_b = delivery_entitled_businesses
+    owner_a = _owner(biz_a.id)
+
+    item_b = await create_item(body=ItemCreate(name="Biz B Pizza", price_cents=5000), user=_owner(biz_b.id), db=db)
+
+    with pytest.raises(NotFoundError):
+        await upsert_menu_mapping(
+            body=MappingUpsertRequest(
+                platform="UBER_EATS", kind="ITEM", external_id="ext-cross-1",
+                external_text="Cross Tenant Pizza", menu_item_id=item_b.id,
+            ),
+            user=owner_a, db=db,
+        )
+
+    leaked = (
+        await db.execute(
+            select(ExternalProductMapping).where(ExternalProductMapping.external_id == "ext-cross-1")
+        )
+    ).scalar_one_or_none()
+    assert leaked is None
