@@ -86,6 +86,7 @@ def make_business(business_id, **overrides):
         receipt_reference_asset_id=None, menu_reference_asset_id=None,
         inventory_enabled=False, digital_receipts_enabled=False,
         delivery_platforms_enabled=False, uber_eats_enabled=False, mrd_enabled=False,
+        advanced_analytics_enabled=False,
         is_whatsapp_enabled=True, wastage_approval_threshold_cents=0,
         staff_live_orders_tab_enabled=True, staff_wastage_tab_enabled=True,
         staff_stocktake_tab_enabled=False, stocktake_frequency="DAILY_1", stocktake_times_json=None,
@@ -258,6 +259,24 @@ async def test_delivery_entitlement_flags_distinct_from_own_driver_delivery_enab
 
 def test_digital_receipts_enabled_not_settable_via_update_schema():
     assert "digital_receipts_enabled" not in BusinessSettingsUpdate.model_fields
+
+
+# ── advanced_analytics_enabled (migration 0047, Commercial V1 gate) ────────
+# Same platform-admin-only rule as inventory_enabled/digital_receipts_enabled/
+# delivery_platforms_enabled above — exposed read-only here so the manager
+# dashboard can show real Advanced Analytics entitlement status.
+
+async def test_get_settings_returns_advanced_analytics_enabled():
+    owner = make_user(role="OWNER")
+    business = make_business(owner.business_id, advanced_analytics_enabled=True)
+    db = FakeDB([FakeResult(business), FakeResult(0)])
+
+    result = await get_business_settings(user=owner, db=db)
+    assert result.advanced_analytics_enabled is True
+
+
+def test_advanced_analytics_enabled_not_settable_via_update_schema():
+    assert "advanced_analytics_enabled" not in BusinessSettingsUpdate.model_fields
 
 
 # ── VAT rate validation (real-browser fix) ──────────────────────────────────

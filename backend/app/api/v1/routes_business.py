@@ -122,6 +122,11 @@ class BusinessSettingsResponse(BaseModel):
     delivery_platforms_enabled: bool = False
     uber_eats_enabled: bool = False
     mrd_enabled: bool = False
+    # Advanced Analytics entitlement (migration 0047) — same platform-admin-
+    # writable / business-plane-READ-ONLY pattern as the flags above. Gates
+    # GET /business/external-orders/channels, /business/analytics/
+    # average-order-value, and /business/analytics/payment-methods.
+    advanced_analytics_enabled: bool = False
     # Platform-admin kill switch (Business.is_whatsapp_enabled) — read-only
     # here so the manager dashboard can hide WhatsApp sections for a
     # POS-only client. Not settable via BusinessSettingsUpdate: enabling/
@@ -192,6 +197,7 @@ class BusinessSettingsResponse(BaseModel):
             delivery_platforms_enabled=b.delivery_platforms_enabled,
             uber_eats_enabled=b.uber_eats_enabled,
             mrd_enabled=b.mrd_enabled,
+            advanced_analytics_enabled=b.advanced_analytics_enabled,
             is_whatsapp_enabled=b.is_whatsapp_enabled,
             wastage_approval_threshold_cents=b.wastage_approval_threshold_cents,
             staff_live_orders_tab_enabled=b.staff_live_orders_tab_enabled,
