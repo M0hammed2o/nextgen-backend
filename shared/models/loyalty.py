@@ -12,7 +12,7 @@ counter nobody can explain later.
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -82,6 +82,19 @@ class LoyaltyReward(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     points_cost: Mapped[int] = mapped_column(Integer, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
+    # Added migration 0050 (POS redemption). NULL is deliberate — every
+    # reward created before this column existed has no value, and defaulting
+    # to 0 would silently turn each one into a real R0 till discount. NULL
+    # means "not redeemable at the till, hand it over manually" — checkout
+    # rejects a NULL-valued reward with a distinct error code rather than
+    # discounting nothing. Single fixed cents only, deliberately — no
+    # reward-type discriminator, no percentage support.
+    value_cents: Mapped[int | None] = mapped_column(
+        Integer, nullable=True,
+        comment="Cents discount applied at POS checkout when this reward is "
+                 "redeemed. NULL = not redeemable at the till (manual handover only)."
+    )
+
     def __repr__(self) -> str:
         return f"<LoyaltyReward {self.name} ({self.points_cost}pts)>"
 
@@ -93,6 +106,21 @@ class LoyaltyTransaction(Base, UUIDPrimaryKeyMixin):
     source of truth it's derived from, so a balance is always explainable.
     """
     __tablename__ = "loyalty_transactions"
+    __table_args__ = (
+        # Belt-and-braces idempotency guard, added migration 0050 alongside
+        # POS redemption — mirrors uq_stock_movements_business_id_idempotency_key
+        # exactly (StockMovement, migration 0025). Partial index (WHERE
+        # idempotency_key IS NOT NULL) is created in the migration, not here,
+        # same reason StockMovement's own comment gives: SQLAlchemy's plain
+        # UniqueConstraint below documents the intended constraint for
+        # metadata/autogenerate purposes, but the actual DB constraint is the
+        # partial index the migration creates directly.
+        UniqueConstraint(
+            "business_id",
+            "idempotency_key",
+            name="uq_loyalty_transactions_business_id_idempotency_key",
+        ),
+    )
 
     business_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("businesses.id", ondelete="CASCADE"),
@@ -116,6 +144,12 @@ class LoyaltyTransaction(Base, UUIDPrimaryKeyMixin):
     )
     balance_after: Mapped[int] = mapped_column(Integer, nullable=False)
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Added migration 0050. Only ever set for a POS-checkout-driven REDEEM
+    # (`REDEEM:<order_id>`) or its reversal (`REDEEM_REVERSAL:<order_id>`) —
+    # every pre-existing transaction type, and the out-of-band manual
+    # redeem endpoint, leaves this NULL, which the partial unique index
+    # excludes from the uniqueness check entirely.
+    idempotency_key: Mapped[str | None] = mapped_column(String(160), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False,
         default=lambda: __import__("datetime").datetime.now(__import__("datetime").timezone.utc),

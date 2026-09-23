@@ -195,6 +195,35 @@ class Order(Base, UUIDPrimaryKeyMixin, TimestampMixin):
                  "pattern as cancelled_by_user_id"
     )
 
+    # ── Loyalty redemption (Phase: POS redemption, migration 0050) ───────
+    # Immutable financial snapshot, same reason total_cents isn't rewritten
+    # on a later refund/void: a reprint a month later must show what was
+    # actually charged and redeemed at the time, not today's catalogue.
+    loyalty_discount_cents: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False,
+        comment="Cents discounted off this sale by a redeemed reward — "
+                 "already netted into total_cents, never rewritten by a "
+                 "later refund/void"
+    )
+    loyalty_reward_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("loyalty_rewards.id", ondelete="SET NULL"),
+        nullable=True, index=True,
+        comment="Which reward was redeemed, if any — SET NULL on delete so "
+                 "removing a reward from the catalogue never rewrites history"
+    )
+    loyalty_points_redeemed: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False,
+        comment="Full points cost of the redeemed reward, even if "
+                 "loyalty_discount_cents was clamped below the reward's "
+                 "full value — money and ledger must agree on what happened"
+    )
+    loyalty_reward_name: Mapped[str | None] = mapped_column(
+        String(255), nullable=True,
+        comment="Snapshot of LoyaltyReward.name at redemption time — a "
+                 "reprint must not depend on the FK resolving or the "
+                 "reward's current name, same pattern as name_snapshot"
+    )
+
     # ── Relationships ────────────────────────────────────────────────────
     items = relationship("OrderItem", back_populates="order", lazy="selectin")
     events = relationship("OrderEvent", back_populates="order", lazy="noload")

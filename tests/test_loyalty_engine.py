@@ -15,7 +15,11 @@ from backend.app.loyalty.engine import (
     award_points_for_paid_order,
     compute_tier,
     get_or_create_customer_by_phone,
+    redeem_idempotency_key,
+    redeem_reversal_idempotency_key,
     redeem_reward,
+    redeem_reward_for_checkout,
+    reverse_redemption,
 )
 
 
@@ -296,4 +300,184 @@ async def test_get_or_create_customer_rejects_unparseable_phone():
     with pytest.raises(AppError) as exc:
         await get_or_create_customer_by_phone(db, business_id, "not-a-phone-number")
     assert exc.value.code == "INVALID_PHONE_NUMBER"
+    assert db.added == []
+
+
+# ── Checkout redemption (redeem_reward_for_checkout) ─────────────────────────
+# clamp-and-warn: cap the discount so the order total never goes below zero,
+# but always deduct the reward's FULL points cost.
+
+async def test_checkout_redemption_stamps_order_id_and_idempotency_key():
+    program = make_program()
+    customer = make_customer(loyalty_points_balance=500)
+    reward = make_reward(points_cost=200, value_cents=5000)
+    order_id = uuid.uuid4()
+    db = FakeDB(customer=customer)
+
+    result = await redeem_reward_for_checkout(
+        db, uuid.uuid4(), customer, reward, program,
+        order_id=order_id, max_discountable_cents=10000,
+    )
+
+    assert result.discount_cents == 5000  # full value fits within the sale
+    assert result.points_cost == 200
+    assert result.shortfall_cents == 0
+    assert result.reward_name == "Free Coffee"
+    assert customer.loyalty_points_balance == 300  # full points cost deducted
+    assert result.txn.order_id == order_id
+    assert result.txn.idempotency_key == redeem_idempotency_key(order_id)
+
+
+async def test_checkout_redemption_clamps_when_reward_exceeds_sale():
+    """Reward worth more than the sale: clamp the discount, deduct full points, report the shortfall."""
+    program = make_program()
+    customer = make_customer(loyalty_points_balance=500)
+    reward = make_reward(points_cost=200, value_cents=15000)  # R150 reward
+    db = FakeDB(customer=customer)
+
+    result = await redeem_reward_for_checkout(
+        db, uuid.uuid4(), customer, reward, program,
+        order_id=uuid.uuid4(), max_discountable_cents=6000,  # R60 sale
+    )
+
+    assert result.discount_cents == 6000  # clamped to what the sale can absorb
+    assert result.points_cost == 200  # full cost regardless of the clamp
+    assert result.shortfall_cents == 9000  # 15000 - 6000
+    assert customer.loyalty_points_balance == 300  # full deduction, not pro-rated
+
+
+async def test_checkout_redemption_never_negative_when_max_discountable_is_zero():
+    program = make_program()
+    customer = make_customer(loyalty_points_balance=500)
+    reward = make_reward(points_cost=200, value_cents=5000)
+    db = FakeDB(customer=customer)
+
+    result = await redeem_reward_for_checkout(
+        db, uuid.uuid4(), customer, reward, program,
+        order_id=uuid.uuid4(), max_discountable_cents=0,
+    )
+    assert result.discount_cents == 0
+    assert result.shortfall_cents == 5000
+
+
+async def test_checkout_redemption_rejects_reward_with_no_cents_value():
+    """A NULL value_cents reward is manual-handover-only — must never silently apply a R0 discount."""
+    program = make_program()
+    customer = make_customer(loyalty_points_balance=500)
+    reward = make_reward(points_cost=200, value_cents=None)
+    db = FakeDB(customer=customer)
+
+    with pytest.raises(AppError) as exc:
+        await redeem_reward_for_checkout(
+            db, uuid.uuid4(), customer, reward, program,
+            order_id=uuid.uuid4(), max_discountable_cents=10000,
+        )
+    assert exc.value.code == "REWARD_NOT_REDEEMABLE_AT_TILL"
+    assert exc.value.status_code == 422
+    # Nothing moved — the balance must be untouched.
+    assert customer.loyalty_points_balance == 500
+    assert db.added == []
+
+
+async def test_checkout_redemption_still_enforces_normal_redeem_reward_checks():
+    """Inactive reward, disabled program, insufficient points all still apply — this wraps redeem_reward, not a parallel path."""
+    program = make_program(is_enabled=False)
+    customer = make_customer(loyalty_points_balance=500)
+    reward = make_reward(points_cost=200, value_cents=5000)
+    db = FakeDB(customer=customer)
+
+    with pytest.raises(AppError) as exc:
+        await redeem_reward_for_checkout(
+            db, uuid.uuid4(), customer, reward, program,
+            order_id=uuid.uuid4(), max_discountable_cents=10000,
+        )
+    assert exc.value.code == "LOYALTY_DISABLED"
+
+
+# ── Reversal (reverse_redemption) ─────────────────────────────────────────────
+
+class FakeTxn:
+    def __init__(self, id, customer_id, order_id, transaction_type, points_delta, idempotency_key=None):
+        self.id = id
+        self.customer_id = customer_id
+        self.order_id = order_id
+        self.transaction_type = transaction_type
+        self.points_delta = points_delta
+        self.idempotency_key = idempotency_key
+
+
+class QueueResult:
+    def __init__(self, scalar):
+        self._scalar = scalar
+
+    def scalar_one_or_none(self):
+        return self._scalar
+
+
+class QueueDB:
+    """A DB fake whose execute() pops pre-seeded results in call order —
+    reverse_redemption issues several DIFFERENT queries in sequence, unlike
+    the single-query FakeDB used above."""
+
+    def __init__(self, results):
+        self._results = list(results)
+        self.added = []
+
+    async def execute(self, stmt):
+        return self._results.pop(0)
+
+    def add(self, obj):
+        self.added.append(obj)
+
+
+async def test_reverse_redemption_restores_full_points_and_writes_adjust_txn():
+    business_id = uuid.uuid4()
+    order_id = uuid.uuid4()
+    customer = make_customer(loyalty_points_balance=300)
+    original = FakeTxn(uuid.uuid4(), customer.id, order_id, "REDEEM", -200)
+    program = make_program(silver_tier_points=400)
+
+    db = QueueDB([
+        QueueResult(original),   # original REDEEM lookup
+        QueueResult(None),       # no existing reversal
+        QueueResult(program),    # program lookup (for tier recompute)
+        QueueResult(customer),   # _lock_customer_for_balance_update
+    ])
+
+    restored = await reverse_redemption(db, business_id, order_id)
+
+    assert restored == 200
+    assert customer.loyalty_points_balance == 500
+    assert customer.loyalty_tier == "SILVER"  # 500 >= silver_tier_points=400
+    assert len(db.added) == 1
+    txn = db.added[0]
+    assert txn.transaction_type == "ADJUST"
+    assert txn.points_delta == 200
+    assert txn.order_id == order_id
+    assert txn.idempotency_key == redeem_reversal_idempotency_key(order_id)
+
+
+async def test_reverse_redemption_is_idempotent_on_already_reversed():
+    """Belt-and-braces: even if called twice, the second call writes nothing and restores nothing."""
+    business_id = uuid.uuid4()
+    order_id = uuid.uuid4()
+    original = FakeTxn(uuid.uuid4(), uuid.uuid4(), order_id, "REDEEM", -200)
+
+    db = QueueDB([
+        QueueResult(original),          # original REDEEM lookup
+        QueueResult(object()),          # a reversal already exists
+    ])
+
+    restored = await reverse_redemption(db, business_id, order_id)
+    assert restored == 0
+    assert db.added == []
+
+
+async def test_reverse_redemption_no_op_when_order_never_redeemed():
+    business_id = uuid.uuid4()
+    order_id = uuid.uuid4()
+    db = QueueDB([QueueResult(None)])  # no REDEEM transaction for this order
+
+    restored = await reverse_redemption(db, business_id, order_id)
+    assert restored == 0
     assert db.added == []

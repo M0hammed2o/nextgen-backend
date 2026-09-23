@@ -10,6 +10,7 @@ check against existing config, no new infrastructure required.
 """
 
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
@@ -19,6 +20,14 @@ from backend.app.core.errors import AppError, NotFoundError
 from backend.app.utils.phone import normalize_sa_mobile
 from shared.models.customer import Customer
 from shared.models.loyalty import LoyaltyProgram, LoyaltyReward, LoyaltyTransaction
+
+
+def redeem_idempotency_key(order_id: uuid.UUID) -> str:
+    return f"REDEEM:{order_id}"
+
+
+def redeem_reversal_idempotency_key(order_id: uuid.UUID) -> str:
+    return f"REDEEM_REVERSAL:{order_id}"
 
 
 def compute_tier(points_balance: int, program: LoyaltyProgram) -> str:
@@ -168,6 +177,7 @@ async def award_loyalty_points_if_enabled(db: AsyncSession, business_id: uuid.UU
 
 async def redeem_reward(
     db: AsyncSession, business_id: uuid.UUID, customer: Customer, reward: LoyaltyReward, program: LoyaltyProgram,
+    *, order_id: uuid.UUID | None = None,
 ) -> LoyaltyTransaction:
     """
     Redeem a reward for a customer. Raises AppError on any validation failure.
@@ -177,6 +187,14 @@ async def redeem_reward(
     closes the lost-update race where two concurrent redemptions both read
     the same balance, both pass the sufficiency check, and both write,
     letting a customer spend the same points twice.
+
+    `order_id` is optional — the out-of-band manual redeem endpoint
+    (`routes_loyalty.py::redeem_loyalty_reward`) has none, matching
+    LoyaltyTransaction.order_id's own "not every transaction is order-driven"
+    nullability. When given (POS checkout, via `redeem_reward_for_checkout`),
+    it stamps a deterministic `idempotency_key` on the written transaction —
+    belt-and-braces defense on top of the order's own idempotency guard,
+    mirroring `post_sale_consumption`'s ledger keys.
     """
     # Cheap in-memory checks first — no need to take the row lock at all if
     # the redemption is going to be rejected regardless of balance.
@@ -202,14 +220,146 @@ async def redeem_reward(
     txn = LoyaltyTransaction(
         business_id=business_id,
         customer_id=customer.id,
-        order_id=None,
+        order_id=order_id,
         transaction_type="REDEEM",
         points_delta=-reward.points_cost,
         balance_after=customer.loyalty_points_balance,
         reason=f"Redeemed: {reward.name}",
+        idempotency_key=redeem_idempotency_key(order_id) if order_id else None,
     )
     db.add(txn)
     return txn
+
+
+@dataclass
+class CheckoutRedemption:
+    """
+    Result of redeeming a reward at POS checkout — see
+    `redeem_reward_for_checkout`. `discount_cents` is the CLAMPED amount
+    actually applied to the sale; `points_cost` is always the reward's FULL
+    cost, deducted in full regardless of clamping, so the ledger and the
+    money agree on what happened (see DECISIONS.md, "reward worth more than
+    the sale").
+    """
+
+    txn: LoyaltyTransaction
+    discount_cents: int
+    points_cost: int
+    shortfall_cents: int
+    reward_name: str
+
+
+async def redeem_reward_for_checkout(
+    db: AsyncSession, business_id: uuid.UUID, customer: Customer, reward: LoyaltyReward, program: LoyaltyProgram,
+    *, order_id: uuid.UUID, max_discountable_cents: int,
+) -> CheckoutRedemption:
+    """
+    POS-checkout entry point for `redeem_reward()` — identical validation and
+    row-locking, plus the "reward worth more than the sale" product decision:
+    clamp the discount so the order total can never go below zero or owe
+    change, while still deducting the reward's FULL points cost. The caller
+    is expected to compute `max_discountable_cents` from the order's own
+    subtotal (minus any staff discount already applied) BEFORE delivery fee
+    and VAT — a reward discounts the food, not the delivery fee, and clamping
+    against a food-only base means the eventual order total (subtotal -
+    discount - loyalty_discount + delivery_fee) can never go negative either.
+
+    Raises `AppError` (`REWARD_NOT_REDEEMABLE_AT_TILL`, 422) if the reward has
+    no `value_cents` configured — such a reward exists for manual handover
+    only (see LoyaltyReward.value_cents' own docstring) and must never
+    silently apply a R0 discount.
+    """
+    if reward.value_cents is None:
+        raise AppError(
+            "REWARD_NOT_REDEEMABLE_AT_TILL",
+            "This reward has no monetary value configured for till redemption — hand it over manually instead",
+            422,
+        )
+
+    txn = await redeem_reward(db, business_id, customer, reward, program, order_id=order_id)
+
+    discount_cents = min(int(reward.value_cents), max(0, int(max_discountable_cents)))
+    shortfall_cents = int(reward.value_cents) - discount_cents
+
+    return CheckoutRedemption(
+        txn=txn,
+        discount_cents=discount_cents,
+        points_cost=reward.points_cost,
+        shortfall_cents=shortfall_cents,
+        reward_name=reward.name,
+    )
+
+
+async def reverse_redemption(
+    db: AsyncSession, business_id: uuid.UUID, order_id: uuid.UUID, *, notes: str | None = None,
+) -> int:
+    """
+    Return points spent on a redeemed reward back to the customer's balance —
+    the loyalty half of a POS void/refund, mirroring
+    `backend/app/inventory/ledger.py::reverse_sale_consumption`'s philosophy
+    exactly: read the ORIGINAL LoyaltyTransaction row for this order rather
+    than re-deriving anything (so a reward's points_cost changing after the
+    sale can never produce a different reversal amount than what was
+    actually charged), and be idempotent by construction — an order with no
+    REDEEM transaction, or one already reversed, returns 0 and writes
+    nothing, so a double-tapped void/refund cannot credit points twice.
+
+    Callers (`routes_pos.py::void_pos_order`/`refund_pos_order`) already hold
+    a `FOR UPDATE` lock on the ORDER row via `_load_pos_order_for_reversal`
+    before this is ever called, which is the PRIMARY guard against a genuine
+    double-tap (the second call sees payment_status already changed and is
+    rejected before reaching here at all) — the idempotency-key check below
+    is belt-and-braces on top of that, same layered-defense pattern as the
+    stock ledger.
+
+    Returns the number of points actually restored (0 if there was nothing
+    to reverse).
+    """
+    original = (
+        await db.execute(
+            select(LoyaltyTransaction).where(
+                LoyaltyTransaction.business_id == business_id,
+                LoyaltyTransaction.order_id == order_id,
+                LoyaltyTransaction.transaction_type == "REDEEM",
+            )
+        )
+    ).scalar_one_or_none()
+    if original is None:
+        return 0
+
+    already_reversed = (
+        await db.execute(
+            select(LoyaltyTransaction.id).where(
+                LoyaltyTransaction.business_id == business_id,
+                LoyaltyTransaction.idempotency_key == redeem_reversal_idempotency_key(order_id),
+            )
+        )
+    ).scalar_one_or_none()
+    if already_reversed is not None:
+        return 0
+
+    program_result = await db.execute(
+        select(LoyaltyProgram).where(LoyaltyProgram.business_id == business_id)
+    )
+    program = program_result.scalar_one_or_none()
+
+    customer = await _lock_customer_for_balance_update(db, business_id, original.customer_id)
+    points_back = -original.points_delta  # the original REDEEM delta is negative
+    customer.loyalty_points_balance += points_back
+    if program:
+        customer.loyalty_tier = compute_tier(customer.loyalty_points_balance, program)
+
+    db.add(LoyaltyTransaction(
+        business_id=business_id,
+        customer_id=customer.id,
+        order_id=order_id,
+        transaction_type="ADJUST",
+        points_delta=points_back,
+        balance_after=customer.loyalty_points_balance,
+        reason=notes or f"Reward redemption reversed for order {order_id}",
+        idempotency_key=redeem_reversal_idempotency_key(order_id),
+    ))
+    return points_back
 
 
 async def get_or_create_customer_by_phone(
