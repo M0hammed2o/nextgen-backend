@@ -6,10 +6,14 @@ when aggregated by real Postgres. A mocked session cannot prove SQL
 aggregation, timezone bucketing, or cross-tenant isolation, so these run
 against the throwaway local Postgres instance (see tests/integration/conftest.py).
 
-Requires DATABASE_URL to point at a reachable real Postgres, e.g.:
+Requires TEST_DATABASE_URL to point at a reachable real Postgres (see
+docker-compose.test.yml / TESTING.md), e.g.:
 
-  DATABASE_URL=postgresql+asyncpg://nextgen:***@localhost:55444/nextgen_test_analytics \
+  export TEST_DATABASE_URL="postgresql+asyncpg://nextgen_test:nextgen_test_only_do_not_use_in_prod@localhost:55677/nextgen_test"
   python -m pytest tests/integration/test_analytics_revenue.py -q
+
+Fails loudly if TEST_DATABASE_URL isn't set at all (see
+tests/integration/_env.py).
 """
 import uuid
 from datetime import timedelta
@@ -195,6 +199,11 @@ async def test_summary_daily_topitems_and_channels_agree_on_owner_scenario(db, t
     assert by_name["Burger"].revenue_cents == 30000  # line total, refund is order-level only
 
     # ── External-orders channel report -- same numbers, split by source ────
+    # Advanced Analytics (migration 0047): the channel report is gated by
+    # advanced_analytics_enabled, defaulting FALSE — enable it on this test's
+    # fixture so the gate itself isn't what's under test here (that has its
+    # own dedicated test below).
+    test_business.advanced_analytics_enabled = True
     channels = await channel_breakdown(days=1, user=owner, db=db)
     by_source = {c["source"]: c for c in channels["channels"]}
     assert by_source["POS"]["order_count"] == 2
@@ -321,6 +330,7 @@ async def test_imported_order_counts_once_with_right_channel_and_vat_sums(db, te
     db.add(imported_order)
     await db.commit()
 
+    test_business.advanced_analytics_enabled = True  # migration 0047 gate
     channels = await channel_breakdown(days=1, user=owner, db=db)
     by_source = {c["source"]: c for c in channels["channels"]}
     assert by_source["UBER_EATS"]["order_count"] == 1
@@ -362,3 +372,84 @@ async def test_external_sales_status_gross_uses_shared_sale_predicate(db, test_b
     assert uber["total_gross_cents_all_time"] == 14000, (
         "gross must exclude the CANCELLED order's total_cents entirely, not just discount it"
     )
+
+
+# ── Advanced Analytics entitlement gate (migration 0047) ────────────────────
+
+async def test_advanced_analytics_endpoints_refuse_a_non_entitled_tenant(db, test_business: Business):
+    """
+    A fresh test_business defaults advanced_analytics_enabled=False (the
+    migration's server_default). Every Advanced Analytics endpoint must
+    refuse it with 409 ADVANCED_ANALYTICS_NOT_ENABLED — a hidden nav item is
+    not enforcement, a direct call must be refused server-side.
+    """
+    from backend.app.api.v1.routes_analytics import (
+        get_average_order_value,
+        get_payment_method_breakdown,
+    )
+    from backend.app.core.errors import AppError
+
+    owner = _owner(test_business.id)
+    assert test_business.advanced_analytics_enabled is False
+
+    for coro in (
+        channel_breakdown(days=7, user=owner, db=db),
+        get_average_order_value(period="7d", user=owner, db=db),
+        get_payment_method_breakdown(days=7, user=owner, db=db),
+    ):
+        with pytest.raises(AppError) as exc:
+            await coro
+        assert exc.value.status_code == 409
+        assert exc.value.code == "ADVANCED_ANALYTICS_NOT_ENABLED"
+
+
+async def test_advanced_analytics_endpoints_work_once_entitled(db, test_business: Business):
+    """Flipping the flag on unblocks all three Advanced Analytics endpoints."""
+    from backend.app.api.v1.routes_analytics import (
+        get_average_order_value,
+        get_payment_method_breakdown,
+    )
+
+    owner, coke, _burger, _chips = await _pos_setup(db, test_business)
+    await create_pos_order(
+        body=POSOrderCreateRequest(
+            items=[POSOrderItemRequest(menu_item_id=coke.id, quantity=1)],
+            payment_method="CASH", cash_tendered_cents=20000,
+        ),
+        user=owner, db=db,
+    )
+
+    test_business.advanced_analytics_enabled = True
+
+    channels = await channel_breakdown(days=1, user=owner, db=db)
+    assert channels["total_orders"] == 1
+
+    aov = await get_average_order_value(period="today", user=owner, db=db)
+    assert aov.completed_orders == 1
+    assert aov.net_cents == 20000
+    assert aov.average_order_value_cents == 20000  # single order -> AOV == its own net
+
+    methods = await get_payment_method_breakdown(days=1, user=owner, db=db)
+    by_method = {m.payment_method: m for m in methods.methods}
+    assert by_method["CASH"].order_count == 1
+    assert by_method["CASH"].gross_cents == 20000
+    assert methods.total_orders == 1
+
+
+async def test_core_analytics_endpoints_never_gated(db, test_business: Business):
+    """
+    /summary, /top-items, /daily must stay available to a POS-only tenant
+    (advanced_analytics_enabled=False, never touched) — these are Core
+    Analytics per docs/COMMERCIAL_FEATURE_MATRIX_2026-10.md, not gated.
+    """
+    owner = _owner(test_business.id)
+    assert test_business.advanced_analytics_enabled is False
+
+    summary = await get_summary(period="today", user=owner, db=db)
+    assert summary.total_orders == 0  # no exception raised is the actual assertion
+
+    daily = await get_daily_breakdown(days=1, user=owner, db=db)
+    assert isinstance(daily, list)
+
+    top_items = await get_top_items(days=1, limit=10, user=owner, db=db)
+    assert top_items == []
