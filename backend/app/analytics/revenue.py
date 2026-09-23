@@ -90,9 +90,14 @@ consistently, not just at the range boundary).
 """
 from __future__ import annotations
 
-from sqlalchemy import Date, case, cast, func
+import uuid
+
+from sqlalchemy import Date, case, cast, func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
+from backend.app.core.errors import AppError, NotFoundError
+from shared.models.business import Business
 from shared.models.order import Order
 
 # ── Predicate vocabulary ────────────────────────────────────────────────────
@@ -178,3 +183,34 @@ def voided_cents_expr() -> ColumnElement:
 
 def true_cancelled_count_expr() -> ColumnElement:
     return func.coalesce(func.sum(case((IS_TRUE_CANCELLATION, 1), else_=0)), 0)
+
+
+# ── Advanced Analytics entitlement gate ─────────────────────────────────────
+
+async def require_advanced_analytics_enabled(db: AsyncSession, business_id: uuid.UUID) -> Business:
+    """
+    Server-side entitlement gate for Advanced Analytics (NextGen Complete
+    tier and above; migration 0047). Mirrors the `_require_inventory_enabled`
+    pattern duplicated per-route-file in routes_inventory.py/routes_recipes.py/
+    routes_wastage.py/routes_stocktake.py/routes_import.py (same AppError
+    shape, same 409) — centralised here instead, since both of this gate's
+    current callers (routes_analytics.py's average-order-value/payment-methods
+    endpoints and routes_external_orders.py's channel report) already live in
+    this analytics module's orbit and would otherwise duplicate the identical
+    query and error twice for no reason.
+
+    Returns the Business row so a caller that also needs it (e.g. for
+    timezone-aware period bucketing) doesn't have to fetch it twice.
+    """
+    business = (
+        await db.execute(select(Business).where(Business.id == business_id))
+    ).scalar_one_or_none()
+    if not business:
+        raise NotFoundError("Business")
+    if not business.advanced_analytics_enabled:
+        raise AppError(
+            "ADVANCED_ANALYTICS_NOT_ENABLED",
+            "Advanced Analytics is not enabled for this business",
+            409,
+        )
+    return business

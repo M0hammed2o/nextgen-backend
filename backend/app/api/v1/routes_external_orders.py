@@ -30,6 +30,7 @@ from backend.app.analytics.revenue import (
     IS_SALE,
     gross_cents_expr,
     refunds_cents_expr,
+    require_advanced_analytics_enabled,
     sale_count_expr,
     sale_timestamp_expr,
 )
@@ -646,7 +647,14 @@ async def channel_breakdown(
     PAID for those — only the fulfilment status does). The date cutoff also
     now uses the sale's own timestamp (external_placed_at for imports,
     created_at otherwise) rather than row-insert time.
+
+    Advanced Analytics (migration 0047, docs/COMMERCIAL_FEATURE_MATRIX_2026-10.md):
+    this is the one Core-adjacent report gated behind
+    `advanced_analytics_enabled` — a POS-only tenant gets 409
+    ADVANCED_ANALYTICS_NOT_ENABLED here, same gate/shape as
+    routes_analytics.py's average-order-value/payment-methods endpoints.
     """
+    await require_advanced_analytics_enabled(db, user.business_id)
     since = datetime.now(timezone.utc) - timedelta(days=days)
     rows = (
         await db.execute(
