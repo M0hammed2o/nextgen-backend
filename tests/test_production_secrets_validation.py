@@ -40,6 +40,7 @@ def settings():
         "UBER_EATS_WEBHOOK_ENABLED": s.UBER_EATS_WEBHOOK_ENABLED,
         "UBER_EATS_CLIENT_ID": s.UBER_EATS_CLIENT_ID,
         "UBER_EATS_CLIENT_SECRET": s.UBER_EATS_CLIENT_SECRET,
+        "SQL_ECHO_ENABLED": s.SQL_ECHO_ENABLED,
     }
     # Start every test from a fully-valid baseline, then break one field at a time.
     s.ENVIRONMENT = "production"
@@ -58,6 +59,7 @@ def settings():
     s.UBER_EATS_WEBHOOK_ENABLED = True
     s.UBER_EATS_CLIENT_ID = _valid_secret("e5")
     s.UBER_EATS_CLIENT_SECRET = _valid_secret("f6")
+    s.SQL_ECHO_ENABLED = False
     yield s
     for key, value in original.items():
         setattr(s, key, value)
@@ -227,3 +229,64 @@ def test_missing_uber_secrets_ignored_when_webhook_disabled(settings):
 
 def test_valid_uber_production_config_passes(settings):
     main_module._validate_production_secrets()  # must not raise (fixture baseline)
+
+
+# ── BUG-0085: SQL_ECHO_ENABLED must fail closed in production/staging — ────
+# ── SQLAlchemy `echo` logs bound parameters verbatim, including real ───────
+# ── customer PII (DigitalReceipt.phone_number_e164, Customer.wa_id). ───────
+
+def test_sql_echo_enabled_is_rejected_in_production(settings):
+    settings.SQL_ECHO_ENABLED = True
+    with pytest.raises(RuntimeError, match="SQL_ECHO_ENABLED"):
+        main_module._validate_production_secrets()
+
+
+def test_sql_echo_enabled_is_rejected_in_staging_too(settings):
+    """
+    Staging is validated exactly like production (see this function's own
+    docstring) — a staging deploy with real/real-looking customer data must
+    not be allowed to echo it either.
+    """
+    settings.ENVIRONMENT = "staging"
+    settings.SQL_ECHO_ENABLED = True
+    with pytest.raises(RuntimeError, match="SQL_ECHO_ENABLED"):
+        main_module._validate_production_secrets()
+
+
+def test_sql_echo_enabled_is_allowed_in_development(settings):
+    """
+    The whole point of decoupling SQL_ECHO_ENABLED from DEBUG (BUG-0085) is
+    that local SQL-query debugging must still be possible — just via its own
+    explicit flag rather than implicitly through DEBUG.
+    """
+    settings.ENVIRONMENT = "development"
+    settings.SQL_ECHO_ENABLED = True
+    main_module._validate_production_secrets()  # must not raise
+
+
+def test_sql_echo_disabled_production_config_passes(settings):
+    settings.SQL_ECHO_ENABLED = False
+    main_module._validate_production_secrets()  # must not raise (fixture baseline)
+
+
+def test_debug_true_alone_does_not_trigger_the_sql_echo_check(settings):
+    """
+    DEBUG and SQL_ECHO_ENABLED are deliberately independent settings — DEBUG
+    being true (e.g. for verbose app-level logging) must not, on its own,
+    fail production boot. Only SQL_ECHO_ENABLED does.
+    """
+    settings.DEBUG = True
+    settings.SQL_ECHO_ENABLED = False
+    main_module._validate_production_secrets()  # must not raise
+
+
+async def test_lifespan_actually_refuses_to_boot_with_sql_echo_in_production(settings):
+    """
+    Proves the FAIL-CLOSED behaviour at the real boot path (the FastAPI
+    `lifespan` context manager main.py's ASGI server actually calls on
+    startup), not just the validator function called directly in isolation.
+    """
+    settings.SQL_ECHO_ENABLED = True
+    with pytest.raises(RuntimeError, match="SQL_ECHO_ENABLED"):
+        async with main_module.lifespan(main_module.app):
+            pytest.fail("lifespan must raise before yielding when SQL_ECHO_ENABLED is true in production")

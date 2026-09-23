@@ -157,6 +157,7 @@ def test_admin_api_rejects_historical_non_exact_placeholder():
         "ENVIRONMENT": "production",
         "JWT_SECRET_KEY": "CHANGE-ME-generate-a-strong-random-string",
         "JWT_ADMIN_SECRET_KEY": "a-real-64-char-admin-secret-1234567890123456789012345",
+        "SQL_ECHO_ENABLED": False,
     })()
 
     with patch("backend.app.core.config.get_settings", return_value=fake_backend_settings):
@@ -171,6 +172,7 @@ def test_admin_api_accepts_real_looking_secrets():
         "ENVIRONMENT": "production",
         "JWT_SECRET_KEY": "a-real-64-char-business-secret-1234567890123456789012",
         "JWT_ADMIN_SECRET_KEY": "a-real-64-char-admin-secret-1234567890123456789012345",
+        "SQL_ECHO_ENABLED": False,
     })()
 
     with patch("backend.app.core.config.get_settings", return_value=fake_backend_settings):
@@ -188,6 +190,39 @@ def test_admin_api_skips_validation_in_development():
 
     with patch("backend.app.core.config.get_settings", return_value=fake_backend_settings):
         admin_main._validate_production_secrets()  # must not raise
+
+
+# ── BUG-0085: admin_api must ALSO refuse SQL_ECHO_ENABLED in production ─────
+# ── (it shares backend's engine object but boots as its own process, so ────
+# ── backend/app/main.py's own lifespan never runs here). ───────────────────
+
+def test_admin_api_rejects_sql_echo_enabled_in_production():
+    from admin_api.app import main as admin_main
+
+    fake_backend_settings = type("S", (), {
+        "ENVIRONMENT": "production",
+        "JWT_SECRET_KEY": "a-real-64-char-business-secret-1234567890123456789012",
+        "JWT_ADMIN_SECRET_KEY": "a-real-64-char-admin-secret-1234567890123456789012345",
+        "SQL_ECHO_ENABLED": True,
+    })()
+
+    with patch("backend.app.core.config.get_settings", return_value=fake_backend_settings):
+        with pytest.raises(RuntimeError, match="SQL_ECHO_ENABLED"):
+            admin_main._validate_production_secrets()
+
+
+def test_admin_api_allows_sql_echo_enabled_in_development():
+    from admin_api.app import main as admin_main
+
+    fake_backend_settings = type("S", (), {
+        "ENVIRONMENT": "development",
+        "JWT_SECRET_KEY": "CHANGE-ME-IN-PRODUCTION",
+        "JWT_ADMIN_SECRET_KEY": "CHANGE-ME-IN-PRODUCTION",
+        "SQL_ECHO_ENABLED": True,
+    })()
+
+    with patch("backend.app.core.config.get_settings", return_value=fake_backend_settings):
+        admin_main._validate_production_secrets()  # must not raise — dev skips entirely
 
 
 # ── _looks_like_placeholder itself (shared helper) ───────────────────────────

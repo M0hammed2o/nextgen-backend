@@ -47,7 +47,11 @@ engine = create_async_engine(
     max_overflow=settings.DATABASE_MAX_OVERFLOW,
     pool_pre_ping=True,
     pool_recycle=1800,
-    echo=settings.DEBUG,
+    # NOT settings.DEBUG — SQL echo logs bound parameters verbatim (customer
+    # PII). Dedicated flag, refused in staging/production at boot. See
+    # KNOWN_BUGS.md BUG-0085 and SQL_ECHO_ENABLED's docstring in
+    # backend/app/core/config.py.
+    echo=settings.SQL_ECHO_ENABLED,
     future=True,
     connect_args={
         "statement_cache_size": 0,

@@ -78,7 +78,25 @@ class Settings(BaseSettings):
     # ── App ──────────────────────────────────────────────────────────────
     APP_NAME: str = "NextGen Backend"
     APP_VERSION: str = "1.0.0"
+    # Controls /docs, /redoc, and the root logging level. Deliberately does
+    # NOT control SQLAlchemy statement echo any more — see SQL_ECHO_ENABLED
+    # below and KNOWN_BUGS.md BUG-0085.
     DEBUG: bool = False
+    # SQLAlchemy engine `echo` — logs every SQL statement AND its bound
+    # parameters verbatim, which includes real customer PII (e.g.
+    # DigitalReceipt.phone_number_e164, Customer.wa_id/phone_number) whenever
+    # a query touches a table holding it. Deliberately its OWN flag, decoupled
+    # from DEBUG (which also gates /docs and log verbosity and has no
+    # PII-leak implications on its own) — see KNOWN_BUGS.md BUG-0085, found
+    # 2026-09-22 when DEBUG=true on a staging stack echoed two synthetic
+    # customer phone numbers into plaintext logs.
+    # Defaults OFF everywhere, including local development — safe to flip on
+    # locally when actually debugging a query; refused outright in
+    # staging/production by _validate_production_secrets() in
+    # backend/app/main.py (and mirrored in admin_api/app/main.py, since both
+    # processes share the same engine object constructed from THIS settings
+    # instance) regardless of who forgets to leave it off.
+    SQL_ECHO_ENABLED: bool = False
     # REQUIRED — no default. See VALID_ENVIRONMENTS above for why.
     ENVIRONMENT: str
     API_V1_PREFIX: str = "/v1"

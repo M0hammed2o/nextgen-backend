@@ -60,6 +60,21 @@ def _validate_production_secrets() -> None:
     if not settings.WHATSAPP_DEFAULT_ACCESS_TOKEN or settings.WHATSAPP_DEFAULT_ACCESS_TOKEN == "CHANGE-ME":
         errors.append("WHATSAPP_DEFAULT_ACCESS_TOKEN is not configured — cannot send WhatsApp messages")
 
+    # BUG-0085: SQLAlchemy `echo` logs every statement's BOUND PARAMETERS
+    # verbatim, which includes real customer PII (DigitalReceipt.
+    # phone_number_e164, Customer.wa_id/phone_number, etc.) whenever a query
+    # touches a table holding it. This must fail closed, not just log a
+    # warning — the whole point of BUG-0085 was that nothing previously
+    # noticed DEBUG=true silently doing this for an unknown period. See
+    # SQL_ECHO_ENABLED's docstring in backend/app/core/config.py for why this
+    # is a dedicated flag rather than reusing DEBUG.
+    if settings.SQL_ECHO_ENABLED:
+        errors.append(
+            "SQL_ECHO_ENABLED is true — SQLAlchemy would log every statement's "
+            "bound parameters verbatim, including real customer PII such as "
+            "DigitalReceipt.phone_number_e164 and Customer.wa_id/phone_number"
+        )
+
     # NextGen's own SaaS billing provider (BILLING_PROVIDER: STRIPE | PAYFAST,
     # see backend/app/billing/registry.py / DECISION-0017) is a config choice,
     # not a code choice — so this check must only demand secrets for whichever

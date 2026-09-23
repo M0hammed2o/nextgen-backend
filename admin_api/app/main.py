@@ -49,6 +49,19 @@ def _validate_production_secrets() -> None:
     if backend_settings.JWT_ADMIN_SECRET_KEY == backend_settings.JWT_SECRET_KEY:
         errors.append("JWT_ADMIN_SECRET_KEY must differ from JWT_SECRET_KEY — planes must not share a signing key")
 
+    # BUG-0085: the SQLAlchemy engine admin_api uses (backend.app.db.session
+    # .engine) is a single shared object constructed from BACKEND settings,
+    # not admin_api's own — so this process must validate it too, the same
+    # reason the JWT checks above read backend_settings instead of trusting
+    # backend/app/main.py's own lifespan to have already run (it doesn't run
+    # in this process at all).
+    if backend_settings.SQL_ECHO_ENABLED:
+        errors.append(
+            "SQL_ECHO_ENABLED is true — SQLAlchemy would log every statement's "
+            "bound parameters verbatim, including real customer PII such as "
+            "DigitalReceipt.phone_number_e164 and Customer.wa_id/phone_number"
+        )
+
     if errors:
         msg = (
             f"FATAL: Admin API {backend_settings.ENVIRONMENT} deployment with unconfigured secrets:\n"
