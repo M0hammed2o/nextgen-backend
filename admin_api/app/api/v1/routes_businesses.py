@@ -120,6 +120,12 @@ class BusinessUpdate(BaseModel):
     delivery_platforms_enabled: bool | None = None
     uber_eats_enabled: bool | None = None
     mrd_enabled: bool | None = None
+    # Advanced Analytics (migration 0047) — Commercial V1 tier gate (NextGen
+    # Complete and above). Same "platform decision, not a tenant toggle"
+    # rationale as the other module flags above; deliberately NOT added to
+    # ONBOARDER_PATCH_ALLOWED_FIELDS below — a sales partner should not be
+    # able to unilaterally unlock a paid tier's analytics for a POS-only deal.
+    advanced_analytics_enabled: bool | None = None
     # Staff app navigation — set during onboarding so a new tenant's till
     # app matches their workflow on day one. Also settable by the owner via
     # the business plane; these hide tabs only, never features.
@@ -178,6 +184,11 @@ class BusinessAdminResponse(BaseModel):
     delivery_platforms_enabled: bool
     uber_eats_enabled: bool
     mrd_enabled: bool
+    # Advanced Analytics entitlement (migration 0047) — exposed in the SAME
+    # commit as the migration/model, per this repo's BUG-0003/BUG-0072
+    # discipline (a Business column existing with no schema exposing it has
+    # bitten this platform three times already).
+    advanced_analytics_enabled: bool
     staff_live_orders_tab_enabled: bool
     staff_wastage_tab_enabled: bool
     staff_stocktake_tab_enabled: bool
@@ -226,6 +237,10 @@ class BusinessOnboarderResponse(BaseModel):
     delivery_platforms_enabled: bool
     uber_eats_enabled: bool
     mrd_enabled: bool
+    # Read-only here too, same rationale as delivery_platforms_enabled above
+    # (visible so an onboarder knows to escalate, not onboarder-actionable —
+    # absent from ONBOARDER_PATCH_ALLOWED_FIELDS).
+    advanced_analytics_enabled: bool
     staff_live_orders_tab_enabled: bool
     staff_wastage_tab_enabled: bool
     staff_stocktake_tab_enabled: bool
