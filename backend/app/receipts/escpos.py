@@ -265,6 +265,10 @@ def render_text(document: ReceiptDocument) -> str:
         out.append(two_column("Discount", "-" + money(totals.discount_cents), cols))
         if totals.discount_reason:
             out.extend(wrap(f"  ({totals.discount_reason})", cols))
+    if totals.loyalty_discount_cents:
+        out.append(two_column("Loyalty reward", "-" + money(totals.loyalty_discount_cents), cols))
+        if totals.loyalty_reward_name:
+            out.extend(wrap(f"  ({totals.loyalty_reward_name})", cols))
     if totals.delivery_fee_cents:
         out.append(two_column("Delivery", money(totals.delivery_fee_cents), cols))
 

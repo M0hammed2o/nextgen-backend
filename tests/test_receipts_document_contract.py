@@ -190,6 +190,63 @@ class TestVatRateConsistencyRule:
         assert totals.vat_rate_basis_points is None
         assert totals.vat_inclusive is None
 
+    # ── Loyalty discount must be netted into the VAT reconciliation base
+    #    (migration 0050) — the exact regression the task's own "most likely
+    #    to break silently" warning called out: forgetting this silently
+    #    drops the VAT rate label on any order with a redemption. ──────────
+
+    def test_rate_shown_for_vat_inclusive_tenant_when_loyalty_discount_is_netted_in(self):
+        # subtotal 25800 - discount 800 - loyalty_discount 5000 + delivery 0 = net 20000
+        # inclusive 15% of 20000 = 2608.7 -> rounds to 2609.
+        order = _order(tax_cents=2609, loyalty_discount_cents=5000)
+        totals = build_receipt_document(order, _business(vat_inclusive_pricing=True)).totals
+        assert totals.vat_rate_basis_points == 1500
+        assert totals.vat_inclusive is True
+
+    def test_rate_shown_for_vat_exclusive_tenant_when_loyalty_discount_is_netted_in(self):
+        from shared.pricing.engine import calculate_vat_cents
+        net = 25800 - 800 - 5000 + 0
+        exclusive_vat = calculate_vat_cents(net, 1500, False)
+        order = _order(tax_cents=exclusive_vat, loyalty_discount_cents=5000)
+        totals = build_receipt_document(order, _business(vat_inclusive_pricing=False)).totals
+        assert totals.vat_rate_basis_points == 1500
+        assert totals.vat_inclusive is False
+
+    def test_rate_wrongly_omitted_if_loyalty_discount_were_ignored(self):
+        """
+        Proves the regression this fix closes: if the reconciliation base
+        did NOT subtract loyalty_discount_cents, the amount computed against
+        the (wrong, too-high) net_total_cents would disagree with the real
+        tax_cents that was actually charged, and the rate would be
+        incorrectly omitted. tax_cents=2609 (correct, loyalty-aware) must
+        NOT reconcile against the loyalty-ignorant net (25000), proving the
+        two bases are genuinely different amounts, not coincidentally equal.
+        """
+        from shared.pricing.engine import calculate_vat_cents
+        loyalty_ignorant_net = 25800 - 800 + 0  # what the buggy formula would have used
+        loyalty_aware_net = 25800 - 800 - 5000 + 0
+        assert calculate_vat_cents(loyalty_ignorant_net, 1500, True) != calculate_vat_cents(loyalty_aware_net, 1500, True)
+
+        order = _order(tax_cents=2609, loyalty_discount_cents=5000)  # correct, loyalty-aware tax
+        totals = build_receipt_document(order, _business(vat_inclusive_pricing=True)).totals
+        # With the fix, this reconciles and the rate IS shown.
+        assert totals.vat_rate_basis_points == 1500
+
+    def test_rate_omitted_when_loyalty_discount_not_netted_by_a_caller(self):
+        """
+        The inverse check: a stored tax_cents that was (incorrectly) computed
+        WITHOUT netting out the loyalty discount must fail to reconcile and
+        omit the rate — never print a rate next to an amount it doesn't
+        actually explain.
+        """
+        from shared.pricing.engine import calculate_vat_cents
+        loyalty_ignorant_tax = calculate_vat_cents(25800 - 800 + 0, 1500, True)  # 3261, ignores loyalty_discount
+        order = _order(tax_cents=loyalty_ignorant_tax, loyalty_discount_cents=5000)
+        totals = build_receipt_document(order, _business(vat_inclusive_pricing=True)).totals
+        assert totals.vat_rate_basis_points is None
+        assert totals.vat_inclusive is None
+        assert totals.vat_cents == loyalty_ignorant_tax  # amount still printed, just without a rate label
+
 
 class TestTimezoneLocalisation:
     def test_issued_at_local_uses_business_timezone_not_utc(self):

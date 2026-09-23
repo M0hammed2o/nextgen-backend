@@ -189,6 +189,11 @@ def render_public_receipt_html(document: ReceiptDocument) -> str:
         if totals.discount_reason:
             label = f"Discount ({totals.discount_reason})"
         parts.append(_money_row(label, totals.discount_display))
+    if totals.loyalty_discount_display:
+        label = "Loyalty reward"
+        if totals.loyalty_reward_name:
+            label = f"Loyalty reward ({totals.loyalty_reward_name})"
+        parts.append(_money_row(label, totals.loyalty_discount_display))
     if totals.delivery_fee_display:
         parts.append(_money_row("Delivery", totals.delivery_fee_display))
     if totals.vat_display:

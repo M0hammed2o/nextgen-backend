@@ -94,6 +94,15 @@ class ReceiptTotals:
     discount_cents: int = 0
     discount_display: str | None = None
     discount_reason: str | None = None
+    # Loyalty reward redemption — a distinct line from the staff/manual
+    # discount above, added migration 0050. loyalty_discount_cents is the
+    # CLAMPED amount actually applied (see LoyaltyReward.value_cents'
+    # clamp-and-warn behaviour); loyalty_points_redeemed is always the
+    # reward's full points cost, even when the discount was clamped.
+    loyalty_discount_cents: int = 0
+    loyalty_discount_display: str | None = None
+    loyalty_reward_name: str | None = None
+    loyalty_points_redeemed: int = 0
     delivery_fee_cents: int = 0
     delivery_fee_display: str | None = None
     vat_cents: int = 0
@@ -230,9 +239,10 @@ def _vat_rate_display(order, business) -> tuple[int | None, bool | None]:
     itself IS a snapshot and is always historically correct on its own.
 
     So: reconstruct what the VAT amount would be if today's live rate had
-    applied to this order's own stored net amount (subtotal - discount +
-    delivery fee — the same base routes_pos.py used to compute tax_cents at
-    checkout). If that reconstruction matches the stored tax_cents exactly,
+    applied to this order's own stored net amount (subtotal - discount -
+    loyalty_discount + delivery fee — the same base routes_pos.py used to
+    compute tax_cents at checkout, migration 0050 added loyalty_discount_cents
+    to that base). If that reconstruction matches the stored tax_cents exactly,
     the live rate still explains this receipt and is safe to print. If the
     tenant has since changed its VAT rate or inclusive/exclusive setting,
     the numbers will disagree — in that case we print the VAT amount (it is
@@ -257,6 +267,7 @@ def _vat_rate_display(order, business) -> tuple[int | None, bool | None]:
     net_total_cents = (
         int(getattr(order, "subtotal_cents", 0) or 0)
         - int(getattr(order, "discount_cents", 0) or 0)
+        - int(getattr(order, "loyalty_discount_cents", 0) or 0)
         + int(getattr(order, "delivery_fee_cents", 0) or 0)
     )
     expected = calculate_vat_cents(net_total_cents, rate, inclusive)
@@ -363,6 +374,7 @@ def build_receipt_document(
 
     subtotal_cents = int(getattr(order, "subtotal_cents", 0) or 0)
     discount_cents = int(getattr(order, "discount_cents", 0) or 0)
+    loyalty_discount_cents = int(getattr(order, "loyalty_discount_cents", 0) or 0)
     delivery_fee_cents = int(getattr(order, "delivery_fee_cents", 0) or 0)
     vat_cents = int(getattr(order, "tax_cents", 0) or 0)
     total_cents = int(getattr(order, "total_cents", 0) or 0)
@@ -374,6 +386,10 @@ def build_receipt_document(
         discount_cents=discount_cents,
         discount_display=("-" + money(discount_cents)) if discount_cents else None,
         discount_reason=getattr(order, "discount_reason", None),
+        loyalty_discount_cents=loyalty_discount_cents,
+        loyalty_discount_display=("-" + money(loyalty_discount_cents)) if loyalty_discount_cents else None,
+        loyalty_reward_name=getattr(order, "loyalty_reward_name", None),
+        loyalty_points_redeemed=int(getattr(order, "loyalty_points_redeemed", 0) or 0),
         delivery_fee_cents=delivery_fee_cents,
         delivery_fee_display=money(delivery_fee_cents) if delivery_fee_cents else None,
         vat_cents=vat_cents,
