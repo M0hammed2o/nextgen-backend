@@ -164,7 +164,14 @@ async def test_full_commercial_e2e_release_gate(db, _invoicing_configured):
     )
     await update_business(
         business_id=business_id,
-        body=BusinessUpdate(delivery_platforms_enabled=True, advanced_analytics_enabled=True),
+        body=BusinessUpdate(
+            delivery_platforms_enabled=True, advanced_analytics_enabled=True,
+            # migration 0051, KNOWN_BUGS.md BUG-0107 — Loyalty is a NextGen
+            # Complete-tier module like the other two SUPER_ADMIN-only flags
+            # above; this business exercises loyalty program config +
+            # checkout redemption further down, so it must be entitled.
+            loyalty_enabled=True,
+        ),
         user=super_auth, db=db,
     )
     biz = await db.get(Business, business_id)
@@ -173,6 +180,7 @@ async def test_full_commercial_e2e_release_gate(db, _invoicing_configured):
     assert biz.digital_receipts_enabled is True
     assert biz.delivery_platforms_enabled is True
     assert biz.advanced_analytics_enabled is True
+    assert biz.loyalty_enabled is True
 
     # ══ Owner created ══════════════════════════════════════════════════════
     owner_login = await create_business_owner(

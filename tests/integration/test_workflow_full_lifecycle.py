@@ -80,6 +80,11 @@ async def test_full_workflow_signup_to_active_subscription(db, test_business: Bu
     assert biz.whatsapp_phone_number_id is not None
 
     # ── Step: Enable Loyalty (so the walk-in POS customer earns points) ──
+    # migration 0051, KNOWN_BUGS.md BUG-0107 — update_loyalty_program now
+    # requires Business.loyalty_enabled (the platform entitlement) before an
+    # owner can flip LoyaltyProgram.is_enabled on at all.
+    biz.loyalty_enabled = True
+    await db.commit()
     await update_loyalty_program(
         body=LoyaltyProgramUpdate(is_enabled=True, points_per_rand=1, points_per_order=10),
         user=owner, db=db,

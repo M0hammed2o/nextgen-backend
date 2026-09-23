@@ -18,7 +18,7 @@ import asyncio
 import uuid
 
 import pytest
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 
 from backend.app.api.v1.routes_menu import CategoryCreate, ItemCreate, create_category, create_item
 from backend.app.api.v1.routes_pos import (
@@ -42,6 +42,20 @@ from tests.integration._db import get_session_factory
 
 def _owner(business_id: uuid.UUID) -> AuthUser:
     return AuthUser(user_id=uuid.uuid4(), business_id=business_id, role="OWNER", token_type="access")
+
+
+async def _enable_loyalty(business_id):
+    """
+    migration 0051, KNOWN_BUGS.md BUG-0107 — create_pos_order now refuses a
+    loyalty_reward_id checkout for a business without Business.loyalty_enabled,
+    checked before its own per-program LOYALTY_DISABLED check. test_business
+    (conftest.py) defaults it False like every other entitlement flag, so
+    every test below that redeems a reward must entitle its business first,
+    same as it already explicitly creates the LoyaltyProgram row.
+    """
+    async with get_session_factory()() as setup_db:
+        await setup_db.execute(update(Business).where(Business.id == business_id).values(loyalty_enabled=True))
+        await setup_db.commit()
 
 
 async def _setup_menu_and_till(business_id, owner, price_cents=10000):
@@ -78,6 +92,7 @@ async def _cleanup(business_id):
 
 async def test_two_simultaneous_checkout_redemptions_of_a_balance_sufficient_for_one(test_business: Business):
     business_id = test_business.id
+    await _enable_loyalty(business_id)
     owner = _owner(business_id)
     item, till = await _setup_menu_and_till(business_id, owner, price_cents=100000)  # R1000 item, plenty of room
 
@@ -158,6 +173,7 @@ async def test_double_tapped_redemption_checkout_produces_one_order_one_ledger_r
     test_business: Business,
 ):
     business_id = test_business.id
+    await _enable_loyalty(business_id)
     owner = _owner(business_id)
     item, till = await _setup_menu_and_till(business_id, owner, price_cents=10000)
 
@@ -241,6 +257,7 @@ async def test_double_tapped_redemption_checkout_produces_one_order_one_ledger_r
 
 async def test_reward_value_exceeding_sale_clamps_discount_and_deducts_full_points_realdb(test_business: Business):
     business_id = test_business.id
+    await _enable_loyalty(business_id)
     owner = _owner(business_id)
     item, till = await _setup_menu_and_till(business_id, owner, price_cents=3000)  # R30 item
 
@@ -285,6 +302,7 @@ async def test_reward_value_exceeding_sale_clamps_discount_and_deducts_full_poin
 
 async def test_reward_deactivated_before_checkout_is_rejected_and_moves_nothing_realdb(test_business: Business):
     business_id = test_business.id
+    await _enable_loyalty(business_id)
     owner = _owner(business_id)
     item, till = await _setup_menu_and_till(business_id, owner, price_cents=5000)
 
@@ -334,6 +352,7 @@ async def test_reward_deactivated_before_checkout_is_rejected_and_moves_nothing_
 
 async def test_reward_from_another_business_is_rejected_not_found(test_business: Business):
     business_a_id = test_business.id
+    await _enable_loyalty(business_a_id)
     owner_a = _owner(business_a_id)
     item_a, till_a = await _setup_menu_and_till(business_a_id, owner_a, price_cents=5000)
 

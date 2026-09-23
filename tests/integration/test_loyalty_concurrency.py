@@ -59,6 +59,13 @@ async def test_two_simultaneous_redemptions_of_a_balance_sufficient_for_exactly_
     business_id = test_business.id
     staff = _staff(business_id)
 
+    # migration 0051, KNOWN_BUGS.md BUG-0107 — redeem_loyalty_reward now
+    # requires Business.loyalty_enabled (checked first, before the program
+    # lookup); test_business defaults it False like every other entitlement
+    # flag, so entitle it explicitly, same as the LoyaltyProgram row below.
+    test_business.loyalty_enabled = True
+    db.add(test_business)
+
     program = LoyaltyProgram(business_id=business_id, is_enabled=True, min_redemption_points=0)
     reward = LoyaltyReward(business_id=business_id, name="Free Coffee", points_cost=100, is_active=True)
     customer = Customer(

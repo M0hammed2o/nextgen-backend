@@ -12,19 +12,19 @@ mapping") plus the Business-column comments in shared/models/business.py
 advanced_analytics_enabled all say "same pattern as inventory_enabled" and
 are business-plane READ-ONLY / platform-admin-writable only).
 
-ONE HONEST GAP, DISCOVERED WRITING THIS FILE, NOT PAPERED OVER
-----------------------------------------------------------------
-Unlike inventory/WhatsApp/delivery/advanced-analytics, there is NO
-Business-level master-switch column for Loyalty. The only gate is
-`LoyaltyProgram.is_enabled`, a per-business config row that ANY OWNER can
-flip on themselves via `PUT /business/loyalty/program` -- that route carries
-no package/entitlement check at all (see routes_loyalty.py). So "loyalty is
-refused for a POS-only tenant" below is only true in the sense that a
-POS-only tenant's LoyaltyProgram starts disabled by default and stays that
-way unless its own owner turns it on -- it is NOT a platform-admin-only kill
-switch like the other four. This is recorded as a real finding (see this
-session's WORKLOG.md/TODO.md entries), not silently assumed to be the same
-kind of gate.
+GAP FOUND WRITING THIS FILE, NOW CLOSED (migration 0051, KNOWN_BUGS.md
+BUG-0107, Fixed)
+----------------------------------------------------------------------
+At the time this file was first written, Loyalty had NO Business-level
+master-switch column, unlike inventory/WhatsApp/delivery/advanced-analytics
+-- the only gate was `LoyaltyProgram.is_enabled`, a per-business config row
+ANY OWNER could flip on themselves via `PUT /business/loyalty/program`, with
+no package/entitlement check anywhere. `Business.loyalty_enabled` (migration
+0051) now closes that gap the same way the other four are gated: platform-
+admin-writable, business-plane READ-ONLY, enforced first in every route in
+routes_loyalty.py and on the POS checkout redemption path. The tests below
+now exercise the REAL platform-level gate, not merely "the owner never
+turned it on."
 
 Requires TEST_DATABASE_URL (see docker-compose.test.yml / TESTING.md).
 """
@@ -97,6 +97,7 @@ async def _make_business(db, **flags) -> Business:
         digital_receipts_enabled=False,
         delivery_platforms_enabled=False,
         advanced_analytics_enabled=False,
+        loyalty_enabled=False,
     )
     defaults.update(flags)
     business = Business(**defaults)
@@ -222,12 +223,11 @@ async def test_nextgen_pos_package_refuses_everything_outside_pos(db):
         assert exc.value.status_code == 409
 
         # ── Loyalty (checkout redemption path): MUST REFUSE ───────────────
-        # See module docstring above: no LoyaltyProgram row exists yet for
-        # this business, so redeem_loyalty_reward 404s on the reward lookup
-        # after the program-enabled check fails first via LOYALTY_DISABLED
-        # at POS checkout -- exercised directly here via the redeem route
-        # instead, which raises NotFoundError for an unknown reward once
-        # the (auto-created, disabled) program is confirmed not enabled.
+        # Business.loyalty_enabled defaults False (migration 0051,
+        # KNOWN_BUGS.md BUG-0107) -- checked FIRST in create_pos_order,
+        # before the till/business/payment-method logic or the per-program
+        # LOYALTY_DISABLED check ever run, so this is a genuine platform-
+        # level refusal, not merely "the owner never turned it on."
         with pytest.raises(AppError) as exc:
             await create_pos_order(
                 body=POSOrderCreateRequest(
@@ -239,8 +239,8 @@ async def test_nextgen_pos_package_refuses_everything_outside_pos(db):
                 ),
                 user=owner, db=db,
             )
-        assert exc.value.code == "LOYALTY_DISABLED"
-        assert exc.value.status_code == 422
+        assert exc.value.code == "LOYALTY_NOT_ENABLED"
+        assert exc.value.status_code == 409
         # The refused create_pos_order call above already took (and, since it
         # raised before its own internal commit, never released) a
         # `.with_for_update()` lock on the till row via `_get_open_till` --
@@ -369,6 +369,10 @@ async def test_nextgen_complete_package_unlocks_whatsapp_loyalty_delivery_and_ad
         db, inventory_enabled=True, is_whatsapp_enabled=True,
         digital_receipts_enabled=True, delivery_platforms_enabled=True,
         advanced_analytics_enabled=True,
+        # migration 0051, KNOWN_BUGS.md BUG-0107 — Loyalty is exercised
+        # below via update_loyalty_program/create_reward/checkout
+        # redemption, all of which now require platform entitlement first.
+        loyalty_enabled=True,
     )
     owner = _owner(business.id)
     try:

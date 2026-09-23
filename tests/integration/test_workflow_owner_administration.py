@@ -162,6 +162,12 @@ async def test_owner_administration_workflow(db, test_business: Business):
     assert deactivated.is_active is False
 
     # ── Loyalty: reward catalogue CRUD + redemption ────────────────────────
+    # migration 0051, KNOWN_BUGS.md BUG-0107 — every route below now
+    # requires Business.loyalty_enabled first; test_business defaults it
+    # False like every other entitlement flag.
+    test_business.loyalty_enabled = True
+    db.add(test_business)
+    await db.commit()
     await update_loyalty_program(
         body=LoyaltyProgramUpdate(is_enabled=True, points_per_rand=1, points_per_order=0, min_redemption_points=0),
         user=owner, db=db,

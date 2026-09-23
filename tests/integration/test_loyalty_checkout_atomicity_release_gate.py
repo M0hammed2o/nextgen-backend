@@ -20,7 +20,7 @@ comment for exactly why earning must be zeroed to observe redemption alone).
 import uuid
 
 import pytest
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from unittest.mock import AsyncMock
 
 from backend.app.api.v1.routes_menu import CategoryCreate, ItemCreate, create_category, create_item
@@ -44,6 +44,22 @@ from tests.integration._db import get_session_factory
 
 def _owner(business_id: uuid.UUID) -> AuthUser:
     return AuthUser(user_id=uuid.uuid4(), business_id=business_id, role="OWNER", token_type="access")
+
+
+async def _enable_loyalty(business_id):
+    """
+    migration 0051, KNOWN_BUGS.md BUG-0107 — `create_pos_order` now refuses
+    a `loyalty_reward_id` checkout for a business without
+    `Business.loyalty_enabled`, checked before create_pos_order's own
+    per-program LOYALTY_DISABLED check. `test_business` (conftest.py)
+    defaults it False like every other entitlement flag, so every test in
+    this file that exercises checkout redemption must explicitly entitle
+    its business first, same as it already explicitly creates the
+    LoyaltyProgram/LoyaltyReward rows below.
+    """
+    async with get_session_factory()() as setup_db:
+        await setup_db.execute(update(Business).where(Business.id == business_id).values(loyalty_enabled=True))
+        await setup_db.commit()
 
 
 async def _setup_menu_and_till(business_id, owner, price_cents):
@@ -96,6 +112,7 @@ async def test_release_gate_scenario_1000_balance_500_point_reward_200_cart_then
     """
     business_id = test_business.id
     owner = _owner(business_id)
+    await _enable_loyalty(business_id)
     # R200 cart -> a single line item priced at exactly 20000 cents.
     item, till = await _setup_menu_and_till(business_id, owner, price_cents=20000)
 
@@ -223,6 +240,7 @@ async def test_failed_transaction_after_points_staged_leaves_balance_and_order_u
     """
     business_id = test_business.id
     owner = _owner(business_id)
+    await _enable_loyalty(business_id)
     item, till = await _setup_menu_and_till(business_id, owner, price_cents=10000)
 
     async with get_session_factory()() as setup_db:
