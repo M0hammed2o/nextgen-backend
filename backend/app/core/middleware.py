@@ -8,6 +8,11 @@ credentials in log output. It is attached not only to this app's own
 loggers but to the third-party loggers that actually emit
 credential-bearing URLs (httpx, uvicorn.access) — see
 _THIRD_PARTY_CREDENTIAL_LOGGERS and setup_logging() below.
+
+BUG-0085 (2026-09-24): the same filter also masks customer PII — `wa_id`
+(the customer's own WhatsApp phone number) and related fields — wherever
+they appear as a logging parameter, by parameter NAME rather than by
+call site. See _PII_ARG_KEYS below.
 """
 
 import logging
@@ -115,6 +120,94 @@ _RECEIPT_PATH_PATTERN = re.compile(r"(/r/)([A-Za-z0-9_\-]{20,})")
 _THIRD_PARTY_CREDENTIAL_LOGGERS = ("httpx", "uvicorn.access")
 
 
+# BUG-0085 (broader finding, 2026-09-24): `wa_id` is the customer's own
+# WhatsApp phone number verbatim (see shared/models/customer.py
+# Customer.wa_id — "WhatsApp user identifier (phone number format)"), and it
+# is logged, UNCONDITIONALLY, on the ordinary message-handling path
+# (bot/pipeline.py, api/v1/routes_webhook.py, bot/whatsapp_sender.py,
+# worker.py, bot/meta_errors.py) at INFO/WARNING level — not gated by DEBUG
+# at all, unlike the SQL-echo leak BUG-0085 was originally filed for. That's
+# roughly two dozen call sites on the platform's single highest-volume code
+# path (every inbound/outbound WhatsApp message).
+#
+# Editing every call site individually is the higher-regression-risk fix —
+# it's exactly the pipeline the tests/replay suite exists to protect,
+# and hand-editing ~25 log lines across 5 files for a purely-cosmetic log
+# change is a lot of needless diff surface for zero behavioural change. The
+# lower-risk fix is the same one already used for tokens/secrets above:
+# mask centrally, in the filter, based on the PARAMETER NAME the message
+# template uses — regardless of which variable the caller actually passed
+# (deliberately conservative: a mislabeled non-PII value next to a
+# PII-shaped key name gets masked too, which is the safe direction to err).
+#
+# NOTE: `phone_number_id` is Meta's opaque WABA phone-number-configuration
+# ID (an internal identifier, not a phone number — see graph_client.py) and
+# is intentionally EXCLUDED here; masking it would remove a genuinely useful,
+# non-PII diagnostic value for no privacy benefit. `phone_number` /
+# `phone_number_e164` / `customer_phone` / `msisdn` are not currently used as
+# logged parameter names anywhere in this codebase (grep-confirmed,
+# 2026-09-24) but are included for when they are.
+_PII_ARG_KEYS = frozenset({
+    "wa_id",
+    "customer_wa_id",
+    "phone_number",
+    "phone_number_e164",
+    "customer_phone",
+    "msisdn",
+})
+
+# Defence-in-depth companion to the position-based masking below: catches the
+# same key names when they appear as already-rendered `name=value` text
+# (e.g. a future f-string, or an exception message that happens to embed
+# one) rather than as a separate %-style logging argument. Value class is
+# digits/+/- only (E.164-shaped, no trailing whitespace) so this can't
+# accidentally eat an unrelated token/UUID that merely follows one of these
+# key names, or swallow trailing punctuation/whitespace into the match.
+_PII_PARAM_PATTERN = re.compile(
+    r"\b(wa_id|customer_wa_id|phone_number_e164|phone_number|customer_phone|msisdn)="
+    r"([0-9+][0-9\-]{4,20})",
+    re.IGNORECASE,
+)
+
+
+def _mask_phone(value):
+    """Partially mask a phone-number-shaped value, keeping only the last 4 characters."""
+    if not isinstance(value, str):
+        try:
+            value = str(value)
+        except Exception:  # noqa: BLE001 — never let logging raise
+            return value
+    if len(value) <= 4:
+        return _REDACTED
+    return f"{_REDACTED}{value[-4:]}"
+
+
+def _pii_arg_positions(template: str) -> set[int]:
+    """
+    Zero-based positions of %s/%r placeholders in `template` immediately
+    preceded by a PII-shaped `key=` label (e.g. "wa_id=%s").
+
+    Pure text scanning over the TEMPLATE only — never touches the actual
+    argument values — so it works before record.args has been formatted in,
+    and correctly tracks placeholder index even when the same key name
+    appears more than once.
+    """
+    positions: set[int] = set()
+    i = 0
+    arg_index = 0
+    while i < len(template):
+        if template[i] == "%" and i + 1 < len(template) and template[i + 1] in "sr":
+            preceding = template[:i]
+            m = re.search(r"(\w+)\s*=\s*$", preceding)
+            if m and m.group(1).lower() in _PII_ARG_KEYS:
+                positions.add(arg_index)
+            arg_index += 1
+            i += 2
+            continue
+        i += 1
+    return positions
+
+
 def _mask_string(s: str) -> str:
     """
     Mask every credential pattern this filter knows about.
@@ -125,6 +218,7 @@ def _mask_string(s: str) -> str:
     s = _SECRET_PARAM_PATTERN.sub(lambda m: f"{m.group(1)}={_REDACTED}", s)
     s = _OAUTH_CODE_PATTERN.sub(lambda m: f"{m.group(1)}={_REDACTED}", s)
     s = _RECEIPT_PATH_PATTERN.sub(lambda m: f"{m.group(1)}{_REDACTED}", s)
+    s = _PII_PARAM_PATTERN.sub(lambda m: f"{m.group(1)}={_mask_phone(m.group(2))}", s)
     s = _BEARER_PATTERN.sub(
         lambda m: f"{m.group(1)}{m.group(2)[:6]}...{m.group(2)[-4:]}",
         s,
@@ -196,14 +290,26 @@ class TokenMaskingFilter(logging.Filter):
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
+        # Computed from the ORIGINAL template, before any masking below might
+        # touch it, so positions always line up with record.args' own order.
+        pii_positions: set[int] = set()
+        if isinstance(record.msg, str) and isinstance(record.args, tuple) and record.args:
+            pii_positions = _pii_arg_positions(record.msg)
+
         if isinstance(record.msg, str):
             record.msg = _mask_record_msg(record.msg, bool(record.args))
         # Also check args (for %-style formatting)
         if record.args:
             if isinstance(record.args, dict):
-                record.args = {k: _mask_arg(v) for k, v in record.args.items()}
+                record.args = {
+                    k: (_mask_phone(v) if k.lower() in _PII_ARG_KEYS else _mask_arg(v))
+                    for k, v in record.args.items()
+                }
             elif isinstance(record.args, tuple):
-                record.args = tuple(_mask_arg(a) for a in record.args)
+                record.args = tuple(
+                    _mask_phone(a) if idx in pii_positions else _mask_arg(a)
+                    for idx, a in enumerate(record.args)
+                )
             else:
                 record.args = _mask_arg(record.args)
         return True
