@@ -225,7 +225,7 @@ async def get_or_create_customer_by_phone(
     `backend.app.utils.phone.normalize_sa_mobile` helper the digital-receipt
     path already uses (`routes_pos.py`'s request_digital_receipt), so
     "0821234567" and "+27821234567" resolve to the SAME customer/points
-    wallet instead of silently creating two (BUG-0098, KNOWN_BUGS.md).
+    wallet instead of silently creating two (BUG-0100, KNOWN_BUGS.md).
     Raises AppError (422) rather than falling back to the raw string on an
     unparseable number — a loyalty identity keyed on a typo the platform
     never validated is worse than asking the till operator to re-enter it,
@@ -234,7 +234,7 @@ async def get_or_create_customer_by_phone(
 
     NOTE: this does NOT retroactively fix any customer row created before
     this change with an un-normalised phone_number already stored — see
-    KNOWN_BUGS.md BUG-0098 for what a full remediation of that pre-existing
+    KNOWN_BUGS.md BUG-0100 for what a full remediation of that pre-existing
     data would require (a decision deliberately left to a human, not made
     here).
     """

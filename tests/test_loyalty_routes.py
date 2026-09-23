@@ -186,7 +186,7 @@ async def test_lookup_customer_creates_when_enabled_and_none_found():
 
     result = await lookup_customer_by_phone(phone="0821234567", user=user, db=db)
 
-    # BUG-0098 fix: get_or_create_customer_by_phone now normalises through
+    # BUG-0100 fix: get_or_create_customer_by_phone now normalises through
     # normalize_sa_mobile before lookup/creation, so the stored (and
     # returned) phone_number is the canonical +27... form, not the raw
     # local-format string the till operator typed.

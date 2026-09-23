@@ -263,7 +263,7 @@ async def test_get_or_create_customer_creates_new_when_none_found():
     result = await get_or_create_customer_by_phone(db, business_id, "0821234567", "Jane")
     assert len(db.added) == 1
     assert db.added[0].wa_id is None
-    # BUG-0098 fix: stored in normalised +27... form, not the raw local
+    # BUG-0100 fix: stored in normalised +27... form, not the raw local
     # "082..." shape the caller typed — this is what lets "0821234567" and
     # "+27821234567" resolve to the same customer instead of two.
     assert db.added[0].phone_number == "+27821234567"
@@ -273,7 +273,7 @@ async def test_get_or_create_customer_creates_new_when_none_found():
 async def test_get_or_create_customer_normalises_before_lookup():
     """
     A local "0821234567" and an international "+27821234567" must look up
-    (and thus resolve to) the same stored customer — BUG-0098: previously a
+    (and thus resolve to) the same stored customer — BUG-0100: previously a
     raw string comparison, so these created two separate points wallets for
     the same real person.
     """
