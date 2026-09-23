@@ -47,11 +47,32 @@ async def _lock_customer_for_balance_update(
     KNOWN_BUGS.md). Callers must be inside a transaction that stays open
     until they commit — the lock is only held for the life of that
     transaction, same as every other FOR UPDATE caller in this codebase.
+
+    `execution_options(populate_existing=True)` is NOT optional here, unlike
+    routes_pos.py's till/order lock helpers: those are always the FIRST
+    load of their row in the session, so there's nothing stale to refresh.
+    Every caller of this function (redeem_loyalty_reward,
+    award_loyalty_points_if_enabled) already did an earlier UNLOCKED select
+    of the SAME customer row for its own 404 check before reaching here —
+    without populate_existing, SQLAlchemy's identity map returns that same
+    Python object with its ALREADY-loaded (pre-lock, potentially stale)
+    loyalty_points_balance left untouched, because a plain re-select of an
+    object already present in the identity map does not, by default,
+    overwrite its already-loaded attributes. The FOR UPDATE lock would then
+    be correctly acquired at the SQL level while every balance comparison
+    and write in Python silently kept operating on stale data — i.e. a real
+    lost update that a naive "just add .with_for_update()" fix would NOT
+    have caught. Caught by this fix's OWN two-real-connection concurrency
+    test (tests/integration/test_loyalty_concurrency.py) failing before
+    this option was added: both concurrent redemptions read the stale
+    pre-lock balance and both "succeeded", exactly the bug this whole
+    change exists to close.
     """
     result = await db.execute(
         select(Customer)
         .where(Customer.id == customer_id, Customer.business_id == business_id)
         .with_for_update()
+        .execution_options(populate_existing=True)
     )
     locked = result.scalar_one_or_none()
     if locked is None:
