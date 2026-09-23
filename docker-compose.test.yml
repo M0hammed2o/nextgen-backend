@@ -1,0 +1,63 @@
+# Dedicated, disposable test environment for tests/integration/*.
+#
+# Deliberately separate from docker-compose.yml (the dev stack) and given a
+# unique project name, unique container names, and host ports that do not
+# collide with anything else running on a dev machine that may also have a
+# nextgen-staging stack (5432/5434), nextgen-wave0a-testdb (55444),
+# Supabase (54321-54324), or other unrelated projects' Postgres containers
+# checked out at the same time — see KNOWN_BUGS.md BUG-0096 for the
+# ambiguous-database incident this file exists to prevent.
+#
+# Usage (see TESTING.md's "Integration-testing approach" for the full
+# documented workflow):
+#
+#   docker compose -f docker-compose.test.yml up -d
+#   export TEST_DATABASE_URL="postgresql+asyncpg://nextgen_test:nextgen_test_only_do_not_use_in_prod@localhost:55677/nextgen_test"
+#   export TEST_REDIS_URL="redis://localhost:55678/0"
+#   python -m alembic upgrade head
+#   python -m pytest tests/integration -q
+#
+# Teardown (destroys the container and its data volume completely):
+#
+#   docker compose -f docker-compose.test.yml down -v
+#
+# This file must never be pointed at by any non-test config, and nothing
+# under tests/ should ever fall back to it silently — every integration
+# test file resolves its connection via tests/integration/_env.py, which
+# fails loudly (does not guess a default) if TEST_DATABASE_URL/
+# TEST_REDIS_URL are not set.
+
+name: nextgen-backend-test
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: nextgen-backend-test-postgres
+    environment:
+      POSTGRES_DB: nextgen_test
+      POSTGRES_USER: nextgen_test
+      POSTGRES_PASSWORD: nextgen_test_only_do_not_use_in_prod
+    ports:
+      - "55677:5432"
+    volumes:
+      - nextgen_backend_test_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nextgen_test -d nextgen_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: nextgen-backend-test-redis
+    ports:
+      - "55678:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  nextgen_backend_test_pgdata:
+    name: nextgen_backend_test_pgdata

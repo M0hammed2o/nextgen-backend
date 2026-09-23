@@ -1,21 +1,28 @@
 """
 Integration-test fixtures — a REAL AsyncSession against a real Postgres
-instance (the local docker-compose dev container), not a mock. This is the
-first integration-test tier in this codebase's history (TESTING.md has
-documented "no integration tests anywhere" as a known gap since this
-project's first audit).
+instance (the dedicated, disposable docker-compose.test.yml container), not
+a mock. This is the first integration-test tier in this codebase's history
+(TESTING.md has documented "no integration tests anywhere" as a known gap
+since this project's first audit).
 
-Requires DATABASE_URL and REDIS_URL to point at reachable real instances —
-set them explicitly when invoking pytest for this directory, e.g.:
+Requires TEST_DATABASE_URL (and, for tests that need it, TEST_REDIS_URL) to
+point at the dedicated test environment — see docker-compose.test.yml and
+TESTING.md's "Integration-testing approach" section for the full workflow:
 
-  DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5434/nextgen \
-  REDIS_URL=redis://localhost:6379/0 \
+  docker compose -f docker-compose.test.yml up -d
+  export TEST_DATABASE_URL="postgresql+asyncpg://nextgen_test:nextgen_test_only_do_not_use_in_prod@localhost:55677/nextgen_test"
+  export TEST_REDIS_URL="redis://localhost:55678/0"
+  python -m alembic upgrade head
   python -m pytest tests/integration -q
 
-These tests are NOT part of the default `pytest tests/ --ignore=tests/replay`
-run — they're deliberately excluded from that command's collection scope by
-living in their own directory, run only when explicitly targeted, since they
-need real infrastructure the mocked unit-test suite never requires.
+This tier is deliberately excluded from the default collection scope
+(pytest.ini's `norecursedirs` includes `integration`), so a plain
+`pytest tests/ --ignore=tests/replay` does NOT collect or run anything
+under this directory — it only runs when explicitly targeted, e.g.
+`pytest tests/integration -q`. If TEST_DATABASE_URL/TEST_REDIS_URL aren't
+set when this directory IS explicitly targeted, every fixture that needs
+them fails loudly (see _env.py) rather than silently connecting to
+whichever Postgres/Redis happens to be reachable on localhost.
 """
 import uuid
 
@@ -23,7 +30,7 @@ import pytest
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.app.db.session import async_session_factory, engine
+from tests.integration._db import dispose_engine, get_session_factory
 from shared.models.audit import AuditEvent
 from shared.models.business import Business
 from shared.utils import generate_business_code
@@ -31,13 +38,13 @@ from shared.utils import generate_business_code
 
 @pytest.fixture
 async def db() -> AsyncSession:
-    async with async_session_factory() as session:
+    async with get_session_factory()() as session:
         yield session
         await session.rollback()  # never leave an open transaction behind
         await session.close()
 
-    # `engine` (backend/app/db/session.py) is a module-level singleton whose
-    # pool holds asyncpg connections bound to whichever event loop was
+    # The engine is a module-level singleton (tests/integration/_db.py)
+    # whose pool holds asyncpg connections bound to whichever event loop was
     # running when they were created. pytest-asyncio gives every test
     # function its own event loop (asyncio_default_fixture_loop_scope =
     # function, pytest.ini), so a connection checked out by test 2 that was
@@ -48,7 +55,7 @@ async def db() -> AsyncSession:
     # only affects the test-only engine instance's pool bookkeeping, not any
     # production behaviour (production runs one event loop for the process
     # lifetime, so this situation never arises there).
-    await engine.dispose()
+    await dispose_engine()
 
 
 @pytest.fixture
