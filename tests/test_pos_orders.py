@@ -476,3 +476,270 @@ async def test_order_records_cashier_and_till_session():
 
     assert order.created_by_user_id == user.user_id
     assert order.till_session_id == till.id
+
+
+# ── Loyalty redemption at checkout ──────────────────────────────────────────
+# Schema-level guards (customer_phone / idempotency_key required alongside
+# loyalty_reward_id) live in POSOrderCreateRequest's own validator — tested
+# directly against the schema, no route/DB involvement needed.
+
+def test_loyalty_reward_requires_customer_phone():
+    with pytest.raises(ValueError):
+        POSOrderCreateRequest(
+            items=[POSOrderItemRequest(menu_item_id=uuid.uuid4(), quantity=1)],
+            payment_method="CARD",
+            loyalty_reward_id=uuid.uuid4(),
+            idempotency_key="key-1",
+        )
+
+
+def test_loyalty_reward_requires_idempotency_key():
+    with pytest.raises(ValueError):
+        POSOrderCreateRequest(
+            items=[POSOrderItemRequest(menu_item_id=uuid.uuid4(), quantity=1)],
+            payment_method="CARD",
+            loyalty_reward_id=uuid.uuid4(),
+            customer_phone="0821234567",
+        )
+
+
+def make_program(**overrides):
+    defaults = dict(is_enabled=True, min_redemption_points=0, silver_tier_points=500, gold_tier_points=2000)
+    defaults.update(overrides)
+    return types.SimpleNamespace(**defaults)
+
+
+def make_loyalty_customer(business_id, **overrides):
+    defaults = dict(
+        id=uuid.uuid4(), business_id=business_id, loyalty_points_balance=500,
+        loyalty_tier="BRONZE", wa_id=None, phone_number="+27821234567", display_name=None,
+    )
+    defaults.update(overrides)
+    return types.SimpleNamespace(**defaults)
+
+
+def make_reward(business_id, **overrides):
+    defaults = dict(
+        id=uuid.uuid4(), business_id=business_id, name="Free Coffee",
+        points_cost=200, is_active=True, value_cents=3000,
+    )
+    defaults.update(overrides)
+    return types.SimpleNamespace(**defaults)
+
+
+async def _run_with_loyalty(body, user, *, program=None, customer=None, reward=None,
+                             business=None, till=None, resolved_items=None):
+    """
+    Builds the FakeDB results queue for the loyalty-redemption path:
+    [idempotency lookup], till, business, program lookup, customer lookup
+    (get_or_create_customer_by_phone), [reward lookup, customer FOR UPDATE
+    lock (redeem_reward)], order-number increment.
+    """
+    resolved_items = resolved_items if resolved_items is not None else [make_resolved_item()]
+    business = business or make_business()
+    till = till if till is not None else make_till(user.business_id)
+
+    results = []
+    if body.idempotency_key:
+        results.append(FakeResult(scalar=None))
+    results.append(FakeResult(scalar=till))
+    results.append(FakeResult(scalar=business))
+    results.append(FakeResult(scalar=program))  # program lookup
+    if program and program.is_enabled:
+        results.append(FakeResult(scalar=customer))  # get_or_create_customer_by_phone lookup
+        if body.loyalty_reward_id is not None:
+            results.append(FakeResult(scalar=reward))  # reward lookup
+            if reward is not None:
+                results.append(FakeResult(scalar=customer))  # redeem_reward's FOR UPDATE lock
+    results.append(FakeResult(row=(1, "ZAR")))  # order-number increment
+
+    db = FakeDB(results)
+    with patch.object(routes_pos, "resolve_pos_items", AsyncMock(return_value=resolved_items)):
+        with patch("backend.app.db.session.get_redis", AsyncMock(side_effect=Exception("no redis in tests"))):
+            order = await create_pos_order(body=body, user=user, db=db)
+    return order, db
+
+
+async def test_loyalty_redemption_applies_discount_and_deducts_points():
+    user = make_user(role="STAFF")
+    program = make_program()
+    customer = make_loyalty_customer(user.business_id, loyalty_points_balance=500)
+    reward = make_reward(user.business_id, points_cost=200, value_cents=3000)
+    body = make_request(
+        payment_method="CASH", cash_tendered_cents=2000,
+        idempotency_key="redeem-1",
+    )
+    body = body.model_copy(update={"loyalty_reward_id": reward.id, "customer_phone": "0821234567"})
+
+    order, db = await _run_with_loyalty(
+        body, user, program=program, customer=customer, reward=reward,
+        resolved_items=[make_resolved_item(line_total_cents=5000)],
+    )
+
+    assert order.loyalty_discount_cents == 3000
+    assert order.loyalty_points_redeemed == 200
+    assert order.loyalty_reward_id == reward.id
+    assert order.loyalty_reward_name == "Free Coffee"
+    assert order.total_cents == 2000  # 5000 subtotal - 3000 loyalty discount
+    assert order.change_due_cents == 0
+    assert customer.loyalty_points_balance == 300  # 500 - 200
+    assert db.commits == 1
+
+
+async def test_loyalty_redemption_clamps_when_reward_exceeds_sale_and_audits_shortfall():
+    user = make_user(role="STAFF")
+    program = make_program()
+    customer = make_loyalty_customer(user.business_id, loyalty_points_balance=500)
+    reward = make_reward(user.business_id, points_cost=200, value_cents=9000)  # R90 reward
+    body = make_request(payment_method="CARD", idempotency_key="redeem-2")
+    body = body.model_copy(update={"loyalty_reward_id": reward.id, "customer_phone": "0821234567"})
+
+    order, db = await _run_with_loyalty(
+        body, user, program=program, customer=customer, reward=reward,
+        resolved_items=[make_resolved_item(line_total_cents=5000)],  # R50 sale
+    )
+
+    assert order.loyalty_discount_cents == 5000  # clamped to the subtotal
+    assert order.loyalty_points_redeemed == 200  # full points cost regardless
+    assert order.total_cents == 0
+    assert customer.loyalty_points_balance == 300
+
+    from shared.models.audit import AuditEvent
+    loyalty_events = [o for o in db.added if isinstance(o, AuditEvent) and o.action == "order.pos.loyalty_redeemed"]
+    assert len(loyalty_events) == 1
+    assert loyalty_events[0].diff_json["shortfall_cents"] == 4000  # 9000 - 5000
+    assert loyalty_events[0].diff_json["points_redeemed"] == 200
+
+
+async def test_loyalty_redemption_rejected_when_program_disabled():
+    user = make_user(role="STAFF")
+    program = make_program(is_enabled=False)
+    reward_id = uuid.uuid4()
+    body = make_request(payment_method="CARD", idempotency_key="redeem-3")
+    body = body.model_copy(update={"loyalty_reward_id": reward_id, "customer_phone": "0821234567"})
+
+    with pytest.raises(AppError) as exc:
+        await _run_with_loyalty(body, user, program=program, customer=None, reward=None)
+    assert exc.value.code == "LOYALTY_DISABLED"
+
+
+async def test_loyalty_redemption_rejects_reward_with_no_cents_value():
+    """A reward with no value_cents is manual-handover-only at the till."""
+    user = make_user(role="STAFF")
+    program = make_program()
+    customer = make_loyalty_customer(user.business_id)
+    reward = make_reward(user.business_id, value_cents=None)
+    body = make_request(payment_method="CARD", idempotency_key="redeem-4")
+    body = body.model_copy(update={"loyalty_reward_id": reward.id, "customer_phone": "0821234567"})
+
+    with pytest.raises(AppError) as exc:
+        await _run_with_loyalty(body, user, program=program, customer=customer, reward=reward)
+    assert exc.value.code == "REWARD_NOT_REDEEMABLE_AT_TILL"
+
+
+async def test_loyalty_redemption_rejects_inactive_reward():
+    """Reward deactivated between selection and checkout — 422, nothing moved."""
+    user = make_user(role="STAFF")
+    program = make_program()
+    customer = make_loyalty_customer(user.business_id, loyalty_points_balance=500)
+    reward = make_reward(user.business_id, is_active=False)
+    body = make_request(payment_method="CARD", idempotency_key="redeem-5")
+    body = body.model_copy(update={"loyalty_reward_id": reward.id, "customer_phone": "0821234567"})
+
+    with pytest.raises(AppError) as exc:
+        await _run_with_loyalty(body, user, program=program, customer=customer, reward=reward)
+    assert exc.value.code == "REWARD_INACTIVE"
+    assert exc.value.status_code == 422
+    assert customer.loyalty_points_balance == 500  # untouched
+
+
+async def test_loyalty_redemption_excluded_from_staff_discount_limit_check():
+    """
+    A reward's discount must never be routed through the max_staff_discount_cents
+    gate — that check only ever looks at body.discount_cents (the staff-typed
+    manual discount), which stays 0 here.
+    """
+    user = make_user(role="STAFF")
+    business = make_business(max_staff_discount_cents=0)  # zero staff discretion
+    program = make_program()
+    customer = make_loyalty_customer(user.business_id, loyalty_points_balance=500)
+    reward = make_reward(user.business_id, points_cost=200, value_cents=3000)
+    body = make_request(payment_method="CARD", idempotency_key="redeem-6")
+    body = body.model_copy(update={"loyalty_reward_id": reward.id, "customer_phone": "0821234567"})
+
+    order, db = await _run_with_loyalty(
+        body, user, program=program, customer=customer, reward=reward, business=business,
+        resolved_items=[make_resolved_item(line_total_cents=5000)],
+    )
+    assert order.loyalty_discount_cents == 3000
+    assert db.commits == 1
+
+
+async def test_invalid_customer_phone_never_burns_an_order_number():
+    """
+    BUG-0102: the customer/loyalty resolution block used to run AFTER the
+    order-number sequence increment — a phone-validation failure there
+    burned an order number permanently. It was moved earlier specifically
+    to close this; this test proves it by giving FakeDB exactly [till,
+    business, program] and nothing else. If the route still reached the
+    order-number increment (or even the customer SELECT) before raising,
+    popping a 4th result from an empty queue would raise IndexError instead
+    of the expected AppError.
+    """
+    user = make_user(role="STAFF")
+    program = make_program()  # is_enabled=True
+    business = make_business()
+    till = make_till(user.business_id)
+    body = make_request(payment_method="CARD")
+    body = body.model_copy(update={"customer_phone": "not-a-real-phone-number"})
+
+    db = FakeDB([
+        FakeResult(scalar=till),
+        FakeResult(scalar=business),
+        FakeResult(scalar=program),
+    ])
+    with patch.object(routes_pos, "resolve_pos_items", AsyncMock(return_value=[make_resolved_item()])):
+        with pytest.raises(AppError) as exc:
+            await create_pos_order(body=body, user=user, db=db)
+    assert exc.value.code == "INVALID_PHONE_NUMBER"
+    assert db.commits == 0
+
+
+async def test_loyalty_redemption_double_tap_same_idempotency_key_replays():
+    """A double-tapped redeem-checkout must replay the winning order, never redeem twice."""
+    user = make_user(role="STAFF")
+    key = "redeem-double-tap"
+    body = POSOrderCreateRequest(
+        items=[POSOrderItemRequest(menu_item_id=uuid.uuid4(), quantity=1)],
+        payment_method="CARD",
+        loyalty_reward_id=uuid.uuid4(),
+        customer_phone="0821234567",
+        idempotency_key=key,
+    )
+    existing_order = types.SimpleNamespace(
+        id=uuid.uuid4(), business_id=user.business_id, idempotency_key=key,
+        order_number="BO-000042", status="ACCEPTED", payment_status="PAID",
+        payment_required=False, payment_method="CARD", payment_reference=None,
+        payment_link_url=None, paid_at=datetime.now(timezone.utc),
+        order_mode="PICKUP", table_number=None, source="POS",
+        cash_tendered_cents=None, change_due_cents=None, till_session_id=uuid.uuid4(),
+        created_by_user_id=user.user_id, subtotal_cents=5000, delivery_fee_cents=0,
+        discount_cents=0, tax_cents=0, discount_reason=None,
+        loyalty_discount_cents=3000, loyalty_reward_id=uuid.uuid4(),
+        loyalty_points_redeemed=200, loyalty_reward_name="Free Coffee",
+        total_cents=2000, currency="ZAR", refund_reference=None, refund_amount_cents=None,
+        refunded_at=None, customer_name=None, phone_number="+27821234567",
+        delivery_address=None, estimated_ready_at=None, confirmed_at=datetime.now(timezone.utc),
+        accepted_at=datetime.now(timezone.utc), ready_at=None, completed_at=None,
+        special_instructions=None, cancelled_reason=None, items=[],
+        created_at=datetime.now(timezone.utc), updated_at=datetime.now(timezone.utc),
+    )
+    db = FakeDB([FakeResult(scalar=existing_order)])  # idempotency lookup finds it immediately
+
+    with patch.object(routes_pos, "resolve_pos_items", AsyncMock(side_effect=AssertionError("must not resolve items on replay"))):
+        order = await create_pos_order(body=body, user=user, db=db)
+
+    assert order.id == existing_order.id
+    assert order.loyalty_discount_cents == 3000
+    assert order.loyalty_points_redeemed == 200
+    assert db.commits == 0  # pure replay, no second redemption

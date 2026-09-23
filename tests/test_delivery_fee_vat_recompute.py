@@ -55,7 +55,8 @@ def make_user(role="STAFF", business_id=None):
     return AuthUser(user_id=uuid.uuid4(), business_id=business_id or uuid.uuid4(), role=role, token_type="access")
 
 
-def make_order(business_id, subtotal_cents=10000, discount_cents=0, status="PENDING_DELIVERY_FEE"):
+def make_order(business_id, subtotal_cents=10000, discount_cents=0, status="PENDING_DELIVERY_FEE",
+               loyalty_discount_cents=0):
     order = Order()
     now = datetime.now(timezone.utc)
     for k, v in dict(
@@ -63,6 +64,7 @@ def make_order(business_id, subtotal_cents=10000, discount_cents=0, status="PEND
         status=status, payment_status="UNPAID", payment_method=None,
         payment_required=False, delivery_fee_cents=0, subtotal_cents=subtotal_cents,
         discount_cents=discount_cents, tax_cents=0, total_cents=subtotal_cents,
+        loyalty_discount_cents=loyalty_discount_cents,
         currency="ZAR", customer_id=None, order_mode="DELIVERY", source="WHATSAPP",
         created_at=now, updated_at=now,
     ).items():
@@ -184,6 +186,44 @@ async def test_unknown_order_is_404():
         await set_delivery_fee(
             order_id=uuid.uuid4(), body=DeliveryFeeRequest(delivery_fee_cents=1000), user=user, db=db,
         )
+
+
+# ── Loyalty discount netted into the recompute (migration 0050) ────────────
+# This endpoint (WhatsApp PENDING_DELIVERY_FEE flow) never itself creates a
+# loyalty-redeemed order today (redemption is POS-only), but the formula
+# must stay consistent with document.py's own reconstruction, and
+# loyalty_discount_cents defaults to 0 for every order this endpoint really
+# does touch, so this only pins the arithmetic against a future order that
+# somehow carries both.
+
+async def test_loyalty_discount_netted_out_alongside_manual_discount():
+    order = make_order(uuid.uuid4(), subtotal_cents=10000, discount_cents=1000, loyalty_discount_cents=2000)
+    business = make_business(order.business_id, vat_registered=False)
+
+    result, _ = await _run(order, business, fee_cents=2000)
+    assert result.total_cents == 10000 - 1000 - 2000 + 2000  # 9000
+
+
+async def test_loyalty_discount_netted_out_under_vat_exclusive():
+    order = make_order(uuid.uuid4(), subtotal_cents=10000, discount_cents=0, loyalty_discount_cents=3000)
+    business = make_business(
+        order.business_id, vat_registered=True, vat_rate_basis_points=1500, vat_inclusive_pricing=False,
+    )
+
+    result, _ = await _run(order, business, fee_cents=2000)
+    net = 10000 - 3000 + 2000
+    expected_tax = round(net * 0.15)
+    assert result.total_cents == net + expected_tax
+    assert result.tax_cents == expected_tax
+
+
+async def test_zero_loyalty_discount_matches_pre_migration_behaviour():
+    """An order with no redemption (the overwhelming majority) is byte-for-byte unchanged."""
+    order = make_order(uuid.uuid4(), subtotal_cents=10000, discount_cents=1000, loyalty_discount_cents=0)
+    business = make_business(order.business_id, vat_registered=False)
+
+    result, _ = await _run(order, business, fee_cents=2000)
+    assert result.total_cents == 10000 - 1000 + 2000
 
 
 async def test_missing_business_is_404():

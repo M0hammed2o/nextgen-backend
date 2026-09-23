@@ -78,6 +78,15 @@ class POSOrderCreateRequest(BaseModel):
     discount_cents: int = Field(default=0, ge=0)
     discount_reason: str | None = Field(default=None, max_length=255)
 
+    # ── Loyalty redemption (POS checkout) ──────────────────────────────────
+    # Deliberately no customer_id field — customer_phone is already the
+    # till's identity handle (see get_or_create_customer_by_phone); accepting
+    # both would invite redeeming customer A's points onto customer B's
+    # receipt.
+    loyalty_reward_id: uuid.UUID | None = Field(
+        default=None, description="A LoyaltyReward to redeem against this sale"
+    )
+
     # ── Payment (Phase 2 — paid at checkout, not after fulfilment) ────────
     payment_method: str = Field(pattern=r"^(CASH|CARD|OTHER)$")
     cash_tendered_cents: int | None = Field(default=None, ge=0)
@@ -94,6 +103,21 @@ class POSOrderCreateRequest(BaseModel):
                 raise ValueError("cash_tendered_cents is required for a CASH payment")
         elif self.cash_tendered_cents is not None:
             raise ValueError("cash_tendered_cents is only valid for a CASH payment")
+        return self
+
+    @model_validator(mode="after")
+    def validate_loyalty_redemption(self) -> "POSOrderCreateRequest":
+        if self.loyalty_reward_id is not None:
+            if not self.customer_phone:
+                raise ValueError("customer_phone is required to redeem a loyalty reward")
+            if not self.idempotency_key:
+                # Every other field on this request tolerates a keyless
+                # double-tap (the worst case is a duplicate order, itself
+                # already a real problem but not a double points deduction).
+                # A keyless double-tapped redemption would deduct points
+                # twice for what the till operator experienced as one
+                # checkout — require the same guard the order itself gets.
+                raise ValueError("idempotency_key is required to redeem a loyalty reward")
         return self
 
 
@@ -152,6 +176,23 @@ class POSRefundRequest(BaseModel):
     restore_stock: bool = Field(
         default=False,
         description="Only true when the food physically came back and is still usable",
+    )
+
+    # Points are a marketing liability, not physical stock — giving them
+    # back costs the business nothing the way un-cooking a meal would, and
+    # withholding them by default would punish an honest full refund. So
+    # this default is deliberately the OPPOSITE of restore_stock's default
+    # above. Only takes effect on a FULL refund (amount_cents == order
+    # total) — a partial refund never touches points regardless of this
+    # flag, because there is no honest pro-rata answer. NOTE: as of this
+    # change there is no manual points-adjustment endpoint anywhere in this
+    # codebase (verified — see TODO.md) — a manager wanting to hand-correct
+    # a partial-refund customer's balance today has no API to do it with;
+    # that gap is real, not a documentation oversight.
+    restore_loyalty_points: bool = Field(
+        default=True,
+        description="Full refund only — restore any loyalty points redeemed on this order. "
+                     "Ignored on a partial refund.",
     )
 
 
@@ -484,8 +525,72 @@ async def create_pos_order(
             403,
         )
 
+    # ── Loyalty: link the Customer record BEFORE any money math or the
+    #    order-number increment below. Moved here from after the order-
+    #    number increment for two reasons: (1) a reward redemption (below)
+    #    needs a resolved customer before the discount/total can be
+    #    computed, and (2) get_or_create_customer_by_phone's own flush used
+    #    to run AFTER the order-number sequence had already been
+    #    incremented, so a failure inside it (e.g. an invalid phone number)
+    #    burned an order number permanently — moving the whole block earlier
+    #    fixes that defect too (see KNOWN_BUGS.md). ───────────────────────
+    order_id = uuid.uuid4()
+    customer = None
+    customer_id = None
+    program = None
+    if body.customer_phone:
+        from backend.app.loyalty.engine import get_or_create_customer_by_phone
+        from shared.models.loyalty import LoyaltyProgram
+        program_result = await db.execute(
+            select(LoyaltyProgram).where(LoyaltyProgram.business_id == user.business_id)
+        )
+        program = program_result.scalar_one_or_none()
+        if program and program.is_enabled:
+            customer = await get_or_create_customer_by_phone(
+                db, user.business_id, body.customer_phone, body.customer_name,
+            )
+            customer_id = customer.id
+
+    # ── Loyalty: redeem a reward, if requested. Resolved AFTER subtotal (the
+    #    clamp below needs it) but BEFORE delivery fee/VAT/net_total_cents —
+    #    "the money" — are computed, so the redemption's clamped discount is
+    #    already baked into total_cents rather than bolted on afterwards.
+    #    Deliberately excluded from the max_staff_discount_cents check
+    #    above: a reward the owner configured in the catalogue already
+    #    carries the owner's authorisation — routing every reward through
+    #    owner sign-off at the till would make the feature unusable. ──────
+    redemption = None
+    reward = None
+    loyalty_discount_cents = 0
+    if body.loyalty_reward_id is not None:
+        from backend.app.loyalty.engine import redeem_reward_for_checkout
+        from shared.models.loyalty import LoyaltyReward
+
+        if not program or not program.is_enabled:
+            raise AppError("LOYALTY_DISABLED", "Loyalty programme is not enabled for this business", 422)
+
+        reward_result = await db.execute(
+            select(LoyaltyReward).where(
+                LoyaltyReward.id == body.loyalty_reward_id,
+                LoyaltyReward.business_id == user.business_id,
+            )
+        )
+        reward = reward_result.scalar_one_or_none()
+        if not reward:
+            raise NotFoundError("LoyaltyReward", str(body.loyalty_reward_id))
+
+        max_discountable_cents = max(0, subtotal_cents - body.discount_cents)
+        redemption = await redeem_reward_for_checkout(
+            db, user.business_id, customer, reward, program,
+            order_id=order_id,
+            max_discountable_cents=max_discountable_cents,
+        )
+        loyalty_discount_cents = redemption.discount_cents
+
     delivery_fee_cents = business.delivery_fee_cents if body.order_mode == "DELIVERY" else 0
-    net_total_cents = max(0, subtotal_cents - body.discount_cents + delivery_fee_cents)
+    net_total_cents = max(
+        0, subtotal_cents - body.discount_cents - loyalty_discount_cents + delivery_fee_cents
+    )
 
     # ── VAT ───────────────────────────────────────────────────────────────
     # Computed BEFORE cash validation because exclusive VAT increases what
@@ -502,6 +607,8 @@ async def create_pos_order(
         total_cents, tax_cents = net_total_cents, 0
 
     # ── Payment validation — computed here, never trusted from the client ─
+    # total_cents already nets the loyalty discount out, so cash tendered
+    # only ever needs to cover what's actually owed after redemption.
     if body.payment_method == POSPaymentMethod.CASH.value:
         if body.cash_tendered_cents < total_cents:
             raise AppError(
@@ -532,25 +639,10 @@ async def create_pos_order(
         raise NotFoundError("Business")
     seq, currency = row
 
-    # Link a Customer record by phone number when loyalty is enabled, so
-    # points can be awarded once this order is created (already PAID).
-    customer_id = None
-    if body.customer_phone:
-        from backend.app.loyalty.engine import get_or_create_customer_by_phone
-        from shared.models.loyalty import LoyaltyProgram
-        program_result = await db.execute(
-            select(LoyaltyProgram).where(LoyaltyProgram.business_id == user.business_id)
-        )
-        program = program_result.scalar_one_or_none()
-        if program and program.is_enabled:
-            customer = await get_or_create_customer_by_phone(
-                db, user.business_id, body.customer_phone, body.customer_name,
-            )
-            customer_id = customer.id
-
     now = datetime.now(timezone.utc)
 
     order = Order(
+        id=order_id,
         business_id=user.business_id,
         customer_id=customer_id,
         order_number=format_order_number(seq),
@@ -574,6 +666,10 @@ async def create_pos_order(
         tax_cents=tax_cents,
         discount_reason=body.discount_reason,
         discount_approved_by_user_id=user.user_id if body.discount_cents > 0 else None,
+        loyalty_discount_cents=loyalty_discount_cents,
+        loyalty_reward_id=reward.id if redemption else None,
+        loyalty_points_redeemed=redemption.points_cost if redemption else 0,
+        loyalty_reward_name=redemption.reward_name if redemption else None,
         total_cents=total_cents,
         currency=currency,
         customer_name=body.customer_name,
@@ -636,6 +732,30 @@ async def create_pos_order(
                     "discount_cents": body.discount_cents,
                     "discount_reason": body.discount_reason,
                     "actor_role": user.role,
+                },
+            ))
+
+        if redemption is not None:
+            # shortfall_cents > 0 means the reward's full value_cents could
+            # not be absorbed by this sale (clamp-and-warn) — recorded here
+            # so the audit trail explains why the applied discount is less
+            # than the reward's configured value, even though the full
+            # points cost was still deducted.
+            db.add(AuditEvent(
+                scope=AuditScope.BUSINESS.value,
+                business_id=user.business_id,
+                actor_user_id=user.user_id,
+                action="order.pos.loyalty_redeemed",
+                target_type="order",
+                target_id=order.id,
+                diff_json={
+                    "reward_id": str(reward.id),
+                    "reward_name": redemption.reward_name,
+                    "reward_value_cents": reward.value_cents,
+                    "discount_applied_cents": redemption.discount_cents,
+                    "points_redeemed": redemption.points_cost,
+                    "shortfall_cents": redemption.shortfall_cents,
+                    "customer_id": str(customer.id) if customer else None,
                 },
             ))
 
@@ -839,7 +959,8 @@ async def refund_pos_order(
     if amount_cents > order.total_cents:
         raise AppError("REFUND_EXCEEDS_TOTAL", "Refund amount cannot exceed the order total", 422)
 
-    order.payment_status = "REFUNDED" if amount_cents == order.total_cents else "PARTIALLY_REFUNDED"
+    is_full_refund = amount_cents == order.total_cents
+    order.payment_status = "REFUNDED" if is_full_refund else "PARTIALLY_REFUNDED"
     order.refund_amount_cents = amount_cents
     order.refund_reference = body.reason
     order.refunded_at = datetime.now(timezone.utc)
@@ -863,6 +984,19 @@ async def refund_pos_order(
                 notes=f"Refund with stock returned: {body.reason}",
             )
 
+    # Points, unlike stock, default to coming back — see POSRefundRequest.
+    # restore_loyalty_points' own docstring for why the default is flipped
+    # relative to restore_stock above. Only a FULL refund is eligible; a
+    # partial refund never touches points, and order.loyalty_reward_id is
+    # never rewritten so this stays discoverable on any future refund
+    # attempt regardless of what happened here.
+    loyalty_points_restored = 0
+    if is_full_refund and body.restore_loyalty_points and order.loyalty_reward_id is not None:
+        from backend.app.loyalty.engine import reverse_redemption
+        loyalty_points_restored = await reverse_redemption(
+            db, user.business_id, order.id, notes=f"Refund: {body.reason}",
+        )
+
     db.add(AuditEvent(
         scope=AuditScope.BUSINESS.value,
         business_id=user.business_id,
@@ -875,6 +1009,8 @@ async def refund_pos_order(
             "reason": body.reason,
             "restore_stock": body.restore_stock,
             "stock_lines_reversed": reversed_lines,
+            "restore_loyalty_points": body.restore_loyalty_points,
+            "loyalty_points_restored": loyalty_points_restored,
         },
     ))
 
@@ -926,6 +1062,21 @@ async def void_pos_order(
             notes=f"Void: {body.reason}",
         )
 
+    # A void always returns points — unlike a refund, there is no flag: a
+    # sale that should never have happened never earned its points-spent
+    # status either. order.loyalty_reward_id (never rewritten by refund/
+    # void) stays the single source of truth for whether there is anything
+    # to reverse; reverse_redemption itself is idempotent, so a double-
+    # tapped void cannot credit points twice (see its own docstring — the
+    # order-row FOR UPDATE lock above is the primary guard, this is belt-
+    # and-braces).
+    loyalty_points_restored = 0
+    if order.loyalty_reward_id is not None:
+        from backend.app.loyalty.engine import reverse_redemption
+        loyalty_points_restored = await reverse_redemption(
+            db, user.business_id, order.id, notes=f"Void: {body.reason}",
+        )
+
     db.add(AuditEvent(
         scope=AuditScope.BUSINESS.value,
         business_id=user.business_id,
@@ -933,7 +1084,11 @@ async def void_pos_order(
         action="order.pos.voided",
         target_type="order",
         target_id=order.id,
-        diff_json={"reason": body.reason, "stock_lines_reversed": reversed_lines},
+        diff_json={
+            "reason": body.reason,
+            "stock_lines_reversed": reversed_lines,
+            "loyalty_points_restored": loyalty_points_restored,
+        },
     ))
 
     await db.commit()

@@ -81,6 +81,18 @@ class OrderResponse(BaseModel):
     discount_cents: int = 0
     tax_cents: int = 0
     discount_reason: str | None = None
+    # Loyalty redemption snapshot (migration 0050). Declared nullable here
+    # even though the DB columns are NOT NULL DEFAULT 0/nullable-with-no-
+    # default — a test or other caller may hand this schema an Order
+    # instance that was constructed directly in Python and never flushed
+    # (SQLAlchemy only applies a column's Python-side default at INSERT
+    # time), which reads back as None rather than 0 for an unset int column.
+    # In production, `db.refresh(order)` always runs first, so these are
+    # real values by the time a client sees them.
+    loyalty_discount_cents: int | None = 0
+    loyalty_reward_id: uuid.UUID | None = None
+    loyalty_points_redeemed: int | None = 0
+    loyalty_reward_name: str | None = None
     total_cents: int
     currency: str
     refund_reference: str | None = None
@@ -816,7 +828,16 @@ async def set_delivery_fee(
     # applied VAT at all — for an exclusive-VAT, VAT-registered business
     # that meant total_cents came out short of what the customer actually
     # owes once a delivery fee is added.
-    net_total_cents = max(0, order.subtotal_cents - order.discount_cents + fee)
+    #
+    # Also nets out loyalty_discount_cents (migration 0050) — this endpoint
+    # is reached only via the WhatsApp PENDING_DELIVERY_FEE flow, which a POS
+    # loyalty redemption never goes through today, but the formula must stay
+    # consistent with document.py::_vat_rate_display's reconstruction of the
+    # same net total, or a future order that somehow carries both would
+    # silently drop its VAT rate label on reprint.
+    net_total_cents = max(
+        0, order.subtotal_cents - order.discount_cents - (order.loyalty_discount_cents or 0) + fee
+    )
     if business.vat_registered:
         total_cents, tax_cents = apply_vat_to_total(
             net_total_cents, business.vat_rate_basis_points, business.vat_inclusive_pricing,

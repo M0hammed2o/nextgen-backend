@@ -67,7 +67,7 @@ def make_user(role="OWNER", business_id=None):
 
 
 def make_pos_order(business_id, total_cents=5000, payment_status="PAID", source=OrderSource.POS.value,
-                    payment_method="CASH"):
+                    payment_method="CASH", loyalty_reward_id=None):
     now = datetime.now(timezone.utc)
     return Order(
         id=uuid.uuid4(), business_id=business_id, order_number="BO-000001",
@@ -75,7 +75,8 @@ def make_pos_order(business_id, total_cents=5000, payment_status="PAID", source=
         source=source, total_cents=total_cents, subtotal_cents=total_cents,
         currency="ZAR",
         payment_required=False, order_mode="PICKUP", delivery_fee_cents=0,
-        discount_cents=0, tax_cents=0, created_at=now, updated_at=now,
+        discount_cents=0, tax_cents=0, loyalty_reward_id=loyalty_reward_id,
+        created_at=now, updated_at=now,
     )
 
 
@@ -112,6 +113,40 @@ async def test_partial_refund_sets_partially_refunded_status():
 
     assert result.payment_status == "PARTIALLY_REFUNDED"
     assert result.refund_amount_cents == 2000
+
+
+async def test_refund_ceiling_is_cash_actually_paid_not_the_rewards_original_value():
+    """
+    Pins a claim from the loyalty-redemption change: order.total_cents is
+    already net of any redeemed reward's discount, so the existing
+    `amount_cents > order.total_cents` ceiling automatically refunds only
+    what was actually charged — a R100 sale with a R30 reward applied has
+    total_cents=7000, and a refund can never exceed that 7000, regardless of
+    the reward's original value. No code change was needed for this to be
+    correct; this test exists so a future "fix" doesn't try to add the
+    reward's value back into the refundable ceiling.
+    """
+    user = make_user()
+    reward_id = uuid.uuid4()
+    order = make_pos_order(user.business_id, total_cents=7000, loyalty_reward_id=reward_id)
+    db = FakeDB([FakeResult(scalar=order), _open_till_result()])
+
+    with pytest.raises(AppError) as exc:
+        await refund_pos_order(
+            order_id=order.id, body=POSRefundRequest(amount_cents=10000), user=user, db=db,
+        )
+    assert exc.value.code == "REFUND_EXCEEDS_TOTAL"
+
+    # A refund AT the actual (already-discounted) ceiling succeeds.
+    db2 = FakeDB([
+        FakeResult(scalar=order), _open_till_result(),
+        FakeResult(scalar=_redeem_txn(uuid.uuid4(), order.id)),
+        FakeResult(scalar=None),
+        FakeResult(scalar=_loyalty_program()),
+        FakeResult(scalar=_loyalty_customer()),
+    ])
+    result = await refund_pos_order(order_id=order.id, body=POSRefundRequest(amount_cents=7000), user=user, db=db2)
+    assert result.refund_amount_cents == 7000
 
 
 async def test_refund_exceeding_total_is_rejected():
@@ -200,6 +235,153 @@ async def test_void_rejects_already_refunded_order():
     with pytest.raises(AppError) as exc:
         await void_pos_order(order_id=order.id, body=POSVoidRequest(reason="oops"), user=user, db=db)
     assert exc.value.code == "ORDER_NOT_PAID"
+
+
+# ── Loyalty points reversal (void always returns points; full refund does by
+#    default; partial refund never touches points) ─────────────────────────
+
+def _redeem_txn(customer_id, order_id, points_delta=-200):
+    return types.SimpleNamespace(
+        id=uuid.uuid4(), customer_id=customer_id, order_id=order_id,
+        transaction_type="REDEEM", points_delta=points_delta, idempotency_key=None,
+    )
+
+
+def _loyalty_customer(points_balance=300):
+    return types.SimpleNamespace(id=uuid.uuid4(), loyalty_points_balance=points_balance, loyalty_tier="BRONZE")
+
+
+def _loyalty_program():
+    return types.SimpleNamespace(is_enabled=True, silver_tier_points=500, gold_tier_points=2000)
+
+
+async def test_void_always_returns_points_even_without_a_flag():
+    user = make_user()
+    reward_id = uuid.uuid4()
+    order = make_pos_order(user.business_id, total_cents=8000, loyalty_reward_id=reward_id)
+    customer = _loyalty_customer(points_balance=300)
+    txn = _redeem_txn(customer.id, order.id, points_delta=-200)
+
+    db = FakeDB([
+        FakeResult(scalar=order),                     # _load_pos_order_for_reversal
+        _open_till_result(),                           # cash-reversal till check
+        FakeResult(scalar=make_business_for_reversal()),  # stock-reversal business lookup
+        FakeResult(scalar=txn),                        # reverse_redemption: original REDEEM lookup
+        FakeResult(scalar=None),                        # reverse_redemption: no existing reversal
+        FakeResult(scalar=_loyalty_program()),           # reverse_redemption: program lookup
+        FakeResult(scalar=customer),                     # reverse_redemption: customer FOR UPDATE lock
+    ])
+
+    result = await void_pos_order(order_id=order.id, body=POSVoidRequest(reason="Rang up wrong item"), user=user, db=db)
+
+    assert result.payment_status == "VOIDED"
+    assert customer.loyalty_points_balance == 500  # 300 + 200 restored
+    from shared.models.audit import AuditEvent
+    events = [o for o in db.added if isinstance(o, AuditEvent) and o.action == "order.pos.voided"]
+    assert events[0].diff_json["loyalty_points_restored"] == 200
+
+
+async def test_void_with_no_redemption_does_not_touch_loyalty():
+    user = make_user()
+    order = make_pos_order(user.business_id, total_cents=8000, loyalty_reward_id=None)
+    db = FakeDB([FakeResult(scalar=order), _open_till_result(), FakeResult(scalar=make_business_for_reversal())])
+
+    await void_pos_order(order_id=order.id, body=POSVoidRequest(reason="Mistake"), user=user, db=db)
+    # No extra FakeResults were queued for a loyalty reversal — if the route
+    # tried to call reverse_redemption anyway, popping from an empty list
+    # would raise IndexError and fail this test.
+
+
+async def test_full_refund_restores_points_by_default():
+    user = make_user()
+    reward_id = uuid.uuid4()
+    order = make_pos_order(user.business_id, total_cents=5000, payment_method="CARD", loyalty_reward_id=reward_id)
+    customer = _loyalty_customer(points_balance=300)
+    txn = _redeem_txn(customer.id, order.id, points_delta=-200)
+
+    db = FakeDB([
+        FakeResult(scalar=order),
+        FakeResult(scalar=txn),
+        FakeResult(scalar=None),
+        FakeResult(scalar=_loyalty_program()),
+        FakeResult(scalar=customer),
+    ])
+
+    result = await refund_pos_order(order_id=order.id, body=POSRefundRequest(), user=user, db=db)
+
+    assert result.payment_status == "REFUNDED"
+    assert customer.loyalty_points_balance == 500
+
+
+async def test_full_refund_with_restore_loyalty_points_false_skips_reversal():
+    user = make_user()
+    reward_id = uuid.uuid4()
+    order = make_pos_order(user.business_id, total_cents=5000, payment_method="CARD", loyalty_reward_id=reward_id)
+    db = FakeDB([FakeResult(scalar=order)])  # no loyalty-reversal FakeResults queued at all
+
+    result = await refund_pos_order(
+        order_id=order.id, body=POSRefundRequest(restore_loyalty_points=False), user=user, db=db,
+    )
+    assert result.payment_status == "REFUNDED"
+    # IndexError from popping an unqueued result would have failed this test
+    # if the route called reverse_redemption anyway.
+
+
+async def test_partial_refund_never_touches_points_even_with_flag_true():
+    """There is no honest pro-rata answer — a partial refund never touches points, regardless of the flag."""
+    user = make_user()
+    reward_id = uuid.uuid4()
+    order = make_pos_order(user.business_id, total_cents=5000, payment_method="CARD", loyalty_reward_id=reward_id)
+    db = FakeDB([FakeResult(scalar=order)])  # no loyalty-reversal FakeResults queued
+
+    result = await refund_pos_order(
+        order_id=order.id,
+        body=POSRefundRequest(amount_cents=2000, restore_loyalty_points=True),
+        user=user, db=db,
+    )
+    assert result.payment_status == "PARTIALLY_REFUNDED"
+
+
+async def test_refund_with_no_redemption_does_not_touch_loyalty():
+    user = make_user()
+    order = make_pos_order(user.business_id, total_cents=5000, payment_method="CARD", loyalty_reward_id=None)
+    db = FakeDB([FakeResult(scalar=order)])
+
+    result = await refund_pos_order(order_id=order.id, body=POSRefundRequest(), user=user, db=db)
+    assert result.payment_status == "REFUNDED"
+
+
+async def test_void_double_tap_restores_points_exactly_once():
+    """
+    The order-row FOR UPDATE lock is the primary guard: a second void call
+    sees payment_status already VOIDED (not PAID) and is rejected by
+    _load_pos_order_for_reversal before reverse_redemption is ever called a
+    second time.
+    """
+    user = make_user()
+    reward_id = uuid.uuid4()
+    order = make_pos_order(user.business_id, total_cents=8000, loyalty_reward_id=reward_id)
+    customer = _loyalty_customer(points_balance=300)
+    txn = _redeem_txn(customer.id, order.id, points_delta=-200)
+
+    db = FakeDB([
+        FakeResult(scalar=order),
+        _open_till_result(),
+        FakeResult(scalar=make_business_for_reversal()),
+        FakeResult(scalar=txn),
+        FakeResult(scalar=None),
+        FakeResult(scalar=_loyalty_program()),
+        FakeResult(scalar=customer),
+    ])
+    await void_pos_order(order_id=order.id, body=POSVoidRequest(reason="oops"), user=user, db=db)
+    assert customer.loyalty_points_balance == 500
+
+    # Second (double-tapped) void call against the now-VOIDED order.
+    db2 = FakeDB([FakeResult(scalar=order)])
+    with pytest.raises(AppError) as exc:
+        await void_pos_order(order_id=order.id, body=POSVoidRequest(reason="oops again"), user=user, db=db2)
+    assert exc.value.code == "ORDER_NOT_PAID"
+    assert customer.loyalty_points_balance == 500  # unchanged by the rejected second call
 
 
 # ── Cash reversal requires an open till (Wave 0A fix) ───────────────────────

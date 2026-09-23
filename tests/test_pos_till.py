@@ -221,6 +221,34 @@ async def test_close_till_computes_variance_and_writes_audit_event():
     assert audit_events[0].diff_json["variance_cents"] == 500
 
 
+async def test_close_till_sums_total_cents_which_is_already_net_of_any_loyalty_reward():
+    """
+    Pins a claim from the loyalty-redemption change (migration 0050): the
+    cash-sales query sums Order.total_cents directly, and total_cents is
+    ALREADY net of any redeemed reward's discount by the time checkout wrote
+    it — so a R80 cash sale that had a R20 reward applied appears here as
+    exactly 8000, not 10000 minus something computed at close time. No code
+    change was needed for this to be correct; this test exists so a future
+    "fix" doesn't accidentally try to subtract loyalty_discount_cents again
+    here (which would double-discount the drawer expectation).
+    """
+    user = make_user(role="OWNER")
+    session = make_session(user.business_id, opening_float_cents=10000)
+    db = FakeDB([
+        FakeResult(scalar=session),
+        FakeResult(items=[8000]),  # a R100 sale with a R20 reward already netted into total_cents
+        FakeResult(items=[]),
+    ])
+
+    result = await close_till(
+        session_id=session.id,
+        body=TillCloseRequest(counted_cash_cents=18000),
+        user=user, db=db,
+    )
+    assert result.expected_cash_cents == 18000  # 10000 float + 8000 (the reward-netted total)
+    assert result.cash_sales_cents == 8000
+
+
 async def test_close_till_cash_query_still_filters_by_payment_status():
     """
     The cash-sales query filters `payment_status IN (PAID, REFUNDED,
