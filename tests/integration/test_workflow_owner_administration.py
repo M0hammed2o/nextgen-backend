@@ -62,6 +62,7 @@ from backend.app.api.v1.routes_specials import SpecialCreate, SpecialUpdate, cre
 from backend.app.api.v1.routes_staff import PinRotation, StaffCreate, StaffUpdate, auto_rotate_pin, create_staff, rotate_pin, update_staff
 from backend.app.api.v1.routes_analytics import get_summary
 from backend.app.core.rbac import AuthUser
+from backend.app.utils.phone import normalize_sa_mobile
 from shared.models.business import Business
 from shared.models.billing_invoice import BillingInvoice
 from shared.models.customer import Customer
@@ -188,7 +189,13 @@ async def test_owner_administration_workflow(db, test_business: Business):
     for next_status in ("IN_PROGRESS", "READY", "COLLECTED"):
         await update_order_status(order_id=order.id, body=StatusUpdateRequest(status=next_status), user=staff_user, db=db)
 
-    cust_result = await db.execute(select(Customer).where(Customer.phone_number == "0839998888"))
+    # BUG-0098/BUG-0100 (KNOWN_BUGS.md): the loyalty customer-lookup path now
+    # normalises the phone number (normalize_sa_mobile) before storing it —
+    # a stale raw-string lookup would no longer find the row the checkout
+    # above just created.
+    cust_result = await db.execute(
+        select(Customer).where(Customer.phone_number == normalize_sa_mobile("0839998888"))
+    )
     customer = cust_result.scalar_one()
     assert customer.loyalty_points_balance == 160  # 16000 cents item -> 160 Rand -> 160 points
 

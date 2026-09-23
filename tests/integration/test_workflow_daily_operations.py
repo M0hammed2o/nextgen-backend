@@ -59,6 +59,7 @@ from backend.app.api.v1.routes_pos import (
 from backend.app.api.v1.routes_staff import StaffCreate, create_staff
 from backend.app.api.v1.routes_analytics import get_summary
 from backend.app.core.rbac import AuthUser
+from backend.app.utils.phone import normalize_sa_mobile
 from shared.models.business import Business
 from shared.models.customer import Customer
 
@@ -123,7 +124,13 @@ async def test_daily_operations_workflow(db, test_business: Business):
         )
     assert order_a.status == "COLLECTED"
 
-    cust_result = await db.execute(select(Customer).where(Customer.phone_number == "0827654321"))
+    # BUG-0098/BUG-0100 (KNOWN_BUGS.md): the loyalty customer-lookup path now
+    # normalises the phone number (normalize_sa_mobile) before storing it,
+    # so a stale raw-string lookup here would no longer find the row the
+    # checkout above just created.
+    cust_result = await db.execute(
+        select(Customer).where(Customer.phone_number == normalize_sa_mobile("0827654321"))
+    )
     customer = cust_result.scalar_one()
     await db.refresh(customer)
     assert customer.loyalty_points_balance == 80  # 8000 cents -> 80 Rand -> 80 points at 1/Rand

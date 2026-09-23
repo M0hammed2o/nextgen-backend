@@ -42,6 +42,7 @@ from backend.app.api.v1.routes_staff import StaffCreate, create_staff
 from backend.app.api.v1.routes_loyalty import LoyaltyProgramUpdate, update_loyalty_program
 from backend.app.billing.stripe_webhooks import _handle_invoice_paid
 from backend.app.core.rbac import AuthUser
+from backend.app.utils.phone import normalize_sa_mobile
 from shared.models.business import Business
 from shared.models.customer import Customer
 from shared.models.loyalty import LoyaltyTransaction
@@ -145,7 +146,13 @@ async def test_full_workflow_signup_to_active_subscription(db, test_business: Bu
     assert order.status == "ACCEPTED"
 
     # Confirm a Customer was created and linked (loyalty walk-in identity).
-    cust_result = await db.execute(select(Customer).where(Customer.phone_number == "0821234567"))
+    # BUG-0098/BUG-0100 (KNOWN_BUGS.md): the loyalty customer-lookup path now
+    # normalises the phone number (normalize_sa_mobile) before storing it —
+    # a stale raw-string lookup would no longer find the row the checkout
+    # above just created.
+    cust_result = await db.execute(
+        select(Customer).where(Customer.phone_number == normalize_sa_mobile("0821234567"))
+    )
     customer = cust_result.scalar_one()
 
     # ── Step: Loyalty points awarded (at checkout, not at a later payment

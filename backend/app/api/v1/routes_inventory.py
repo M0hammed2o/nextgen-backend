@@ -38,13 +38,19 @@ from backend.app.core.errors import AppError, DuplicateError, NotFoundError
 from backend.app.core.ownership import require_owned
 from backend.app.core.rbac import AuthUser, require_owner_or_manager, require_staff_or_above
 from backend.app.db.session import get_db
-from backend.app.inventory.ledger import build_movement, stock_on_hand
+from backend.app.inventory.ledger import (
+    build_movement,
+    is_idempotency_violation,
+    opening_balance_idempotency_key,
+    stock_on_hand,
+)
 from backend.app.inventory.units import (
     UnitError,
     cost_per_canonical_micro_cents,
     format_quantity,
     to_canonical,
     to_milli,
+    value_cents,
 )
 from shared.enums import (
     AuditScope,
@@ -233,6 +239,32 @@ class AdjustmentRequest(BaseModel):
     quantity: str = Field(description="Signed: negative removes stock")
     unit: str = Field(max_length=32)
     reason: str = Field(min_length=3, max_length=255)
+
+
+class OpeningStockRequest(BaseModel):
+    ingredient_id: uuid.UUID
+    quantity: str = Field(description="Opening stock quantity — positive, unsigned")
+    unit: str = Field(max_length=32)
+    source: str | None = Field(
+        default=None,
+        max_length=255,
+        description="Where this count came from, e.g. 'Physical count on "
+                    "go-live day', 'Carried over from previous system'",
+    )
+    occurred_at: datetime | None = Field(
+        default=None,
+        description="When this stock position was actually true. Defaults "
+                    "to now if omitted.",
+    )
+
+
+class OpeningStockResponse(BaseModel):
+    ingredient_id: uuid.UUID
+    ingredient_name: str
+    quantity_milli: int
+    quantity_display: str
+    value_cents: int
+    occurred_at: datetime
 
 
 # ── Ingredients ──────────────────────────────────────────────────────────────
@@ -888,6 +920,150 @@ async def list_goods_receipts(
         }
         for r in rows
     ]
+
+
+# ── Opening stock ────────────────────────────────────────────────────────────
+
+@router.post("/opening-stock", response_model=OpeningStockResponse, status_code=201)
+async def set_opening_stock(
+    body: OpeningStockRequest,
+    user: AuthUser = Depends(require_owner_or_manager),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Post an ingredient's one-time starting stock position, through the
+    ledger like every other movement — never a direct mutation of a
+    quantity column, because stock here has no cached quantity, it is
+    always derived by summing stock_movements.
+
+    NO SEPARATE "OPENING COST" FIELD
+    ---------------------------------
+    Deliberately absent. Every ledger movement values itself from the
+    ingredient's already-configured cost_per_canonical_micro_cents at
+    post time (same as goods receipts, wastage, and manual adjustments) —
+    an ingredient created without a cost simply posts a R0 valuation, same
+    as any other movement type would. Set the ingredient's cost via
+    PATCH .../ingredients/{id} first if valuation at go-live matters.
+
+    ONE OPENING BALANCE PER INGREDIENT, EVER — REJECTED ON A REPEAT
+    ------------------------------------------------------------------
+    An opening balance is by definition the stock position BEFORE any
+    other movement existed. A second attempt for the same ingredient is
+    ambiguous — did the first one get the quantity wrong, or did more
+    stock genuinely arrive since? — and silently picking either
+    interpretation (replace, or add) risks quietly corrupting the stock
+    position. So a repeat attempt is REJECTED (409), not replaced and not
+    additive: correct a mistake with a manual adjustment
+    (POST .../adjustments, which is auditable and explicitly a
+    correction), and record stock that actually arrived since with a
+    goods receipt (POST .../goods-receipts) — both ledger-append,
+    auditable, and unambiguous about what they mean, unlike a second
+    "opening" balance would be.
+
+    The rejection is enforced two ways: a pre-check by movement_type (which
+    also catches an ingredient's opening balance already posted by the CSV
+    ingredient importer, routes_import.py — that path has no idempotency
+    key, only "the ingredient must be new", so it cannot be caught by the
+    key below alone), and — for the genuine race between two concurrent
+    submissions — the deterministic idempotency_key
+    opening_balance_idempotency_key(ingredient_id), paired with the ledger's
+    partial unique index (business_id, idempotency_key). The unique index
+    is the actual backstop; the pre-check exists only to fail fast with a
+    clear message in the non-racing, common case.
+    """
+    await _require_inventory_enabled(db, user.business_id)
+
+    ingredient = (
+        await db.execute(
+            select(Ingredient).where(
+                Ingredient.id == body.ingredient_id,
+                Ingredient.business_id == user.business_id,
+                Ingredient.is_deleted.is_(False),
+            )
+        )
+    ).scalar_one_or_none()
+    if not ingredient:
+        raise NotFoundError("Ingredient", str(body.ingredient_id))
+
+    quantity_milli = _convert(body.quantity, body.unit, ingredient.canonical_unit)
+    if quantity_milli <= 0:
+        raise AppError("INVALID_QUANTITY", "Opening stock must be greater than zero", 422)
+
+    already = (
+        await db.execute(
+            select(StockMovement.id)
+            .where(
+                StockMovement.business_id == user.business_id,
+                StockMovement.ingredient_id == ingredient.id,
+                StockMovement.movement_type == StockMovementType.OPENING_BALANCE.value,
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if already is not None:
+        raise AppError(
+            "OPENING_STOCK_ALREADY_SET",
+            "Opening stock has already been recorded for this ingredient. "
+            "Use a manual adjustment to correct it, or a goods receipt for "
+            "stock received since.",
+            409,
+        )
+
+    occurred = body.occurred_at or datetime.now(timezone.utc)
+    unit_cost = int(ingredient.cost_per_canonical_micro_cents or 0)
+    movement = build_movement(
+        business_id=user.business_id,
+        ingredient_id=ingredient.id,
+        quantity_milli=quantity_milli,
+        movement_type=StockMovementType.OPENING_BALANCE.value,
+        unit_cost_micro_cents=unit_cost,
+        source_type=StockSourceType.OPENING_STOCK.value,
+        source_id=ingredient.id,
+        created_by_user_id=user.user_id,
+        idempotency_key=opening_balance_idempotency_key(ingredient.id),
+        notes=body.source or "Opening stock",
+        occurred_at=occurred,
+    )
+    db.add(movement)
+    db.add(
+        AuditEvent(
+            scope=AuditScope.BUSINESS.value,
+            business_id=user.business_id,
+            actor_user_id=user.user_id,
+            action="inventory.stock.opening_balance_set",
+            target_type="ingredient",
+            target_id=ingredient.id,
+            diff_json={
+                "quantity_milli": quantity_milli,
+                "entered": f"{body.quantity} {body.unit}",
+                "source": body.source,
+                "actor_role": user.role,
+            },
+        )
+    )
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        if not is_idempotency_violation(exc):
+            raise
+        raise AppError(
+            "OPENING_STOCK_ALREADY_SET",
+            "Opening stock has already been recorded for this ingredient "
+            "(concurrent submission detected).",
+            409,
+        ) from exc
+
+    return OpeningStockResponse(
+        ingredient_id=ingredient.id,
+        ingredient_name=ingredient.name,
+        quantity_milli=quantity_milli,
+        quantity_display=format_quantity(
+            quantity_milli, CanonicalUnit(ingredient.canonical_unit), ingredient.unit_label
+        ),
+        value_cents=value_cents(quantity_milli, unit_cost),
+        occurred_at=occurred,
+    )
 
 
 # ── Manual adjustment ────────────────────────────────────────────────────────

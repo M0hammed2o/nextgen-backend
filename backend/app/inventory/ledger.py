@@ -33,6 +33,7 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.inventory.consumption import (
@@ -87,6 +88,31 @@ def wastage_idempotency_key(entry_id: uuid.UUID, ingredient_id: uuid.UUID) -> st
     wastage entry, forever" even under a retried POST.
     """
     return f"WASTAGE:{entry_id}:{ingredient_id}"
+
+
+def opening_balance_idempotency_key(ingredient_id: uuid.UUID) -> str:
+    """
+    Scoped per ingredient, not per request — an ingredient may only ever
+    carry ONE opening-balance movement, by design (see
+    routes_inventory.py::set_opening_stock: a second attempt is rejected,
+    never replaced or merged). This key, paired with the partial unique
+    index on (business_id, idempotency_key), is what makes that guarantee
+    hold even under a genuine race between two concurrent submissions —
+    the route's own pre-check alone cannot close that window.
+    """
+    return f"OPENING_BALANCE:{ingredient_id}"
+
+
+def is_idempotency_violation(exc: IntegrityError) -> bool:
+    """
+    True if this IntegrityError is a violation of the ledger's partial
+    unique index (business_id, idempotency_key) — checked against the
+    driver's own error text, same technique as
+    routes_pos.py::_is_unique_violation, so this stays driver-agnostic.
+    """
+    return "uq_stock_movements_business_id_idempotency_key" in str(
+        getattr(exc, "orig", exc)
+    )
 
 
 # ── Loading recipes ──────────────────────────────────────────────────────────

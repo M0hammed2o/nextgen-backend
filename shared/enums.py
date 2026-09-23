@@ -319,6 +319,7 @@ class StockSourceType(str, enum.Enum):
     WASTAGE_ENTRY = "WASTAGE_ENTRY"
     STOCKTAKE = "STOCKTAKE"
     MANUAL = "MANUAL"
+    OPENING_STOCK = "OPENING_STOCK"
 
 
 # ── Inventory: wastage ───────────────────────────────────────────────────────
