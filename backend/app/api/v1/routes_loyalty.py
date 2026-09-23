@@ -5,6 +5,22 @@ staff-facing customer lookup/redemption for the POS.
 Program config and reward catalogue are OWNER/MANAGER-only (business
 decisions about earning/redemption rules); looking up a customer's balance
 and redeeming a reward are STAFF-or-above (till-floor actions).
+
+`extra="forbid"` decision (2026-09-23, made while fixing the `value_cents`
+exposure gap below): deliberately NOT added to any schema in this file.
+A future frontend field silently landing on the wrong schema (exactly this
+bug) would have been caught immediately as a 422 rather than a silent drop
+— a real argument for it, and this is now the documented fourth occurrence
+of a `Business`/model column existing with no schema exposing it on this
+platform. Not applied here because the blast radius of rejecting any
+currently-tolerated extra field from an existing frontend request is
+unverified from this backend-only session (would need to read the actual
+request shapes `nextgen-manager-v3` sends, out of this task's scope) —
+flipping write validation from "ignore extras" to "reject extras" is a
+behavioural change with real risk of breaking an unrelated in-flight
+request shape, not something to do incidentally while fixing an unrelated
+missing-field bug. Recorded as a considered, deliberate follow-up in
+TODO.md rather than applied silently.
 """
 
 import uuid
@@ -12,14 +28,22 @@ import uuid
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.errors import NotFoundError
 from backend.app.core.rbac import AuthUser, require_owner_or_manager, require_staff_or_above
 from backend.app.db.session import get_db
-from backend.app.loyalty.engine import get_or_create_customer_by_phone, redeem_reward
+from backend.app.loyalty.engine import (
+    adjust_points,
+    get_or_create_customer_by_phone,
+    manual_adjustment_idempotency_key,
+    redeem_reward,
+)
+from shared.enums import AuditScope
+from shared.models.audit import AuditEvent
 from shared.models.customer import Customer
-from shared.models.loyalty import LoyaltyProgram, LoyaltyReward
+from shared.models.loyalty import LoyaltyProgram, LoyaltyReward, LoyaltyTransaction
 
 router = APIRouter(prefix="/business/loyalty", tags=["loyalty"])
 
@@ -61,6 +85,22 @@ class LoyaltyRewardCreate(BaseModel):
     name: str = Field(max_length=255)
     description: str | None = None
     points_cost: int = Field(ge=1)
+    # Added 2026-09-23 — `LoyaltyReward.value_cents` (nullable, migration
+    # `0050_loyalty_pos_redemption`) was already read/enforced by
+    # routes_pos.py's checkout redemption path, but this schema never
+    # declared it, so it was silently dropped on every create/update
+    # (Pydantic ignores unknown fields by default — no `extra="forbid"` was
+    # set) and every reward was therefore permanently unredeemable at the
+    # till. See KNOWN_BUGS.md for the bug record. NULL stays the default —
+    # never default to 0, which would silently turn a manual-handover-only
+    # reward into a real R0 till discount (matches the model column's own
+    # docstring).
+    value_cents: int | None = Field(
+        default=None, ge=0,
+        description="Cents discount applied at POS checkout when redeemed. "
+                     "Omit or send null for a manual-handover-only reward "
+                     "(not redeemable at the till).",
+    )
 
 
 class LoyaltyRewardUpdate(BaseModel):
@@ -68,6 +108,13 @@ class LoyaltyRewardUpdate(BaseModel):
     description: str | None = None
     points_cost: int | None = Field(default=None, ge=1)
     is_active: bool | None = None
+    # Same gap as LoyaltyRewardCreate.value_cents above — writable here too,
+    # including explicitly clearing it back to NULL (manual-handover-only).
+    # `exclude_unset=True` (used by both PUT handlers below) means this only
+    # applies when the client actually sends the key, so `null` clears it
+    # while an omitted key leaves the stored value untouched, exactly like
+    # every other optional field on this schema.
+    value_cents: int | None = Field(default=None, ge=0)
 
 
 class LoyaltyRewardResponse(BaseModel):
@@ -76,6 +123,7 @@ class LoyaltyRewardResponse(BaseModel):
     description: str | None
     points_cost: int
     is_active: bool
+    value_cents: int | None
     model_config = {"from_attributes": True}
 
 
@@ -96,6 +144,36 @@ class RedeemResponse(BaseModel):
     success: bool
     points_delta: int
     balance_after: int
+
+
+class LoyaltyAdjustmentRequest(BaseModel):
+    """
+    A manual owner/manager correction to a customer's points balance — up
+    or down. Closes the gap left by DECISIONS.md DECISION-0034: a partial
+    refund deliberately never touches points automatically (there is no
+    honest pro-rata answer), so a manager who needs to correct the
+    resulting balance had no API to do it with before this endpoint.
+    """
+    points_delta: int = Field(
+        description="Signed points change. Positive credits points, negative debits them. Cannot be zero."
+    )
+    reason: str = Field(
+        min_length=3, max_length=255,
+        description="Mandatory — why this correction was made (e.g. 'Partial refund on order BO-000123, "
+                     "reward points not auto-reversed')",
+    )
+    idempotency_key: str | None = Field(
+        default=None, max_length=140,
+        description="Optional. Supply the same key on a retried/double-submitted correction to make the "
+                     "second attempt a no-op replay of the first rather than a second adjustment.",
+    )
+
+
+class LoyaltyAdjustmentResponse(BaseModel):
+    customer_id: uuid.UUID
+    points_delta: int
+    balance_after: int
+    reason: str | None
 
 
 # ── Program config ───────────────────────────────────────────────────────────
@@ -253,3 +331,150 @@ async def redeem_loyalty_reward(
     await db.commit()
 
     return RedeemResponse(success=True, points_delta=txn.points_delta, balance_after=txn.balance_after)
+
+
+# ── Manual points adjustment (owner/manager) ─────────────────────────────────
+
+def _is_adjustment_idempotency_violation(exc: IntegrityError) -> bool:
+    """
+    True if this IntegrityError is a violation of the loyalty ledger's
+    partial unique index (business_id, idempotency_key) — checked against
+    the driver's own error text, same driver-agnostic technique as
+    backend/app/inventory/ledger.py::is_idempotency_violation and
+    routes_pos.py::_is_unique_violation.
+    """
+    return "uq_loyalty_transactions_business_id_idempotency_key" in str(getattr(exc, "orig", exc))
+
+
+async def _find_by_idempotency_key(
+    db: AsyncSession, business_id: uuid.UUID, idempotency_key: str,
+) -> LoyaltyTransaction | None:
+    result = await db.execute(
+        select(LoyaltyTransaction).where(
+            LoyaltyTransaction.business_id == business_id,
+            LoyaltyTransaction.idempotency_key == idempotency_key,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+@router.post(
+    "/customers/{customer_id}/adjust-points",
+    response_model=LoyaltyAdjustmentResponse,
+    status_code=201,
+)
+async def adjust_customer_points(
+    customer_id: uuid.UUID,
+    body: LoyaltyAdjustmentRequest,
+    user: AuthUser = Depends(require_owner_or_manager),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Manually correct a customer's loyalty points balance, up or down, with
+    a mandatory reason — see DECISIONS.md DECISION-0034 and TODO.md's
+    Loyalty Programme section for why this exists: a partial refund
+    deliberately never touches points automatically (no honest pro-rata
+    answer exists), so before this endpoint a manager had no way at all to
+    hand-correct the resulting balance short of direct database access.
+
+    OWNER/MANAGER only (`require_owner_or_manager`) — this moves something
+    of real value, unlike the till-floor lookup/redeem actions above, which
+    are STAFF-or-above.
+
+    `customer_id` is resolved against `Customer.business_id ==
+    user.business_id` (the JWT claim, never client input) — a customer
+    belonging to another business is indistinguishable from one that does
+    not exist at all (404 `CUSTOMER_NOT_FOUND`), matching every other
+    cross-tenant-probe-resistant lookup in this codebase.
+
+    A zero `points_delta` is refused (`ZERO_ADJUSTMENT`, 422) rather than
+    writing a meaningless ledger row, and a downward adjustment that would
+    take the balance negative is refused cleanly (`INSUFFICIENT_POINTS_FOR_ADJUSTMENT`,
+    422) rather than surfacing as a raw
+    `ck_customers_loyalty_points_balance_nonneg` IntegrityError — both
+    enforced in `backend/app/loyalty/engine.py::adjust_points`, which also
+    takes the same customer row lock every other balance-mutating loyalty
+    path uses, so this can never lost-update against a concurrent
+    redemption/earn/other adjustment for the same customer.
+
+    Idempotency: OPTIONAL `idempotency_key`. A human typing a one-off
+    correction into a form is a different risk profile from an automated
+    webhook retry — there is no automatic retry loop that could hammer this
+    endpoint — but a double-submitted form (a manager double-clicking Save,
+    or a flaky connection triggering a client-side retry) is a real,
+    ordinary risk worth guarding against for a money-adjacent action. Reuses
+    the exact `loyalty_transactions.idempotency_key` +
+    `uq_loyalty_transactions_business_id_idempotency_key` partial unique
+    index migration `0050` already added (namespaced via
+    `manual_adjustment_idempotency_key` so it can never collide with a POS
+    checkout's own `REDEEM:<order_id>`/`REDEEM_REVERSAL:<order_id>` keys in
+    the same index) — a retried request with the SAME key replays the
+    original result instead of applying a second adjustment, checked both
+    up front (the common case) and by catching the unique-index violation
+    on a genuine concurrent double-submit (the race case), following the
+    exact two-layer pattern `routes_pos.py::create_pos_order`'s own
+    idempotency replay uses.
+    """
+    cust_result = await db.execute(
+        select(Customer).where(Customer.id == customer_id, Customer.business_id == user.business_id)
+    )
+    customer = cust_result.scalar_one_or_none()
+    if not customer:
+        raise NotFoundError("Customer", str(customer_id))
+
+    namespaced_key = manual_adjustment_idempotency_key(body.idempotency_key) if body.idempotency_key else None
+
+    if namespaced_key:
+        existing = await _find_by_idempotency_key(db, user.business_id, namespaced_key)
+        if existing is not None:
+            return LoyaltyAdjustmentResponse(
+                customer_id=existing.customer_id,
+                points_delta=existing.points_delta,
+                balance_after=existing.balance_after,
+                reason=existing.reason,
+            )
+
+    program_result = await db.execute(select(LoyaltyProgram).where(LoyaltyProgram.business_id == user.business_id))
+    program = program_result.scalar_one_or_none()
+
+    try:
+        txn = await adjust_points(
+            db, user.business_id, customer, program,
+            points_delta=body.points_delta, reason=body.reason, idempotency_key=namespaced_key,
+        )
+        db.add(
+            AuditEvent(
+                scope=AuditScope.BUSINESS.value,
+                business_id=user.business_id,
+                actor_user_id=user.user_id,
+                action="loyalty.points.adjusted",
+                target_type="customer",
+                target_id=customer.id,
+                diff_json={
+                    "points_delta": body.points_delta,
+                    "balance_after": txn.balance_after,
+                    "reason": body.reason,
+                    "actor_role": user.role,
+                },
+            )
+        )
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        if namespaced_key and _is_adjustment_idempotency_violation(exc):
+            existing = await _find_by_idempotency_key(db, user.business_id, namespaced_key)
+            if existing is not None:
+                return LoyaltyAdjustmentResponse(
+                    customer_id=existing.customer_id,
+                    points_delta=existing.points_delta,
+                    balance_after=existing.balance_after,
+                    reason=existing.reason,
+                )
+        raise
+
+    return LoyaltyAdjustmentResponse(
+        customer_id=customer.id,
+        points_delta=txn.points_delta,
+        balance_after=txn.balance_after,
+        reason=txn.reason,
+    )

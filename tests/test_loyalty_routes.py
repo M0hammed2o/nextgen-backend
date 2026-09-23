@@ -7,22 +7,29 @@ import uuid
 from datetime import datetime, timezone
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 
+from backend.app.api.v1 import routes_loyalty as routes
 from backend.app.api.v1.routes_loyalty import (
+    LoyaltyAdjustmentRequest,
     LoyaltyProgramUpdate,
     LoyaltyRewardCreate,
+    LoyaltyRewardUpdate,
     RedeemRequest,
+    adjust_customer_points,
     create_reward,
     delete_reward,
     get_loyalty_program,
+    list_rewards,
     lookup_customer_by_phone,
     redeem_loyalty_reward,
     update_loyalty_program,
+    update_reward,
 )
-from backend.app.core.errors import NotFoundError
+from backend.app.core.errors import AppError, NotFoundError
 from backend.app.core.rbac import AuthUser
 from shared.models.customer import Customer
-from shared.models.loyalty import LoyaltyProgram, LoyaltyReward
+from shared.models.loyalty import LoyaltyProgram, LoyaltyReward, LoyaltyTransaction
 
 
 class FakeResult:
@@ -34,10 +41,13 @@ class FakeResult:
 
 
 class FakeDB:
-    def __init__(self, results):
+    def __init__(self, results, commit_exc=None):
         self._results = list(results)
         self.added = []
         self.commits = 0
+        self.rollbacks = 0
+        self._commit_exc = commit_exc
+        self._commit_calls = 0
 
     async def execute(self, stmt):
         return self._results.pop(0)
@@ -76,7 +86,13 @@ class FakeDB:
                 obj.loyalty_tier = "BRONZE"
 
     async def commit(self):
+        self._commit_calls += 1
+        if self._commit_exc is not None and self._commit_calls == 1:
+            raise self._commit_exc
         self.commits += 1
+
+    async def rollback(self):
+        self.rollbacks += 1
 
     async def refresh(self, obj):
         self._finalize(obj)
@@ -229,3 +245,231 @@ async def test_redeem_via_route_success():
     assert result.success is True
     assert result.balance_after == 300
     assert customer.loyalty_points_balance == 300
+
+
+# ── Manual points adjustment (adjust_customer_points) ───────────────────────
+# Closes DECISIONS.md DECISION-0034's "known gap" — see engine-level tests
+# in test_loyalty_engine.py for the business-logic behaviour; these exercise
+# the route layer: tenant isolation, role gating, and idempotency replay.
+
+def make_customer(business_id, **overrides):
+    c = Customer(business_id=business_id, phone_number="0821234567", loyalty_points_balance=500)
+    FakeDB([])._finalize(c)
+    for k, v in overrides.items():
+        setattr(c, k, v)
+    return c
+
+
+def make_integrity_error(constraint_name="uq_loyalty_transactions_business_id_idempotency_key") -> IntegrityError:
+    return IntegrityError(
+        "INSERT INTO loyalty_transactions ...", {},
+        Exception(f'duplicate key value violates unique constraint "{constraint_name}"'),
+    )
+
+
+def test_adjust_points_route_is_owner_or_manager_only():
+    """Introspects the actual Depends() closure, not just the decorator —
+    same technique as tests/test_routes_delivery.py::TestRoleGating, since
+    calling a route function directly (as every other test in this file
+    does) bypasses FastAPI's Depends() resolution entirely."""
+    for route in routes.router.routes:
+        if route.path == "/business/loyalty/customers/{customer_id}/adjust-points" and "POST" in route.methods:
+            for d in route.dependant.dependencies:
+                if d.call.__name__ == "_check":
+                    freevars = d.call.__code__.co_freevars
+                    closure = d.call.__closure__
+                    mapping = dict(zip(freevars, [c.cell_contents for c in closure])) if closure else {}
+                    assert mapping.get("allowed_roles") == ["OWNER", "MANAGER"]
+                    return
+    raise AssertionError("adjust-points route not found")
+
+
+async def test_adjust_points_customer_in_another_business_is_not_found():
+    """A customer_id that belongs to a different business must be
+    indistinguishable from one that does not exist — business_id in the
+    lookup comes from user.business_id (the JWT), never from the request,
+    so a cross-tenant id and a nonexistent one both resolve to the exact
+    same scalar_one_or_none()=None the query would genuinely return."""
+    user = make_user(role="OWNER")
+    other_business_customer_id = uuid.uuid4()
+    db = FakeDB([FakeResult(scalar=None)])  # business_id filter excludes the other tenant's row
+
+    with pytest.raises(NotFoundError) as exc:
+        await adjust_customer_points(
+            customer_id=other_business_customer_id,
+            body=LoyaltyAdjustmentRequest(points_delta=50, reason="Should never be reached"),
+            user=user, db=db,
+        )
+    assert exc.value.code == "CUSTOMER_NOT_FOUND"
+    assert db.added == []
+    assert db.commits == 0
+
+
+async def test_adjust_points_route_rejects_zero_delta():
+    user = make_user(role="OWNER")
+    customer = make_customer(user.business_id)
+    program = make_program(user.business_id, is_enabled=True)
+    db = FakeDB([FakeResult(scalar=customer), FakeResult(scalar=program)])
+
+    with pytest.raises(AppError) as exc:
+        await adjust_customer_points(
+            customer_id=customer.id,
+            body=LoyaltyAdjustmentRequest(points_delta=0, reason="No actual change"),
+            user=user, db=db,
+        )
+    assert exc.value.code == "ZERO_ADJUSTMENT"
+    assert db.added == []
+    assert db.commits == 0
+
+
+async def test_adjust_points_route_refuses_negative_balance_cleanly():
+    user = make_user(role="MANAGER")
+    customer = make_customer(user.business_id, loyalty_points_balance=100)
+    program = make_program(user.business_id, is_enabled=True)
+    db = FakeDB([
+        FakeResult(scalar=customer),  # tenant-scoped lookup
+        FakeResult(scalar=program),   # program lookup for tier recompute
+        FakeResult(scalar=customer),  # adjust_points' own row-lock reselect
+    ])
+
+    with pytest.raises(AppError) as exc:
+        await adjust_customer_points(
+            customer_id=customer.id,
+            body=LoyaltyAdjustmentRequest(points_delta=-500, reason="Overcorrection attempt"),
+            user=user, db=db,
+        )
+    assert exc.value.code == "INSUFFICIENT_POINTS_FOR_ADJUSTMENT"
+    assert customer.loyalty_points_balance == 100  # untouched
+    assert db.added == []
+    assert db.commits == 0
+
+
+async def test_adjust_points_route_success_upward_writes_ledger_and_audit_event():
+    user = make_user(role="OWNER")
+    customer = make_customer(user.business_id, loyalty_points_balance=500)
+    program = make_program(user.business_id, is_enabled=True)
+    db = FakeDB([
+        FakeResult(scalar=customer),
+        FakeResult(scalar=program),
+        FakeResult(scalar=customer),  # row-lock reselect
+    ])
+
+    result = await adjust_customer_points(
+        customer_id=customer.id,
+        body=LoyaltyAdjustmentRequest(points_delta=75, reason="Partial refund on order BO-000042, points not auto-reversed"),
+        user=user, db=db,
+    )
+
+    assert result.customer_id == customer.id
+    assert result.points_delta == 75
+    assert result.balance_after == 575
+    assert customer.loyalty_points_balance == 575
+    assert db.commits == 1
+
+    txns = [o for o in db.added if isinstance(o, LoyaltyTransaction)]
+    assert len(txns) == 1
+    assert txns[0].transaction_type == "ADJUST"
+    assert txns[0].points_delta == 75
+    assert txns[0].order_id is None
+
+    from shared.models.audit import AuditEvent
+    audits = [o for o in db.added if isinstance(o, AuditEvent)]
+    assert len(audits) == 1
+    assert audits[0].action == "loyalty.points.adjusted"
+    assert audits[0].business_id == user.business_id
+    assert audits[0].actor_user_id == user.user_id
+    assert audits[0].target_id == customer.id
+    assert audits[0].diff_json["points_delta"] == 75
+    assert audits[0].diff_json["balance_after"] == 575
+
+
+async def test_adjust_points_route_success_downward():
+    user = make_user(role="OWNER")
+    customer = make_customer(user.business_id, loyalty_points_balance=500)
+    program = make_program(user.business_id, is_enabled=True)
+    db = FakeDB([
+        FakeResult(scalar=customer),
+        FakeResult(scalar=program),
+        FakeResult(scalar=customer),
+    ])
+
+    result = await adjust_customer_points(
+        customer_id=customer.id,
+        body=LoyaltyAdjustmentRequest(points_delta=-120, reason="Correcting a duplicate manual EARN"),
+        user=user, db=db,
+    )
+
+    assert result.points_delta == -120
+    assert result.balance_after == 380
+    assert customer.loyalty_points_balance == 380
+
+
+async def test_adjust_points_route_idempotent_replay_on_repeated_key():
+    """A request carrying the SAME idempotency_key as an already-applied
+    adjustment must replay the original result, not apply a second one —
+    the common-case pre-check path (no race, no IntegrityError)."""
+    user = make_user(role="OWNER")
+    customer = make_customer(user.business_id, loyalty_points_balance=500)
+    existing_txn = LoyaltyTransaction(
+        business_id=user.business_id, customer_id=customer.id, order_id=None,
+        transaction_type="ADJUST", points_delta=30, balance_after=530,
+        reason="Already applied", idempotency_key="ADJUST:form-key-1",
+    )
+    FakeDB([])._finalize(existing_txn)
+
+    db = FakeDB([
+        FakeResult(scalar=customer),       # tenant-scoped lookup
+        FakeResult(scalar=existing_txn),   # idempotency pre-check finds the original
+    ])
+
+    result = await adjust_customer_points(
+        customer_id=customer.id,
+        body=LoyaltyAdjustmentRequest(points_delta=30, reason="Retried form submission", idempotency_key="form-key-1"),
+        user=user, db=db,
+    )
+
+    assert result.points_delta == 30
+    assert result.balance_after == 530
+    # No new work done — the customer's balance was never touched by this
+    # (replayed) call, and nothing new was added/committed.
+    assert customer.loyalty_points_balance == 500
+    assert db.added == []
+    assert db.commits == 0
+
+
+async def test_adjust_points_route_race_caught_by_unique_index_returns_committed_state():
+    """Two concurrent requests carrying the SAME idempotency_key both pass
+    the pre-check before either has committed — the partial unique index
+    is what actually decides the winner; the loser's commit hits it and
+    must replay the winner's committed result instead of 500ing or
+    double-adjusting."""
+    user = make_user(role="OWNER")
+    customer = make_customer(user.business_id, loyalty_points_balance=500)
+    winner_txn = LoyaltyTransaction(
+        business_id=user.business_id, customer_id=customer.id, order_id=None,
+        transaction_type="ADJUST", points_delta=40, balance_after=540,
+        reason="Winner of the race", idempotency_key="ADJUST:race-key",
+    )
+    FakeDB([])._finalize(winner_txn)
+
+    db = FakeDB(
+        [
+            FakeResult(scalar=customer),     # tenant-scoped lookup
+            FakeResult(scalar=None),         # pre-check passes (race window)
+            FakeResult(scalar=None),         # program lookup — none configured
+            FakeResult(scalar=customer),     # adjust_points' own row-lock reselect
+            FakeResult(scalar=winner_txn),   # post-IntegrityError lookup finds the winner
+        ],
+        commit_exc=make_integrity_error(),
+    )
+
+    result = await adjust_customer_points(
+        customer_id=customer.id,
+        body=LoyaltyAdjustmentRequest(points_delta=40, reason="Loser of the race", idempotency_key="race-key"),
+        user=user, db=db,
+    )
+
+    assert result.points_delta == 40
+    assert result.balance_after == 540
+    assert db.rollbacks == 1
+    assert db.commits == 0

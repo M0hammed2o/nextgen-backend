@@ -362,6 +362,90 @@ async def reverse_redemption(
     return points_back
 
 
+def manual_adjustment_idempotency_key(raw_key: str) -> str:
+    """
+    Namespaced so a manager's manual-adjustment idempotency key can never
+    collide with a checkout REDEEM/REDEEM_REVERSAL key in the same partial
+    unique index (`uq_loyalty_transactions_business_id_idempotency_key`),
+    even if a client happened to reuse a raw string shape.
+    """
+    return f"ADJUST:{raw_key}"
+
+
+async def adjust_points(
+    db: AsyncSession, business_id: uuid.UUID, customer: Customer, program: LoyaltyProgram | None,
+    *, points_delta: int, reason: str, idempotency_key: str | None = None,
+) -> LoyaltyTransaction:
+    """
+    Manually adjust a customer's points balance, up or down, with a
+    mandatory reason — closes the gap recorded in DECISIONS.md
+    DECISION-0034 ("a manager who genuinely needs to correct a customer's
+    balance after a partial refund has no API to do it with today") and
+    TODO.md's Loyalty Programme section.
+
+    Deliberately does NOT gate on `program.is_enabled` (unlike
+    redeem_reward/award_points_for_paid_order) — this is an owner/manager
+    correction tool, not a customer-facing earn/redeem action, and a
+    balance may legitimately need correcting even while the programme is
+    currently disabled (e.g. a shortfall discovered after the business
+    paused the programme). `program` may be None if no LoyaltyProgram row
+    exists yet for this business; tier is simply left unrecomputed in that
+    case, mirroring `reverse_redemption`'s own `if program:` guard.
+
+    Row-locks the customer (`_lock_customer_for_balance_update`) before
+    reading/writing `loyalty_points_balance`, exactly like every other
+    balance-mutating path in this module — an adjustment racing a
+    concurrent redemption/earn/another adjustment for the SAME customer
+    must not lost-update either. Because the lock serialises every writer
+    of one customer's balance, the "would this go negative?" check below
+    is evaluated against a guaranteed-fresh balance — there is no window
+    for a second, concurrent adjustment to sneak the balance negative
+    between this check and the write, so the database's
+    `ck_customers_loyalty_points_balance_nonneg` CHECK constraint
+    (migration 0049) is not expected to ever actually fire for this path;
+    the check below exists to give the caller a clean, actionable 422
+    instead of relying on that DB constraint as the only backstop.
+
+    Raises AppError:
+      - `ZERO_ADJUSTMENT` (422) — a zero delta has no ledger meaning and
+        would write a row nobody can explain later; mirrors
+        routes_inventory.py::create_adjustment's identical zero-quantity
+        refusal.
+      - `INSUFFICIENT_POINTS_FOR_ADJUSTMENT` (422) — a downward adjustment
+        that would take the balance below zero.
+    """
+    if points_delta == 0:
+        raise AppError("ZERO_ADJUSTMENT", "Adjustment cannot be zero", 422)
+
+    customer = await _lock_customer_for_balance_update(db, business_id, customer.id)
+
+    new_balance = customer.loyalty_points_balance + points_delta
+    if new_balance < 0:
+        raise AppError(
+            "INSUFFICIENT_POINTS_FOR_ADJUSTMENT",
+            f"This adjustment would take the balance below zero "
+            f"(current balance: {customer.loyalty_points_balance}, requested change: {points_delta:+d})",
+            422,
+        )
+
+    customer.loyalty_points_balance = new_balance
+    if program:
+        customer.loyalty_tier = compute_tier(customer.loyalty_points_balance, program)
+
+    txn = LoyaltyTransaction(
+        business_id=business_id,
+        customer_id=customer.id,
+        order_id=None,
+        transaction_type="ADJUST",
+        points_delta=points_delta,
+        balance_after=customer.loyalty_points_balance,
+        reason=reason,
+        idempotency_key=idempotency_key,
+    )
+    db.add(txn)
+    return txn
+
+
 async def get_or_create_customer_by_phone(
     db: AsyncSession, business_id: uuid.UUID, phone_number: str, display_name: str | None = None,
 ) -> Customer:

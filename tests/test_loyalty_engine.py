@@ -12,9 +12,11 @@ import pytest
 
 from backend.app.core.errors import AppError
 from backend.app.loyalty.engine import (
+    adjust_points,
     award_points_for_paid_order,
     compute_tier,
     get_or_create_customer_by_phone,
+    manual_adjustment_idempotency_key,
     redeem_idempotency_key,
     redeem_reversal_idempotency_key,
     redeem_reward,
@@ -481,3 +483,130 @@ async def test_reverse_redemption_no_op_when_order_never_redeemed():
     restored = await reverse_redemption(db, business_id, order_id)
     assert restored == 0
     assert db.added == []
+
+
+# ── Manual adjustment (adjust_points) ─────────────────────────────────────────
+# Closes DECISIONS.md DECISION-0034's "known gap": a manager correcting a
+# customer's balance after a partial refund (which deliberately never
+# touches points automatically) had no API to do it with before this.
+
+async def test_adjust_points_rejects_zero_delta():
+    program = make_program()
+    customer = make_customer(loyalty_points_balance=500)
+    db = FakeDB(customer=customer)
+    with pytest.raises(AppError) as exc:
+        await adjust_points(db, uuid.uuid4(), customer, program, points_delta=0, reason="typo, no change")
+    assert exc.value.code == "ZERO_ADJUSTMENT"
+    assert exc.value.status_code == 422
+    # Nothing moved, nothing written — a zero-delta attempt must not reach
+    # the row lock or write a meaningless ledger row.
+    assert customer.loyalty_points_balance == 500
+    assert db.added == []
+
+
+async def test_adjust_points_upward_success():
+    program = make_program(silver_tier_points=600)
+    customer = make_customer(loyalty_points_balance=500)
+    db = FakeDB(customer=customer)
+
+    txn = await adjust_points(
+        db, uuid.uuid4(), customer, program,
+        points_delta=150, reason="Goodwill correction after partial refund on order BO-000042",
+    )
+
+    assert customer.loyalty_points_balance == 650
+    assert customer.loyalty_tier == "SILVER"  # 650 >= silver_tier_points=600
+    assert txn.transaction_type == "ADJUST"
+    assert txn.points_delta == 150
+    assert txn.balance_after == 650
+    assert txn.order_id is None
+    assert "partial refund" in txn.reason
+    assert db.added == [txn]
+
+
+async def test_adjust_points_downward_success():
+    program = make_program()
+    customer = make_customer(loyalty_points_balance=500)
+    db = FakeDB(customer=customer)
+
+    txn = await adjust_points(
+        db, uuid.uuid4(), customer, program,
+        points_delta=-200, reason="Correcting a duplicate manual EARN entered by another till",
+    )
+
+    assert customer.loyalty_points_balance == 300
+    assert txn.points_delta == -200
+    assert txn.balance_after == 300
+
+
+async def test_adjust_points_refuses_to_go_negative_cleanly():
+    """The non-negative CHECK constraint (migration 0049) must never be the
+    thing that catches this — the app-level check refuses first, with a
+    clear error, and the balance must be left completely untouched."""
+    program = make_program()
+    customer = make_customer(loyalty_points_balance=100)
+    db = FakeDB(customer=customer)
+
+    with pytest.raises(AppError) as exc:
+        await adjust_points(db, uuid.uuid4(), customer, program, points_delta=-150, reason="Overcorrection attempt")
+
+    assert exc.value.code == "INSUFFICIENT_POINTS_FOR_ADJUSTMENT"
+    assert exc.value.status_code == 422
+    assert customer.loyalty_points_balance == 100  # untouched
+    assert db.added == []
+
+
+async def test_adjust_points_exactly_to_zero_is_allowed():
+    """Landing exactly on zero is fine — only going BELOW zero is refused."""
+    program = make_program()
+    customer = make_customer(loyalty_points_balance=100)
+    db = FakeDB(customer=customer)
+
+    txn = await adjust_points(db, uuid.uuid4(), customer, program, points_delta=-100, reason="Zero out on request")
+    assert customer.loyalty_points_balance == 0
+    assert txn.balance_after == 0
+
+
+async def test_adjust_points_works_without_a_loyalty_program_row():
+    """A business with no LoyaltyProgram row yet (e.g. never enabled) must
+    not crash tier recomputation — program=None is a valid caller input,
+    mirroring reverse_redemption's own `if program:` guard."""
+    customer = make_customer(loyalty_points_balance=500, loyalty_tier="BRONZE")
+    db = FakeDB(customer=customer)
+
+    txn = await adjust_points(db, uuid.uuid4(), customer, None, points_delta=50, reason="Manual correction")
+    assert customer.loyalty_points_balance == 550
+    assert customer.loyalty_tier == "BRONZE"  # left unchanged, no crash
+    assert txn.balance_after == 550
+
+
+async def test_adjust_points_stamps_supplied_idempotency_key():
+    program = make_program()
+    customer = make_customer(loyalty_points_balance=500)
+    db = FakeDB(customer=customer)
+    key = manual_adjustment_idempotency_key("some-client-key")
+
+    txn = await adjust_points(
+        db, uuid.uuid4(), customer, program,
+        points_delta=25, reason="Manual correction", idempotency_key=key,
+    )
+    assert txn.idempotency_key == key
+
+
+async def test_adjust_points_raises_not_found_if_customer_vanished_under_lock():
+    program = make_program()
+    customer = make_customer(loyalty_points_balance=500)
+    db = FakeDB(customer=None)  # simulates "vanished under lock"
+    with pytest.raises(AppError) as exc:
+        await adjust_points(db, uuid.uuid4(), customer, program, points_delta=10, reason="Manual correction")
+    assert exc.value.code == "CUSTOMER_NOT_FOUND"
+
+
+def test_manual_adjustment_idempotency_key_is_namespaced():
+    """Must never collide with a checkout REDEEM/REDEEM_REVERSAL key in the
+    same partial unique index — this is the entire reason a raw client key
+    is wrapped rather than used verbatim."""
+    key = manual_adjustment_idempotency_key("abc123")
+    assert key == "ADJUST:abc123"
+    assert not key.startswith("REDEEM:")
+    assert not key.startswith("REDEEM_REVERSAL:")
