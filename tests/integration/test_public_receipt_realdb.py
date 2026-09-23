@@ -10,9 +10,10 @@ sandbox; see TestRateLimitConfiguration below for what IS verified about
 rate limiting without one, and the task report for what is explicitly
 Unknown/unverified as a result).
 
-Requires DATABASE_URL to point at a reachable real Postgres migrated to at
-least 0039_digital_receipts. Skips cleanly if unreachable, via the `db`/
-fixtures below (same pattern as tests/integration/test_receipts_realdb.py).
+Requires TEST_DATABASE_URL to point at a reachable real Postgres migrated
+to at least 0039_digital_receipts (see docker-compose.test.yml /
+TESTING.md). Fails loudly if unreachable/unset, via the `db` fixture below
+(same pattern as tests/integration/test_receipts_realdb.py).
 """
 
 import uuid

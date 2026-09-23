@@ -10,15 +10,17 @@ these are specifically the ones a mock can't honestly prove, because the
 whole point is two independent DB connections racing against Postgres's own
 unique-index enforcement.
 
-Requires DATABASE_URL to point at a reachable real Postgres already
-migrated to at least 0033_order_number_uniqueness — set explicitly when
-invoking pytest, e.g.:
+Requires TEST_DATABASE_URL to point at a reachable real Postgres already
+migrated to at least 0033_order_number_uniqueness (see
+docker-compose.test.yml / TESTING.md) — set explicitly when invoking
+pytest, e.g.:
 
-  DATABASE_URL=postgresql+asyncpg://nextgen:<password>@localhost:55444/nextgen_test_pos \\
+  export TEST_DATABASE_URL="postgresql+asyncpg://nextgen_test:nextgen_test_only_do_not_use_in_prod@localhost:55677/nextgen_test"
   python -m pytest tests/integration/test_wave0a_pos_concurrency.py -q
 
-Skips cleanly (does not fail) if no real Postgres is reachable, and creates
-its own uniquely-named business per test so it is safely re-runnable.
+Fails loudly if TEST_DATABASE_URL isn't set at all (see
+tests/integration/_env.py); creates its own uniquely-named business per
+test so it is safely re-runnable.
 """
 import asyncio
 import uuid
@@ -37,7 +39,7 @@ from backend.app.api.v1.routes_pos import (
 )
 from backend.app.core.errors import AppError
 from backend.app.core.rbac import AuthUser
-from backend.app.db.session import async_session_factory
+from tests.integration._db import get_session_factory
 from shared.models.business import Business
 from shared.models.order import Order
 from shared.models.till import TillSession
@@ -59,7 +61,7 @@ async def test_two_simultaneous_till_opens_collapse_to_one_open_session(test_bus
     user = _staff(business_id)
 
     async def attempt():
-        async with async_session_factory() as session:
+        async with get_session_factory()() as session:
             try:
                 result = await open_till(
                     body=TillOpenRequest(opening_float_cents=10000), user=user, db=session,
@@ -78,7 +80,7 @@ async def test_two_simultaneous_till_opens_collapse_to_one_open_session(test_bus
     conflict = next(r for r in results if r[0] == "conflict")
     assert conflict[1] == "TILL_ALREADY_OPEN"
 
-    async with async_session_factory() as session:
+    async with get_session_factory()() as session:
         rows = (
             await session.execute(
                 select(TillSession).where(
@@ -99,7 +101,7 @@ async def test_two_simultaneous_identical_checkouts_produce_exactly_one_order(te
     owner = AuthUser(user_id=uuid.uuid4(), business_id=business_id, role="OWNER", token_type="access")
     staff = _staff(business_id)
 
-    async with async_session_factory() as setup_db:
+    async with get_session_factory()() as setup_db:
         category = await create_category(
             body=CategoryCreate(name="Mains", sort_order=0), user=owner, db=setup_db,
         )
@@ -112,7 +114,7 @@ async def test_two_simultaneous_identical_checkouts_produce_exactly_one_order(te
     idempotency_key = f"race-{uuid.uuid4().hex[:12]}"
 
     async def attempt():
-        async with async_session_factory() as session:
+        async with get_session_factory()() as session:
             body = POSOrderCreateRequest(
                 items=[POSOrderItemRequest(menu_item_id=item.id, quantity=1)],
                 payment_method="CASH", cash_tendered_cents=5000,
@@ -135,7 +137,7 @@ async def test_two_simultaneous_identical_checkouts_produce_exactly_one_order(te
     order_ids = {r[1] for r in results}
     assert len(order_ids) == 1, f"both requests must resolve to the SAME order id, got: {results}"
 
-    async with async_session_factory() as session:
+    async with get_session_factory()() as session:
         orders = (
             await session.execute(
                 select(Order).where(
@@ -146,7 +148,7 @@ async def test_two_simultaneous_identical_checkouts_produce_exactly_one_order(te
         assert len(orders) == 1, "exactly one order row must exist for this idempotency key"
         assert len(orders[0].items) == 1, "exactly one set of order_items must exist"
 
-    async with async_session_factory() as cleanup_db:
+    async with get_session_factory()() as cleanup_db:
         from sqlalchemy import delete
         from shared.models.order import OrderEvent, OrderItem
         from shared.models.audit import AuditEvent

@@ -12,9 +12,12 @@ protection, last-SUPER_ADMIN protection, and immediate access loss on
 deactivation/demotion — the actual security fix this branch makes, verified
 through the REAL get_current_admin dependency, not a hand-built AuthUser).
 
-Skips cleanly (rather than erroring) if the local Postgres instance this
-branch was given isn't reachable, since this suite is not part of the
-default `pytest tests --ignore=tests/replay --ignore=tests/integration` run.
+Requires TEST_DATABASE_URL (see docker-compose.test.yml / TESTING.md).
+Skips cleanly (rather than erroring) if the dedicated test Postgres is
+configured but temporarily unreachable; fails loudly if TEST_DATABASE_URL
+isn't set at all (see tests/integration/_env.py). This suite is not part of
+the default `pytest tests --ignore=tests/replay` run — it's excluded from
+that command's collection scope entirely (pytest.ini's `norecursedirs`).
 """
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -94,7 +97,7 @@ async def _db_or_skip(db):
     try:
         await db.execute(select(1))
     except OperationalError:
-        pytest.skip("Real Postgres not reachable — see DATABASE_URL")
+        pytest.skip("Dedicated test Postgres not reachable — see TEST_DATABASE_URL / docker-compose.test.yml")
     return db
 
 
@@ -429,7 +432,7 @@ async def test_concurrent_demotions_of_the_last_two_super_admins_cannot_both_suc
     """
     import asyncio
 
-    from backend.app.db.session import async_session_factory
+    from tests.integration._db import get_session_factory
 
     db = _db_or_skip
     unique = uuid.uuid4().hex[:8]
@@ -438,7 +441,7 @@ async def test_concurrent_demotions_of_the_last_two_super_admins_cannot_both_suc
     created_ids = [admin_a.id, admin_b.id]
 
     async def _demote(actor_id: uuid.UUID, target_id: uuid.UUID):
-        async with async_session_factory() as session:
+        async with get_session_factory()() as session:
             try:
                 result = await update_admin_user(
                     admin_id=target_id,

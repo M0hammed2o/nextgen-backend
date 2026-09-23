@@ -8,9 +8,11 @@ stored snapshot regardless of what the live MenuItem/Business rows say
 *now*, that cross-tenant access is refused at the DB layer, and that a
 reprint is actually audited.
 
-Requires a real DATABASE_URL, per tests/integration/conftest.py. Skips
-(via the `db`/`business` fixtures raising at connection time, same as
-every other file in this directory) if that DB is unreachable.
+Requires TEST_DATABASE_URL, per tests/integration/conftest.py /
+tests/integration/_env.py. Fails loudly (via the `db`/`business` fixtures)
+whether TEST_DATABASE_URL is unset entirely or the dedicated test Postgres
+is unreachable — this tier is opt-in only, so there is no "quietly skip
+and look green" path here.
 """
 
 import uuid

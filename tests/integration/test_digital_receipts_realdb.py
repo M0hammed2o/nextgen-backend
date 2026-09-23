@@ -7,12 +7,13 @@ cross-tenant isolation, and the two real trigger points
 (_mark_order_paid, update_order_status) wired end to end against real
 Order/Business/Customer rows.
 
-Requires DATABASE_URL to point at a reachable real Postgres migrated to at
-least 0039_digital_receipts — set explicitly when invoking pytest. Skips
-cleanly if unreachable (via the `db`/`test_business` fixtures in
-tests/integration/conftest.py). Every business/order/customer row created
-here uses a fresh uuid4-suffixed identifier so this file is safely
-re-runnable.
+Requires TEST_DATABASE_URL to point at a reachable real Postgres migrated
+to at least 0039_digital_receipts — set explicitly when invoking pytest
+(see docker-compose.test.yml / TESTING.md). Fails loudly if TEST_DATABASE_URL
+isn't set at all (via the `db`/`test_business` fixtures in
+tests/integration/conftest.py, see tests/integration/_env.py). Every
+business/order/customer row created here uses a fresh uuid4-suffixed
+identifier so this file is safely re-runnable.
 
 The actual Meta HTTP call is never made — every test patches
 `backend.app.bot.whatsapp_sender.send_template_message` (the exact name
@@ -34,7 +35,7 @@ from backend.app.api.v1.routes_payments import _mark_order_paid
 from backend.app.api.v1.routes_receipts import get_digital_receipts_usage
 from backend.app.bot.meta_errors import MetaErrorInfo
 from backend.app.core.rbac import AuthUser
-from backend.app.db.session import async_session_factory
+from tests.integration._db import get_session_factory
 from backend.app.receipts.whatsapp_receipt import send_digital_receipt
 from shared.models.business import Business
 from shared.models.customer import Customer
@@ -145,7 +146,7 @@ class TestIdempotentGetOrCreate:
 
 class TestConcurrentDuplicateRequests:
     async def test_two_simultaneous_requests_produce_exactly_one_row_and_one_send(self, business):
-        async with async_session_factory() as setup_db:
+        async with get_session_factory()() as setup_db:
             order = await _make_order(setup_db, business)
             customer = await _make_customer(setup_db, business)
             order_id, customer_id = order.id, customer.id
@@ -153,7 +154,7 @@ class TestConcurrentDuplicateRequests:
         mock_send = _ok_send()
 
         async def attempt():
-            async with async_session_factory() as session:
+            async with get_session_factory()() as session:
                 order_row = (await session.execute(select(Order).where(Order.id == order_id))).scalar_one()
                 customer_row = (
                     await session.execute(select(Customer).where(Customer.id == customer_id))
@@ -171,7 +172,7 @@ class TestConcurrentDuplicateRequests:
             f"expected exactly one WhatsApp send attempt under concurrency, got {mock_send.call_count}"
         )
 
-        async with async_session_factory() as check_db:
+        async with get_session_factory()() as check_db:
             rows = (
                 await check_db.execute(select(DigitalReceipt).where(DigitalReceipt.order_id == order_id))
             ).scalars().all()

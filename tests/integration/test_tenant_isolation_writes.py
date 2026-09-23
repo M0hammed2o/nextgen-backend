@@ -11,37 +11,32 @@ OrderItem sub-query (BUG-0005).
 
 A mocked session cannot honestly prove a WHERE-clause tenant filter — it
 just returns whatever canned value a test wires up — so these run against
-a REAL Postgres database. They read the target from the TEST_DB_URL env
-var, defaulting to the Wave 0A throwaway local container. If that database
-is unreachable, every test in this module SKIPS cleanly (not fails), so
-the default mocked suite (`pytest tests --ignore=tests/replay
---ignore=tests/integration`) stays green on machines without it.
-
-This module intentionally builds its own engine/session (rather than
-importing `backend.app.db.session.engine`), because whichever DATABASE_URL
-gets resolved first at collection time — real env var, or the generic
-placeholder `tests/conftest.py` falls back to — controls what that shared,
-already-imported engine is bound to for the rest of the process. Reading
-TEST_DB_URL independently guarantees this module talks to the intended
-throwaway database regardless of collection order.
+a REAL Postgres database: the dedicated, disposable environment described
+in docker-compose.test.yml / TESTING.md, resolved via TEST_DATABASE_URL
+through tests/integration/_db.py's shared engine (the single source of
+truth for every file in this directory — see _db.py's own docstring for
+why this deliberately does NOT import `backend.app.db.session.engine`). If
+TEST_DATABASE_URL isn't set at all, this fails loudly (see _env.py) rather
+than falling back to any default; if it IS set but the target is
+temporarily unreachable, this module's `db` fixture skips cleanly instead
+of failing the whole run.
 
 Run directly with:
+    docker compose -f docker-compose.test.yml up -d   # once
+    export TEST_DATABASE_URL=...   # see TESTING.md
+    python -m alembic upgrade head
     python -m pytest tests/integration/test_tenant_isolation_writes.py -q
 """
 from __future__ import annotations
 
-import os
 import uuid
 
 import pytest
 from sqlalchemy import delete, select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession
 
-DEFAULT_TEST_DB_URL = "postgresql+asyncpg://nextgen:wave0a_local_only@localhost:55444/nextgen_test"
-TEST_DB_URL = os.environ.get("TEST_DB_URL", DEFAULT_TEST_DB_URL)
-
-_engine = create_async_engine(TEST_DB_URL, pool_pre_ping=True, connect_args={"statement_cache_size": 0})
-_session_factory = async_sessionmaker(bind=_engine, class_=AsyncSession, expire_on_commit=False)
+from tests.integration._db import dispose_engine, get_engine, get_session_factory
+from tests.integration._env import DedicatedTestEnvironmentNotConfigured, get_test_database_url
 
 from backend.app.api.v1.routes_business import BusinessSettingsUpdate, update_business_settings
 from backend.app.api.v1.routes_export import export_orders_csv
@@ -88,12 +83,17 @@ from shared.utils import generate_business_code
 @pytest.fixture
 async def db():
     try:
-        async with _engine.connect():
+        async with get_engine().connect():
             pass
+    except DedicatedTestEnvironmentNotConfigured:
+        # TEST_DATABASE_URL isn't set at all — fail loudly, never skip. A
+        # skip here would silently look like "0 relevant tests, all green"
+        # instead of "you forgot to configure the dedicated test env".
+        raise
     except Exception as exc:  # pragma: no cover - environment dependent
-        pytest.skip(f"Wave 0A throwaway DB unreachable at {TEST_DB_URL}: {exc}")
+        pytest.skip(f"Dedicated test DB unreachable at {get_test_database_url()}: {exc}")
 
-    async with _session_factory() as session:
+    async with get_session_factory()() as session:
         yield session
         await session.rollback()
         await session.close()
@@ -101,7 +101,7 @@ async def db():
     # Same reasoning as tests/integration/conftest.py's `db` fixture: dispose
     # the pool after every test so the next test (its own event loop, under
     # pytest-asyncio's function-scoped loop) opens fresh connections.
-    await _engine.dispose()
+    await dispose_engine()
 
 
 async def _make_business(db: AsyncSession, **overrides) -> Business:

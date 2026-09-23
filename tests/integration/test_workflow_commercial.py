@@ -8,8 +8,12 @@ invoice lifecycle (draft -> issue -> mark-paid/cancel, immutability,
 idempotent mark-paid, sequential numbering, VAT on/off, INVOICING_NOT_
 CONFIGURED), permissions (ONBOARDER commercial access survives handover but
 configuration access does not; cross-tenant 404), owner-facing endpoints,
-PDF rendering, and go-live readiness. Skips cleanly if the real Postgres
-instance isn't reachable.
+PDF rendering, and go-live readiness.
+
+Requires TEST_DATABASE_URL (see docker-compose.test.yml / TESTING.md).
+Skips cleanly if the dedicated test Postgres is configured but temporarily
+unreachable; fails loudly if TEST_DATABASE_URL isn't set at all (see
+tests/integration/_env.py).
 """
 import uuid
 from datetime import date, datetime, timedelta, timezone
@@ -104,7 +108,7 @@ async def _db_or_skip(db):
     try:
         await db.execute(select(1))
     except OperationalError:
-        pytest.skip("Real Postgres not reachable — see DATABASE_URL")
+        pytest.skip("Dedicated test Postgres not reachable — see TEST_DATABASE_URL / docker-compose.test.yml")
     return db
 
 
