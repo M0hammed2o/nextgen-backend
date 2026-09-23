@@ -293,6 +293,23 @@ class Business(Base, UUIDPrimaryKeyMixin, TimestampMixin):
                 "effect today beyond being readable/settable.",
     )
 
+    # ── Advanced Analytics entitlement (Commercial V1 gate, migration 0047) ──
+    # Master switch, same pattern as inventory_enabled/digital_receipts_enabled/
+    # delivery_platforms_enabled. NextGen POS gets Core Analytics (order counts,
+    # revenue, top items, daily trend) ungated. NextGen Complete and above also
+    # gets Advanced Analytics: the delivery-channel breakdown
+    # (GET /business/external-orders/channels), average order value
+    # (GET /business/analytics/average-order-value), and the cash/card payment-
+    # method breakdown (GET /business/analytics/payment-methods). Platform-
+    # admin-writable, business-plane READ-ONLY (see backend routes_business.py).
+    advanced_analytics_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False,
+        comment="Master switch for Advanced Analytics (NextGen Complete tier "
+                "and above). When false, gated analytics endpoints return "
+                "409 ADVANCED_ANALYTICS_NOT_ENABLED. Core analytics (order "
+                "counts, revenue, top items, daily trend) are never gated."
+    )
+
     # ── Inventory module (Ciao Pizza P0) ─────────────────────────────────
     inventory_enabled: Mapped[bool] = mapped_column(
         Boolean, default=False, nullable=False,
