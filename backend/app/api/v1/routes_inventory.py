@@ -29,11 +29,12 @@ from decimal import Decimal
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from backend.app.core.errors import AppError, NotFoundError
+from backend.app.core.errors import AppError, DuplicateError, NotFoundError
 from backend.app.core.ownership import require_owned
 from backend.app.core.rbac import AuthUser, require_owner_or_manager, require_staff_or_above
 from backend.app.db.session import get_db
@@ -169,6 +170,17 @@ class SupplierCreateRequest(BaseModel):
     email: str | None = Field(default=None, max_length=255)
 
 
+class SupplierUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=255)
+    contact_name: str | None = Field(default=None, max_length=255)
+    phone: str | None = Field(default=None, max_length=32)
+    email: str | None = Field(default=None, max_length=255)
+    is_active: bool | None = Field(
+        default=None,
+        description="Deactivate (false) or reactivate (true) this supplier",
+    )
+
+
 class SupplierResponse(BaseModel):
     id: uuid.UUID
     name: str
@@ -176,7 +188,10 @@ class SupplierResponse(BaseModel):
     phone: str | None
     email: str | None
     is_active: bool
-    model_config = {"from_attributes": True}
+    # Usage visibility, so deactivation/deletion is an informed decision —
+    # derived from goods_receipts, never a cached/denormalised counter.
+    goods_receipt_count: int = 0
+    last_received_at: datetime | None = None
 
 
 class GoodsReceiptLineRequest(BaseModel):
@@ -522,24 +537,64 @@ async def get_ingredient_movements(
 
 # ── Suppliers ────────────────────────────────────────────────────────────────
 
+async def _supplier_usage(
+    db: AsyncSession, business_id: uuid.UUID, supplier_ids: list
+) -> dict:
+    """
+    Goods-receipt count + most recent receipt date per supplier — the usage
+    signal a manager needs before deactivating or deleting one. Derived
+    live from goods_receipts (never a cached counter), same discipline as
+    everything else in this module being ledger/record-derived.
+    """
+    ids = [s for s in supplier_ids if s is not None]
+    if not ids:
+        return {}
+    rows = (
+        await db.execute(
+            select(
+                GoodsReceipt.supplier_id,
+                func.count(GoodsReceipt.id),
+                func.max(GoodsReceipt.occurred_at),
+            )
+            .where(
+                GoodsReceipt.business_id == business_id,
+                GoodsReceipt.supplier_id.in_(list(set(ids))),
+            )
+            .group_by(GoodsReceipt.supplier_id)
+        )
+    ).all()
+    return {row[0]: (int(row[1]), row[2]) for row in rows}
+
+
+def _supplier_response(supplier: Supplier, usage: tuple = (0, None)) -> SupplierResponse:
+    count, last_at = usage
+    return SupplierResponse(
+        id=supplier.id,
+        name=supplier.name,
+        contact_name=supplier.contact_name,
+        phone=supplier.phone,
+        email=supplier.email,
+        is_active=supplier.is_active,
+        goods_receipt_count=count,
+        last_received_at=last_at,
+    )
+
+
 @router.get("/suppliers", response_model=list[SupplierResponse])
 async def list_suppliers(
+    include_inactive: bool = Query(
+        False, description="Include deactivated suppliers, for review before permanent deletion"
+    ),
     user: AuthUser = Depends(require_staff_or_above),
     db: AsyncSession = Depends(get_db),
 ):
     await _require_inventory_enabled(db, user.business_id)
-    rows = (
-        (
-            await db.execute(
-                select(Supplier)
-                .where(Supplier.business_id == user.business_id, Supplier.is_active.is_(True))
-                .order_by(Supplier.name)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    return [SupplierResponse.model_validate(s) for s in rows]
+    stmt = select(Supplier).where(Supplier.business_id == user.business_id)
+    if not include_inactive:
+        stmt = stmt.where(Supplier.is_active.is_(True))
+    rows = (await db.execute(stmt.order_by(Supplier.name))).scalars().all()
+    usage = await _supplier_usage(db, user.business_id, [s.id for s in rows])
+    return [_supplier_response(s, usage.get(s.id, (0, None))) for s in rows]
 
 
 @router.post("/suppliers", response_model=SupplierResponse, status_code=201)
@@ -551,9 +606,140 @@ async def create_supplier(
     await _require_inventory_enabled(db, user.business_id)
     supplier = Supplier(business_id=user.business_id, **body.model_dump())
     db.add(supplier)
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise DuplicateError("supplier", "name") from exc
     await db.refresh(supplier)
-    return SupplierResponse.model_validate(supplier)
+    return _supplier_response(supplier)
+
+
+@router.patch("/suppliers/{supplier_id}", response_model=SupplierResponse)
+async def update_supplier(
+    supplier_id: uuid.UUID,
+    body: SupplierUpdateRequest,
+    user: AuthUser = Depends(require_owner_or_manager),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Edit supplier details, and/or deactivate or reactivate via is_active.
+
+    Deactivating does not touch any goods receipt already attributed to
+    this supplier — it only stops the supplier appearing in the default
+    (active-only) list and picker, same soft-delete discipline as
+    ingredients. Every change is audited (AuditEvent), same as manual
+    stock adjustments — this is reference data that affects costing and
+    who a receipt is attributed to, so who changed what and when matters.
+    """
+    await _require_inventory_enabled(db, user.business_id)
+    supplier = await require_owned(db, Supplier, supplier_id, user.business_id, label="Supplier")
+
+    diff: dict = {}
+    if body.name is not None:
+        new_name = body.name.strip()
+        if not new_name:
+            raise AppError("INVALID_NAME", "Supplier name cannot be blank", 422)
+        if new_name != supplier.name:
+            diff["name"] = {"old": supplier.name, "new": new_name}
+            supplier.name = new_name
+    for field in ("contact_name", "phone", "email"):
+        value = getattr(body, field)
+        if value is not None and value != getattr(supplier, field):
+            diff[field] = {"old": getattr(supplier, field), "new": value}
+            setattr(supplier, field, value)
+    if body.is_active is not None and body.is_active != supplier.is_active:
+        diff["is_active"] = {"old": supplier.is_active, "new": body.is_active}
+        supplier.is_active = body.is_active
+
+    if diff:
+        db.add(
+            AuditEvent(
+                scope=AuditScope.BUSINESS.value,
+                business_id=user.business_id,
+                actor_user_id=user.user_id,
+                action="inventory.supplier.updated",
+                target_type="supplier",
+                target_id=supplier.id,
+                diff_json={**diff, "actor_role": user.role},
+            )
+        )
+        try:
+            await db.commit()
+        except IntegrityError as exc:
+            await db.rollback()
+            raise DuplicateError("supplier", "name") from exc
+        await db.refresh(supplier)
+
+    usage = await _supplier_usage(db, user.business_id, [supplier.id])
+    return _supplier_response(supplier, usage.get(supplier.id, (0, None)))
+
+
+@router.delete("/suppliers/{supplier_id}", status_code=204)
+async def delete_supplier(
+    supplier_id: uuid.UUID,
+    user: AuthUser = Depends(require_owner_or_manager),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Permanently delete a supplier — irreversible, unlike the soft
+    deactivate above (PATCH .../suppliers/{id} with is_active=false).
+
+    Only allowed when BOTH hold, verified server-side against the actual
+    data rather than assumed:
+      1. The supplier has never been attributed on a goods receipt — a
+         hard delete must never orphan or corrupt historical
+         goods-received data (goods_receipts.supplier_id is ON DELETE SET
+         NULL, so the FK itself would technically allow it, but silently
+         nulling out who delivered a past receipt is exactly the kind of
+         data loss this check exists to prevent).
+      2. The supplier is already deactivated — the same two-step gate this
+         platform already uses for staff (`DELETE
+         /business/staff/{id}/permanent`), against deleting something
+         still in active use by mistake.
+    A supplier that fails either check should be deactivated instead,
+    which is always safe and always available.
+    """
+    await _require_inventory_enabled(db, user.business_id)
+    supplier = await require_owned(db, Supplier, supplier_id, user.business_id, label="Supplier")
+
+    usage_count = (
+        await db.execute(
+            select(func.count(GoodsReceipt.id)).where(
+                GoodsReceipt.business_id == user.business_id,
+                GoodsReceipt.supplier_id == supplier.id,
+            )
+        )
+    ).scalar_one()
+    if usage_count > 0:
+        raise AppError(
+            "SUPPLIER_IN_USE",
+            f"This supplier has {usage_count} goods receipt(s) on record and "
+            "cannot be permanently deleted. Deactivate it instead.",
+            409,
+            details={"goods_receipt_count": usage_count},
+        )
+    if supplier.is_active:
+        raise AppError(
+            "SUPPLIER_STILL_ACTIVE",
+            "Deactivate this supplier before permanently deleting it",
+            409,
+        )
+
+    db.add(
+        AuditEvent(
+            scope=AuditScope.BUSINESS.value,
+            business_id=user.business_id,
+            actor_user_id=user.user_id,
+            action="inventory.supplier.deleted",
+            target_type="supplier",
+            target_id=supplier.id,
+            diff_json={"name": supplier.name, "actor_role": user.role},
+        )
+    )
+    await db.delete(supplier)
+    await db.commit()
+    return None
 
 
 # ── Goods received ───────────────────────────────────────────────────────────
