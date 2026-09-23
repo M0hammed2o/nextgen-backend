@@ -310,6 +310,28 @@ class Business(Base, UUIDPrimaryKeyMixin, TimestampMixin):
                 "counts, revenue, top items, daily trend) are never gated."
     )
 
+    # ── Loyalty entitlement (Commercial V1 gate, migration 0051) ─────────
+    # Master switch, same pattern as inventory_enabled/digital_receipts_enabled/
+    # delivery_platforms_enabled/advanced_analytics_enabled. Closes
+    # KNOWN_BUGS.md BUG-0107: before this column existed, the only gate on
+    # Loyalty was LoyaltyProgram.is_enabled, which any OWNER/MANAGER could
+    # flip on themselves via PUT /business/loyalty/program with no
+    # package-tier check at all. Platform-admin-writable, business-plane
+    # READ-ONLY (see backend routes_business.py). Migration 0051 backfills
+    # this TRUE for any business with an already-enabled LoyaltyProgram at
+    # the time it shipped, so no existing user of the feature lost it —
+    # see that migration's docstring for the full reasoning.
+    loyalty_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False,
+        comment="Master switch for the Loyalty module (NextGen Complete tier "
+                "and above). When false, every route in routes_loyalty.py "
+                "and POS checkout's loyalty_reward_id redemption refuse with "
+                "409 LOYALTY_NOT_ENABLED. Points EARNING on a paid order is "
+                "deliberately NOT gated by this column — see "
+                "backend/app/loyalty/engine.py::award_points_for_paid_order "
+                "and DECISIONS.md for why."
+    )
+
     # ── Inventory module (Ciao Pizza P0) ─────────────────────────────────
     inventory_enabled: Mapped[bool] = mapped_column(
         Boolean, default=False, nullable=False,
