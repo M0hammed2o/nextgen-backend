@@ -186,8 +186,24 @@ async def test_lookup_customer_creates_when_enabled_and_none_found():
 
     result = await lookup_customer_by_phone(phone="0821234567", user=user, db=db)
 
-    assert result.phone_number == "0821234567"
+    # BUG-0098 fix: get_or_create_customer_by_phone now normalises through
+    # normalize_sa_mobile before lookup/creation, so the stored (and
+    # returned) phone_number is the canonical +27... form, not the raw
+    # local-format string the till operator typed.
+    assert result.phone_number == "+27821234567"
     assert result.loyalty_points_balance == 0
+
+
+async def test_lookup_customer_rejects_unparseable_phone():
+    user = make_user(role="STAFF")
+    program = make_program(user.business_id, is_enabled=True)
+    db = FakeDB([FakeResult(scalar=program)])
+
+    from backend.app.core.errors import AppError
+
+    with pytest.raises(AppError) as exc:
+        await lookup_customer_by_phone(phone="not-a-phone", user=user, db=db)
+    assert exc.value.code == "INVALID_PHONE_NUMBER"
 
 
 async def test_redeem_via_route_success():
@@ -198,7 +214,13 @@ async def test_redeem_via_route_success():
     reward = LoyaltyReward(business_id=user.business_id, name="Free Coffee", points_cost=200)
     FakeDB([])._finalize(reward)
 
-    db = FakeDB([FakeResult(scalar=program), FakeResult(scalar=customer), FakeResult(scalar=reward)])
+    # Query order: program lookup, unlocked customer lookup (404 check),
+    # reward lookup, then redeem_reward()'s OWN row-lock reselect of the
+    # SAME customer (BUG-0097 fix) — four executes, not three.
+    db = FakeDB([
+        FakeResult(scalar=program), FakeResult(scalar=customer),
+        FakeResult(scalar=reward), FakeResult(scalar=customer),
+    ])
 
     result = await redeem_loyalty_reward(
         body=RedeemRequest(customer_id=customer.id, reward_id=reward.id), user=user, db=db,
