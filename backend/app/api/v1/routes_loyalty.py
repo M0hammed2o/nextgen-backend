@@ -21,6 +21,48 @@ behavioural change with real risk of breaking an unrelated in-flight
 request shape, not something to do incidentally while fixing an unrelated
 missing-field bug. Recorded as a considered, deliberate follow-up in
 TODO.md rather than applied silently.
+
+`Business.loyalty_enabled` entitlement gate (2026-09-23, migration 0051,
+closing KNOWN_BUGS.md BUG-0107): every route below now calls
+`_require_loyalty_enabled()` FIRST — programme read/update, reward
+list/create/update/delete, customer lookup, `/redeem`, and manual points
+adjustment all refuse with 409 `LOYALTY_NOT_ENABLED` for a business the
+platform hasn't entitled. The POS checkout redemption path
+(`routes_pos.py::create_pos_order`, when `loyalty_reward_id` is supplied)
+carries the identical gate, checked before any customer/points mutation.
+
+DELIBERATE CARVE-OUT — points EARNING is NOT gated by `loyalty_enabled`:
+`backend/app/loyalty/engine.py::award_points_for_paid_order` /
+`award_loyalty_points_if_enabled` remain governed ONLY by
+`LoyaltyProgram.is_enabled`, exactly as before this change. Reasoning:
+  1. Going forward this is close to moot — `PUT /business/loyalty/program`
+     (the only way to flip `LoyaltyProgram.is_enabled` to True) is now
+     itself gated on `loyalty_enabled`, so a business can no longer reach
+     `is_enabled=True` in the first place without the platform entitlement.
+  2. The one real remaining case is a business that WAS entitled, enabled
+     the programme, and is later downgraded (`loyalty_enabled` flipped back
+     to False by a platform admin) without anyone also disabling
+     `LoyaltyProgram.is_enabled`. Silently gating earning here would mean a
+     customer's points quietly stop accruing on every paid order with no
+     visible signal to the till operator or the customer — a materially
+     worse failure mode than an explicit, visible 409 on a redemption or
+     configuration request, which is exactly what a REFUSED action should
+     look like. Earning is a passive, automatic side effect of a payment
+     confirmation that must never fail a payment
+     (`award_loyalty_points_if_enabled`'s own docstring: "this must never be
+     able to block a payment confirmation").
+  3. A silent earning stop creates a PERMANENT, non-backfillable gap in a
+     customer's balance: unlike redemption (which just resumes correctly
+     the moment entitlement returns) there is no honest way to later
+     reconstruct "how many points would this customer have earned during
+     the gap." A tenant who is re-entitled (upgrades again) would otherwise
+     face inexplicable customer complaints about missing points with no
+     correct fix available — worse than the commercial harm of a few extra
+     orders continuing to accrue points into an already-existing wallet
+     during a brief downgrade window, which costs the platform nothing
+     (points are not cash) and is trivially correctable via the manual
+     points-adjustment endpoint if it ever matters.
+See DECISIONS.md for the same reasoning recorded as a standing decision.
 """
 
 import uuid
@@ -31,7 +73,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.app.core.errors import NotFoundError
+from backend.app.core.errors import AppError, NotFoundError
 from backend.app.core.rbac import AuthUser, require_owner_or_manager, require_staff_or_above
 from backend.app.db.session import get_db
 from backend.app.loyalty.engine import (
@@ -42,10 +84,42 @@ from backend.app.loyalty.engine import (
 )
 from shared.enums import AuditScope
 from shared.models.audit import AuditEvent
+from shared.models.business import Business
 from shared.models.customer import Customer
 from shared.models.loyalty import LoyaltyProgram, LoyaltyReward, LoyaltyTransaction
 
 router = APIRouter(prefix="/business/loyalty", tags=["loyalty"])
+
+
+# ── Entitlement gate (migration 0051, KNOWN_BUGS.md BUG-0107) ────────────────
+
+async def _require_loyalty_enabled(db: AsyncSession, business_id: uuid.UUID) -> Business:
+    """
+    Server-side commercial-package gate for the whole Loyalty module —
+    mirrors `_require_inventory_enabled` (routes_recipes.py) /
+    `require_advanced_analytics_enabled` (backend/app/analytics/revenue.py).
+    Deliberately called FIRST in every route below, before any other query
+    or mutation (including `_get_or_create_program`, which itself writes a
+    row on first touch) — a non-entitled business must be refused before
+    anything else happens, not merely before its money/points are touched.
+
+    Does NOT gate points EARNING (`award_points_for_paid_order` /
+    `award_loyalty_points_if_enabled` in backend/app/loyalty/engine.py) —
+    that is a deliberate, separate decision, see this file's own module
+    docstring addendum below and DECISIONS.md.
+    """
+    business = (
+        await db.execute(select(Business).where(Business.id == business_id))
+    ).scalar_one_or_none()
+    if not business:
+        raise NotFoundError("Business")
+    if not business.loyalty_enabled:
+        raise AppError(
+            "LOYALTY_NOT_ENABLED",
+            "The loyalty module is not enabled for this business",
+            409,
+        )
+    return business
 
 
 # ── Schemas ──────────────────────────────────────────────────────────────────
@@ -195,6 +269,7 @@ async def get_loyalty_program(
     user: AuthUser = Depends(require_owner_or_manager),
     db: AsyncSession = Depends(get_db),
 ):
+    await _require_loyalty_enabled(db, user.business_id)
     program = await _get_or_create_program(db, user.business_id)
     return LoyaltyProgramResponse.model_validate(program)
 
@@ -205,6 +280,7 @@ async def update_loyalty_program(
     user: AuthUser = Depends(require_owner_or_manager),
     db: AsyncSession = Depends(get_db),
 ):
+    await _require_loyalty_enabled(db, user.business_id)
     program = await _get_or_create_program(db, user.business_id)
     for field, value in body.model_dump(exclude_unset=True).items():
         setattr(program, field, value)
@@ -220,6 +296,7 @@ async def list_rewards(
     user: AuthUser = Depends(require_staff_or_above),
     db: AsyncSession = Depends(get_db),
 ):
+    await _require_loyalty_enabled(db, user.business_id)
     result = await db.execute(
         select(LoyaltyReward)
         .where(LoyaltyReward.business_id == user.business_id, LoyaltyReward.is_active.is_(True))
@@ -234,6 +311,7 @@ async def create_reward(
     user: AuthUser = Depends(require_owner_or_manager),
     db: AsyncSession = Depends(get_db),
 ):
+    await _require_loyalty_enabled(db, user.business_id)
     reward = LoyaltyReward(business_id=user.business_id, **body.model_dump())
     db.add(reward)
     await db.commit()
@@ -248,6 +326,7 @@ async def update_reward(
     user: AuthUser = Depends(require_owner_or_manager),
     db: AsyncSession = Depends(get_db),
 ):
+    await _require_loyalty_enabled(db, user.business_id)
     result = await db.execute(
         select(LoyaltyReward).where(LoyaltyReward.id == reward_id, LoyaltyReward.business_id == user.business_id)
     )
@@ -267,6 +346,7 @@ async def delete_reward(
     user: AuthUser = Depends(require_owner_or_manager),
     db: AsyncSession = Depends(get_db),
 ):
+    await _require_loyalty_enabled(db, user.business_id)
     result = await db.execute(
         select(LoyaltyReward).where(LoyaltyReward.id == reward_id, LoyaltyReward.business_id == user.business_id)
     )
@@ -289,6 +369,7 @@ async def lookup_customer_by_phone(
     Find (or create, if loyalty is enabled) a customer by phone number, for
     a staff member to check a walk-in customer's points balance at the till.
     """
+    await _require_loyalty_enabled(db, user.business_id)
     program = await _get_or_create_program(db, user.business_id)
     if not program.is_enabled:
         raise NotFoundError("LoyaltyProgram")
@@ -311,6 +392,7 @@ async def redeem_loyalty_reward(
     user: AuthUser = Depends(require_staff_or_above),
     db: AsyncSession = Depends(get_db),
 ):
+    await _require_loyalty_enabled(db, user.business_id)
     program = await _get_or_create_program(db, user.business_id)
 
     cust_result = await db.execute(
@@ -387,6 +469,11 @@ async def adjust_customer_points(
     not exist at all (404 `CUSTOMER_NOT_FOUND`), matching every other
     cross-tenant-probe-resistant lookup in this codebase.
 
+    Gated on `Business.loyalty_enabled` (migration 0051) like every other
+    route in this file — see `_require_loyalty_enabled` and this module's
+    own docstring for why a manual correction is gated even though points
+    EARNING deliberately is not.
+
     A zero `points_delta` is refused (`ZERO_ADJUSTMENT`, 422) rather than
     writing a meaningless ledger row, and a downward adjustment that would
     take the balance negative is refused cleanly (`INSUFFICIENT_POINTS_FOR_ADJUSTMENT`,
@@ -415,6 +502,8 @@ async def adjust_customer_points(
     exact two-layer pattern `routes_pos.py::create_pos_order`'s own
     idempotency replay uses.
     """
+    await _require_loyalty_enabled(db, user.business_id)
+
     cust_result = await db.execute(
         select(Customer).where(Customer.id == customer_id, Customer.business_id == user.business_id)
     )

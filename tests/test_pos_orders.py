@@ -116,6 +116,13 @@ def make_business(**overrides):
         receipt_config_json=None,
         inventory_enabled=False,
         wastage_approval_threshold_cents=0,
+        # Loyalty entitlement (migration 0051, KNOWN_BUGS.md BUG-0107).
+        # Defaults True here since most POS tests aren't about the
+        # entitlement gate — the gate itself only ever reads this attribute
+        # when body.loyalty_reward_id is set (short-circuited otherwise), so
+        # this default doesn't mask the gate; see the dedicated
+        # TestLoyaltyEntitlementGate tests below for loyalty_enabled=False.
+        loyalty_enabled=True,
     )
     defaults.update(overrides)
     return types.SimpleNamespace(**defaults)
@@ -621,6 +628,58 @@ async def test_loyalty_redemption_rejected_when_program_disabled():
     with pytest.raises(AppError) as exc:
         await _run_with_loyalty(body, user, program=program, customer=None, reward=None)
     assert exc.value.code == "LOYALTY_DISABLED"
+
+
+# ── Business-level entitlement gate (migration 0051, KNOWN_BUGS.md BUG-0107) ─
+
+async def test_pos_loyalty_redemption_refused_for_non_entitled_business_nothing_mutated():
+    """
+    A request carrying loyalty_reward_id for a business without
+    Business.loyalty_enabled must be refused BEFORE any mutation — checked
+    immediately after the business is loaded, ahead of payment-method
+    validation, item resolution, customer creation, the order-number
+    sequence increment, and the redemption itself. Proven here by giving
+    FakeDB only [idempotency lookup, till, business] — if the route reached
+    any further query (item resolution is patched to assert-fail; a 4th
+    execute() would IndexError on an empty queue), this test would fail for
+    a different reason than the assertion below.
+    """
+    user = make_user(role="STAFF")
+    business = make_business(loyalty_enabled=False)
+    till = make_till(user.business_id)
+    body = make_request(payment_method="CARD", idempotency_key="redeem-gate-1")
+    body = body.model_copy(update={"loyalty_reward_id": uuid.uuid4(), "customer_phone": "0821234567"})
+
+    db = FakeDB([
+        FakeResult(scalar=None),  # idempotency lookup: no existing order
+        FakeResult(scalar=till),
+        FakeResult(scalar=business),
+    ])
+    with patch.object(
+        routes_pos, "resolve_pos_items",
+        AsyncMock(side_effect=AssertionError("must not resolve items for a non-entitled business")),
+    ):
+        with pytest.raises(AppError) as exc:
+            await create_pos_order(body=body, user=user, db=db)
+    assert exc.value.code == "LOYALTY_NOT_ENABLED"
+    assert exc.value.status_code == 409
+    assert db.commits == 0
+    assert db.added == []
+
+
+async def test_pos_checkout_without_reward_unaffected_by_non_entitled_business():
+    """The entitlement gate is scoped to loyalty_reward_id only — a normal
+    (non-loyalty) checkout must succeed regardless of Business.loyalty_enabled,
+    and a customer_phone-only checkout (points EARNING) is not gated either,
+    per this file's/routes_loyalty.py's deliberate earning carve-out."""
+    user = make_user(role="STAFF")
+    business = make_business(loyalty_enabled=False)
+    body = make_request(payment_method="CARD")
+
+    order, db = await _run(body, user, business=business)
+
+    assert order is not None
+    assert db.commits == 1
 
 
 async def test_loyalty_redemption_rejects_reward_with_no_cents_value():

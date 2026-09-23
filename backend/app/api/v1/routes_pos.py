@@ -479,6 +479,22 @@ async def create_pos_order(
     if not business:
         raise NotFoundError("Business")
 
+    # Loyalty commercial-package gate (migration 0051, KNOWN_BUGS.md
+    # BUG-0107) — checked as early as possible, right after the business is
+    # loaded and before ANY mutation (customer creation, item resolution,
+    # the order-number sequence increment, or redemption itself), so a
+    # request carrying loyalty_reward_id from a non-entitled business is
+    # refused with nothing touched. Deliberately scoped to loyalty_reward_id
+    # only, not to customer_phone alone — a plain customer lookup/points
+    # EARNING is NOT gated (see routes_loyalty.py's module docstring and
+    # DECISIONS.md for the earning-vs-redemption carve-out reasoning).
+    if body.loyalty_reward_id is not None and not business.loyalty_enabled:
+        raise AppError(
+            "LOYALTY_NOT_ENABLED",
+            "The loyalty module is not enabled for this business",
+            409,
+        )
+
     if not _payment_method_enabled(business, body.payment_method):
         raise AppError(
             "PAYMENT_METHOD_NOT_ACCEPTED",

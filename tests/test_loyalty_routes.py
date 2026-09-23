@@ -3,6 +3,7 @@ Loyalty routes (backend/app/api/v1/routes_loyalty.py) — program config,
 reward catalogue CRUD, and the staff-facing customer-lookup/redeem
 endpoints the POS will call.
 """
+import types
 import uuid
 from datetime import datetime, timezone
 
@@ -113,11 +114,27 @@ def make_program(business_id, **overrides):
     return p
 
 
+def make_business(business_id=None, **overrides):
+    """
+    Stands in for the Business row `_require_loyalty_enabled()` (migration
+    0051, KNOWN_BUGS.md BUG-0107) now fetches FIRST in every route in this
+    file. Defaults loyalty_enabled=True so every pre-existing test in this
+    file (written before the entitlement gate existed) keeps exercising its
+    own actual behaviour rather than being short-circuited by the gate —
+    the gate's OWN refusal behaviour is covered by the dedicated
+    `TestLoyaltyEntitlementGate` tests below.
+    """
+    defaults = dict(id=business_id or uuid.uuid4(), loyalty_enabled=True)
+    defaults.update(overrides)
+    return types.SimpleNamespace(**defaults)
+
+
 # ── Program config ───────────────────────────────────────────────────────────
 
 async def test_get_program_creates_default_disabled_program_when_none_exists():
     user = make_user()
-    db = FakeDB([FakeResult(scalar=None)])  # no existing program
+    business = make_business(user.business_id)
+    db = FakeDB([FakeResult(scalar=business), FakeResult(scalar=None)])  # no existing program
 
     result = await get_loyalty_program(user=user, db=db)
 
@@ -127,8 +144,9 @@ async def test_get_program_creates_default_disabled_program_when_none_exists():
 
 async def test_get_program_returns_existing():
     user = make_user()
+    business = make_business(user.business_id)
     program = make_program(user.business_id, is_enabled=True, points_per_rand=3)
-    db = FakeDB([FakeResult(scalar=program)])
+    db = FakeDB([FakeResult(scalar=business), FakeResult(scalar=program)])
 
     result = await get_loyalty_program(user=user, db=db)
 
@@ -139,8 +157,9 @@ async def test_get_program_returns_existing():
 
 async def test_update_program_applies_only_provided_fields():
     user = make_user()
+    business = make_business(user.business_id)
     program = make_program(user.business_id, is_enabled=False, points_per_rand=1)
-    db = FakeDB([FakeResult(scalar=program)])
+    db = FakeDB([FakeResult(scalar=business), FakeResult(scalar=program)])
 
     result = await update_loyalty_program(
         body=LoyaltyProgramUpdate(is_enabled=True, points_per_rand=5), user=user, db=db,
@@ -154,7 +173,8 @@ async def test_update_program_applies_only_provided_fields():
 
 async def test_create_reward():
     user = make_user()
-    db = FakeDB([])
+    business = make_business(user.business_id)
+    db = FakeDB([FakeResult(scalar=business)])
 
     result = await create_reward(
         body=LoyaltyRewardCreate(name="Free Coffee", points_cost=100), user=user, db=db,
@@ -167,9 +187,10 @@ async def test_create_reward():
 
 async def test_delete_reward_soft_deletes():
     user = make_user()
+    business = make_business(user.business_id)
     reward = LoyaltyReward(business_id=user.business_id, name="Free Coffee", points_cost=100)
     FakeDB([])._finalize(reward)
-    db = FakeDB([FakeResult(scalar=reward)])
+    db = FakeDB([FakeResult(scalar=business), FakeResult(scalar=reward)])
 
     await delete_reward(reward_id=reward.id, user=user, db=db)
 
@@ -178,7 +199,8 @@ async def test_delete_reward_soft_deletes():
 
 async def test_delete_unknown_reward_is_404():
     user = make_user()
-    db = FakeDB([FakeResult(scalar=None)])
+    business = make_business(user.business_id)
+    db = FakeDB([FakeResult(scalar=business), FakeResult(scalar=None)])
 
     with pytest.raises(NotFoundError):
         await delete_reward(reward_id=uuid.uuid4(), user=user, db=db)
@@ -188,8 +210,9 @@ async def test_delete_unknown_reward_is_404():
 
 async def test_lookup_customer_is_404_when_loyalty_disabled():
     user = make_user(role="STAFF")
+    business = make_business(user.business_id)
     program = make_program(user.business_id, is_enabled=False)
-    db = FakeDB([FakeResult(scalar=program)])
+    db = FakeDB([FakeResult(scalar=business), FakeResult(scalar=program)])
 
     with pytest.raises(NotFoundError):
         await lookup_customer_by_phone(phone="0821234567", user=user, db=db)
@@ -197,8 +220,9 @@ async def test_lookup_customer_is_404_when_loyalty_disabled():
 
 async def test_lookup_customer_creates_when_enabled_and_none_found():
     user = make_user(role="STAFF")
+    business = make_business(user.business_id)
     program = make_program(user.business_id, is_enabled=True)
-    db = FakeDB([FakeResult(scalar=program), FakeResult(scalar=None)])
+    db = FakeDB([FakeResult(scalar=business), FakeResult(scalar=program), FakeResult(scalar=None)])
 
     result = await lookup_customer_by_phone(phone="0821234567", user=user, db=db)
 
@@ -212,8 +236,9 @@ async def test_lookup_customer_creates_when_enabled_and_none_found():
 
 async def test_lookup_customer_rejects_unparseable_phone():
     user = make_user(role="STAFF")
+    business = make_business(user.business_id)
     program = make_program(user.business_id, is_enabled=True)
-    db = FakeDB([FakeResult(scalar=program)])
+    db = FakeDB([FakeResult(scalar=business), FakeResult(scalar=program)])
 
     from backend.app.core.errors import AppError
 
@@ -224,16 +249,18 @@ async def test_lookup_customer_rejects_unparseable_phone():
 
 async def test_redeem_via_route_success():
     user = make_user(role="STAFF")
+    business = make_business(user.business_id)
     program = make_program(user.business_id, is_enabled=True)
     customer = Customer(business_id=user.business_id, phone_number="0821234567", loyalty_points_balance=500)
     FakeDB([])._finalize(customer)
     reward = LoyaltyReward(business_id=user.business_id, name="Free Coffee", points_cost=200)
     FakeDB([])._finalize(reward)
 
-    # Query order: program lookup, unlocked customer lookup (404 check),
-    # reward lookup, then redeem_reward()'s OWN row-lock reselect of the
-    # SAME customer (BUG-0097 fix) — four executes, not three.
+    # Query order: business entitlement lookup, program lookup, unlocked
+    # customer lookup (404 check), reward lookup, then redeem_reward()'s OWN
+    # row-lock reselect of the SAME customer (BUG-0097 fix) — five executes.
     db = FakeDB([
+        FakeResult(scalar=business),
         FakeResult(scalar=program), FakeResult(scalar=customer),
         FakeResult(scalar=reward), FakeResult(scalar=customer),
     ])
@@ -291,8 +318,9 @@ async def test_adjust_points_customer_in_another_business_is_not_found():
     so a cross-tenant id and a nonexistent one both resolve to the exact
     same scalar_one_or_none()=None the query would genuinely return."""
     user = make_user(role="OWNER")
+    business = make_business(user.business_id)
     other_business_customer_id = uuid.uuid4()
-    db = FakeDB([FakeResult(scalar=None)])  # business_id filter excludes the other tenant's row
+    db = FakeDB([FakeResult(scalar=business), FakeResult(scalar=None)])  # business_id filter excludes the other tenant's row
 
     with pytest.raises(NotFoundError) as exc:
         await adjust_customer_points(
@@ -307,9 +335,10 @@ async def test_adjust_points_customer_in_another_business_is_not_found():
 
 async def test_adjust_points_route_rejects_zero_delta():
     user = make_user(role="OWNER")
+    business = make_business(user.business_id)
     customer = make_customer(user.business_id)
     program = make_program(user.business_id, is_enabled=True)
-    db = FakeDB([FakeResult(scalar=customer), FakeResult(scalar=program)])
+    db = FakeDB([FakeResult(scalar=business), FakeResult(scalar=customer), FakeResult(scalar=program)])
 
     with pytest.raises(AppError) as exc:
         await adjust_customer_points(
@@ -324,9 +353,11 @@ async def test_adjust_points_route_rejects_zero_delta():
 
 async def test_adjust_points_route_refuses_negative_balance_cleanly():
     user = make_user(role="MANAGER")
+    business = make_business(user.business_id)
     customer = make_customer(user.business_id, loyalty_points_balance=100)
     program = make_program(user.business_id, is_enabled=True)
     db = FakeDB([
+        FakeResult(scalar=business),   # entitlement gate
         FakeResult(scalar=customer),  # tenant-scoped lookup
         FakeResult(scalar=program),   # program lookup for tier recompute
         FakeResult(scalar=customer),  # adjust_points' own row-lock reselect
@@ -346,9 +377,11 @@ async def test_adjust_points_route_refuses_negative_balance_cleanly():
 
 async def test_adjust_points_route_success_upward_writes_ledger_and_audit_event():
     user = make_user(role="OWNER")
+    business = make_business(user.business_id)
     customer = make_customer(user.business_id, loyalty_points_balance=500)
     program = make_program(user.business_id, is_enabled=True)
     db = FakeDB([
+        FakeResult(scalar=business),
         FakeResult(scalar=customer),
         FakeResult(scalar=program),
         FakeResult(scalar=customer),  # row-lock reselect
@@ -385,9 +418,11 @@ async def test_adjust_points_route_success_upward_writes_ledger_and_audit_event(
 
 async def test_adjust_points_route_success_downward():
     user = make_user(role="OWNER")
+    business = make_business(user.business_id)
     customer = make_customer(user.business_id, loyalty_points_balance=500)
     program = make_program(user.business_id, is_enabled=True)
     db = FakeDB([
+        FakeResult(scalar=business),
         FakeResult(scalar=customer),
         FakeResult(scalar=program),
         FakeResult(scalar=customer),
@@ -409,6 +444,7 @@ async def test_adjust_points_route_idempotent_replay_on_repeated_key():
     adjustment must replay the original result, not apply a second one —
     the common-case pre-check path (no race, no IntegrityError)."""
     user = make_user(role="OWNER")
+    business = make_business(user.business_id)
     customer = make_customer(user.business_id, loyalty_points_balance=500)
     existing_txn = LoyaltyTransaction(
         business_id=user.business_id, customer_id=customer.id, order_id=None,
@@ -418,6 +454,7 @@ async def test_adjust_points_route_idempotent_replay_on_repeated_key():
     FakeDB([])._finalize(existing_txn)
 
     db = FakeDB([
+        FakeResult(scalar=business),       # entitlement gate
         FakeResult(scalar=customer),       # tenant-scoped lookup
         FakeResult(scalar=existing_txn),   # idempotency pre-check finds the original
     ])
@@ -444,6 +481,7 @@ async def test_adjust_points_route_race_caught_by_unique_index_returns_committed
     must replay the winner's committed result instead of 500ing or
     double-adjusting."""
     user = make_user(role="OWNER")
+    business = make_business(user.business_id)
     customer = make_customer(user.business_id, loyalty_points_balance=500)
     winner_txn = LoyaltyTransaction(
         business_id=user.business_id, customer_id=customer.id, order_id=None,
@@ -454,6 +492,7 @@ async def test_adjust_points_route_race_caught_by_unique_index_returns_committed
 
     db = FakeDB(
         [
+            FakeResult(scalar=business),     # entitlement gate
             FakeResult(scalar=customer),     # tenant-scoped lookup
             FakeResult(scalar=None),         # pre-check passes (race window)
             FakeResult(scalar=None),         # program lookup — none configured
@@ -473,3 +512,198 @@ async def test_adjust_points_route_race_caught_by_unique_index_returns_committed
     assert result.balance_after == 540
     assert db.rollbacks == 1
     assert db.commits == 0
+
+
+# ── Missing route-layer coverage: list_rewards / update_reward ─────────────
+# Neither had a dedicated test in this file before the entitlement gate was
+# added — closing that gap in the same pass, per this task's "add coverage
+# that would catch a sixth [missing-schema-field] occurrence" instruction.
+
+class _Scalars:
+    def __init__(self, items):
+        self._items = items
+
+    def all(self):
+        return self._items
+
+
+class _ListResult:
+    """FakeResult's scalar_one_or_none() shape doesn't cover list_rewards'
+    select(...).scalars().all() call — this stands in for that specific
+    query shape only."""
+
+    def __init__(self, items):
+        self._items = items
+
+    def scalars(self):
+        return _Scalars(self._items)
+
+
+async def test_list_rewards_returns_only_active_rewards_for_this_business():
+    user = make_user(role="STAFF")
+    business = make_business(user.business_id)
+    reward = LoyaltyReward(business_id=user.business_id, name="Free Coffee", points_cost=100)
+    FakeDB([])._finalize(reward)
+    db = FakeDB([FakeResult(scalar=business)])
+    db._results.append(_ListResult([reward]))
+
+    result = await list_rewards(user=user, db=db)
+
+    assert len(result) == 1
+    assert result[0].name == "Free Coffee"
+
+
+async def test_update_reward_applies_only_provided_fields():
+    user = make_user(role="OWNER")
+    business = make_business(user.business_id)
+    reward = LoyaltyReward(business_id=user.business_id, name="Free Coffee", points_cost=100)
+    FakeDB([])._finalize(reward)
+    db = FakeDB([FakeResult(scalar=business), FakeResult(scalar=reward)])
+
+    result = await update_reward(
+        reward_id=reward.id, body=LoyaltyRewardUpdate(points_cost=150), user=user, db=db,
+    )
+
+    assert result.points_cost == 150
+    assert result.name == "Free Coffee"  # untouched
+
+
+async def test_update_reward_unknown_is_404():
+    user = make_user(role="OWNER")
+    business = make_business(user.business_id)
+    db = FakeDB([FakeResult(scalar=business), FakeResult(scalar=None)])
+
+    with pytest.raises(NotFoundError):
+        await update_reward(reward_id=uuid.uuid4(), body=LoyaltyRewardUpdate(points_cost=1), user=user, db=db)
+
+
+# ── Entitlement gate refusal (migration 0051, KNOWN_BUGS.md BUG-0107) ──────
+# Every route in this file must refuse with 409 LOYALTY_NOT_ENABLED — checked
+# FIRST, before any other query or mutation — for a business the platform
+# has not entitled to the Loyalty module. Each test below gives FakeDB only
+# the single business-lookup result, proving the route reaches nowhere else
+# (a second execute() call would IndexError on an empty queue).
+
+class TestLoyaltyEntitlementGate:
+    async def test_get_program_refused_for_non_entitled_business(self):
+        user = make_user(role="OWNER")
+        business = make_business(user.business_id, loyalty_enabled=False)
+        db = FakeDB([FakeResult(scalar=business)])
+
+        with pytest.raises(AppError) as exc:
+            await get_loyalty_program(user=user, db=db)
+        assert exc.value.code == "LOYALTY_NOT_ENABLED"
+        assert exc.value.status_code == 409
+
+    async def test_update_program_refused_for_non_entitled_business(self):
+        user = make_user(role="OWNER")
+        business = make_business(user.business_id, loyalty_enabled=False)
+        db = FakeDB([FakeResult(scalar=business)])
+
+        with pytest.raises(AppError) as exc:
+            await update_loyalty_program(
+                body=LoyaltyProgramUpdate(is_enabled=True), user=user, db=db,
+            )
+        assert exc.value.code == "LOYALTY_NOT_ENABLED"
+        assert db.commits == 0
+        assert db.added == []
+
+    async def test_list_rewards_refused_for_non_entitled_business(self):
+        user = make_user(role="STAFF")
+        business = make_business(user.business_id, loyalty_enabled=False)
+        db = FakeDB([FakeResult(scalar=business)])
+
+        with pytest.raises(AppError) as exc:
+            await list_rewards(user=user, db=db)
+        assert exc.value.code == "LOYALTY_NOT_ENABLED"
+
+    async def test_create_reward_refused_for_non_entitled_business(self):
+        user = make_user(role="OWNER")
+        business = make_business(user.business_id, loyalty_enabled=False)
+        db = FakeDB([FakeResult(scalar=business)])
+
+        with pytest.raises(AppError) as exc:
+            await create_reward(
+                body=LoyaltyRewardCreate(name="Free Coffee", points_cost=100), user=user, db=db,
+            )
+        assert exc.value.code == "LOYALTY_NOT_ENABLED"
+        assert db.commits == 0
+        assert db.added == []
+
+    async def test_update_reward_refused_for_non_entitled_business(self):
+        user = make_user(role="OWNER")
+        business = make_business(user.business_id, loyalty_enabled=False)
+        db = FakeDB([FakeResult(scalar=business)])
+
+        with pytest.raises(AppError) as exc:
+            await update_reward(
+                reward_id=uuid.uuid4(), body=LoyaltyRewardUpdate(points_cost=1), user=user, db=db,
+            )
+        assert exc.value.code == "LOYALTY_NOT_ENABLED"
+
+    async def test_delete_reward_refused_for_non_entitled_business(self):
+        user = make_user(role="OWNER")
+        business = make_business(user.business_id, loyalty_enabled=False)
+        db = FakeDB([FakeResult(scalar=business)])
+
+        with pytest.raises(AppError) as exc:
+            await delete_reward(reward_id=uuid.uuid4(), user=user, db=db)
+        assert exc.value.code == "LOYALTY_NOT_ENABLED"
+        assert db.commits == 0
+
+    async def test_lookup_customer_refused_for_non_entitled_business(self):
+        user = make_user(role="STAFF")
+        business = make_business(user.business_id, loyalty_enabled=False)
+        db = FakeDB([FakeResult(scalar=business)])
+
+        with pytest.raises(AppError) as exc:
+            await lookup_customer_by_phone(phone="0821234567", user=user, db=db)
+        assert exc.value.code == "LOYALTY_NOT_ENABLED"
+
+    async def test_redeem_refused_for_non_entitled_business(self):
+        user = make_user(role="STAFF")
+        business = make_business(user.business_id, loyalty_enabled=False)
+        db = FakeDB([FakeResult(scalar=business)])
+
+        with pytest.raises(AppError) as exc:
+            await redeem_loyalty_reward(
+                body=RedeemRequest(customer_id=uuid.uuid4(), reward_id=uuid.uuid4()), user=user, db=db,
+            )
+        assert exc.value.code == "LOYALTY_NOT_ENABLED"
+        assert db.commits == 0
+
+    async def test_adjust_points_refused_for_non_entitled_business(self):
+        user = make_user(role="OWNER")
+        business = make_business(user.business_id, loyalty_enabled=False)
+        db = FakeDB([FakeResult(scalar=business)])
+
+        with pytest.raises(AppError) as exc:
+            await adjust_customer_points(
+                customer_id=uuid.uuid4(),
+                body=LoyaltyAdjustmentRequest(points_delta=10, reason="Should never be reached"),
+                user=user, db=db,
+            )
+        assert exc.value.code == "LOYALTY_NOT_ENABLED"
+        assert db.commits == 0
+        assert db.added == []
+
+    async def test_get_program_business_not_found_is_404(self):
+        """A business_id that resolves to no row at all (should never happen
+        for a real JWT, but defensive) is a distinct 404, not a 409."""
+        user = make_user(role="OWNER")
+        db = FakeDB([FakeResult(scalar=None)])
+
+        with pytest.raises(NotFoundError):
+            await get_loyalty_program(user=user, db=db)
+
+    async def test_get_program_succeeds_for_entitled_business(self):
+        """Positive control — an entitled business is unaffected by the
+        gate and reaches its normal program-fetch/create behaviour."""
+        user = make_user(role="OWNER")
+        business = make_business(user.business_id, loyalty_enabled=True)
+        db = FakeDB([FakeResult(scalar=business), FakeResult(scalar=None)])
+
+        result = await get_loyalty_program(user=user, db=db)
+
+        assert result.is_enabled is False
+        assert db.commits == 1
