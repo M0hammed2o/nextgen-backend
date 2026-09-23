@@ -63,6 +63,21 @@ class WastageEntry(Base, UUIDPrimaryKeyMixin):
         nullable=True,
         comment="Manager sign-off, required above Business.wastage_approval_threshold_cents",
     )
+    rejected_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=True,
+        comment=(
+            "Manager rejection of an entry that had not yet been approved. "
+            "Mutually exclusive with approved_by_user_id in application "
+            "logic (routes_wastage.py refuses to reject an approved entry "
+            "or approve a rejected one) — not DB-enforced, same pattern as "
+            "the rest of this table's soft state."
+        ),
+    )
+    rejected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    rejection_reason: Mapped[str | None] = mapped_column(
+        Text, nullable=True, comment="Why the manager disagreed the loss should stand"
+    )
     photo_asset_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("assets.id", ondelete="SET NULL"), nullable=True
     )

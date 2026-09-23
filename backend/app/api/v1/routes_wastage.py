@@ -18,13 +18,20 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.app.api.v1.routes_assets import asset_public_url
 from backend.app.core.errors import AppError, NotFoundError
 from backend.app.core.ownership import require_owned
 from backend.app.core.rbac import AuthUser, require_owner_or_manager, require_staff_or_above
 from backend.app.db.session import get_db
-from backend.app.inventory.ledger import build_movement, wastage_idempotency_key
+from backend.app.inventory.ledger import (
+    build_movement,
+    is_idempotency_violation,
+    wastage_idempotency_key,
+    wastage_reversal_idempotency_key,
+)
 from backend.app.inventory.units import UnitError, format_quantity, to_milli, value_cents
 from shared.enums import (
     CanonicalUnit,
@@ -34,7 +41,7 @@ from shared.enums import (
 )
 from shared.models.asset import Asset
 from shared.models.business import Business
-from shared.models.inventory import Ingredient
+from shared.models.inventory import Ingredient, StockMovement
 from shared.models.order import Order
 from shared.models.user import BusinessUser
 from shared.models.wastage import WastageEntry
@@ -100,6 +107,82 @@ async def _staff_name_map(
     return {row[0]: row[1] for row in rows}
 
 
+async def _photo_url_map(db: AsyncSession, business_id: uuid.UUID, asset_ids: set) -> dict:
+    """
+    Tenant-scoped, batched resolution of photo_asset_id -> a displayable
+    URL, same pattern as routes_menu.py's image_asset_id resolution.
+    Skips the query entirely when nothing needs resolving (the common case:
+    most wastage entries carry no photo), so this never adds an extra round
+    trip to the hot path.
+    """
+    ids = {a for a in asset_ids if a is not None}
+    if not ids:
+        return {}
+    rows = (
+        await db.execute(
+            select(Asset.id, Asset.storage_path).where(
+                Asset.business_id == business_id,
+                Asset.id.in_(ids),
+            )
+        )
+    ).all()
+    return {row[0]: asset_public_url(row[1]) for row in rows}
+
+
+def _wastage_status(entry: WastageEntry, requires_approval: bool) -> str:
+    """
+    One-word summary of where an entry sits in the review lifecycle.
+    REJECTED and APPROVED are mutually exclusive in application logic (see
+    reject_wastage/approve_wastage); PENDING_APPROVAL only applies while
+    neither has happened yet AND the entry actually needs sign-off.
+    """
+    if entry.rejected_by_user_id is not None:
+        return "REJECTED"
+    if entry.approved_by_user_id is not None:
+        return "APPROVED"
+    if requires_approval:
+        return "PENDING_APPROVAL"
+    return "NOT_REQUIRED"
+
+
+def _wastage_response(
+    entry: WastageEntry,
+    ingredient: Ingredient,
+    threshold: int,
+    names: dict,
+    photo_urls: dict,
+) -> "WastageResponse":
+    """Single builder for the response shape, used by every route below so
+    create/list/approve/reject can never drift out of sync with each other."""
+    requires_approval = bool(threshold) and int(entry.value_cents or 0) >= threshold
+    return WastageResponse(
+        id=entry.id,
+        ingredient_id=entry.ingredient_id,
+        ingredient_name=ingredient.name,
+        quantity_milli=int(entry.quantity_milli),
+        quantity_display=format_quantity(
+            int(entry.quantity_milli), CanonicalUnit(ingredient.canonical_unit),
+            ingredient.unit_label
+        ),
+        reason=entry.reason,
+        note=entry.note,
+        value_cents=int(entry.value_cents or 0),
+        requires_approval=requires_approval,
+        approved_by_user_id=entry.approved_by_user_id,
+        rejected_by_user_id=entry.rejected_by_user_id,
+        rejection_reason=entry.rejection_reason,
+        rejected_at=entry.rejected_at,
+        status=_wastage_status(entry, requires_approval),
+        logged_by_name=names.get(entry.created_by_user_id),
+        approved_by_name=names.get(entry.approved_by_user_id),
+        rejected_by_name=names.get(entry.rejected_by_user_id),
+        related_order_id=entry.related_order_id,
+        photo_asset_id=entry.photo_asset_id,
+        photo_url=photo_urls.get(entry.photo_asset_id),
+        occurred_at=entry.occurred_at,
+    )
+
+
 class WastageCreateRequest(BaseModel):
     ingredient_id: uuid.UUID
     quantity: str = Field(description="Positive magnitude wasted")
@@ -130,9 +213,25 @@ class WastageResponse(BaseModel):
     value_cents: int
     requires_approval: bool
     approved_by_user_id: uuid.UUID | None
+    rejected_by_user_id: uuid.UUID | None = None
+    rejection_reason: str | None = None
+    rejected_at: datetime | None = None
+    status: str = "NOT_REQUIRED"
     logged_by_name: str | None = None
     approved_by_name: str | None = None
+    rejected_by_name: str | None = None
+    related_order_id: uuid.UUID | None = None
+    photo_asset_id: uuid.UUID | None = None
+    photo_url: str | None = None
     occurred_at: datetime
+
+
+class WastageRejectRequest(BaseModel):
+    reason: str = Field(
+        min_length=3, max_length=500,
+        description="Why this entry is being rejected — required, distinct "
+                    "from the entry's own loss reason code",
+    )
 
 
 @router.get("/reasons")
@@ -263,38 +362,38 @@ async def record_wastage(
     await db.refresh(entry)
 
     names = await _staff_name_map(
-        db, user.business_id, {entry.created_by_user_id, entry.approved_by_user_id}
+        db, user.business_id,
+        {entry.created_by_user_id, entry.approved_by_user_id, entry.rejected_by_user_id},
     )
+    photo_urls = await _photo_url_map(db, user.business_id, {entry.photo_asset_id})
 
-    return WastageResponse(
-        id=entry.id,
-        ingredient_id=ingredient.id,
-        ingredient_name=ingredient.name,
-        quantity_milli=quantity_milli,
-        quantity_display=format_quantity(
-            quantity_milli, CanonicalUnit(ingredient.canonical_unit), ingredient.unit_label
-        ),
-        reason=entry.reason,
-        note=entry.note,
-        value_cents=loss_value,
-        requires_approval=requires_approval,
-        approved_by_user_id=entry.approved_by_user_id,
-        logged_by_name=names.get(entry.created_by_user_id),
-        approved_by_name=names.get(entry.approved_by_user_id),
-        occurred_at=entry.occurred_at,
-    )
+    return _wastage_response(entry, ingredient, threshold, names, photo_urls)
 
 
 @router.get("", response_model=list[WastageResponse])
 async def list_wastage(
     limit: int = Query(100, ge=1, le=500),
     since: datetime | None = Query(None),
+    pending_only: bool = Query(
+        False,
+        description="Only entries awaiting manager review — value at/above "
+                    "the business's approval threshold, neither approved "
+                    "nor rejected yet. The review queue view.",
+    ),
     user: AuthUser = Depends(require_staff_or_above),
     db: AsyncSession = Depends(get_db),
 ):
     """Recent wastage, newest first."""
     business = await _require_inventory_enabled(db, user.business_id)
     threshold = int(business.wastage_approval_threshold_cents or 0)
+
+    if pending_only and not threshold:
+        # Nothing can be "pending" when the business has no approval
+        # threshold configured at all — every entry is NOT_REQUIRED, so an
+        # unfiltered query would return everything, which would be
+        # misleading for a screen titled "awaiting approval".
+        return []
+
     stmt = (
         select(WastageEntry, Ingredient)
         .join(Ingredient, Ingredient.id == WastageEntry.ingredient_id)
@@ -304,41 +403,29 @@ async def list_wastage(
     )
     if since is not None:
         stmt = stmt.where(WastageEntry.occurred_at >= since)
+    if pending_only:
+        stmt = stmt.where(
+            WastageEntry.approved_by_user_id.is_(None),
+            WastageEntry.rejected_by_user_id.is_(None),
+            WastageEntry.value_cents >= threshold,
+        )
 
     rows = (await db.execute(stmt)).all()
 
-    # One batched tenant-scoped name lookup for every entry on this page,
-    # instead of a query per row.
+    # One batched tenant-scoped name/photo lookup for every entry on this
+    # page, instead of a query per row.
     name_ids = set()
+    photo_ids = set()
     for entry, _ in rows:
         name_ids.add(entry.created_by_user_id)
         name_ids.add(entry.approved_by_user_id)
+        name_ids.add(entry.rejected_by_user_id)
+        photo_ids.add(entry.photo_asset_id)
     names = await _staff_name_map(db, user.business_id, name_ids)
+    photo_urls = await _photo_url_map(db, user.business_id, photo_ids)
 
     return [
-        WastageResponse(
-            id=entry.id,
-            ingredient_id=entry.ingredient_id,
-            ingredient_name=ingredient.name,
-            quantity_milli=int(entry.quantity_milli),
-            quantity_display=format_quantity(
-                int(entry.quantity_milli), CanonicalUnit(ingredient.canonical_unit),
-                ingredient.unit_label
-            ),
-            reason=entry.reason,
-            note=entry.note,
-            value_cents=int(entry.value_cents or 0),
-            # Derived from the business's CURRENT threshold (not persisted
-            # per-entry) — whether this loss needed sign-off, independent of
-            # whether it has been approved yet. Previously this incorrectly
-            # equated "requires_approval" with "already approved", which
-            # made a pending entry look like it needed no approval at all.
-            requires_approval=bool(threshold) and int(entry.value_cents or 0) >= threshold,
-            approved_by_user_id=entry.approved_by_user_id,
-            logged_by_name=names.get(entry.created_by_user_id),
-            approved_by_name=names.get(entry.approved_by_user_id),
-            occurred_at=entry.occurred_at,
-        )
+        _wastage_response(entry, ingredient, threshold, names, photo_urls)
         for entry, ingredient in rows
     ]
 
@@ -377,30 +464,157 @@ async def approve_wastage(
         raise NotFoundError("Wastage entry", str(entry_id))
     entry, ingredient = row
 
+    if entry.rejected_by_user_id is not None:
+        raise AppError(
+            "WASTAGE_ALREADY_REJECTED",
+            "This entry was rejected and cannot be approved. "
+            "Log a fresh entry if the loss should be recorded after all.",
+            409,
+        )
+
     if entry.approved_by_user_id is None:
         entry.approved_by_user_id = user.user_id
         await db.commit()
         await db.refresh(entry)
 
     names = await _staff_name_map(
-        db, user.business_id, {entry.created_by_user_id, entry.approved_by_user_id}
+        db, user.business_id,
+        {entry.created_by_user_id, entry.approved_by_user_id, entry.rejected_by_user_id},
     )
+    photo_urls = await _photo_url_map(db, user.business_id, {entry.photo_asset_id})
 
-    return WastageResponse(
-        id=entry.id,
-        ingredient_id=entry.ingredient_id,
-        ingredient_name=ingredient.name,
-        quantity_milli=int(entry.quantity_milli),
-        quantity_display=format_quantity(
-            int(entry.quantity_milli), CanonicalUnit(ingredient.canonical_unit),
-            ingredient.unit_label
-        ),
-        reason=entry.reason,
-        note=entry.note,
-        value_cents=int(entry.value_cents or 0),
-        requires_approval=bool(threshold) and int(entry.value_cents or 0) >= threshold,
-        approved_by_user_id=entry.approved_by_user_id,
-        logged_by_name=names.get(entry.created_by_user_id),
-        approved_by_name=names.get(entry.approved_by_user_id),
-        occurred_at=entry.occurred_at,
+    return _wastage_response(entry, ingredient, threshold, names, photo_urls)
+
+
+@router.post("/{entry_id}/reject", response_model=WastageResponse)
+async def reject_wastage(
+    entry_id: uuid.UUID,
+    body: WastageRejectRequest,
+    user: AuthUser = Depends(require_owner_or_manager),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Reject a wastage entry a manager disagrees with, reversing its stock
+    movement.
+
+    WHY A REVERSAL, NOT A NO-OP
+    ----------------------------
+    record_wastage posts the stock deduction at SUBMISSION time, not at
+    approval time — the loss is already physically gone the moment it's
+    logged, so the ledger has to reflect that immediately regardless of
+    whether a manager later signs off (see record_wastage's own docstring).
+    Rejecting therefore means putting the stock back, not skipping a
+    deduction that was never made.
+
+    INVARIANT: EXACTLY ONE REVERSAL, EVER
+    --------------------------------------
+    The reversal is keyed with wastage_reversal_idempotency_key(entry_id,
+    ingredient_id), paired with the same partial unique index on
+    (business_id, idempotency_key) that already guarantees "at most one
+    movement" for a sale, a stocktake adjustment, and the original wastage
+    deduction itself. That is the enforcement mechanism — not application
+    bookkeeping — so a genuine race between two reject calls can post the
+    reversal at most once even if both pass the in-memory checks below.
+
+    An entry that has already been approved cannot be rejected (approval is
+    a closed, signed-off record; use a manual adjustment to correct it
+    instead). Rejecting an already-rejected entry is a no-op that returns
+    the same state without posting a second reversal.
+    """
+    business = await _require_inventory_enabled(db, user.business_id)
+    threshold = int(business.wastage_approval_threshold_cents or 0)
+
+    row = (
+        await db.execute(
+            select(WastageEntry, Ingredient)
+            .join(Ingredient, Ingredient.id == WastageEntry.ingredient_id)
+            .where(
+                WastageEntry.id == entry_id,
+                WastageEntry.business_id == user.business_id,
+            )
+        )
+    ).first()
+    if not row:
+        raise NotFoundError("Wastage entry", str(entry_id))
+    entry, ingredient = row
+
+    if entry.approved_by_user_id is not None:
+        raise AppError(
+            "WASTAGE_ALREADY_APPROVED",
+            "This entry was already approved and cannot be rejected. "
+            "Use a manual stock adjustment to correct it instead.",
+            409,
+        )
+
+    if entry.rejected_by_user_id is None:
+        original = (
+            await db.execute(
+                select(StockMovement)
+                .where(
+                    StockMovement.business_id == user.business_id,
+                    StockMovement.source_type == StockSourceType.WASTAGE_ENTRY.value,
+                    StockMovement.source_id == entry.id,
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if original is None:
+            # Should be unreachable — record_wastage always posts exactly
+            # one movement per entry (see its own docstring) — but refuse
+            # rather than mark this entry rejected with no matching stock
+            # reversal, which would leave the ledger and the entry's status
+            # disagreeing with each other.
+            raise AppError(
+                "WASTAGE_MOVEMENT_MISSING",
+                "No stock movement was found for this entry, so it cannot "
+                "be safely rejected. Contact support.",
+                409,
+            )
+
+        entry.rejected_by_user_id = user.user_id
+        entry.rejected_at = datetime.now(timezone.utc)
+        entry.rejection_reason = body.reason
+        db.add(
+            build_movement(
+                business_id=user.business_id,
+                ingredient_id=entry.ingredient_id,
+                quantity_milli=-int(original.quantity_milli),  # negate the original
+                movement_type=StockMovementType.WASTAGE_REVERSAL.value,
+                unit_cost_micro_cents=int(original.unit_cost_micro_cents or 0),
+                source_type=StockSourceType.WASTAGE_ENTRY.value,
+                source_id=entry.id,
+                created_by_user_id=user.user_id,
+                idempotency_key=wastage_reversal_idempotency_key(entry.id, entry.ingredient_id),
+                notes=f"Rejected: {body.reason}",
+            )
+        )
+        try:
+            await db.commit()
+        except IntegrityError as exc:
+            await db.rollback()
+            if not is_idempotency_violation(exc):
+                raise
+            # A concurrent reject call already won the race and committed
+            # its reversal — reload and return that committed state rather
+            # than erroring, so a retried request is genuinely idempotent.
+            row = (
+                await db.execute(
+                    select(WastageEntry, Ingredient)
+                    .join(Ingredient, Ingredient.id == WastageEntry.ingredient_id)
+                    .where(
+                        WastageEntry.id == entry_id,
+                        WastageEntry.business_id == user.business_id,
+                    )
+                )
+            ).first()
+            entry, ingredient = row
+        else:
+            await db.refresh(entry)
+
+    names = await _staff_name_map(
+        db, user.business_id,
+        {entry.created_by_user_id, entry.approved_by_user_id, entry.rejected_by_user_id},
     )
+    photo_urls = await _photo_url_map(db, user.business_id, {entry.photo_asset_id})
+
+    return _wastage_response(entry, ingredient, threshold, names, photo_urls)

@@ -90,6 +90,17 @@ def wastage_idempotency_key(entry_id: uuid.UUID, ingredient_id: uuid.UUID) -> st
     return f"WASTAGE:{entry_id}:{ingredient_id}"
 
 
+def wastage_reversal_idempotency_key(entry_id: uuid.UUID, ingredient_id: uuid.UUID) -> str:
+    """
+    Scoped per (wastage entry, ingredient), distinct prefix from
+    wastage_idempotency_key() so the original loss movement and its
+    reversal (routes_wastage.py::reject_wastage) never collide on the same
+    key. Same guarantee as reversal_idempotency_key() for sales: a retried
+    or racing reject can post at most one reversal per entry, forever.
+    """
+    return f"WASTAGE_REVERSAL:{entry_id}:{ingredient_id}"
+
+
 def opening_balance_idempotency_key(ingredient_id: uuid.UUID) -> str:
     """
     Scoped per ingredient, not per request — an ingredient may only ever
