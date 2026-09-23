@@ -87,6 +87,7 @@ def make_business(business_id, **overrides):
         inventory_enabled=False, digital_receipts_enabled=False,
         delivery_platforms_enabled=False, uber_eats_enabled=False, mrd_enabled=False,
         advanced_analytics_enabled=False,
+        loyalty_enabled=False,
         is_whatsapp_enabled=True, wastage_approval_threshold_cents=0,
         staff_live_orders_tab_enabled=True, staff_wastage_tab_enabled=True,
         staff_stocktake_tab_enabled=False, stocktake_frequency="DAILY_1", stocktake_times_json=None,
@@ -277,6 +278,34 @@ async def test_get_settings_returns_advanced_analytics_enabled():
 
 def test_advanced_analytics_enabled_not_settable_via_update_schema():
     assert "advanced_analytics_enabled" not in BusinessSettingsUpdate.model_fields
+
+
+# ── loyalty_enabled (migration 0051, Commercial V1 gate, BUG-0107) ─────────
+# Same platform-admin-only rule as the flags above — exposed read-only here
+# so the manager dashboard can show real Loyalty entitlement status. This is
+# the round-trip half of the coverage the task explicitly asked for (the
+# admin-plane PATCH->GET half lives in tests/test_admin_loyalty_entitlement.py).
+
+async def test_get_settings_returns_loyalty_enabled():
+    owner = make_user(role="OWNER")
+    business = make_business(owner.business_id, loyalty_enabled=True)
+    db = FakeDB([FakeResult(business), FakeResult(0)])
+
+    result = await get_business_settings(user=owner, db=db)
+    assert result.loyalty_enabled is True
+
+
+async def test_get_settings_returns_loyalty_enabled_false_by_default():
+    owner = make_user(role="OWNER")
+    business = make_business(owner.business_id)  # loyalty_enabled=False, untouched
+    db = FakeDB([FakeResult(business), FakeResult(0)])
+
+    result = await get_business_settings(user=owner, db=db)
+    assert result.loyalty_enabled is False
+
+
+def test_loyalty_enabled_not_settable_via_update_schema():
+    assert "loyalty_enabled" not in BusinessSettingsUpdate.model_fields
 
 
 # ── VAT rate validation (real-browser fix) ──────────────────────────────────

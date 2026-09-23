@@ -127,6 +127,13 @@ class BusinessSettingsResponse(BaseModel):
     # GET /business/external-orders/channels, /business/analytics/
     # average-order-value, and /business/analytics/payment-methods.
     advanced_analytics_enabled: bool = False
+    # Loyalty entitlement (migration 0051, KNOWN_BUGS.md BUG-0107) — same
+    # platform-admin-writable / business-plane-READ-ONLY pattern as the
+    # flags above. Gates every route in routes_loyalty.py plus POS
+    # checkout's loyalty_reward_id redemption. NOT the same thing as
+    # LoyaltyProgram.is_enabled (per-business config a business can turn on
+    # for itself, but only once entitled — see routes_loyalty.py).
+    loyalty_enabled: bool = False
     # Platform-admin kill switch (Business.is_whatsapp_enabled) — read-only
     # here so the manager dashboard can hide WhatsApp sections for a
     # POS-only client. Not settable via BusinessSettingsUpdate: enabling/
@@ -198,6 +205,7 @@ class BusinessSettingsResponse(BaseModel):
             uber_eats_enabled=b.uber_eats_enabled,
             mrd_enabled=b.mrd_enabled,
             advanced_analytics_enabled=b.advanced_analytics_enabled,
+            loyalty_enabled=b.loyalty_enabled,
             is_whatsapp_enabled=b.is_whatsapp_enabled,
             wastage_approval_threshold_cents=b.wastage_approval_threshold_cents,
             staff_live_orders_tab_enabled=b.staff_live_orders_tab_enabled,

@@ -126,6 +126,13 @@ class BusinessUpdate(BaseModel):
     # ONBOARDER_PATCH_ALLOWED_FIELDS below — a sales partner should not be
     # able to unilaterally unlock a paid tier's analytics for a POS-only deal.
     advanced_analytics_enabled: bool | None = None
+    # Loyalty entitlement (migration 0051, KNOWN_BUGS.md BUG-0107) —
+    # Commercial V1 tier gate (NextGen Complete and above). Same "platform
+    # decision, not a tenant toggle" rationale as the other module flags
+    # above; deliberately NOT added to ONBOARDER_PATCH_ALLOWED_FIELDS below
+    # — a sales partner should not be able to unilaterally unlock a paid
+    # tier's Loyalty module for a POS-only deal.
+    loyalty_enabled: bool | None = None
     # Staff app navigation — set during onboarding so a new tenant's till
     # app matches their workflow on day one. Also settable by the owner via
     # the business plane; these hide tabs only, never features.
@@ -189,6 +196,11 @@ class BusinessAdminResponse(BaseModel):
     # discipline (a Business column existing with no schema exposing it has
     # bitten this platform three times already).
     advanced_analytics_enabled: bool
+    # Loyalty entitlement (migration 0051) — exposed in the SAME commit as
+    # the migration/model, per this repo's BUG-0003/BUG-0072 discipline (a
+    # Business column existing with no schema exposing it has bitten this
+    # platform four times already — see KNOWN_BUGS.md BUG-0107).
+    loyalty_enabled: bool
     staff_live_orders_tab_enabled: bool
     staff_wastage_tab_enabled: bool
     staff_stocktake_tab_enabled: bool
@@ -241,6 +253,10 @@ class BusinessOnboarderResponse(BaseModel):
     # (visible so an onboarder knows to escalate, not onboarder-actionable —
     # absent from ONBOARDER_PATCH_ALLOWED_FIELDS).
     advanced_analytics_enabled: bool
+    # Read-only here too, same rationale as advanced_analytics_enabled above
+    # (visible so an onboarder knows to escalate, not onboarder-actionable —
+    # absent from ONBOARDER_PATCH_ALLOWED_FIELDS). See KNOWN_BUGS.md BUG-0107.
+    loyalty_enabled: bool
     staff_live_orders_tab_enabled: bool
     staff_wastage_tab_enabled: bool
     staff_stocktake_tab_enabled: bool
