@@ -359,7 +359,18 @@ class Settings(BaseSettings):
     # Platform-wide kill switch, independent of any tenant's own
     # uber_eats_enabled entitlement — lets ops pull the plug on ALL Uber
     # Eats webhook processing (e.g. during an incident) without a DB change.
-    UBER_EATS_WEBHOOK_ENABLED: bool = True
+    #
+    # DEFAULTS TO FALSE, deliberately (changed 2026-09-24, BUG-0109).
+    # It previously defaulted to True, which made the 0051 release candidate
+    # refuse to boot in production: _validate_production_secrets() requires
+    # UBER_EATS_CLIENT_SECRET/CLIENT_ID whenever this is on, and NextGen has
+    # no Uber credentials because Uber has not approved us as a partner yet
+    # (docs/UBER_EATS_INTEGRATION_2026-10.md §3). A feature that cannot
+    # legally operate until a third party approves it must not be on by
+    # default, and a deployment must not depend on someone remembering to
+    # set an opt-out — the same reasoning applied to SQL_ECHO_ENABLED above.
+    # Turn this on explicitly, per environment, once Uber access exists.
+    UBER_EATS_WEBHOOK_ENABLED: bool = False
     # Per-IP rate limit on POST /v1/webhook/delivery/{provider} — fixed
     # scope regardless of {provider} value, see BUG-0077 and
     # routes_delivery_webhook.py's module docstring. Generous relative to

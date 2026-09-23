@@ -231,6 +231,38 @@ def test_valid_uber_production_config_passes(settings):
     main_module._validate_production_secrets()  # must not raise (fixture baseline)
 
 
+def test_uber_webhook_defaults_to_disabled_so_production_boots_without_uber_access():
+    """
+    BUG-0109 regression guard. UBER_EATS_WEBHOOK_ENABLED previously defaulted to
+    True, which made the 0051 release candidate refuse to boot in production:
+    the validator above requires UBER_EATS_CLIENT_SECRET/CLIENT_ID whenever the
+    webhook is enabled, and NextGen has no Uber credentials because Uber has
+    not approved us as a partner yet.
+
+    Asserted on a FRESH Settings() built with no Uber environment variables at
+    all — i.e. exactly what a real production deploy looks like today — rather
+    than on the mutable `settings` fixture, so this genuinely pins the DEFAULT
+    and not some test-local override.
+    """
+    import os
+    from backend.app.core.config import Settings
+
+    uber_keys = [k for k in os.environ if k.startswith("UBER_EATS_")]
+    saved = {k: os.environ.pop(k) for k in uber_keys}
+    try:
+        fresh = Settings(ENVIRONMENT="production")
+        assert fresh.UBER_EATS_WEBHOOK_ENABLED is False, (
+            "UBER_EATS_WEBHOOK_ENABLED must default to False — a feature that "
+            "cannot operate until a third party approves it must not be on by "
+            "default, and production boot must not depend on someone "
+            "remembering to set an opt-out."
+        )
+        assert fresh.UBER_EATS_CLIENT_SECRET == ""
+        assert fresh.UBER_EATS_CLIENT_ID == ""
+    finally:
+        os.environ.update(saved)
+
+
 # ── BUG-0085: SQL_ECHO_ENABLED must fail closed in production/staging — ────
 # ── SQLAlchemy `echo` logs bound parameters verbatim, including real ───────
 # ── customer PII (DigitalReceipt.phone_number_e164, Customer.wa_id). ───────
