@@ -33,6 +33,10 @@ stripe==11.4.1
 
 # ── SSE ──────────────────────────────────────────────────────────────────────
 sse-starlette==2.2.1
+# Already an implicit transitive dependency of fastapi/starlette; pinned
+# explicitly because backend/app/realtime/sse.py now imports it directly
+# (anyio.CancelScope(shield=True), see KNOWN_BUGS.md BUG-0110).
+anyio==4.9.0
 
 # ── Testing ──────────────────────────────────────────────────────────────────
 pytest==8.3.4

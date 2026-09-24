@@ -9,6 +9,7 @@ import json
 import logging
 import uuid
 
+import anyio
 import jwt
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -170,8 +171,63 @@ async def live_order_stream(
         except asyncio.CancelledError:
             pass
         finally:
-            await pubsub.unsubscribe(channel)
-            await pubsub.close()
+            # ── WHY THIS CLEANUP IS SHIELDED (KNOWN_BUGS.md BUG-0110) ───────
+            # sse_starlette's EventSourceResponse drives this generator from
+            # inside an anyio task group (sse_starlette.sse.EventSourceRespo
+            # nse.__call__): on client disconnect it calls
+            # `task_group.cancel_scope.cancel()`. Unlike a single
+            # `asyncio.Task.cancel()`, anyio's structured-concurrency
+            # cancellation is NOT one-shot — every checkpoint (every `await`)
+            # reached while still inside that cancelled scope raises the
+            # cancellation exception again, including ones in a `finally`
+            # block. The previous version of this code awaited
+            # `pubsub.unsubscribe(channel)` FIRST in this block; that await
+            # was itself cancelled before it could complete, so
+            # `pubsub.close()` on the next line never ran and the connection
+            # was never returned to get_redis()'s bounded pool. Measured
+            # production effect: exactly `max_connections` abandoned SSE
+            # streams permanently exhausted the pool, `/ready` went 503
+            # forever (no recovery short of a process restart), while
+            # `/health` stayed 200 the whole time.
+            #
+            # `anyio.CancelScope(shield=True)` opens a scope that ignores the
+            # *outer* cancellation, so every await inside it is guaranteed to
+            # run to completion no matter how many times the outer scope
+            # re-delivers CancelledError. `pubsub.aclose()` (the `.close()`
+            # alias) is the call that actually returns the connection to the
+            # pool — it disconnects the socket and calls
+            # `connection_pool.release()` — so it is the one operation that
+            # MUST complete. Unsubscribing first is not required for that:
+            # closing the socket already ends the server-side subscription,
+            # so it is now attempted best-effort, ordered ahead of close()
+            # only because it's the "nicer" protocol citizen when it
+            # succeeds, and its failure must never prevent close() from
+            # running.
+            with anyio.CancelScope(shield=True):
+                try:
+                    await pubsub.unsubscribe(channel)
+                except Exception:
+                    logger.debug(
+                        "SSE pubsub unsubscribe failed during cleanup (non-fatal, "
+                        "the connection is being closed regardless): business=%s",
+                        business_id,
+                        exc_info=True,
+                    )
+                try:
+                    await pubsub.aclose()
+                except Exception:
+                    # Extremely unlikely (would require the underlying
+                    # redis-py aclose() to itself fail, e.g. an already-broken
+                    # socket) — logged loudly rather than silently swallowed,
+                    # since redis-py's own aclose() skips returning the
+                    # connection to the pool if this raises.
+                    logger.warning(
+                        "SSE pubsub close() raised while returning its redis "
+                        "connection to the pool; the connection may remain "
+                        "unavailable until reaped by health-check/TTL: business=%s",
+                        business_id,
+                        exc_info=True,
+                    )
             logger.info("SSE client disconnected: business=%s", business_id)
 
     return EventSourceResponse(event_generator())

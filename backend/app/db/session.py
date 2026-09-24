@@ -86,19 +86,38 @@ _redis_pool = None
 
 
 async def get_redis():
-    """Get the shared Redis connection pool. Lazy-initialized."""
+    """
+    Get the shared Redis connection pool. Lazy-initialized.
+
+    Uses `BlockingConnectionPool` rather than the default (non-blocking)
+    pool: the default pool raises `ConnectionError` the instant every
+    `max_connections` slot is checked out, which would turn a brief, benign
+    burst (several people opening the Manager Dashboard at once, each
+    holding one long-lived SSE pubsub connection — see
+    backend/app/realtime/sse.py) into an immediate hard failure for every
+    OTHER unrelated Redis-touching request (rate limiting, idempotency)
+    sharing this same pool. `BlockingConnectionPool` instead makes a caller
+    wait up to `REDIS_POOL_BLOCKING_TIMEOUT_SECONDS` for a slot to free —
+    strictly more graceful for the short-lived uses, without changing the
+    eventual failure mode if the pool really is exhausted. See
+    KNOWN_BUGS.md BUG-0110 for the pool-exhaustion incident (a leak, since
+    fixed in sse.py — this pool-sizing/behaviour change is a separate,
+    additional judgement call, not a substitute for that fix).
+    """
     global _redis_pool
     if _redis_pool is None:
         import redis.asyncio as aioredis
 
-        _redis_pool = aioredis.from_url(
+        pool = aioredis.BlockingConnectionPool.from_url(
             settings.REDIS_URL,
             decode_responses=True,
-            max_connections=20,
+            max_connections=settings.REDIS_MAX_CONNECTIONS,
+            timeout=settings.REDIS_POOL_BLOCKING_TIMEOUT_SECONDS,
             socket_connect_timeout=5,
             socket_timeout=5,
             health_check_interval=30,
         )
+        _redis_pool = aioredis.Redis(connection_pool=pool)
     return _redis_pool
 
 

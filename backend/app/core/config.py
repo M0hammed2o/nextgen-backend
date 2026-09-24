@@ -109,6 +109,28 @@ class Settings(BaseSettings):
 
     # ── Redis ────────────────────────────────────────────────────────────
     REDIS_URL: str = "redis://localhost:6379/0"
+    # Shared across every Redis use in this process: rate limiting and
+    # idempotency keys (both short-lived — borrowed and returned within a
+    # single request) AND backend/app/realtime/sse.py's live-order pubsub,
+    # which holds ONE connection for the entire duration of each connected
+    # SSE client's session (can be hours — the Manager Dashboard opens this
+    # stream app-wide, so ordinary open browser tabs alone consume slots
+    # here, independent of any bug). The old value (20) was sized as if
+    # every use were short-lived and never accounted for the long-lived SSE
+    # case; see KNOWN_BUGS.md BUG-0110. Bumped to give a small restaurant's
+    # worth of concurrent staff/manager sessions real headroom — this is a
+    # judgement call, not a measured capacity figure; revisit with real
+    # concurrent-SSE-session telemetry once available.
+    REDIS_MAX_CONNECTIONS: int = 50
+    # BlockingConnectionPool (see get_redis()) makes a caller WAIT up to this
+    # many seconds for a connection to free up when the pool is momentarily
+    # exhausted, instead of raising ConnectionError the instant the last
+    # slot is taken. Most of this pool's uses (rate limiting, idempotency)
+    # return their connection within milliseconds, so a short wait lets a
+    # brief burst resolve itself instead of hard-failing an unrelated
+    # request. Still eventually raises ConnectionError if the pool stays
+    # exhausted longer than this.
+    REDIS_POOL_BLOCKING_TIMEOUT_SECONDS: float = 3.0
 
     # ── JWT ───────────────────────────────────────────────────────────────
     JWT_SECRET_KEY: str = "CHANGE-ME-IN-PRODUCTION"
