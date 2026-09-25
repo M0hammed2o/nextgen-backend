@@ -34,7 +34,7 @@ from pathlib import Path
 
 import pytest
 
-from backend.app.core.errors import NotFoundError, _normalize_not_found_code
+from backend.app.core.errors import DuplicateError, NotFoundError, _normalize_not_found_code
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -212,4 +212,82 @@ def test_no_call_site_still_uses_the_camelcase_menuitem_spelling() -> None:
     assert camel_case_offenders == set(), (
         f"Found call sites still using the orphaned CamelCase spelling: "
         f"{camel_case_offenders}"
+    )
+
+
+# ── DuplicateError carries the identical defect class (BUG-0113 follow-up) ───
+# `DuplicateError.__init__` built its code the same unnormalised way, emitting
+# "ADMIN USER_DUPLICATE" and "BUSINESS FIELD_DUPLICATE". Fixed by routing it
+# through the same `_normalize_not_found_code` helper. Verified zero frontend
+# or e2e consumers of any *_DUPLICATE code from this class before changing it
+# (the only *_DUPLICATE code any frontend matches on is the hand-written
+# OPENING_STOCK_ALREADY_SET, which this class does not produce).
+
+
+def _collect_duplicate_resource_literals() -> list[tuple[Path, int, str]]:
+    results: list[tuple[Path, int, str]] = []
+    for path in _iter_source_files():
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+            if name != "DuplicateError":
+                continue
+            if node.args and isinstance(node.args[0], ast.Constant) and isinstance(
+                node.args[0].value, str
+            ):
+                results.append((path, node.lineno, node.args[0].value))
+    return results
+
+
+ALL_DUPLICATE_RESOURCE_LITERALS = _collect_duplicate_resource_literals()
+
+
+def test_duplicate_error_scan_found_call_sites() -> None:
+    """Guard against the scan silently finding nothing (which would make the
+    contract test below vacuously pass)."""
+    assert len(ALL_DUPLICATE_RESOURCE_LITERALS) >= 4, (
+        f"Expected to find DuplicateError call sites; found "
+        f"{len(ALL_DUPLICATE_RESOURCE_LITERALS)}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("resource", "expected_code"),
+    [
+        ("Admin user", "ADMIN_USER_DUPLICATE"),
+        ("business field", "BUSINESS_FIELD_DUPLICATE"),
+        ("User", "USER_DUPLICATE"),
+        ("mapping", "MAPPING_DUPLICATE"),
+        ("supplier", "SUPPLIER_DUPLICATE"),
+    ],
+)
+def test_duplicate_error_code_is_normalised(resource: str, expected_code: str) -> None:
+    err = DuplicateError(resource, "email")
+    assert err.code == expected_code
+    # The human-readable message must still read naturally from the original
+    # resource string — normalisation applies to the code only.
+    assert resource in err.message
+
+
+@pytest.mark.parametrize(
+    ("path", "lineno", "resource"),
+    [pytest.param(p, ln, r, id=f"{p.name}:{ln}:{r}") for p, ln, r in ALL_DUPLICATE_RESOURCE_LITERALS],
+)
+def test_every_duplicate_call_site_produces_a_well_formed_code(
+    path: Path, lineno: int, resource: str
+) -> None:
+    code = f"{_normalize_not_found_code(resource)}_DUPLICATE"
+    assert CODE_FORMAT_RE.match(code), (
+        f"{path}:{lineno} — DuplicateError(\"{resource}\") produces malformed "
+        f"code {code!r}"
+    )
+    assert "__" not in code, (
+        f"{path}:{lineno} — DuplicateError(\"{resource}\") produces code "
+        f"{code!r} with a double underscore"
     )

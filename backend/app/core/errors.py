@@ -186,8 +186,18 @@ class InvalidTransitionError(AppError):
 
 class DuplicateError(AppError):
     def __init__(self, resource: str, field: str):
+        # Same normalisation as NotFoundError, for the same reason (BUG-0113):
+        # this class had the identical unnormalised-code defect, emitting
+        # "ADMIN USER_DUPLICATE" and "BUSINESS FIELD_DUPLICATE" — malformed
+        # machine-readable codes with a literal space. Verified zero frontend
+        # or e2e consumers of any *_DUPLICATE code from this class before
+        # changing it (the only *_DUPLICATE code any frontend matches on is
+        # OPENING_STOCK_ALREADY_SET, which is a distinct hand-written code and
+        # is unaffected). The human-readable message is deliberately left
+        # building from the original `resource` string so it still reads
+        # naturally ("A business field with this slug already exists").
         super().__init__(
-            code=f"{resource.upper()}_DUPLICATE",
+            code=f"{_normalize_not_found_code(resource)}_DUPLICATE",
             message=f"A {resource} with this {field} already exists",
             status_code=409,
         )
