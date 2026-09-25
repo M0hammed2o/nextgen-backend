@@ -25,7 +25,7 @@ RBAC, matched to how a restaurant actually runs
 
 import uuid
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field, field_validator
@@ -853,8 +853,50 @@ async def create_goods_receipt(
                 "INVALID_QUANTITY", "Received quantity must be greater than zero", 422
             )
 
-        line_cost = int(line.unit_cost_cents or 0)
-        total_cost += line_cost
+        # COST SEMANTICS (BUG-0111 fix; see DECISIONS.md and DATABASE.md for
+        # the full write-up):
+        #
+        # `unit_cost_cents` is the cost of ONE of the `unit` on THIS line —
+        # cents per kg, cents per litre, cents per whole pack, etc. — not a
+        # per-line total. The receipt line, the receipt total, and the stock
+        # movement's valuation must all agree for one delivery, so the
+        # actual line total is that rate multiplied by the entered quantity,
+        # done in Decimal (never float) and rounded to whole cents once, at
+        # the end, the same discipline units.value_cents() already uses.
+        #
+        # Whichever cost basis backs this line, it is then re-expressed as
+        # micro-cents per CANONICAL unit — the same representation the
+        # ingredient's own standing cost is held in — via the existing
+        # cost_per_canonical_micro_cents() derivation (it takes any cost and
+        # the milli-quantity it was paid for; a receipt line's own cost over
+        # its own quantity_milli is exactly that). Feeding that back into
+        # build_movement()/value_cents() is what guarantees the stock
+        # movement's valuation is numerically identical to the line's own
+        # recorded cost, rather than drifting between two independent
+        # calculations.
+        if line.unit_cost_cents is not None:
+            # This receipt states its own cost — use it, not the
+            # ingredient's standing cost. This is what BUG-0111 got wrong:
+            # the movement used to be valued from the standing cost even
+            # when the delivery note said otherwise.
+            line_cost_cents = int(
+                (Decimal(line.unit_cost_cents) * Decimal(str(line.quantity))).quantize(
+                    Decimal("1"), rounding=ROUND_HALF_UP
+                )
+            )
+            line_unit_cost_micro_cents = cost_per_canonical_micro_cents(
+                line_cost_cents, quantity_milli
+            )
+        else:
+            # No cost supplied on this line (legal per the schema — cost is
+            # optional so a receipt can still be recorded when a delivery
+            # note is missing a price). Fall back to the ingredient's
+            # standing cost rather than silently recording R0.00 against
+            # real stock value, which is the other half of BUG-0111.
+            line_unit_cost_micro_cents = int(ingredient.cost_per_canonical_micro_cents or 0)
+            line_cost_cents = value_cents(quantity_milli, line_unit_cost_micro_cents)
+
+        total_cost += line_cost_cents
 
         db.add(
             GoodsReceiptLine(
@@ -865,7 +907,7 @@ async def create_goods_receipt(
                 entered_unit=line.unit,
                 quantity_milli=quantity_milli,
                 unit_cost_cents=line.unit_cost_cents,
-                line_cost_cents=line_cost,
+                line_cost_cents=line_cost_cents,
             )
         )
         db.add(
@@ -874,7 +916,13 @@ async def create_goods_receipt(
                 ingredient_id=ingredient.id,
                 quantity_milli=quantity_milli,
                 movement_type=StockMovementType.GOODS_RECEIVED.value,
-                unit_cost_micro_cents=int(ingredient.cost_per_canonical_micro_cents or 0),
+                # Valued from THIS line's own cost basis (receipt cost if
+                # supplied, else the ingredient's standing cost) — never
+                # unconditionally the standing cost. Receiving goods does
+                # NOT update the ingredient's standing cost itself (see
+                # DECISIONS.md "Goods-receipt cost-update policy") — this
+                # only affects how this one movement is valued.
+                unit_cost_micro_cents=line_unit_cost_micro_cents,
                 source_type=StockSourceType.GOODS_RECEIPT.value,
                 source_id=receipt.id,
                 created_by_user_id=user.user_id,
