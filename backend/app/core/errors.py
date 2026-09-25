@@ -12,6 +12,7 @@ All API errors follow this format:
 """
 
 import logging
+import re
 
 from fastapi import FastAPI, Request, status
 from redis.exceptions import ConnectionError as RedisConnectionError
@@ -101,10 +102,44 @@ class AppError(Exception):
 
 # ── Common errors ────────────────────────────────────────────────────────────
 
+_NOT_FOUND_CODE_SEPARATOR_RE = re.compile(r"[\s\-]+")
+_NOT_FOUND_CODE_MULTI_UNDERSCORE_RE = re.compile(r"_{2,}")
+
+
+def _normalize_not_found_code(resource: str) -> str:
+    """
+    Build the machine-readable prefix of a NOT_FOUND code from a
+    human-readable resource name (BUG-0113).
+
+    `NotFoundError` used to build its `code` as `f"{resource.upper()}_NOT_FOUND"`
+    with no normalisation, so any resource string containing a space or
+    hyphen produced a malformed code (e.g. "Menu item" -> "MENU ITEM_NOT_FOUND",
+    "Menu add-on" -> "MENU ADD-ON_NOT_FOUND"). This collapses any run of
+    whitespace and/or hyphens to a single underscore, then collapses any
+    resulting run of underscores to one and strips leading/trailing
+    underscores, so "Menu item", "Menu-item" and "menu   item" all resolve
+    to the same MENU_ITEM code.
+
+    Deliberately CamelCase-preserving: word boundaries inside a single
+    unbroken token (e.g. "LoyaltyProgram") are NOT split here — only
+    whitespace/hyphen separators are normalised. This is intentional, not
+    an oversight: "LoyaltyProgram" must keep producing the exact
+    LOYALTYPROGRAM_NOT_FOUND code, which four live nextgen-staff-v3
+    consumers (`LoyaltyBalance.tsx`, `lib/loyalty.ts`, `types/index.ts`)
+    depend on to detect "this business has no loyalty programme" cleanly.
+    Splitting it into LOYALTY_PROGRAM_NOT_FOUND would silently break that
+    (the exact class of regression already fixed once as BUG-0108). See
+    DECISIONS.md for the recorded carve-out.
+    """
+    normalized = _NOT_FOUND_CODE_SEPARATOR_RE.sub("_", resource.strip()).upper()
+    normalized = _NOT_FOUND_CODE_MULTI_UNDERSCORE_RE.sub("_", normalized)
+    return normalized.strip("_")
+
+
 class NotFoundError(AppError):
     def __init__(self, resource: str, resource_id: str | None = None):
         super().__init__(
-            code=f"{resource.upper()}_NOT_FOUND",
+            code=f"{_normalize_not_found_code(resource)}_NOT_FOUND",
             message=f"{resource} not found" + (f": {resource_id}" if resource_id else ""),
             status_code=404,
         )

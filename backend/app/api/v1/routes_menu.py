@@ -377,7 +377,7 @@ async def update_item(
     )
     item = result.scalar_one_or_none()
     if not item:
-        raise NotFoundError("MenuItem", str(item_id))
+        raise NotFoundError("Menu item", str(item_id))
 
     update_fields = body.model_dump(exclude_unset=True)
 
@@ -419,7 +419,7 @@ async def soft_delete_item(
     )
     item = result.scalar_one_or_none()
     if not item:
-        raise NotFoundError("MenuItem", str(item_id))
+        raise NotFoundError("Menu item", str(item_id))
 
     item.is_deleted = True
     item.is_active = False
@@ -503,7 +503,7 @@ async def update_add_on(
     )
     add_on = result.scalar_one_or_none()
     if not add_on:
-        raise NotFoundError("MenuAddOn", str(add_on_id))
+        raise NotFoundError("Menu add-on", str(add_on_id))
     for field, value in body.model_dump(exclude_unset=True).items():
         setattr(add_on, field, value)
     await db.commit()
@@ -526,7 +526,7 @@ async def delete_add_on(
     )
     add_on = result.scalar_one_or_none()
     if not add_on:
-        raise NotFoundError("MenuAddOn", str(add_on_id))
+        raise NotFoundError("Menu add-on", str(add_on_id))
     add_on.is_deleted = True
     add_on.is_active = False
     await db.commit()
@@ -549,7 +549,7 @@ async def attach_add_on(
         )
     )
     if not item_res.scalar_one_or_none():
-        raise NotFoundError("MenuItem", str(item_id))
+        raise NotFoundError("Menu item", str(item_id))
 
     ao_res = await db.execute(
         select(MenuAddOn).where(
@@ -559,7 +559,7 @@ async def attach_add_on(
         )
     )
     if not ao_res.scalar_one_or_none():
-        raise NotFoundError("MenuAddOn", str(add_on_id))
+        raise NotFoundError("Menu add-on", str(add_on_id))
 
     # Insert into join table — ignore if already exists
     from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -583,11 +583,11 @@ async def detach_add_on(
     # another business purely by guessing/knowing its two UUIDs.
     await require_owned(
         db, MenuItem, item_id, user.business_id,
-        label="MenuItem", extra_filters=(MenuItem.is_deleted == False,),
+        label="Menu item", extra_filters=(MenuItem.is_deleted == False,),
     )
     await require_owned(
         db, MenuAddOn, add_on_id, user.business_id,
-        label="MenuAddOn", extra_filters=(MenuAddOn.is_deleted == False,),
+        label="Menu add-on", extra_filters=(MenuAddOn.is_deleted == False,),
     )
 
     from sqlalchemy import delete as _delete

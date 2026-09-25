@@ -211,7 +211,7 @@ async def resolve_pos_items(
     for item in items:
         menu_item = menu_items_by_id.get(item.menu_item_id)
         if not menu_item:
-            raise NotFoundError("MenuItem", str(item.menu_item_id))
+            raise NotFoundError("Menu item", str(item.menu_item_id))
         if not menu_item.is_active:
             raise AppError(
                 "MENU_ITEM_INACTIVE",
