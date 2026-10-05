@@ -217,6 +217,13 @@ class GoodsReceiptCreateRequest(BaseModel):
     reference: str | None = Field(default=None, max_length=128)
     notes: str | None = None
     occurred_at: datetime | None = None
+    idempotency_key: str | None = Field(
+        default=None, max_length=128,
+        description="Optional client-generated key (BUG-0112). A retry/"
+                     "double-click with the same key returns the original "
+                     "receipt instead of creating a duplicate. Omit entirely "
+                     "to keep old-client behaviour unchanged.",
+    )
 
 
 class StockLevelResponse(BaseModel):
@@ -776,6 +783,48 @@ async def delete_supplier(
 
 # ── Goods received ───────────────────────────────────────────────────────────
 
+def _is_goods_receipt_idempotency_violation(exc: IntegrityError) -> bool:
+    """
+    True if this IntegrityError is a violation of
+    uq_goods_receipts_business_idempotency_key (migration 0052) — checked
+    against the driver's own error text (what Postgres actually reports for
+    a unique_violation), same technique as
+    routes_pos.py::_is_unique_violation / ledger.py::is_idempotency_violation,
+    so this stays driver-agnostic.
+    """
+    return "uq_goods_receipts_business_idempotency_key" in str(
+        getattr(exc, "orig", exc)
+    )
+
+
+async def _replay_existing_goods_receipt(
+    db: AsyncSession, business_id: uuid.UUID, idempotency_key: str,
+) -> dict | None:
+    """
+    Look up a previously-committed receipt for this (business, key). Used
+    both for the fast sequential-retry path (checked before any validation
+    runs) and for the losing side of a genuine concurrent-insert race
+    (checked after an IntegrityError on the partial unique index) — same
+    shape as routes_pos.py::_replay_idempotent_checkout.
+    """
+    result = await db.execute(
+        select(GoodsReceipt)
+        .options(selectinload(GoodsReceipt.lines))
+        .where(
+            GoodsReceipt.business_id == business_id,
+            GoodsReceipt.idempotency_key == idempotency_key,
+        )
+    )
+    existing = result.scalar_one_or_none()
+    if existing is None:
+        return None
+    return {
+        "id": str(existing.id),
+        "lines": len(existing.lines),
+        "total_cost_cents": int(existing.total_cost_cents or 0),
+    }
+
+
 @router.post("/goods-receipts", status_code=201)
 async def create_goods_receipt(
     body: GoodsReceiptCreateRequest,
@@ -789,8 +838,31 @@ async def create_goods_receipt(
     instead of counted quantity is one of the top causes of an unexplained
     variance surfacing weeks later, so the field is labelled accordingly and
     there is deliberately no "expected quantity" to copy from.
+
+    IDEMPOTENCY (BUG-0112, migration 0052): an optional client-supplied
+    idempotency_key makes a double-click, a client retry after an apparent
+    timeout, or two browser tabs submitting the same delivery produce
+    exactly one receipt — mirrors create_pos_order's orders.idempotency_key
+    pattern exactly: an early replay lookup, a partial unique DB index
+    (uq_goods_receipts_business_idempotency_key, NULLs excluded) as the
+    actual concurrency guard, and a losing-race replay on IntegrityError.
+    Omitting the field entirely preserves old-client behaviour unchanged —
+    the column is nullable, same compatibility shape as
+    orders.idempotency_key (migration 0023).
     """
     await _require_inventory_enabled(db, user.business_id)
+
+    # ── Idempotency: fast sequential-retry path. Deliberately runs before
+    #    any ingredient/supplier validation, exactly like create_pos_order's
+    #    early idempotency check — a replayed request shouldn't fail
+    #    validation just because, e.g., an ingredient was deleted since the
+    #    original (already-successful) submission. ─────────────────────────
+    if body.idempotency_key:
+        replayed = await _replay_existing_goods_receipt(
+            db, user.business_id, body.idempotency_key
+        )
+        if replayed is not None:
+            return replayed
 
     ingredient_ids = [line.ingredient_id for line in body.lines]
     ingredients = {
@@ -819,17 +891,24 @@ async def create_goods_receipt(
         await require_owned(db, Supplier, body.supplier_id, user.business_id, label="Supplier")
 
     occurred = body.occurred_at or datetime.now(timezone.utc)
+    # id generated client-side (the model's default only fires at flush) so
+    # it's available for the lines'/movement's FK below without needing an
+    # early flush — the flush/commit is deliberately deferred to the very
+    # end, after every line has been resolved and costed, so an
+    # idempotency-key collision is the LAST thing that can go wrong, not
+    # the first, and nothing partial is ever staged past that point.
+    receipt_id = uuid.uuid4()
     receipt = GoodsReceipt(
+        id=receipt_id,
         business_id=user.business_id,
         supplier_id=body.supplier_id,
         reference=body.reference,
         received_by_user_id=user.user_id,
+        idempotency_key=body.idempotency_key,
         notes=body.notes,
         occurred_at=occurred,
         created_at=datetime.now(timezone.utc),
     )
-    db.add(receipt)
-    await db.flush()
 
     total_cost = 0
     for line in body.lines:
@@ -901,7 +980,7 @@ async def create_goods_receipt(
         db.add(
             GoodsReceiptLine(
                 business_id=user.business_id,
-                goods_receipt_id=receipt.id,
+                goods_receipt_id=receipt_id,
                 ingredient_id=ingredient.id,
                 entered_quantity=str(line.quantity),
                 entered_unit=line.unit,
@@ -924,14 +1003,58 @@ async def create_goods_receipt(
                 # only affects how this one movement is valued.
                 unit_cost_micro_cents=line_unit_cost_micro_cents,
                 source_type=StockSourceType.GOODS_RECEIPT.value,
-                source_id=receipt.id,
+                source_id=receipt_id,
                 created_by_user_id=user.user_id,
                 occurred_at=occurred,
             )
         )
 
     receipt.total_cost_cents = total_cost
-    await db.commit()
+    db.add(receipt)
+
+    # ── Everything above is staged in the session, nothing has hit the DB
+    #    yet. A double-tapped submission with the SAME idempotency_key can
+    #    race past the early replay lookup above before either side has
+    #    committed — the partial unique index
+    #    (uq_goods_receipts_business_idempotency_key) is what actually
+    #    decides the winner. The loser's flush/commit raises IntegrityError
+    #    here, caught below and replayed into the winner's receipt instead
+    #    of propagating as an unhandled 500 — same shape as
+    #    create_pos_order's try/except IntegrityError block. ───────────────
+    try:
+        await db.flush()
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        if body.idempotency_key and _is_goods_receipt_idempotency_violation(exc):
+            replayed = await _replay_existing_goods_receipt(
+                db, user.business_id, body.idempotency_key
+            )
+            if replayed is not None:
+                if (
+                    replayed["total_cost_cents"] != total_cost
+                    or replayed["lines"] != len(body.lines)
+                ):
+                    # Same key, materially different payload. Decision
+                    # (DECISIONS.md): mirror create_pos_order exactly —
+                    # replay the winning receipt silently rather than
+                    # reject with a conflict, and log so a real client bug
+                    # (reusing a key across two different deliveries) is
+                    # still visible operationally.
+                    import logging
+                    logging.getLogger("nextgen").warning(
+                        "Idempotency replay for goods_receipts key=%s returned a "
+                        "different receipt than this request would have "
+                        "created: existing total_cost_cents=%s lines=%s vs this "
+                        "request's total_cost_cents=%s lines=%s",
+                        body.idempotency_key, replayed["total_cost_cents"],
+                        replayed["lines"], total_cost, len(body.lines),
+                    )
+                return replayed
+        # Not an idempotency-key collision (or no key was supplied at all) —
+        # a real constraint violation must never be masked as a replay.
+        raise
+
     await db.refresh(receipt)
     return {"id": str(receipt.id), "lines": len(body.lines), "total_cost_cents": total_cost}
 

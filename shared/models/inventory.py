@@ -277,6 +277,16 @@ class GoodsReceipt(Base, UUIDPrimaryKeyMixin):
     total_cost_cents: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    idempotency_key: Mapped[str | None] = mapped_column(
+        String(128), nullable=True,
+        comment="Client-generated key; a retry/double-click with the same key "
+                 "returns the original receipt instead of double-counting stock "
+                 "(unique per business_id, partial index — see migration 0052, "
+                 "KNOWN_BUGS.md BUG-0112). Nullable so pre-0052 clients that send "
+                 "no key keep working, same compatibility shape as "
+                 "orders.idempotency_key (migration 0023)."
+    )
+
     occurred_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
