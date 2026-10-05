@@ -8,6 +8,7 @@ Model 1 Architecture:
 """
 
 from functools import lru_cache
+from urllib.parse import urlparse
 
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -58,6 +59,40 @@ def _looks_like_placeholder(value: str) -> bool:
     if len(value) < 32:
         return True
     return False
+
+
+def _points_at_loopback_or_is_invalid(value: object) -> bool:
+    """
+    True if `value` is not a usable, non-local connection URL.
+
+    Used ONLY to decide pass/fail for DATABASE_URL/REDIS_URL at production/
+    staging boot — this function's return value must NEVER be combined with
+    `value` itself in a log line or error message. Both settings carry
+    credentials (postgresql+asyncpg://user:password@host/db,
+    redis://:password@host/db); interpolating the url into a "helpful"
+    error message is exactly the class of mistake BUG-0085 was (a safety
+    check that itself leaks PII/secrets into logs).
+
+    Deliberately does NOT validate anything beyond "is the host missing or a
+    loopback address" — no scheme/port/driver/credential-presence checking.
+    A fuller URL validator is out of scope for what this is actually guarding
+    against: `Settings.DATABASE_URL`/`REDIS_URL` both default to a literal
+    `localhost` connection string (see below), so a production/staging
+    deploy that forgot to set the real value would otherwise boot
+    successfully against nothing and fail only at first query/cache use. See
+    DECISIONS.md for why an explicitly-set loopback value is rejected
+    identically to the unset-and-defaulted case rather than trying to tell
+    the two apart.
+    """
+    if not isinstance(value, str) or not value:
+        return True
+    try:
+        host = urlparse(value).hostname
+    except ValueError:
+        return True
+    if not host:
+        return True
+    return host.lower() in {"localhost", "127.0.0.1", "::1"}
 
 
 # Redis key the ARQ worker heartbeats to (see backend/app/worker.py) and that

@@ -158,6 +158,8 @@ def test_admin_api_rejects_historical_non_exact_placeholder():
         "JWT_SECRET_KEY": "CHANGE-ME-generate-a-strong-random-string",
         "JWT_ADMIN_SECRET_KEY": "a-real-64-char-admin-secret-1234567890123456789012345",
         "SQL_ECHO_ENABLED": False,
+        "DATABASE_URL": "postgresql+asyncpg://nextgen:realpassword@db.prod.internal:5432/nextgen",
+        "REDIS_URL": "redis://:realpassword@redis.prod.internal:6379/0",
     })()
 
     with patch("backend.app.core.config.get_settings", return_value=fake_backend_settings):
@@ -173,6 +175,8 @@ def test_admin_api_accepts_real_looking_secrets():
         "JWT_SECRET_KEY": "a-real-64-char-business-secret-1234567890123456789012",
         "JWT_ADMIN_SECRET_KEY": "a-real-64-char-admin-secret-1234567890123456789012345",
         "SQL_ECHO_ENABLED": False,
+        "DATABASE_URL": "postgresql+asyncpg://nextgen:realpassword@db.prod.internal:5432/nextgen",
+        "REDIS_URL": "redis://:realpassword@redis.prod.internal:6379/0",
     })()
 
     with patch("backend.app.core.config.get_settings", return_value=fake_backend_settings):
@@ -204,6 +208,8 @@ def test_admin_api_rejects_sql_echo_enabled_in_production():
         "JWT_SECRET_KEY": "a-real-64-char-business-secret-1234567890123456789012",
         "JWT_ADMIN_SECRET_KEY": "a-real-64-char-admin-secret-1234567890123456789012345",
         "SQL_ECHO_ENABLED": True,
+        "DATABASE_URL": "postgresql+asyncpg://nextgen:realpassword@db.prod.internal:5432/nextgen",
+        "REDIS_URL": "redis://:realpassword@redis.prod.internal:6379/0",
     })()
 
     with patch("backend.app.core.config.get_settings", return_value=fake_backend_settings):
@@ -238,3 +244,83 @@ def test_looks_like_placeholder_true(value):
 def test_looks_like_placeholder_false_for_real_secret():
     real = "8f3a1c9e7b2d4f6a0c8e1b3d5f7a9c1e3b5d7f9a1c3e5b7d9f1a3c5e7b9d1f3a"
     assert _looks_like_placeholder(real) is False
+
+
+# ── Hardening: admin_api must ALSO refuse a localhost/missing DATABASE_URL ──
+# ── or REDIS_URL in production — it shares backend's engine/redis pool ──────
+# ── (built from backend_settings, never AdminSettings' own same-named, ──────
+# ── otherwise-unused fields) but boots as its own separate deployable, the ──
+# ── same "checked one deployable but not its sibling" gap class this repo ───
+# ── has hit before (see SQL_ECHO_ENABLED's own admin_api tests above). ──────
+
+def test_admin_api_rejects_default_database_url_in_production():
+    from admin_api.app import main as admin_main
+
+    fake_backend_settings = type("S", (), {
+        "ENVIRONMENT": "production",
+        "JWT_SECRET_KEY": "a-real-64-char-business-secret-1234567890123456789012",
+        "JWT_ADMIN_SECRET_KEY": "a-real-64-char-admin-secret-1234567890123456789012345",
+        "SQL_ECHO_ENABLED": False,
+        "DATABASE_URL": "postgresql+asyncpg://postgres:postgres@localhost:5432/nextgen",
+        "REDIS_URL": "redis://:realpassword@redis.prod.internal:6379/0",
+    })()
+
+    with patch("backend.app.core.config.get_settings", return_value=fake_backend_settings):
+        with pytest.raises(RuntimeError, match="DATABASE_URL"):
+            admin_main._validate_production_secrets()
+
+
+def test_admin_api_rejects_default_redis_url_in_production():
+    from admin_api.app import main as admin_main
+
+    fake_backend_settings = type("S", (), {
+        "ENVIRONMENT": "production",
+        "JWT_SECRET_KEY": "a-real-64-char-business-secret-1234567890123456789012",
+        "JWT_ADMIN_SECRET_KEY": "a-real-64-char-admin-secret-1234567890123456789012345",
+        "SQL_ECHO_ENABLED": False,
+        "DATABASE_URL": "postgresql+asyncpg://nextgen:realpassword@db.prod.internal:5432/nextgen",
+        "REDIS_URL": "redis://localhost:6379/0",
+    })()
+
+    with patch("backend.app.core.config.get_settings", return_value=fake_backend_settings):
+        with pytest.raises(RuntimeError, match="REDIS_URL"):
+            admin_main._validate_production_secrets()
+
+
+def test_admin_api_allows_local_database_url_in_development():
+    from admin_api.app import main as admin_main
+
+    fake_backend_settings = type("S", (), {
+        "ENVIRONMENT": "development",
+        "JWT_SECRET_KEY": "CHANGE-ME-IN-PRODUCTION",
+        "JWT_ADMIN_SECRET_KEY": "CHANGE-ME-IN-PRODUCTION",
+        "DATABASE_URL": "postgresql+asyncpg://postgres:postgres@localhost:5432/nextgen",
+        "REDIS_URL": "redis://localhost:6379/0",
+    })()
+
+    with patch("backend.app.core.config.get_settings", return_value=fake_backend_settings):
+        admin_main._validate_production_secrets()  # must not raise — dev skips entirely
+
+
+def test_admin_api_database_url_error_message_never_contains_credentials():
+    """Same leak-proof requirement as backend's own validator, verified here too."""
+    from admin_api.app import main as admin_main
+
+    secret_marker = "AdminPlaneSecret_987"
+    fake_backend_settings = type("S", (), {
+        "ENVIRONMENT": "production",
+        "JWT_SECRET_KEY": "a-real-64-char-business-secret-1234567890123456789012",
+        "JWT_ADMIN_SECRET_KEY": "a-real-64-char-admin-secret-1234567890123456789012345",
+        "SQL_ECHO_ENABLED": False,
+        "DATABASE_URL": f"postgresql+asyncpg://produser:{secret_marker}@127.0.0.1:5432/nextgen",
+        "REDIS_URL": "redis://:realpassword@redis.prod.internal:6379/0",
+    })()
+
+    with patch("backend.app.core.config.get_settings", return_value=fake_backend_settings):
+        with pytest.raises(RuntimeError) as exc:
+            admin_main._validate_production_secrets()
+    message = str(exc.value)
+    assert "DATABASE_URL" in message
+    assert secret_marker not in message
+    assert "produser" not in message
+    assert "127.0.0.1" not in message

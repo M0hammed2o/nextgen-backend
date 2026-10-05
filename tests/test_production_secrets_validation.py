@@ -41,9 +41,13 @@ def settings():
         "UBER_EATS_CLIENT_ID": s.UBER_EATS_CLIENT_ID,
         "UBER_EATS_CLIENT_SECRET": s.UBER_EATS_CLIENT_SECRET,
         "SQL_ECHO_ENABLED": s.SQL_ECHO_ENABLED,
+        "DATABASE_URL": s.DATABASE_URL,
+        "REDIS_URL": s.REDIS_URL,
     }
     # Start every test from a fully-valid baseline, then break one field at a time.
     s.ENVIRONMENT = "production"
+    s.DATABASE_URL = "postgresql+asyncpg://nextgen:realpassword@db.prod.internal:5432/nextgen"
+    s.REDIS_URL = "redis://:realpassword@redis.prod.internal:6379/0"
     s.JWT_SECRET_KEY = _valid_secret("a1")
     s.JWT_ADMIN_SECRET_KEY = _valid_secret("b2")
     s.CREDENTIALS_ENCRYPTION_KEY = _valid_secret("c3")
@@ -322,3 +326,141 @@ async def test_lifespan_actually_refuses_to_boot_with_sql_echo_in_production(set
     with pytest.raises(RuntimeError, match="SQL_ECHO_ENABLED"):
         async with main_module.lifespan(main_module.app):
             pytest.fail("lifespan must raise before yielding when SQL_ECHO_ENABLED is true in production")
+
+
+# ── Hardening: DATABASE_URL/REDIS_URL must fail closed in production/ ──────
+# ── staging. Both default to a literal localhost connection string (see ────
+# ── Settings in backend/app/core/config.py); previously a deployment that ──
+# ── omitted either "booted successfully" and only failed at first real ─────
+# ── database/Redis use. See DECISIONS.md for the "production-appropriate" ──
+# ── definition and why an explicit loopback value is rejected identically ──
+# ── to the unset-and-defaulted case. ─────────────────────────────────────
+
+def test_default_database_url_rejected_in_production(settings):
+    """The exact un-overridden Settings default — the realistic forgot-to-set case."""
+    from backend.app.core.config import Settings
+
+    settings.DATABASE_URL = Settings.model_fields["DATABASE_URL"].default
+    with pytest.raises(RuntimeError, match="DATABASE_URL"):
+        main_module._validate_production_secrets()
+
+
+def test_default_redis_url_rejected_in_production(settings):
+    from backend.app.core.config import Settings
+
+    settings.REDIS_URL = Settings.model_fields["REDIS_URL"].default
+    with pytest.raises(RuntimeError, match="REDIS_URL"):
+        main_module._validate_production_secrets()
+
+
+def test_explicit_loopback_ip_database_url_rejected_in_production(settings):
+    """An explicitly-typed 127.0.0.1 value is just as wrong as the unset default."""
+    settings.DATABASE_URL = "postgresql+asyncpg://user:pw@127.0.0.1:5432/nextgen"
+    with pytest.raises(RuntimeError, match="DATABASE_URL"):
+        main_module._validate_production_secrets()
+
+
+def test_empty_database_url_rejected_in_production(settings):
+    settings.DATABASE_URL = ""
+    with pytest.raises(RuntimeError, match="DATABASE_URL"):
+        main_module._validate_production_secrets()
+
+
+def test_unparseable_redis_url_rejected_in_production(settings):
+    settings.REDIS_URL = "not a url at all"
+    with pytest.raises(RuntimeError, match="REDIS_URL"):
+        main_module._validate_production_secrets()
+
+
+def test_database_and_redis_url_rejected_in_staging_too(settings):
+    """Staging is validated exactly like production, same as every other check here."""
+    settings.ENVIRONMENT = "staging"
+    settings.DATABASE_URL = "postgresql+asyncpg://postgres:postgres@localhost:5432/nextgen"
+    with pytest.raises(RuntimeError, match="DATABASE_URL"):
+        main_module._validate_production_secrets()
+
+
+def test_local_database_url_allowed_in_development():
+    """
+    Must NOT reject legitimate local development configuration — the whole
+    point of this check is a production/staging deployment pointed at
+    nothing real, never a developer's own machine.
+    """
+    from backend.app.core.config import Settings
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(main_module, "settings", Settings(
+            ENVIRONMENT="development",
+            JWT_SECRET_KEY="CHANGE-ME-IN-PRODUCTION",
+            DATABASE_URL="postgresql+asyncpg://postgres:postgres@localhost:5432/nextgen",
+            REDIS_URL="redis://localhost:6379/0",
+        ))
+        main_module._validate_production_secrets()  # must not raise
+
+
+def test_valid_production_database_redis_urls_pass(settings):
+    """The fixture's own baseline values (real-looking hosts) must pass."""
+    main_module._validate_production_secrets()  # must not raise
+
+
+def test_database_url_error_message_never_contains_the_url_or_credentials(settings):
+    """
+    Proves the fix itself does not become a credential leak (BUG-0085's exact
+    class of mistake): the raised message must name only WHICH variable is
+    wrong, never any fragment of its value — no host, no username, no
+    password, no scheme-specific substring unique to the value supplied.
+    """
+    secret_marker = "S3cr3tP4ssw0rd_doNotLeak"
+    host_marker = "127.0.0.1"  # loopback, so the check fires — distinct from
+    # the generic word "localhost" used in the check's own static wording,
+    # so this proves the *specific value supplied* isn't echoed back, not
+    # merely that the literal word "localhost" is absent.
+    settings.DATABASE_URL = f"postgresql+asyncpg://produser:{secret_marker}@{host_marker}:5432/nextgen"
+    with pytest.raises(RuntimeError) as exc:
+        main_module._validate_production_secrets()
+    message = str(exc.value)
+    assert "DATABASE_URL" in message  # names the variable
+    assert secret_marker not in message
+    assert "produser" not in message
+    assert settings.DATABASE_URL not in message
+    assert host_marker not in message  # even the (non-secret) host is withheld
+
+
+def test_redis_url_error_message_never_contains_the_url_or_credentials(settings):
+    secret_marker = "AnotherSecret_123"
+    settings.REDIS_URL = f"redis://:{secret_marker}@localhost:6379/0"
+    with pytest.raises(RuntimeError) as exc:
+        main_module._validate_production_secrets()
+    message = str(exc.value)
+    assert "REDIS_URL" in message
+    assert secret_marker not in message
+    assert settings.REDIS_URL not in message
+
+
+# ── _points_at_loopback_or_is_invalid itself (shared helper) ─────────────────
+
+def test_points_at_loopback_helper_rejects_local_hosts():
+    from backend.app.core.config import _points_at_loopback_or_is_invalid
+
+    for bad in (
+        "postgresql+asyncpg://u:p@localhost:5432/db",
+        "postgresql+asyncpg://u:p@127.0.0.1:5432/db",
+        "redis://localhost:6379/0",
+        "redis://[::1]:6379/0",
+        "",
+        "not-a-url-with-no-host",
+        None,
+        12345,
+    ):
+        assert _points_at_loopback_or_is_invalid(bad) is True, repr(bad)
+
+
+def test_points_at_loopback_helper_accepts_real_hosts():
+    from backend.app.core.config import _points_at_loopback_or_is_invalid
+
+    for good in (
+        "postgresql+asyncpg://u:p@db.prod.internal:5432/db",
+        "redis://:pw@redis.prod.internal:6379/0",
+        "postgresql+asyncpg://u:p@10.0.4.12:5432/db",
+    ):
+        assert _points_at_loopback_or_is_invalid(good) is False, repr(good)

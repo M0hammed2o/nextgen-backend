@@ -9,7 +9,12 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from backend.app.core.config import WORKER_HEARTBEAT_REDIS_KEY, _looks_like_placeholder, get_settings
+from backend.app.core.config import (
+    WORKER_HEARTBEAT_REDIS_KEY,
+    _looks_like_placeholder,
+    _points_at_loopback_or_is_invalid,
+    get_settings,
+)
 from backend.app.core.errors import UnhandledExceptionMiddleware, register_error_handlers
 from backend.app.core.middleware import CorrelationIDMiddleware, RequestLoggingMiddleware, setup_logging
 from backend.app.db.session import close_db, close_redis
@@ -51,6 +56,42 @@ def _validate_production_secrets() -> None:
         errors.append("JWT_ADMIN_SECRET_KEY looks like a placeholder — admin JWTs are forgeable")
     if settings.JWT_ADMIN_SECRET_KEY == settings.JWT_SECRET_KEY:
         errors.append("JWT_ADMIN_SECRET_KEY must differ from JWT_SECRET_KEY — planes must not share a signing key")
+
+    # DATABASE_URL/REDIS_URL both default to a literal localhost connection
+    # string (see Settings in backend/app/core/config.py) so a deployment
+    # that forgot to set either would previously boot "successfully" and
+    # only fail the first time a request actually touched the database or
+    # cache/queue/SSE layer — never at startup, where a missing/wrong value
+    # is cheapest to catch. Table-driven like the webhook-secret block below,
+    # so the next required connection string has an obvious place to go.
+    # Deliberately generalised via _points_at_loopback_or_is_invalid rather
+    # than an exact-string/placeholder check (that function's own docstring
+    # explains why an explicit loopback value is treated the same as the
+    # unset-and-defaulted case). NEVER interpolate the URL itself into the
+    # message below — both carry credentials; see BUG-0085 for the exact
+    # class of mistake that would be.
+    _datastore_url_requirements = (
+        (
+            settings.DATABASE_URL,
+            "DATABASE_URL",
+            "the database would be unreachable (or, worse, silently point at "
+            "a local/loopback Postgres instead of the real one)",
+        ),
+        (
+            settings.REDIS_URL,
+            "REDIS_URL",
+            "rate limiting, idempotency keys, the ARQ job queue, and the "
+            "live-order SSE pub/sub would all be unreachable",
+        ),
+    )
+    for _url_value, _var_name, _consequence in _datastore_url_requirements:
+        if _points_at_loopback_or_is_invalid(_url_value):
+            errors.append(
+                f"{_var_name} is missing, unparseable, or still points at "
+                f"localhost/loopback — {_consequence}. (Value withheld from "
+                f"this message — {_var_name} carries credentials.)"
+            )
+
     if not settings.CREDENTIALS_ENCRYPTION_KEY:
         errors.append("CREDENTIALS_ENCRYPTION_KEY is not set — payment credentials would be stored in plaintext")
     if settings.META_APP_SECRET in _PLACEHOLDER_META:

@@ -10,7 +10,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from admin_api.app.core.config import get_admin_settings
-from backend.app.core.config import _looks_like_placeholder
+from backend.app.core.config import _looks_like_placeholder, _points_at_loopback_or_is_invalid
 from backend.app.core.errors import UnhandledExceptionMiddleware, register_error_handlers
 from backend.app.core.middleware import CorrelationIDMiddleware, RequestLoggingMiddleware, setup_logging
 from backend.app.db.session import close_db, close_redis
@@ -61,6 +61,35 @@ def _validate_production_secrets() -> None:
             "bound parameters verbatim, including real customer PII such as "
             "DigitalReceipt.phone_number_e164 and Customer.wa_id/phone_number"
         )
+
+    # Same reasoning as SQL_ECHO_ENABLED immediately above: admin_api is a
+    # separate deployable from backend/app/main.py, with no guarantee the
+    # backend process's own startup check ever ran anywhere near it, yet it
+    # imports and uses the exact same shared engine/redis pool — built from
+    # backend_settings.DATABASE_URL/REDIS_URL, never from AdminSettings'
+    # own same-named (and, confirmed in-session, otherwise-unused) fields.
+    # A hardening entry alongside BUG-0115 records the backend-side half of
+    # this check; this is the "checked one deployable but not its sibling"
+    # gap this repo has hit before, closed here for both at once.
+    for _url_value, _var_name, _consequence in (
+        (
+            backend_settings.DATABASE_URL,
+            "DATABASE_URL",
+            "the database would be unreachable (or silently point at a "
+            "local/loopback Postgres instead of the real one)",
+        ),
+        (
+            backend_settings.REDIS_URL,
+            "REDIS_URL",
+            "rate limiting and idempotency keys would be unreachable",
+        ),
+    ):
+        if _points_at_loopback_or_is_invalid(_url_value):
+            errors.append(
+                f"{_var_name} is missing, unparseable, or still points at "
+                f"localhost/loopback — {_consequence}. (Value withheld from "
+                f"this message — {_var_name} carries credentials.)"
+            )
 
     if errors:
         msg = (
