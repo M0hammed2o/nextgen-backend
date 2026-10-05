@@ -504,6 +504,7 @@ async def get_current_stocktake(
     db: AsyncSession = Depends(get_db),
 ):
     """The count in progress, if any — how a tablet resumes a saved draft."""
+    await _require_inventory_enabled(db, user.business_id)
     session = (
         await db.execute(
             select(StocktakeSession)
@@ -539,6 +540,7 @@ async def list_stocktakes(
     same snapshot frozen at completion — never recomputed, so a count read
     today shows what it showed the day it was signed off.
     """
+    await _require_inventory_enabled(db, user.business_id)
     rows = (
         (
             await db.execute(

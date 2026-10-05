@@ -64,6 +64,8 @@ from backend.app.api.v1.routes_stocktake import (
     StocktakeOpenRequest,
     approve_stocktake,
     complete_stocktake,
+    get_current_stocktake,
+    list_stocktakes,
     open_stocktake,
     submit_counts,
 )
@@ -222,6 +224,28 @@ async def test_nextgen_pos_package_refuses_everything_outside_pos(db):
         assert exc.value.code == "INVENTORY_NOT_ENABLED"
         assert exc.value.status_code == 409
 
+        # ── Stocktake reads: MUST REFUSE (KNOWN_BUGS.md BUG-0115) ──────────
+        # Found by direct API probe 2026-09-26: every other inventory-module
+        # endpoint refused a non-entitled tenant except these two reads,
+        # which returned 200 ([] / null) instead of 409. Stocktake is a
+        # NextGen Operations (R1,499) feature — a POS-only (R899) tenant
+        # must be refused here exactly like every write below already was.
+        with pytest.raises(AppError) as exc:
+            await list_stocktakes(user=owner, db=db)
+        assert exc.value.code == "INVENTORY_NOT_ENABLED"
+        assert exc.value.status_code == 409
+
+        with pytest.raises(AppError) as exc:
+            await get_current_stocktake(user=owner, db=db)
+        assert exc.value.code == "INVENTORY_NOT_ENABLED"
+        assert exc.value.status_code == 409
+
+        # ── Stocktake writes: MUST REFUSE (already correct — regression guard) ─
+        with pytest.raises(AppError) as exc:
+            await open_stocktake(body=StocktakeOpenRequest(), user=owner, db=db)
+        assert exc.value.code == "INVENTORY_NOT_ENABLED"
+        assert exc.value.status_code == 409
+
         # ── Loyalty (checkout redemption path): MUST REFUSE ───────────────
         # Business.loyalty_enabled defaults False (migration 0051,
         # KNOWN_BUGS.md BUG-0107) -- checked FIRST in create_pos_order,
@@ -321,6 +345,13 @@ async def test_nextgen_operations_package_unlocks_inventory_but_not_complete_tie
         # ── Stocktake full lifecycle: MUST WORK ────────────────────────────
         stocktake = await open_stocktake(body=StocktakeOpenRequest(reference="Gate Test Count"), user=owner, db=db)
         assert stocktake.status == "DRAFT"
+
+        # ── Stocktake READS: MUST WORK for an entitled tenant (BUG-0115 ────
+        # non-regression — the fix must not break the paying Operations
+        # customer the gate is meant to let through) ───────────────────────
+        current = await get_current_stocktake(user=owner, db=db)
+        assert current is not None and current.id == stocktake.id
+
         stocktake = await submit_counts(
             session_id=stocktake.id,
             body=CountSubmitRequest(lines=[CountLineRequest(ingredient_id=ingredient.id, quantity="10", unit="KG")]),
@@ -330,6 +361,12 @@ async def test_nextgen_operations_package_unlocks_inventory_but_not_complete_tie
         assert stocktake.status == "COMPLETED"
         stocktake = await approve_stocktake(session_id=stocktake.id, user=owner, db=db)
         assert stocktake.status == "APPROVED"
+
+        history = await list_stocktakes(limit=50, user=owner, db=db)
+        assert any(row["id"] == str(stocktake.id) for row in history), (
+            "list_stocktakes must still return an entitled tenant's own "
+            "history after the BUG-0115 fix"
+        )
 
         # ── Wastage + approval queue: MUST WORK ────────────────────────────
         biz_row = await db.get(Business, business.id)
@@ -376,6 +413,11 @@ async def test_nextgen_complete_package_unlocks_whatsapp_loyalty_delivery_and_ad
     )
     owner = _owner(business.id)
     try:
+        # ── Stocktake reads: MUST WORK (BUG-0115 non-regression on the ─────
+        # top commercial tier too — inventory_enabled=True here as well) ───
+        assert await list_stocktakes(limit=50, user=owner, db=db) == []
+        assert await get_current_stocktake(user=owner, db=db) is None
+
         # ── WhatsApp connect: MUST WORK (no longer refused) ────────────────
         status = await get_connection_status(user=owner, db=db)
         assert status.whatsapp_module_enabled is True
