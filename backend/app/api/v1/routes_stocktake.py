@@ -631,6 +631,7 @@ async def get_stocktake(
     user: AuthUser = Depends(require_staff_or_above),
     db: AsyncSession = Depends(get_db),
 ):
+    await _require_inventory_enabled(db, user.business_id)
     session = await _load_session(db, user.business_id, session_id)
     return await _build_response(db, user.business_id, session)
 
@@ -908,6 +909,7 @@ async def get_variance_report(
     value-weighted so a trivial miscount of a cheap ingredient cannot swamp a
     real loss of an expensive one.
     """
+    await _require_inventory_enabled(db, user.business_id)
     session = await _load_session(db, user.business_id, session_id)
     response = await _build_response(db, user.business_id, session)
 
