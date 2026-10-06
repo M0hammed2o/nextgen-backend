@@ -67,6 +67,12 @@ def make_business(business_id, **overrides):
     now = datetime.now(timezone.utc)
     b = types.SimpleNamespace(
         id=business_id, name="Test Biz", slug="test-biz", business_code="ABC123",
+        # UI V2 branding (migration 0053). A real Business row always has these
+        # columns; this stand-in has to carry them too or
+        # BusinessSettingsResponse.from_business raises AttributeError.
+        logo_asset_id=None, brand_icon_asset_id=None,
+        brand_primary_colour=None, brand_accent_colour=None,
+        brand_display_name=None, brand_theme="LIGHT",
         timezone="Africa/Johannesburg", business_hours=None,
         greeting_text=None, fallback_text=None, closed_text=None, busy_text=None,
         order_in_only=False, delivery_enabled=False, delivery_fee_cents=0,

@@ -18,6 +18,7 @@ from backend.app.core.rbac import AuthUser, require_owner_or_manager, require_st
 from backend.app.db.session import get_db
 from backend.app.payments.registry import get_provider
 from shared.enums import AuditScope
+from backend.app.api.v1.routes_assets import asset_public_url
 from shared.models.asset import Asset
 from shared.models.audit import AuditEvent
 from shared.models.business import Business
@@ -26,7 +27,15 @@ from shared.models.user import BusinessUser
 # Body fields that reference an Asset row by id — every one of them must be
 # ownership-checked before being written to Business, the same principle
 # routes_menu.py::_resolve_item_image already applies to menu item images.
-_ASSET_REFERENCE_FIELDS = ("receipt_reference_asset_id", "menu_reference_asset_id")
+_ASSET_REFERENCE_FIELDS = (
+    "receipt_reference_asset_id",
+    "menu_reference_asset_id",
+    # UI V2 branding. These MUST be here: the shared loop below runs
+    # require_owned() over this tuple, which is the only thing stopping a
+    # tenant from pointing its logo at another restaurant's asset id.
+    "logo_asset_id",
+    "brand_icon_asset_id",
+)
 
 router = APIRouter(prefix="/business", tags=["business"])
 
@@ -35,6 +44,13 @@ router = APIRouter(prefix="/business", tags=["business"])
 # so this constraint and the registry can never silently drift apart
 # (BUG-0006: this field previously had no validation at all).
 _VALID_PAYMENT_PROVIDERS = r"^(DIRECT_EFT|MOCK|YOCO|PAYFAST|STITCH|IKHOKA)$"
+
+# UI V2 branding. A colour is stored exactly as a colour picker emits it, so
+# the pattern is deliberately strict: 6-digit hex with a leading #. Anything
+# looser (named colours, rgb(), 3-digit shorthand) would have to be normalised
+# somewhere, and "somewhere" would end up being two different places.
+_HEX_COLOUR = r"^#[0-9a-fA-F]{6}$"
+_VALID_BRAND_THEMES = r"^(LIGHT|DARK|SYSTEM)$"
 
 # Money-routing fields: a MANAGER changing any of these could redirect where
 # the restaurant's payments end up (own bank account, own payment-provider
@@ -107,6 +123,20 @@ class BusinessSettingsResponse(BaseModel):
     receipt_config_json: dict | None = None
     receipt_reference_asset_id: uuid.UUID | None = None
     menu_reference_asset_id: uuid.UUID | None = None
+    # ── UI V2 restaurant branding ────────────────────────────────────────
+    # Business-plane WRITABLE (unlike the entitlement flags below): a
+    # restaurant owns its own visual identity. Asset ids are returned
+    # alongside RESOLVED public URLs so the dashboard never has to know how
+    # Supabase Storage paths are built -- the same shape routes_menu.py
+    # already uses for image_asset_id -> image_url.
+    logo_asset_id: uuid.UUID | None = None
+    logo_url: str | None = None
+    brand_icon_asset_id: uuid.UUID | None = None
+    brand_icon_url: str | None = None
+    brand_primary_colour: str | None = None
+    brand_accent_colour: str | None = None
+    brand_display_name: str | None = None
+    brand_theme: str = "LIGHT"
     inventory_enabled: bool = False
     # Same platform-admin-only rule as inventory_enabled above — read-only
     # here (BUG-0072 follow-up: admin_api itself only gained this field
@@ -199,6 +229,18 @@ class BusinessSettingsResponse(BaseModel):
             receipt_config_json=b.receipt_config_json,
             receipt_reference_asset_id=b.receipt_reference_asset_id,
             menu_reference_asset_id=b.menu_reference_asset_id,
+            # UI V2 branding. These MUST be listed explicitly: this builder
+            # constructs the response with named kwargs rather than
+            # from_attributes, so a field added to the model but omitted here
+            # silently returns its default forever. That is exactly what
+            # happened on the first run of the branding integration tests --
+            # the columns persisted correctly and the API returned None.
+            logo_asset_id=b.logo_asset_id,
+            brand_icon_asset_id=b.brand_icon_asset_id,
+            brand_primary_colour=b.brand_primary_colour,
+            brand_accent_colour=b.brand_accent_colour,
+            brand_display_name=b.brand_display_name,
+            brand_theme=b.brand_theme or "LIGHT",
             inventory_enabled=b.inventory_enabled,
             digital_receipts_enabled=b.digital_receipts_enabled,
             delivery_platforms_enabled=b.delivery_platforms_enabled,
@@ -251,6 +293,13 @@ class BusinessSettingsResponse(BaseModel):
 
 class BusinessSettingsUpdate(BaseModel):
     name: str | None = None
+    # ── UI V2 restaurant branding ────────────────────────────────────────
+    logo_asset_id: uuid.UUID | None = None
+    brand_icon_asset_id: uuid.UUID | None = None
+    brand_primary_colour: str | None = Field(default=None, pattern=_HEX_COLOUR)
+    brand_accent_colour: str | None = Field(default=None, pattern=_HEX_COLOUR)
+    brand_display_name: str | None = Field(default=None, max_length=255)
+    brand_theme: str | None = Field(default=None, pattern=_VALID_BRAND_THEMES)
     timezone: str | None = None
     business_hours: dict | None = None
     greeting_text: str | None = None
@@ -356,6 +405,38 @@ class BusinessSettingsUpdate(BaseModel):
 
 # ── Routes ───────────────────────────────────────────────────────────────────
 
+async def _attach_brand_urls(
+    db: AsyncSession, business: Business, response: BusinessSettingsResponse
+) -> BusinessSettingsResponse:
+    """
+    Resolve the branding asset ids to displayable public URLs.
+
+    Separate from `BusinessSettingsResponse.from_business`, which is a sync
+    classmethod over an already-loaded row: resolving an asset needs a DB read,
+    and widening that classmethod into an async, db-taking one would ripple
+    through every other caller for no benefit.
+
+    Reuses `asset_public_url()` -- the same shared resolver routes_menu.py uses
+    for `image_asset_id -> image_url` -- so there is exactly one place that
+    knows how a Supabase Storage path becomes a URL.
+
+    A dangling or cross-tenant asset id resolves to None rather than raising.
+    That is deliberate: a missing logo must degrade to the monogram fallback,
+    never 500 the entire settings page. Writes are already prevented from
+    creating that situation by `_ASSET_REFERENCE_FIELDS` + `require_owned`.
+    """
+    for asset_id, field in (
+        (business.logo_asset_id, "logo_url"),
+        (business.brand_icon_asset_id, "brand_icon_url"),
+    ):
+        if asset_id is None:
+            continue
+        asset = await db.get(Asset, asset_id)
+        if asset is not None and asset.business_id == business.id:
+            setattr(response, field, asset_public_url(asset.storage_path))
+    return response
+
+
 @router.get("/settings", response_model=BusinessSettingsResponse)
 async def get_business_settings(
     user: AuthUser = Depends(require_owner_or_manager),
@@ -375,7 +456,7 @@ async def get_business_settings(
     response = BusinessSettingsResponse.from_business(business)
     response.monthly_orders_used = quota.used
     response.monthly_orders_remaining = quota.remaining
-    return response
+    return await _attach_brand_urls(db, business, response)
 
 
 @router.put("/settings", response_model=BusinessSettingsResponse)
@@ -464,7 +545,83 @@ async def update_business_settings(
 
     await db.commit()
     await db.refresh(business)
-    return BusinessSettingsResponse.from_business(business)
+    return await _attach_brand_urls(db, business, BusinessSettingsResponse.from_business(business))
+
+
+# ── UI V2: restaurant branding, readable by the till ─────────────────────────
+
+class BrandingResponse(BaseModel):
+    """
+    The restaurant's visual identity, and nothing else.
+
+    A deliberately NARROW projection of the settings payload. The staff PWA
+    needs the logo, name and colours to brand the till and the PIN screen, but
+    `GET /business/settings` is `require_owner_or_manager` and returns payment
+    routing, credential hints, VAT configuration and entitlement flags -- none
+    of which a cashier's token should be able to read. Widening the settings
+    gate to `require_staff_or_above` to serve branding would have handed every
+    till all of that; this endpoint exists so it does not have to.
+    """
+    business_id: uuid.UUID
+    display_name: str
+    legal_name: str
+    logo_url: str | None = None
+    icon_url: str | None = None
+    primary_colour: str | None = None
+    accent_colour: str | None = None
+    theme: str = "LIGHT"
+
+
+@router.get("/branding", response_model=BrandingResponse)
+async def get_business_branding(
+    # staff_or_above, not owner_or_manager: a cashier's till has to be able to
+    # render its own restaurant's identity.
+    user: AuthUser = Depends(require_staff_or_above),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    The signed-in user's own restaurant branding.
+
+    Scoped by `user.business_id` from the JWT and never by anything the client
+    sends, so this cannot be used to read another tenant's branding -- the same
+    invariant every other business-plane route holds.
+
+    There is deliberately NO public, unauthenticated variant of this keyed by
+    business code. The staff PIN screen renders before authentication and would
+    be the obvious caller, but such an endpoint would let anyone enumerate valid
+    business codes. The PWA instead caches the branding it received while
+    authenticated and reuses it on the PIN screen, so only the very first launch
+    on a given device is unbranded.
+    """
+    business = (
+        await db.execute(select(Business).where(Business.id == user.business_id))
+    ).scalar_one_or_none()
+    if not business:
+        raise NotFoundError("Business")
+
+    urls: dict[str, str | None] = {"logo_url": None, "icon_url": None}
+    for asset_id, key in (
+        (business.logo_asset_id, "logo_url"),
+        (business.brand_icon_asset_id, "icon_url"),
+    ):
+        if asset_id is None:
+            continue
+        asset = await db.get(Asset, asset_id)
+        if asset is not None and asset.business_id == business.id:
+            urls[key] = asset_public_url(asset.storage_path)
+
+    return BrandingResponse(
+        business_id=business.id,
+        # The till shows the trading name; `name` stays the legal/registered
+        # name that NextGen's own commercial invoices bill.
+        display_name=(business.brand_display_name or business.name),
+        legal_name=business.name,
+        logo_url=urls["logo_url"],
+        icon_url=urls["icon_url"],
+        primary_colour=business.brand_primary_colour,
+        accent_colour=business.brand_accent_colour,
+        theme=business.brand_theme or "LIGHT",
+    )
 
 
 # ── Payment provider health check ────────────────────────────────────────────

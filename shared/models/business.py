@@ -143,8 +143,37 @@ class Business(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     order_number_sequence: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
     # ── Logo / Branding ──────────────────────────────────────────────────
+    # logo_asset_id has existed since 0001_initial_schema but lay dormant
+    # (nothing read or wrote it) until the UI V2 programme wired it up. It is
+    # reused rather than replaced — see migration 0053 for why a second logo
+    # column was deliberately NOT added.
     logo_asset_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), nullable=True
+        UUID(as_uuid=True), nullable=True,
+        comment="Restaurant logo in `assets` (kind BUSINESS_LOGO). Resolved to a "
+                "displayable URL via routes_assets.asset_public_url()."
+    )
+    brand_primary_colour: Mapped[str | None] = mapped_column(
+        String(9), nullable=True,
+        comment="Primary brand colour as #RRGGBB. NULL = NextGen default theme. "
+                "Derived variants are computed at runtime, never stored."
+    )
+    brand_accent_colour: Mapped[str | None] = mapped_column(
+        String(9), nullable=True,
+        comment="Optional secondary accent as #RRGGBB. NULL = derived from primary."
+    )
+    brand_icon_asset_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True,
+        comment="Square icon/monogram source in `assets`. Separate from logo_asset_id "
+                "because a wide wordmark cannot be cropped square without distorting it."
+    )
+    brand_display_name: Mapped[str | None] = mapped_column(
+        String(255), nullable=True,
+        comment="Short trading name shown in the UI. Falls back to `name`, which stays "
+                "the legal/registered name used on NextGen's commercial invoices."
+    )
+    brand_theme: Mapped[str] = mapped_column(
+        String(8), nullable=False, server_default="LIGHT",
+        comment="LIGHT | DARK | SYSTEM."
     )
     menu_image_url: Mapped[str | None] = mapped_column(
         Text, nullable=True,
