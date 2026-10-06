@@ -256,6 +256,15 @@ class POSSettingsResponse(BaseModel):
     # Inventory — the till shows the quick-wastage action only when enabled
     inventory_enabled: bool = False
 
+    # Digital receipts — the till shows the WhatsApp receipt option only when
+    # the business is actually entitled to it. Without this the cashier can
+    # only discover the module is off by tapping WhatsApp and watching the
+    # send come back NOT_REQUESTED, which looks like a failure to a customer
+    # standing at the counter. Read-only here, exactly like inventory_enabled
+    # above: this is a platform-admin-managed entitlement and the business
+    # plane never writes it.
+    digital_receipts_enabled: bool = False
+
     # Staff navigation — which tabs this tenant's bottom bar should show.
     # Display configuration only: a hidden tab never disables the underlying
     # feature, and the API for each still enforces its own permissions.
@@ -407,6 +416,7 @@ async def get_pos_settings(
     if not business:
         raise NotFoundError("Business")
     return POSSettingsResponse(
+        digital_receipts_enabled=business.digital_receipts_enabled,
         cash_enabled=business.pos_cash_enabled,
         card_enabled=business.pos_card_enabled,
         other_payment_enabled=(

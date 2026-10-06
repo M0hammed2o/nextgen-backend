@@ -481,6 +481,11 @@ async def test_pos_settings_reflects_business_config():
         vat_inclusive_pricing=True, receipt_paper_width_mm=58,
         receipt_auto_print=True, receipt_copies=2, print_kitchen_receipt=True,
         receipt_config_json=None, inventory_enabled=True,
+        # Opposite of the response model's own default, so the assertion
+        # below proves the route reads the business row rather than
+        # falling through to the schema default -- same reasoning as the
+        # staff navigation flags a few lines down.
+        digital_receipts_enabled=True,
         wastage_approval_threshold_cents=0,
         # Staff navigation flags. Set to the OPPOSITE of their model defaults
         # so the assertions below prove the route reads the business row
@@ -506,6 +511,7 @@ async def test_pos_settings_reflects_business_config():
     assert settings.receipt_copies == 2
     assert settings.print_kitchen_receipt is True
     assert settings.inventory_enabled is True
+    assert settings.digital_receipts_enabled is True
     assert settings.staff_live_orders_tab_enabled is False
     assert settings.staff_wastage_tab_enabled is False
     assert settings.staff_stocktake_tab_enabled is True
@@ -530,6 +536,7 @@ async def test_pos_settings_stocktake_tab_needs_the_inventory_module():
         receipt_config_json=None,
         # Tab switched on, module switched off.
         inventory_enabled=False,
+        digital_receipts_enabled=False,
         wastage_approval_threshold_cents=0,
         staff_live_orders_tab_enabled=True,
         staff_wastage_tab_enabled=True,
