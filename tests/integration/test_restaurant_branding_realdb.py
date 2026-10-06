@@ -37,7 +37,9 @@ from backend.app.api.v1.routes_business import (
     get_business_settings,
     update_business_settings,
 )
+from backend.app.api.v1.routes_assets import resolve_business_logo_url
 from backend.app.core.errors import AppError
+from backend.app.receipts.document import build_receipt_document
 from backend.app.core.rbac import AuthUser
 from shared.models import Asset, AuditEvent, Business
 from shared.utils import generate_business_code
@@ -374,3 +376,89 @@ async def test_display_name_falls_back_to_the_legal_name_and_never_overwrites_it
 
     await db.refresh(biz)
     assert biz.name == legal
+
+
+# ── Phase G: the receipt is the restaurant's document ────────────────────────
+
+
+async def test_receipt_carries_the_restaurants_logo_and_trading_name(
+    db: AsyncSession, two_businesses
+):
+    """
+    A restaurant that configures branding must see it on the customer receipt.
+    Before UI V2 the receipt read only `receipt_config_json`, so a logo set in
+    Settings never reached the document.
+    """
+    biz, _ = two_businesses
+    logo = await _make_asset(db, biz.id)
+    await update_business_settings(
+        body=BusinessSettingsUpdate(logo_asset_id=logo.id, brand_display_name="NOOSH"),
+        user=_owner(biz.id),
+        db=db,
+    )
+    await db.refresh(biz)
+
+    brand_logo_url = await resolve_business_logo_url(db, biz)
+    assert brand_logo_url and logo.storage_path in brand_logo_url
+
+    doc = build_receipt_document(
+        _FakeOrder(), biz, order_items=[], brand_logo_url=brand_logo_url
+    )
+    # Trading name, not the registered name.
+    assert doc.header.trading_name == "NOOSH"
+    assert doc.header.logo_url == brand_logo_url
+
+
+async def test_receipt_falls_back_to_the_registered_name_without_branding(
+    db: AsyncSession, two_businesses
+):
+    biz, _ = two_businesses
+    doc = build_receipt_document(_FakeOrder(), biz, order_items=[], brand_logo_url=None)
+    assert doc.header.trading_name == biz.name
+    assert doc.header.logo_url is None
+
+
+async def test_a_deleted_logo_does_not_break_the_receipt(db: AsyncSession, two_businesses):
+    """
+    A receipt must still print when the logo asset has been removed. A receipt
+    that 500s over a missing image is a far worse failure than one without a
+    logo.
+    """
+    biz, _ = two_businesses
+    logo = await _make_asset(db, biz.id)
+    await update_business_settings(
+        body=BusinessSettingsUpdate(logo_asset_id=logo.id), user=_owner(biz.id), db=db
+    )
+    await db.execute(delete(Asset).where(Asset.id == logo.id))
+    await db.commit()
+    await db.refresh(biz)
+
+    assert await resolve_business_logo_url(db, biz) is None
+
+
+async def test_a_logo_belonging_to_another_tenant_never_renders(db: AsyncSession, two_businesses):
+    biz_a, biz_b = two_businesses
+    b_logo = await _make_asset(db, biz_b.id)
+    # Simulate a bad write that put B's asset id on A, bypassing the API guard.
+    await db.execute(
+        text("UPDATE businesses SET logo_asset_id = :a WHERE id = :i"),
+        {"a": str(b_logo.id), "i": str(biz_a.id)},
+    )
+    await db.commit()
+    await db.refresh(biz_a)
+    # The resolver re-checks ownership, so nothing renders.
+    assert await resolve_business_logo_url(db, biz_a) is None
+
+
+class _FakeOrder:
+    """Minimal order stand-in: this test is about the HEADER, not the lines."""
+
+    id = uuid.uuid4()
+    order_number = "A-001"
+    created_at = None
+    subtotal_cents = 0
+    total_cents = 0
+    discount_cents = 0
+    vat_cents = 0
+    payment_method = "CASH"
+    status = "PAID"

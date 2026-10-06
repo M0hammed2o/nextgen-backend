@@ -181,6 +181,30 @@ def asset_public_url(storage_path: str) -> str:
     )
 
 
+async def resolve_business_logo_url(db, business) -> str | None:
+    """
+    The public URL of a business's branding logo, or None.
+
+    Shared by every caller that needs to RENDER a restaurant's logo (customer
+    receipts, the public receipt page) so none of them re-implements the
+    asset-id -> URL lookup. Ownership is re-checked here even though the id
+    comes off the business row itself: it is cheap, and it means a logo can
+    never render from another tenant's asset even if a bad write ever landed.
+
+    Returns None rather than raising on a missing or foreign asset -- a
+    receipt must still print when a logo has been deleted. A receipt that
+    500s because of a missing image would be a far worse failure than one
+    without a logo.
+    """
+    asset_id = getattr(business, "logo_asset_id", None)
+    if asset_id is None:
+        return None
+    asset = await db.get(Asset, asset_id)
+    if asset is None or asset.business_id != business.id:
+        return None
+    return asset_public_url(asset.storage_path)
+
+
 # ── Routes ───────────────────────────────────────────────────────────────────
 
 @router.post("/upload-url", response_model=UploadUrlResponse)

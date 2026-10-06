@@ -26,6 +26,7 @@ from sqlalchemy.orm import selectinload
 from backend.app.core.errors import NotFoundError
 from backend.app.core.rbac import AuthUser, require_owner_or_manager, require_staff_or_above
 from backend.app.db.session import get_db
+from backend.app.api.v1.routes_assets import resolve_business_logo_url
 from backend.app.receipts.document import build_receipt_document
 from backend.app.receipts.escpos import PrinterCapabilities, render_escpos, render_text
 from shared.enums import AuditScope
@@ -143,6 +144,8 @@ async def _document(
     else:
         reprint_count = prior_count
         last_reprinted_at = prior_last_at
+    # The restaurant's own logo, for printed and PWA-rendered receipts alike.
+    brand_logo_url = await resolve_business_logo_url(db, business)
     return build_receipt_document(
         order,
         business,
@@ -151,6 +154,7 @@ async def _document(
         is_reprint=is_reprint,
         reprint_count=reprint_count,
         last_reprinted_at=last_reprinted_at,
+        brand_logo_url=brand_logo_url,
     )
 
 

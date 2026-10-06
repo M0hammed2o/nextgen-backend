@@ -59,6 +59,7 @@ from backend.app.core.config import get_settings
 from backend.app.core.ratelimit import limiter
 from backend.app.db.session import get_db
 from backend.app.receipts.document import build_receipt_document
+from backend.app.api.v1.routes_assets import resolve_business_logo_url
 from backend.app.receipts.html_public import render_not_found_html, render_public_receipt_html
 from shared.models.business import Business
 from shared.models.digital_receipt import DigitalReceipt
@@ -138,7 +139,11 @@ async def get_public_receipt(
         # receipt that was already generated/sent must remain viewable via
         # its own token regardless of the tenant's CURRENT entitlement
         # state (see DECISIONS.md and this change's report).
-        document = build_receipt_document(order, business)
+        # The customer-facing receipt is the RESTAURANT's document, so it
+        # carries their logo. Resolved here because build_receipt_document is
+        # synchronous and holds no database session.
+        brand_logo_url = await resolve_business_logo_url(db, business)
+        document = build_receipt_document(order, business, brand_logo_url=brand_logo_url)
         html = render_public_receipt_html(document)
         return Response(
             content=html,

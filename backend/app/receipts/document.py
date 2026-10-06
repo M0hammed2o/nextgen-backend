@@ -286,6 +286,7 @@ def build_receipt_document(
     is_reprint: bool = False,
     reprint_count: int = 0,
     last_reprinted_at: str | None = None,
+    brand_logo_url: str | None = None,
 ) -> ReceiptDocument:
     """
     Assemble a printable document from an Order plus its business config.
@@ -312,7 +313,16 @@ def build_receipt_document(
     is_kitchen = document_type == "KITCHEN"
 
     header = ReceiptHeader(
-        trading_name=config.get("trading_name") or getattr(business, "name", "") or "",
+        # UI V2: the receipt is the restaurant's document, so it carries the
+        # TRADING name. receipt_config_json still wins where a business has
+        # explicitly set one (some restaurants print a different legal entity),
+        # then the branding trading name, then the registered name.
+        trading_name=(
+            config.get("trading_name")
+            or getattr(business, "brand_display_name", None)
+            or getattr(business, "name", "")
+            or ""
+        ),
         franchise_name=config.get("franchise_name"),
         branch_name=config.get("branch_name"),
         address=config.get("address") or getattr(business, "address", None),
@@ -323,7 +333,10 @@ def build_receipt_document(
             else None
         ),
         registration_number=config.get("registration_number"),
-        logo_url=config.get("logo_url"),
+        # An explicit receipt-config logo still wins; otherwise the restaurant's
+        # branding logo is used, resolved by the caller (this function has no
+        # database session and must stay synchronous and pure).
+        logo_url=config.get("logo_url") or brand_logo_url,
         extra_lines=list(config.get("header_lines") or []),
     )
 
