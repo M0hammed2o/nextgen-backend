@@ -338,6 +338,15 @@ class LiveStockRow(BaseModel):
     variance_percent: str | None
     needs_attention: bool
 
+    # The expected quantity as a NUMBER, alongside its formatted display
+    # string. Added for the UI V2 stock-status indicator: the dashboard needs
+    # to distinguish "running low" from "actually out", and it cannot derive
+    # that from expected_value_cents -- an ingredient whose cost is unset has
+    # a value of 0 while still having stock on hand, so value is not a safe
+    # proxy for quantity. `expected` is already computed here; this just stops
+    # the frontend having to parse a display string to get at it.
+    expected_milli: int
+
     expected_value_cents: int
     below_par: bool
 
@@ -497,6 +506,7 @@ async def get_live_stock(
             wastage_display=show(wastage),
             adjustments_display=show(adjustments),
             expected_display=show(expected),
+            expected_milli=int(expected),
             last_counted_display=counted_display,
             last_counted_at=last_count.cutoff_at if last_count else None,
             variance_display=variance_display,
