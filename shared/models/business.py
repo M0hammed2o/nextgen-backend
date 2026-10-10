@@ -322,6 +322,36 @@ class Business(Base, UUIDPrimaryKeyMixin, TimestampMixin):
                 "effect today beyond being readable/settable.",
     )
 
+    # ── Delivery reconciliation entitlement (migration 0054) ─────────────
+    # A DELIBERATELY SEPARATE concept from delivery_platforms_enabled above.
+    # That flag means commercial access to the LIVE marketplace integrations
+    # (Uber Eats direct order injection, Mr D connection). This flag means
+    # commercial access to the older CSV/manual delivery-order reconciliation
+    # feature (routes_external_orders.py's preview/commit/batches/mappings),
+    # which has always been baseline functionality with no entitlement gate
+    # at all. A tenant can have either, both, or neither — never conflate the
+    # two in frontend or schema logic (see UI V2.1 follow-up DECISIONS.md
+    # entry and PRODUCT_MAP.md).
+    #
+    # Platform-admin-writable, business-plane READ-ONLY, same pattern as
+    # every other Commercial V1 entitlement column. Defaults FALSE for every
+    # tenant, including existing CSV-importer users — deliberately NOT
+    # backfilled TRUE like loyalty_enabled was, because there is no reliable
+    # existing on/off signal to backfill from (see migration 0054's
+    # docstring). The backend import routes themselves do NOT yet enforce
+    # this column — it is model/schema/nav-visibility only in this change;
+    # enforcing it at the API layer is a deliberate follow-up once Admin has
+    # explicitly granted it to every tenant who currently relies on the
+    # importer, not something this migration should flip unilaterally.
+    delivery_reconciliation_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False,
+        comment="Commercial entitlement for CSV/manual delivery-order "
+                "reconciliation (Uber Eats, Mr D, generic platforms), "
+                "separate from delivery_platforms_enabled's live-marketplace "
+                "meaning. Not yet enforced by routes_external_orders.py — "
+                "nav-visibility/schema only as of migration 0054.",
+    )
+
     # ── Advanced Analytics entitlement (Commercial V1 gate, migration 0047) ──
     # Master switch, same pattern as inventory_enabled/digital_receipts_enabled/
     # delivery_platforms_enabled. NextGen POS gets Core Analytics (order counts,

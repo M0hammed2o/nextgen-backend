@@ -92,6 +92,7 @@ def make_business(business_id, **overrides):
         receipt_reference_asset_id=None, menu_reference_asset_id=None,
         inventory_enabled=False, digital_receipts_enabled=False,
         delivery_platforms_enabled=False, uber_eats_enabled=False, mrd_enabled=False,
+        delivery_reconciliation_enabled=False,
         advanced_analytics_enabled=False,
         loyalty_enabled=False,
         is_whatsapp_enabled=True, wastage_approval_threshold_cents=0,
@@ -266,6 +267,41 @@ async def test_delivery_entitlement_flags_distinct_from_own_driver_delivery_enab
 
 def test_digital_receipts_enabled_not_settable_via_update_schema():
     assert "digital_receipts_enabled" not in BusinessSettingsUpdate.model_fields
+
+
+# ── delivery_reconciliation_enabled (migration 0054) ───────────────────────
+# UI V2.1 follow-up: a DELIBERATELY SEPARATE entitlement from
+# delivery_platforms_enabled above — gates the CSV/manual reconciliation
+# importer, not the live marketplace integrations. Same platform-admin-only
+# rule as every other flag in this file.
+
+async def test_get_settings_returns_delivery_reconciliation_enabled():
+    owner = make_user(role="OWNER")
+    business = make_business(owner.business_id, delivery_reconciliation_enabled=True)
+    db = FakeDB([FakeResult(business), FakeResult(0)])
+
+    result = await get_business_settings(user=owner, db=db)
+    assert result.delivery_reconciliation_enabled is True
+
+
+def test_delivery_reconciliation_enabled_not_settable_via_update_schema():
+    assert "delivery_reconciliation_enabled" not in BusinessSettingsUpdate.model_fields
+
+
+async def test_delivery_reconciliation_enabled_distinct_from_delivery_platforms_enabled():
+    """The two delivery entitlements are independent -- a business can have
+    either, both, or neither, and reading one must never reflect the other."""
+    owner = make_user(role="OWNER")
+    business = make_business(
+        owner.business_id,
+        delivery_platforms_enabled=True,
+        delivery_reconciliation_enabled=False,
+    )
+    db = FakeDB([FakeResult(business), FakeResult(0)])
+
+    result = await get_business_settings(user=owner, db=db)
+    assert result.delivery_platforms_enabled is True
+    assert result.delivery_reconciliation_enabled is False
 
 
 # ── advanced_analytics_enabled (migration 0047, Commercial V1 gate) ────────

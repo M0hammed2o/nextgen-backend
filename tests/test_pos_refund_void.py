@@ -486,6 +486,11 @@ async def test_pos_settings_reflects_business_config():
         # falling through to the schema default -- same reasoning as the
         # staff navigation flags a few lines down.
         digital_receipts_enabled=True,
+        # UI V2.1 follow-up: loyalty_enabled, opposite of the response
+        # model's own default (False), so the assertion below proves the
+        # route reads the business row rather than falling through to the
+        # schema default — same reasoning as the staff navigation flags.
+        loyalty_enabled=True,
         wastage_approval_threshold_cents=0,
         # Staff navigation flags. Set to the OPPOSITE of their model defaults
         # so the assertions below prove the route reads the business row
@@ -512,6 +517,7 @@ async def test_pos_settings_reflects_business_config():
     assert settings.print_kitchen_receipt is True
     assert settings.inventory_enabled is True
     assert settings.digital_receipts_enabled is True
+    assert settings.loyalty_enabled is True
     assert settings.staff_live_orders_tab_enabled is False
     assert settings.staff_wastage_tab_enabled is False
     assert settings.staff_stocktake_tab_enabled is True
@@ -537,6 +543,7 @@ async def test_pos_settings_stocktake_tab_needs_the_inventory_module():
         # Tab switched on, module switched off.
         inventory_enabled=False,
         digital_receipts_enabled=False,
+        loyalty_enabled=False,
         wastage_approval_threshold_cents=0,
         staff_live_orders_tab_enabled=True,
         staff_wastage_tab_enabled=True,
@@ -557,3 +564,76 @@ async def test_pos_settings_unknown_business_is_404():
     db = FakeDB([FakeResult(scalar=None)])
     with pytest.raises(NotFoundError):
         await get_pos_settings(user=user, db=db)
+
+
+def _pos_settings_business(loyalty_enabled: bool):
+    """Minimal Business stand-in carrying every field get_pos_settings reads,
+    varying only loyalty_enabled -- see test_pos_settings_loyalty_enabled_*
+    below (UI V2.1 follow-up Part B1: a real field, not an API-error probe)."""
+    return types.SimpleNamespace(
+        pos_cash_enabled=True, pos_card_enabled=True,
+        pos_payfast_enabled=False, pos_yoco_enabled=False, pos_ikhoka_enabled=False,
+        pos_direct_eft_enabled=False, pos_other_payment_enabled=False,
+        pos_table_number_required=False, delivery_fee_cents=0, max_staff_discount_cents=0,
+        vat_registered=False, vat_number=None, vat_rate_basis_points=0,
+        vat_inclusive_pricing=True, receipt_paper_width_mm=80,
+        receipt_auto_print=True, receipt_copies=1, print_kitchen_receipt=False,
+        receipt_config_json=None, inventory_enabled=False,
+        digital_receipts_enabled=False,
+        loyalty_enabled=loyalty_enabled,
+        wastage_approval_threshold_cents=0,
+        staff_live_orders_tab_enabled=True,
+        staff_wastage_tab_enabled=True,
+        staff_stocktake_tab_enabled=False,
+    )
+
+
+async def test_pos_settings_loyalty_enabled_false_is_returned_as_false():
+    user = make_user(role="STAFF")
+    db = FakeDB([FakeResult(scalar=_pos_settings_business(loyalty_enabled=False))])
+
+    settings = await get_pos_settings(user=user, db=db)
+
+    assert settings.loyalty_enabled is False
+
+
+async def test_pos_settings_loyalty_enabled_true_is_returned_as_true():
+    user = make_user(role="STAFF")
+    db = FakeDB([FakeResult(scalar=_pos_settings_business(loyalty_enabled=True))])
+
+    settings = await get_pos_settings(user=user, db=db)
+
+    assert settings.loyalty_enabled is True
+
+
+async def test_pos_settings_queries_by_the_callers_own_business_id_only():
+    """
+    Tenant isolation: GET /pos/settings must filter strictly by
+    user.business_id, never by anything else -- the same invariant every
+    other business-scoped route relies on. Asserted structurally (the WHERE
+    clause's bound parameter), the same technique already used above for
+    _require_open_till_for_cash_reversal's lock, since a fake in-memory DB
+    can't enforce a real SQL WHERE.
+    """
+    class CapturingDB:
+        def __init__(self, result):
+            self.captured_stmt = None
+            self._result = result
+
+        async def execute(self, stmt):
+            self.captured_stmt = stmt
+            return self._result
+
+    business_id = uuid.uuid4()
+    user = make_user(role="STAFF", business_id=business_id)
+    db = CapturingDB(FakeResult(scalar=_pos_settings_business(loyalty_enabled=True)))
+
+    await get_pos_settings(user=user, db=db)
+
+    assert db.captured_stmt is not None
+    compiled = db.captured_stmt.compile(compile_kwargs={"literal_binds": True})
+    assert business_id.hex in str(compiled).replace("-", ""), (
+        "GET /pos/settings must filter Business by the caller's own "
+        "business_id -- this query must never be able to read another "
+        "tenant's row"
+    )

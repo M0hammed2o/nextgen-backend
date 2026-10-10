@@ -152,6 +152,13 @@ class BusinessSettingsResponse(BaseModel):
     delivery_platforms_enabled: bool = False
     uber_eats_enabled: bool = False
     mrd_enabled: bool = False
+    # Delivery reconciliation entitlement (migration 0054) — DELIBERATELY
+    # SEPARATE from delivery_platforms_enabled above: this one gates the
+    # CSV/manual reconciliation importer (routes_external_orders.py), not
+    # the live marketplace integrations. Same platform-admin-writable /
+    # business-plane-READ-ONLY pattern. See shared/models/business.py for
+    # the full rationale and why it is not yet enforced at the API layer.
+    delivery_reconciliation_enabled: bool = False
     # Advanced Analytics entitlement (migration 0047) — same platform-admin-
     # writable / business-plane-READ-ONLY pattern as the flags above. Gates
     # GET /business/external-orders/channels, /business/analytics/
@@ -246,6 +253,7 @@ class BusinessSettingsResponse(BaseModel):
             delivery_platforms_enabled=b.delivery_platforms_enabled,
             uber_eats_enabled=b.uber_eats_enabled,
             mrd_enabled=b.mrd_enabled,
+            delivery_reconciliation_enabled=b.delivery_reconciliation_enabled,
             advanced_analytics_enabled=b.advanced_analytics_enabled,
             loyalty_enabled=b.loyalty_enabled,
             is_whatsapp_enabled=b.is_whatsapp_enabled,

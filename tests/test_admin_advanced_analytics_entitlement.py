@@ -66,6 +66,7 @@ def _make_business(**overrides):
         last_webhook_received_at=None, created_at=now,
         is_whatsapp_enabled=True, inventory_enabled=False, digital_receipts_enabled=False,
         delivery_platforms_enabled=False, uber_eats_enabled=False, mrd_enabled=False,
+        delivery_reconciliation_enabled=False,
         advanced_analytics_enabled=False,
         loyalty_enabled=False,
         staff_live_orders_tab_enabled=True, staff_wastage_tab_enabled=True,

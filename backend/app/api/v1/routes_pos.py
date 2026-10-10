@@ -265,6 +265,17 @@ class POSSettingsResponse(BaseModel):
     # plane never writes it.
     digital_receipts_enabled: bool = False
 
+    # Loyalty — the till shows the Loyalty staff page/nav entry only when the
+    # business is actually entitled to it (UI V2.1 follow-up). Read-only
+    # here, exactly like inventory_enabled/digital_receipts_enabled above:
+    # this is a platform-admin-managed entitlement and the business plane
+    # never writes it. Mirrors Business.loyalty_enabled directly — the ONE
+    # source of truth, same column routes_loyalty.py's
+    # `_require_loyalty_enabled()` reads. Replaces the earlier
+    # useLoyaltyEnabled() probe (which inferred entitlement from a
+    # LOYALTY_NOT_ENABLED API error) with a real field.
+    loyalty_enabled: bool = False
+
     # Staff navigation — which tabs this tenant's bottom bar should show.
     # Display configuration only: a hidden tab never disables the underlying
     # feature, and the API for each still enforces its own permissions.
@@ -437,6 +448,7 @@ async def get_pos_settings(
         receipt_copies=business.receipt_copies,
         print_kitchen_receipt=business.print_kitchen_receipt,
         inventory_enabled=business.inventory_enabled,
+        loyalty_enabled=business.loyalty_enabled,
         staff_live_orders_tab_enabled=business.staff_live_orders_tab_enabled,
         staff_wastage_tab_enabled=business.staff_wastage_tab_enabled,
         # A stocktake tab is only useful if there is stock to count. Gating the
