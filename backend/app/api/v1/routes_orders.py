@@ -59,6 +59,22 @@ class OrderItemResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class PaymentAllocationResponse(BaseModel):
+    """
+    One settled payment allocation (migration 0055) — only meaningfully
+    populated for payment_method == 'SPLIT'; never exposes internal UUIDs
+    (payment_link_intent_id) or a raw payment link URL.
+    """
+    payment_method: str
+    amount_cents: int
+    cash_tendered_cents: int | None = None
+    change_due_cents: int | None = None
+    payment_reference: str | None = None
+    provider: str | None = None
+    paid_at: datetime | None = None
+    model_config = {"from_attributes": True}
+
+
 class OrderResponse(BaseModel):
     id: uuid.UUID
     order_number: str
@@ -109,6 +125,7 @@ class OrderResponse(BaseModel):
     special_instructions: str | None = None
     cancelled_reason: str | None
     items: list[OrderItemResponse] = []
+    payment_allocations: list[PaymentAllocationResponse] = []
     created_at: datetime
     updated_at: datetime
     model_config = {"from_attributes": True}

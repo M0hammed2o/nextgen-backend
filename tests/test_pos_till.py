@@ -197,8 +197,9 @@ async def test_close_till_computes_variance_and_writes_audit_event():
     session = make_session(user.business_id, opening_float_cents=10000)
     db = FakeDB([
         FakeResult(scalar=session),           # TillSession lookup
+        FakeResult(scalar=0),                 # allocation-based cash sum (none — legacy orders, no allocation rows)
         FakeResult(items=[5000, 3000]),       # Order.total_cents for CASH-paid orders in this session
-        FakeResult(items=[]),                 # Order.refund_amount_cents for CASH refunds/voids in this session
+        FakeResult(items=[]),                 # Order.refund_cash_cents for refunds/voids in this session
     ])
 
     result = await close_till(
@@ -236,6 +237,7 @@ async def test_close_till_sums_total_cents_which_is_already_net_of_any_loyalty_r
     session = make_session(user.business_id, opening_float_cents=10000)
     db = FakeDB([
         FakeResult(scalar=session),
+        FakeResult(scalar=0),      # allocation-based cash sum (none — legacy order, no allocation rows)
         FakeResult(items=[8000]),  # a R100 sale with a R20 reward already netted into total_cents
         FakeResult(items=[]),
     ])
@@ -263,6 +265,7 @@ async def test_close_till_cash_query_still_filters_by_payment_status():
     session = make_session(user.business_id, opening_float_cents=10000)
     db = FakeDB([
         FakeResult(scalar=session),
+        FakeResult(scalar=0),  # allocation-based cash sum (none — legacy order, no allocation rows)
         FakeResult(items=[5000]),
         FakeResult(items=[]),
     ])
@@ -273,7 +276,9 @@ async def test_close_till_cash_query_still_filters_by_payment_status():
         user=user, db=db,
     )
 
-    cash_query = db.executed_statements[1]
+    # index 2: the legacy Order-column fallback query (index 1 is the new
+    # allocation-based query, which has no payment_status filter of its own).
+    cash_query = db.executed_statements[2]
     compiled = str(cash_query.compile(compile_kwargs={"literal_binds": True}))
     assert "payment_status" in compiled
 
@@ -286,6 +291,7 @@ async def test_close_till_cash_refund_reduces_expected_cash():
     session = make_session(user.business_id, opening_float_cents=10000)
     db = FakeDB([
         FakeResult(scalar=session),
+        FakeResult(scalar=0),          # allocation-based cash sum (none — legacy orders, no allocation rows)
         FakeResult(items=[5000]),      # one CASH sale of R50
         FakeResult(items=[2000]),      # one CASH refund of R20 in the same session
     ])
@@ -314,6 +320,7 @@ async def test_close_till_cash_sales_query_links_via_till_session_id():
     session = make_session(user.business_id, opening_float_cents=10000)
     db = FakeDB([
         FakeResult(scalar=session),
+        FakeResult(scalar=0),  # allocation-based cash sum (none — legacy order, no allocation rows)
         FakeResult(items=[]),
         FakeResult(items=[]),
     ])
@@ -324,7 +331,10 @@ async def test_close_till_cash_sales_query_links_via_till_session_id():
         user=user, db=db,
     )
 
-    cash_query = db.executed_statements[1]
+    # index 2: the legacy Order-column fallback query (index 1 is the new
+    # allocation-based query, which also filters on till_session_id, but
+    # this test's intent is specifically the legacy Order linkage).
+    cash_query = db.executed_statements[2]
     assert "till_session_id" in str(cash_query.compile(compile_kwargs={"literal_binds": True}))
 
 
@@ -341,6 +351,7 @@ async def test_close_till_refund_query_uses_refunded_at_not_till_session_id():
     session = make_session(user.business_id, opening_float_cents=10000)
     db = FakeDB([
         FakeResult(scalar=session),
+        FakeResult(scalar=0),  # allocation-based cash sum (none — legacy order, no allocation rows)
         FakeResult(items=[]),
         FakeResult(items=[]),
     ])
@@ -351,7 +362,7 @@ async def test_close_till_refund_query_uses_refunded_at_not_till_session_id():
         user=user, db=db,
     )
 
-    refund_query = db.executed_statements[2]
+    refund_query = db.executed_statements[3]
     compiled = str(refund_query.compile(compile_kwargs={"literal_binds": True}))
     assert "refunded_at" in compiled
     assert "till_session_id" not in compiled
@@ -371,8 +382,9 @@ async def test_close_till_same_session_refund_is_not_double_counted():
     session = make_session(user.business_id, opening_float_cents=10000)
     db = FakeDB([
         FakeResult(scalar=session),
+        FakeResult(scalar=0),        # allocation-based cash sum (none — legacy orders, no allocation rows)
         FakeResult(items=[8000]),    # order B's original sale still counted (payment_status filter now includes REFUNDED)
-        FakeResult(items=[8000]),    # order B's refund_amount_cents, scoped by refunded_at
+        FakeResult(items=[8000]),    # order B's refund_cash_cents, scoped by refunded_at
     ])
 
     result = await close_till(
@@ -397,6 +409,7 @@ async def test_close_till_two_cash_sales_one_refunded_nets_correctly():
     session = make_session(user.business_id, opening_float_cents=10000)
     db = FakeDB([
         FakeResult(scalar=session),
+        FakeResult(scalar=0),            # allocation-based cash sum (none — legacy orders, no allocation rows)
         FakeResult(items=[8000, 8000]),  # A (kept) + B (later refunded) — both counted as sales
         FakeResult(items=[8000]),        # B's refund
     ])

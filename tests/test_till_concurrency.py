@@ -186,6 +186,7 @@ async def test_close_till_locks_the_session_row():
     session = make_session(user.business_id, opening_float_cents=10000)
     db = FakeDB([
         FakeResult(scalar=session),
+        FakeResult(scalar=0),  # allocation-based cash sum (none — legacy order, no allocation rows)
         FakeResult(items=[]),
         FakeResult(items=[]),
     ])

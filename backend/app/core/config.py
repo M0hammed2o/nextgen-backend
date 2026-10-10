@@ -376,6 +376,12 @@ class Settings(BaseSettings):
     # above when a tenant's own WABA needs a differently-named/localised one.
     RECEIPT_WHATSAPP_TEMPLATE_NAME: str = "nextgen_receipt_ready"
     RECEIPT_WHATSAPP_TEMPLATE_LANGUAGE: str = "en_US"
+    # POS Pay-by-Link (migration 0055) — same PLACEHOLDER-name caveat as
+    # RECEIPT_WHATSAPP_TEMPLATE_NAME above applies here: whether this
+    # template is actually Meta-approved for any given WABA is unverified.
+    # Per-business override: Business.whatsapp_payment_link_template_name/_language.
+    POS_PAYMENT_LINK_TEMPLATE_NAME: str = "nextgen_pos_payment_request"
+    POS_PAYMENT_LINK_TEMPLATE_LANGUAGE: str = "en_US"
     # Per-IP rate limit on the public, unauthenticated GET /v1/r/{token}
     # receipt page (backend/app/core/ratelimit.py). Generous enough for a
     # real customer refreshing the page a few times; the primary defence

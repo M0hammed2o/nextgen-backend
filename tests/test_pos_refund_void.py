@@ -24,11 +24,15 @@ from shared.models.order import Order
 
 
 class FakeResult:
-    def __init__(self, scalar=None):
+    def __init__(self, scalar=None, items=None):
         self._scalar = scalar
+        self._items = items
 
     def scalar_one_or_none(self):
         return self._scalar
+
+    def all(self):
+        return self._items or []
 
 
 class FakeDB:
@@ -637,3 +641,123 @@ async def test_pos_settings_queries_by_the_callers_own_business_id_only():
         "business_id -- this query must never be able to read another "
         "tenant's row"
     )
+
+
+# ── Split payments (migration 0055): refund_cash_cents ───────────────────────
+
+def make_split_order(business_id, total_cents=30000, payment_status="PAID"):
+    return make_pos_order(business_id, total_cents=total_cents, payment_status=payment_status, payment_method="SPLIT")
+
+
+async def test_void_on_split_order_requires_open_till_when_it_has_a_cash_allocation():
+    user = make_user()
+    order = make_split_order(user.business_id)
+    db = FakeDB([
+        FakeResult(scalar=order),      # order lock
+        FakeResult(scalar=None),       # _require_open_till_for_cash_reversal's existence check: no CASH allocation -> no till lock needed
+        FakeResult(scalar=None),       # _compute_cash_portion's own sum query: still 0
+        FakeResult(scalar=make_business_for_reversal()),
+    ])
+    result = await void_pos_order(order_id=order.id, body=POSVoidRequest(reason="Mistake"), user=user, db=db)
+    assert order.refund_cash_cents == 0
+    assert result.payment_status == "VOIDED"
+
+
+async def test_void_on_split_order_with_cash_allocation_computes_cash_portion():
+    user = make_user()
+    order = make_split_order(user.business_id, total_cents=30000)
+    db = FakeDB([
+        FakeResult(scalar=order),                        # order lock
+        FakeResult(scalar=uuid.uuid4()),                 # has a CASH allocation -> open till required
+        _open_till_result(),                             # till lock
+        FakeResult(scalar=10000),                         # _compute_cash_portion: sum of CASH allocations
+        FakeResult(scalar=make_business_for_reversal()),  # business lookup for inventory reversal
+    ])
+    await void_pos_order(order_id=order.id, body=POSVoidRequest(reason="Mistake"), user=user, db=db)
+    assert order.refund_cash_cents == 10000
+    assert order.refund_amount_cents == 30000
+
+
+async def test_full_refund_on_split_order_computes_cash_portion_from_allocations():
+    user = make_user()
+    order = make_split_order(user.business_id, total_cents=30000)
+    db = FakeDB([
+        FakeResult(scalar=order),        # order lock
+        FakeResult(scalar=uuid.uuid4()), # has a CASH allocation -> open till required
+        _open_till_result(),             # till lock
+        FakeResult(scalar=10000),        # _compute_cash_portion (full refund): sum of CASH allocations
+    ])
+    result = await refund_pos_order(order_id=order.id, body=POSRefundRequest(), user=user, db=db)
+    assert result.payment_status == "REFUNDED"
+    assert order.refund_cash_cents == 10000
+
+
+async def test_partial_refund_on_mixed_split_requires_explicit_cash_refund_cents():
+    """
+    A partial refund of a split order mixing cash and non-cash methods is
+    genuinely ambiguous (which method's money is coming back?) — the
+    manager must say explicitly via cash_refund_cents, never guessed.
+    """
+    user = make_user()
+    order = make_split_order(user.business_id, total_cents=30000)
+    db = FakeDB([
+        FakeResult(scalar=order),
+        FakeResult(scalar=uuid.uuid4()),  # has a CASH allocation
+        _open_till_result(),
+        FakeResult(items=[("CASH", 10000), ("CARD", 20000)]),  # mixed allocations
+    ])
+    with pytest.raises(AppError) as exc:
+        await refund_pos_order(order_id=order.id, body=POSRefundRequest(amount_cents=5000), user=user, db=db)
+    assert exc.value.code == "CASH_REFUND_PORTION_REQUIRED"
+
+
+async def test_partial_refund_on_mixed_split_with_explicit_cash_refund_cents_succeeds():
+    user = make_user()
+    order = make_split_order(user.business_id, total_cents=30000)
+    db = FakeDB([
+        FakeResult(scalar=order),
+        FakeResult(scalar=uuid.uuid4()),
+        _open_till_result(),
+        FakeResult(items=[("CASH", 10000), ("CARD", 20000)]),
+    ])
+    result = await refund_pos_order(
+        order_id=order.id,
+        body=POSRefundRequest(amount_cents=5000, cash_refund_cents=5000),
+        user=user, db=db,
+    )
+    assert result.payment_status == "PARTIALLY_REFUNDED"
+    assert order.refund_cash_cents == 5000
+
+
+async def test_partial_refund_cash_refund_cents_cannot_exceed_cash_allocated():
+    user = make_user()
+    order = make_split_order(user.business_id, total_cents=30000)
+    db = FakeDB([
+        FakeResult(scalar=order),
+        FakeResult(scalar=uuid.uuid4()),
+        _open_till_result(),
+        FakeResult(items=[("CASH", 10000), ("CARD", 20000)]),
+    ])
+    with pytest.raises(AppError) as exc:
+        await refund_pos_order(
+            order_id=order.id,
+            body=POSRefundRequest(amount_cents=15000, cash_refund_cents=15000),
+            user=user, db=db,
+        )
+    assert exc.value.code == "CASH_REFUND_PORTION_INVALID"
+
+
+async def test_partial_refund_on_cash_only_split_does_not_require_explicit_value():
+    """An all-cash split (e.g. two Cash allocations) is unambiguous even for
+    a partial refund — no cash_refund_cents needed, same as a legacy CASH order."""
+    user = make_user()
+    order = make_split_order(user.business_id, total_cents=30000)
+    db = FakeDB([
+        FakeResult(scalar=order),
+        FakeResult(scalar=uuid.uuid4()),
+        _open_till_result(),
+        FakeResult(items=[("CASH", 10000), ("CASH", 20000)]),
+    ])
+    result = await refund_pos_order(order_id=order.id, body=POSRefundRequest(amount_cents=5000), user=user, db=db)
+    assert result.payment_status == "PARTIALLY_REFUNDED"
+    assert order.refund_cash_cents == 5000

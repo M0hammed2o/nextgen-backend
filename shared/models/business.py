@@ -292,6 +292,21 @@ class Business(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         comment="Per-business override of settings.RECEIPT_WHATSAPP_TEMPLATE_LANGUAGE "
                 "— a Meta template language code, e.g. 'en_US'."
     )
+    # ── POS Pay by Link (migration 0055) — same pattern as the receipt pair
+    # above: a platform default (settings.POS_PAYMENT_LINK_TEMPLATE_NAME/
+    # _LANGUAGE) with an optional per-business override here. Whether any
+    # such template is actually Meta-approved for a given WABA is NOT
+    # verified by this column's existence — see
+    # backend/app/payments/pos_link_whatsapp.py for the honest
+    # TEMPLATE_REQUIRED failure path when it isn't.
+    whatsapp_payment_link_template_name: Mapped[str | None] = mapped_column(
+        String(512), nullable=True,
+        comment="Per-business override of settings.POS_PAYMENT_LINK_TEMPLATE_NAME."
+    )
+    whatsapp_payment_link_template_language: Mapped[str | None] = mapped_column(
+        String(16), nullable=True,
+        comment="Per-business override of settings.POS_PAYMENT_LINK_TEMPLATE_LANGUAGE."
+    )
 
     # ── Delivery marketplace integrations (migration 0044) ───────────────
     # NOT the same thing as `delivery_enabled` above, which governs whether

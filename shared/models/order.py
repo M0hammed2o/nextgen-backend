@@ -224,9 +224,35 @@ class Order(Base, UUIDPrimaryKeyMixin, TimestampMixin):
                  "reward's current name, same pattern as name_snapshot"
     )
 
+    # ── Split payments (migration 0055) ──────────────────────────────────
+    # How much of a refund/void was handed back as physical CASH, for till
+    # reconciliation — distinct from refund_amount_cents (the total refund,
+    # any method). Set automatically for a legacy single-CASH-method order
+    # (same value as refund_amount_cents, preserving today's exact
+    # behaviour) and for a VOID (full reversal of the order's own cash
+    # allocation(s), always unambiguous); for a PARTIAL refund of a split
+    # sale mixing cash and non-cash methods, the caller must state this
+    # explicitly (POSRefundRequest.cash_refund_cents) — see
+    # routes_pos.py::refund_pos_order's own comment for why this is
+    # deliberately NOT auto-computed in that one ambiguous case.
+    refund_cash_cents: Mapped[int | None] = mapped_column(
+        Integer, nullable=True,
+        comment="Portion of this order's refund/void that was physical "
+                 "cash. NULL means nothing has been refunded, or the "
+                 "refund involved no cash at all."
+    )
+
     # ── Relationships ────────────────────────────────────────────────────
     items = relationship("OrderItem", back_populates="order", lazy="selectin")
     events = relationship("OrderEvent", back_populates="order", lazy="noload")
+    # selectin (not the default lazy="select"): close_till/payment-mix
+    # analytics/receipts all need this for every order they touch, and a
+    # per-order N+1 SELECT here is exactly the class of bug Part 4 of the
+    # earlier entitlement-followup audit warned about.
+    payment_allocations = relationship(
+        "POSPaymentAllocation", back_populates="order", lazy="selectin",
+        order_by="POSPaymentAllocation.created_at",
+    )
 
     def __repr__(self) -> str:
         return f"<Order {self.order_number} [{self.status}]>"

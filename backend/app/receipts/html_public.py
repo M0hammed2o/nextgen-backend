@@ -208,12 +208,24 @@ def render_public_receipt_html(document: ReceiptDocument) -> str:
     parts.append("</div>")  # .totals
 
     parts.append('<div class="payment">')
-    if payment.method:
+    if payment.allocations:
+        # Split payment (migration 0055) — one line per allocation, with
+        # CASH's tendered/change sub-lines, instead of the single-method
+        # fields below (which stay unset for a split order — see
+        # build_receipt_document()'s docstring).
+        for alloc in payment.allocations:
+            parts.append(_money_row(alloc.method, alloc.amount_display))
+            if alloc.cash_tendered_display:
+                parts.append(_money_row("Cash tendered", alloc.cash_tendered_display))
+            if alloc.change_due_display:
+                parts.append(_money_row("Change", alloc.change_due_display))
+    elif payment.method:
         parts.append(_money_row("Payment method", payment.method.replace("_", " ").title()))
-    if payment.cash_tendered_display:
-        parts.append(_money_row("Cash tendered", payment.cash_tendered_display))
-    if payment.change_due_display:
-        parts.append(_money_row("Change", payment.change_due_display))
+    if not payment.allocations:
+        if payment.cash_tendered_display:
+            parts.append(_money_row("Cash tendered", payment.cash_tendered_display))
+        if payment.change_due_display:
+            parts.append(_money_row("Change", payment.change_due_display))
     if payment.refund_amount_display:
         parts.append(_money_row("Refunded", payment.refund_amount_display))
     parts.append("</div>")  # .payment

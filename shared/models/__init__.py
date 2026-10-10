@@ -27,6 +27,7 @@ from shared.models.loyalty import LoyaltyProgram, LoyaltyReward, LoyaltyTransact
 from shared.models.menu import MenuAddOn, MenuCategory, MenuItem
 from shared.models.message import Message
 from shared.models.order import Order, OrderEvent, OrderItem
+from shared.models.pos_payment import POSPaymentAllocation, POSPaymentLinkIntent
 from shared.models.push_subscription import PushSubscription
 from shared.models.recipe import Recipe, RecipeItem
 from shared.models.specials import Special
@@ -73,6 +74,8 @@ __all__ = [
     "Order",
     "OrderEvent",
     "OrderItem",
+    "POSPaymentAllocation",
+    "POSPaymentLinkIntent",
     "PushSubscription",
     "Recipe",
     "RecipeItem",

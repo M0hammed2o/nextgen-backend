@@ -16,11 +16,11 @@ rationale.
 """
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field, model_validator
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy import update as sa_update
 from sqlalchemy.exc import IntegrityError, MultipleResultsFound
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -45,9 +45,15 @@ from shared.pricing.engine import apply_vat_to_total
 from shared.models.audit import AuditEvent
 from shared.models.business import Business
 from shared.models.order import Order, OrderEvent, OrderItem
+from shared.models.pos_payment import POSPaymentAllocation, POSPaymentLinkIntent
 from shared.models.till import TillSession
 from shared.models.user import BusinessUser
 from shared.utils import format_order_number
+
+# Pay-by-Link is only safe with a provider whose webhook verifies an exact
+# amount — see docs/SPLIT_PAYMENTS_CONTRACT.md's support matrix. iKhoka and
+# Stitch are deliberately excluded, not "not yet gotten to."
+_POS_LINK_ELIGIBLE_PROVIDERS = ("YOCO", "PAYFAST")
 
 router = APIRouter(prefix="/business/pos", tags=["pos"])
 settings = get_settings()
@@ -69,6 +75,39 @@ class POSOrderItemRequest(BaseModel):
     special_instructions: str | None = None
 
 
+class POSPaymentAllocationRequest(BaseModel):
+    """
+    One entry of a split-payment checkout's `payments` array. See
+    docs/SPLIT_PAYMENTS_CONTRACT.md for the full design — amount_cents is
+    always the portion of the order total this allocation settles, never
+    the amount physically tendered (that's cash_tendered_cents, CASH only).
+    """
+    payment_method: str = Field(pattern=r"^(CASH|CARD|OTHER|PAY_BY_LINK)$")
+    amount_cents: int = Field(gt=0)
+    cash_tendered_cents: int | None = Field(default=None, ge=0)
+    payment_reference: str | None = Field(default=None, max_length=255)
+    payment_intent_id: uuid.UUID | None = Field(
+        default=None, description="PAY_BY_LINK only — a PAID POSPaymentLinkIntent"
+    )
+
+    @model_validator(mode="after")
+    def validate_shape(self) -> "POSPaymentAllocationRequest":
+        if self.payment_method == "CASH":
+            if self.cash_tendered_cents is None or self.cash_tendered_cents < self.amount_cents:
+                raise ValueError(
+                    "cash_tendered_cents is required and must be >= amount_cents for a CASH allocation"
+                )
+        elif self.cash_tendered_cents is not None:
+            raise ValueError("cash_tendered_cents is only valid for a CASH allocation")
+
+        if self.payment_method == "PAY_BY_LINK":
+            if self.payment_intent_id is None:
+                raise ValueError("payment_intent_id is required for a PAY_BY_LINK allocation")
+        elif self.payment_intent_id is not None:
+            raise ValueError("payment_intent_id is only valid for a PAY_BY_LINK allocation")
+        return self
+
+
 class POSOrderCreateRequest(BaseModel):
     items: list[POSOrderItemRequest] = Field(min_length=1)
     order_mode: str = Field(default="PICKUP", pattern=r"^(PICKUP|DELIVERY|DINE_IN)$")
@@ -88,16 +127,33 @@ class POSOrderCreateRequest(BaseModel):
     )
 
     # ── Payment (Phase 2 — paid at checkout, not after fulfilment) ────────
-    payment_method: str = Field(pattern=r"^(CASH|CARD|OTHER)$")
+    # Exactly ONE of (payment_method) or (payments) must be given — see
+    # validate_payment_shape below. `payments` (>= 2 entries) is the new
+    # split-payment shape (migration 0055); everything else about this
+    # endpoint is unchanged for the legacy single-payment shape.
+    payment_method: str | None = Field(default=None, pattern=r"^(CASH|CARD|OTHER)$")
     cash_tendered_cents: int | None = Field(default=None, ge=0)
     payment_reference: str | None = Field(default=None, max_length=255)
+    payments: list[POSPaymentAllocationRequest] | None = Field(default=None, min_length=2)
 
     # A client-generated key; retrying the same checkout with the same key
     # returns the original order instead of ringing up a second sale.
     idempotency_key: str | None = Field(default=None, max_length=128)
 
     @model_validator(mode="after")
+    def validate_payment_shape(self) -> "POSOrderCreateRequest":
+        if self.payments is not None and self.payment_method is not None:
+            raise ValueError("Use either payment_method or payments, not both")
+        if self.payments is None and self.payment_method is None:
+            raise ValueError("payment_method or payments is required")
+        return self
+
+    @model_validator(mode="after")
     def validate_cash_tender(self) -> "POSOrderCreateRequest":
+        if self.payment_method is None:
+            # Split-payment shape — each allocation validates its own cash
+            # tender via POSPaymentAllocationRequest.validate_shape above.
+            return self
         if self.payment_method == POSPaymentMethod.CASH.value:
             if self.cash_tendered_cents is None:
                 raise ValueError("cash_tendered_cents is required for a CASH payment")
@@ -195,6 +251,20 @@ class POSRefundRequest(BaseModel):
                      "Ignored on a partial refund.",
     )
 
+    # Split payments (migration 0055). A FULL refund/void's cash portion is
+    # always deterministic (the order's own cash allocation(s), or the
+    # whole amount for a legacy single-CASH order) and this field is ignored
+    # for it. A PARTIAL refund of a split order that mixes cash and
+    # non-cash methods is genuinely ambiguous — which method's money is
+    # being handed back is a real-world fact only the manager at the till
+    # knows, not something this endpoint should guess — so it's required in
+    # exactly that one case (see refund_pos_order's own comment).
+    cash_refund_cents: int | None = Field(
+        default=None, ge=0,
+        description="Required for a PARTIAL refund of a split order that mixes cash and "
+                     "non-cash payment methods — how much of THIS refund is physical cash.",
+    )
+
 
 class POSVoidRequest(BaseModel):
     reason: str = Field(max_length=255)
@@ -283,8 +353,105 @@ class POSSettingsResponse(BaseModel):
     staff_wastage_tab_enabled: bool = True
     staff_stocktake_tab_enabled: bool = False
 
+    # Pay by Link (migration 0055) — true only when a Pay-by-Link-eligible
+    # provider (Yoco or PayFast — see docs/SPLIT_PAYMENTS_CONTRACT.md) is
+    # configured. This does NOT verify WhatsApp deliverability (WABA
+    # connection, approved template) — that's checked per-request when a
+    # link is actually created, since it can depend on live Meta state this
+    # settings snapshot can't reflect. "Split payment" itself only needs
+    # >= 2 of cash_enabled/card_enabled/other_payment_enabled/
+    # pay_by_link_enabled to be true — that comparison happens client-side.
+    pay_by_link_enabled: bool = False
+
+
+class POSPaymentIntentCreateRequest(BaseModel):
+    amount_cents: int = Field(gt=0)
+    customer_phone: str = Field(max_length=32)
+
+
+class POSPaymentIntentResponse(BaseModel):
+    """
+    Safe, Staff-facing state of a WhatsApp Pay-by-Link request. Deliberately
+    never includes `payment_link_url` — the product requirement is
+    WhatsApp-delivery-only; the cashier never sees, copies, or opens the
+    raw link (see docs/SPLIT_PAYMENTS_CONTRACT.md).
+    """
+    id: uuid.UUID
+    status: str
+    amount_cents: int
+    currency: str
+    provider: str
+    whatsapp_status: str | None
+    whatsapp_failure_reason: str | None
+    customer_phone_masked: str | None
+    expires_at: datetime
+    created_at: datetime
+    paid_at: datetime | None
+
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _pos_link_provider(business: Business) -> str | None:
+    """
+    Which Pay-by-Link-eligible provider (if any) this business has
+    configured. YOCO is preferred when both are enabled — an arbitrary but
+    documented tie-break; a business is expected to configure one "other"
+    provider for till use, same assumption `_payment_method_enabled`'s
+    OTHER bucket already makes.
+    """
+    if getattr(business, "pos_yoco_enabled", False):
+        return "YOCO"
+    if getattr(business, "pos_payfast_enabled", False):
+        return "PAYFAST"
+    return None
+
+
+def _mask_phone(phone: str | None) -> str | None:
+    """E.164 '+27821234567' -> '+27 •• ••• 1234'. Never log/return the full number elsewhere."""
+    if not phone:
+        return None
+    digits = phone[-4:] if len(phone) >= 4 else phone
+    prefix = phone[:3] if phone.startswith("+") else ""
+    return f"{prefix} •• ••• {digits}".strip()
+
+
+def _intent_to_response(intent: POSPaymentLinkIntent) -> POSPaymentIntentResponse:
+    return POSPaymentIntentResponse(
+        id=intent.id,
+        status=intent.status,
+        amount_cents=intent.amount_cents,
+        currency=intent.currency,
+        provider=intent.provider,
+        whatsapp_status=intent.whatsapp_status,
+        whatsapp_failure_reason=intent.whatsapp_failure_reason,
+        customer_phone_masked=_mask_phone(intent.customer_phone),
+        expires_at=intent.expires_at,
+        created_at=intent.created_at,
+        paid_at=intent.paid_at,
+    )
+
+
+async def _compute_cash_portion(db: AsyncSession, order: Order, requested_cents: int) -> int:
+    """
+    How much of `requested_cents` (an amount being refunded or voided) is
+    physical cash, for till reconciliation (Order.refund_cash_cents).
+    Deterministic in every case this is called for — see refund_pos_order's
+    own comment for the one case (a partial refund of a split order mixing
+    cash and non-cash methods) this function is deliberately NOT used for.
+    """
+    if order.payment_method == POSPaymentMethod.CASH.value:
+        return requested_cents
+    if order.payment_method == "SPLIT":
+        alloc_result = await db.execute(
+            select(func.coalesce(func.sum(POSPaymentAllocation.amount_cents), 0)).where(
+                POSPaymentAllocation.order_id == order.id,
+                POSPaymentAllocation.payment_method == "CASH",
+            )
+        )
+        cash_allocated = alloc_result.scalar_one_or_none() or 0
+        return min(cash_allocated, requested_cents)
+    return 0
+
 
 async def _get_open_till(db: AsyncSession, business_id: uuid.UUID) -> TillSession:
     """
@@ -457,7 +624,197 @@ async def get_pos_settings(
         staff_stocktake_tab_enabled=(
             business.staff_stocktake_tab_enabled and business.inventory_enabled
         ),
+        pay_by_link_enabled=_pos_link_provider(business) is not None,
     )
+
+
+# ── WhatsApp Pay by Link — payment-link intents ───────────────────────────────
+# A payment-link intent is created BEFORE any order exists (the customer may
+# take anywhere from seconds to never to pay a link sent to their phone).
+# It becomes a POSPaymentAllocation row only once PAID and consumed by a
+# final checkout — see shared/models/pos_payment.py and
+# docs/SPLIT_PAYMENTS_CONTRACT.md for the full design.
+
+async def _load_pos_payment_intent(
+    db: AsyncSession, business_id: uuid.UUID, intent_id: uuid.UUID, *, for_update: bool = False,
+) -> POSPaymentLinkIntent:
+    query = select(POSPaymentLinkIntent).where(
+        POSPaymentLinkIntent.id == intent_id,
+        POSPaymentLinkIntent.business_id == business_id,
+    )
+    if for_update:
+        query = query.with_for_update()
+    result = await db.execute(query)
+    intent = result.scalar_one_or_none()
+    if not intent:
+        raise NotFoundError("POSPaymentLinkIntent", str(intent_id))
+    return intent
+
+
+def _maybe_expire(intent: POSPaymentLinkIntent) -> bool:
+    """Lazy expiry — PENDING past expires_at becomes EXPIRED. Returns True if changed."""
+    if intent.status == "PENDING" and intent.expires_at <= datetime.now(timezone.utc):
+        intent.status = "EXPIRED"
+        return True
+    return False
+
+
+@router.post("/payment-intents", response_model=POSPaymentIntentResponse, status_code=201)
+async def create_pos_payment_intent(
+    body: POSPaymentIntentCreateRequest,
+    user: AuthUser = Depends(require_staff_or_above),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Create a WhatsApp-delivered payment-link request for a POS split-payment
+    allocation. Never returns the raw payment link — only a safe status the
+    Staff app can poll (GET .../{id}).
+    """
+    biz_result = await db.execute(select(Business).where(Business.id == user.business_id))
+    business = biz_result.scalar_one_or_none()
+    if not business:
+        raise NotFoundError("Business")
+
+    till_result = await db.execute(
+        select(TillSession.id).where(
+            TillSession.business_id == user.business_id,
+            TillSession.status == "OPEN",
+        )
+    )
+    till_session_id = till_result.scalar_one_or_none()
+    if not till_session_id:
+        raise AppError("TILL_NOT_OPEN", "Open the till before requesting a payment link", 409)
+
+    provider_name = _pos_link_provider(business)
+    if not provider_name:
+        raise AppError(
+            "PAY_BY_LINK_NOT_AVAILABLE",
+            "No Pay-by-Link-eligible payment provider (Yoco or PayFast) is configured for this business",
+            409,
+        )
+
+    try:
+        normalized_phone = normalize_sa_mobile(body.customer_phone)
+    except ValueError as exc:
+        raise AppError("INVALID_PHONE_NUMBER", str(exc), 422)
+
+    now = datetime.now(timezone.utc)
+    intent = POSPaymentLinkIntent(
+        business_id=user.business_id,
+        till_session_id=till_session_id,
+        created_by_user_id=user.user_id,
+        amount_cents=body.amount_cents,
+        currency=business.currency or "ZAR",
+        provider=provider_name,
+        status="PENDING",
+        customer_phone=normalized_phone,
+        whatsapp_status="NOT_SENT",
+        created_at=now,
+        expires_at=now + timedelta(minutes=15),
+    )
+    db.add(intent)
+    await db.flush()  # assigns intent.id, needed for the provider correlation reference below
+
+    from backend.app.payments.registry import get_provider
+    provider = get_provider(provider_name, business)
+    payment_link_url = await provider.create_payment_link(
+        None, business,
+        amount_cents=intent.amount_cents,
+        external_reference=f"pos_intent:{intent.id}",
+    )
+    if not payment_link_url:
+        intent.status = "FAILED"
+        intent.whatsapp_status = "FAILED"
+        intent.whatsapp_failure_reason = "Payment provider did not return a payment link"
+        await db.commit()
+        await db.refresh(intent)
+        return _intent_to_response(intent)
+
+    intent.payment_link_url = payment_link_url
+
+    from backend.app.payments.pos_link_whatsapp import send_pos_payment_link
+    await send_pos_payment_link(db, intent, business, payment_link_url)
+
+    await db.commit()
+    await db.refresh(intent)
+    return _intent_to_response(intent)
+
+
+@router.get("/payment-intents/{intent_id}", response_model=POSPaymentIntentResponse)
+async def get_pos_payment_intent(
+    intent_id: uuid.UUID,
+    user: AuthUser = Depends(require_staff_or_above),
+    db: AsyncSession = Depends(get_db),
+):
+    intent = await _load_pos_payment_intent(db, user.business_id, intent_id)
+    if _maybe_expire(intent):
+        await db.commit()
+        await db.refresh(intent)
+    return _intent_to_response(intent)
+
+
+@router.post("/payment-intents/{intent_id}/resend", response_model=POSPaymentIntentResponse)
+async def resend_pos_payment_intent(
+    intent_id: uuid.UUID,
+    user: AuthUser = Depends(require_staff_or_above),
+    db: AsyncSession = Depends(get_db),
+):
+    """Re-sends the SAME link for a still-PENDING intent — never creates a second payable link."""
+    intent = await _load_pos_payment_intent(db, user.business_id, intent_id, for_update=True)
+    if _maybe_expire(intent):
+        await db.commit()
+        await db.refresh(intent)
+        return _intent_to_response(intent)
+    if intent.status != "PENDING":
+        raise AppError("PAYMENT_INTENT_NOT_PENDING", f"Cannot resend — this payment link is {intent.status}", 422)
+    if not intent.payment_link_url:
+        raise AppError("PAYMENT_LINK_UNAVAILABLE", "No payment link exists to resend", 422)
+
+    # Best-effort resend rate limit — protects against a double-tapped resend
+    # button creating WhatsApp send spam. Redis-backed so it holds across
+    # multiple backend instances; if Redis is unreachable, fail open rather
+    # than block a legitimate resend over an unrelated infra hiccup.
+    try:
+        from backend.app.db.session import get_redis
+        redis = await get_redis()
+        allowed = await redis.set(f"pos_intent_resend:{intent.id}", "1", nx=True, ex=10)
+        if not allowed:
+            raise AppError("RESEND_TOO_SOON", "Please wait a few seconds before resending", 429)
+    except AppError:
+        raise
+    except Exception:
+        pass
+
+    biz_result = await db.execute(select(Business).where(Business.id == user.business_id))
+    business = biz_result.scalar_one_or_none()
+    if not business:
+        raise NotFoundError("Business")
+
+    from backend.app.payments.pos_link_whatsapp import send_pos_payment_link
+    await send_pos_payment_link(db, intent, business, intent.payment_link_url)
+    await db.commit()
+    await db.refresh(intent)
+    return _intent_to_response(intent)
+
+
+@router.post("/payment-intents/{intent_id}/cancel", response_model=POSPaymentIntentResponse)
+async def cancel_pos_payment_intent(
+    intent_id: uuid.UUID,
+    user: AuthUser = Depends(require_staff_or_above),
+    db: AsyncSession = Depends(get_db),
+):
+    intent = await _load_pos_payment_intent(db, user.business_id, intent_id, for_update=True)
+    if _maybe_expire(intent):
+        await db.commit()
+        await db.refresh(intent)
+        return _intent_to_response(intent)
+    if intent.status != "PENDING":
+        raise AppError("PAYMENT_INTENT_NOT_PENDING", f"Cannot cancel — this payment link is {intent.status}", 422)
+    intent.status = "CANCELLED"
+    intent.cancelled_at = datetime.now(timezone.utc)
+    await db.commit()
+    await db.refresh(intent)
+    return _intent_to_response(intent)
 
 
 # ── Order creation / checkout ─────────────────────────────────────────────────
@@ -517,7 +874,22 @@ async def create_pos_order(
             409,
         )
 
-    if not _payment_method_enabled(business, body.payment_method):
+    if body.payments is not None:
+        for p in body.payments:
+            if p.payment_method == "PAY_BY_LINK":
+                if not _pos_link_provider(business):
+                    raise AppError(
+                        "PAYMENT_METHOD_NOT_ACCEPTED",
+                        "This business does not accept Pay by Link at the till",
+                        422,
+                    )
+            elif not _payment_method_enabled(business, p.payment_method):
+                raise AppError(
+                    "PAYMENT_METHOD_NOT_ACCEPTED",
+                    f"This business does not accept {p.payment_method} at the till",
+                    422,
+                )
+    elif not _payment_method_enabled(business, body.payment_method):
         raise AppError(
             "PAYMENT_METHOD_NOT_ACCEPTED",
             f"This business does not accept {body.payment_method} at the till",
@@ -645,9 +1017,82 @@ async def create_pos_order(
         total_cents, tax_cents = net_total_cents, 0
 
     # ── Payment validation — computed here, never trusted from the client ─
-    # total_cents already nets the loyalty discount out, so cash tendered
-    # only ever needs to cover what's actually owed after redemption.
-    if body.payment_method == POSPaymentMethod.CASH.value:
+    # total_cents already nets the loyalty discount out, so any payment
+    # allocation only ever needs to cover what's actually owed after
+    # redemption.
+    now = datetime.now(timezone.utc)
+    change_due_cents = None
+    pay_by_link_intents: list[POSPaymentLinkIntent] = []  # locked + validated; consumed below on success
+
+    if body.payments is not None:
+        sum_cents = sum(p.amount_cents for p in body.payments)
+        if sum_cents != total_cents:
+            raise AppError(
+                "PAYMENT_TOTAL_MISMATCH",
+                f"Payment allocations sum to {sum_cents} cents but the order total is {total_cents} cents",
+                422,
+            )
+        for p in body.payments:
+            if p.payment_method != "PAY_BY_LINK":
+                continue
+            # Locked for the rest of this transaction — a concurrent checkout
+            # trying to consume the SAME intent blocks here until this one
+            # commits or rolls back, so a paid intent can never be attached
+            # to two orders (see docs/SPLIT_PAYMENTS_CONTRACT.md).
+            intent_result = await db.execute(
+                select(POSPaymentLinkIntent)
+                .where(
+                    POSPaymentLinkIntent.id == p.payment_intent_id,
+                    POSPaymentLinkIntent.business_id == user.business_id,
+                )
+                .with_for_update()
+            )
+            intent = intent_result.scalar_one_or_none()
+            if not intent:
+                raise NotFoundError("POSPaymentLinkIntent", str(p.payment_intent_id))
+
+            if intent.status == "CONSUMED":
+                # A double-tapped retry of THIS SAME checkout (identical
+                # idempotency_key) can race itself past the early
+                # idempotency lookup above before either side has committed.
+                # If the order this intent was already consumed into
+                # carries the same idempotency_key, replay it instead of
+                # erroring — a genuinely different checkout trying to reuse
+                # an already-spent intent is rejected below.
+                if body.idempotency_key and intent.order_id:
+                    existing_result = await db.execute(
+                        select(Order).where(Order.id == intent.order_id)
+                    )
+                    existing_order = existing_result.scalar_one_or_none()
+                    if existing_order and existing_order.idempotency_key == body.idempotency_key:
+                        return OrderResponse.model_validate(existing_order)
+                raise AppError(
+                    "PAYMENT_INTENT_ALREADY_CONSUMED",
+                    "This payment link has already been used for a completed sale",
+                    409,
+                )
+            if intent.status != "PAID":
+                raise AppError(
+                    "PAYMENT_INTENT_NOT_PAID",
+                    f"This payment link is {intent.status.lower()}, not paid",
+                    422,
+                )
+            if intent.amount_cents != p.amount_cents:
+                raise AppError(
+                    "PAYMENT_INTENT_AMOUNT_MISMATCH",
+                    "This payment link's confirmed amount does not match the allocation",
+                    422,
+                )
+            pay_by_link_intents.append(intent)
+
+        # All allocations validated — consume every PAY_BY_LINK intent now.
+        # These mutations ride in the same session/transaction as the order
+        # insert below and commit (or roll back) together with it.
+        for intent in pay_by_link_intents:
+            intent.status = "CONSUMED"
+            intent.order_id = order_id
+            intent.consumed_at = now
+    elif body.payment_method == POSPaymentMethod.CASH.value:
         if body.cash_tendered_cents < total_cents:
             raise AppError(
                 "INSUFFICIENT_CASH_TENDERED",
@@ -655,8 +1100,6 @@ async def create_pos_order(
                 422,
             )
         change_due_cents = body.cash_tendered_cents - total_cents
-    else:
-        change_due_cents = None
 
     # A sale containing ANY item that needs kitchen prep goes to the kitchen
     # (starting at ACCEPTED — no separate "accept" click, since paying for
@@ -677,7 +1120,13 @@ async def create_pos_order(
         raise NotFoundError("Business")
     seq, currency = row
 
-    now = datetime.now(timezone.utc)
+    # Legacy single-payment sale: Order's own payment_method/reference/
+    # cash fields are populated exactly as before this feature shipped.
+    # Split sale: Order.payment_method becomes the "SPLIT" summary marker
+    # and these per-order fields are left null — the real breakdown lives
+    # only in the pos_payment_allocations rows created below (unified
+    # design, see shared/models/pos_payment.py's module docstring).
+    order_payment_method = "SPLIT" if body.payments is not None else body.payment_method
 
     order = Order(
         id=order_id,
@@ -687,11 +1136,11 @@ async def create_pos_order(
         status=initial_status.value,
         payment_status="PAID",
         payment_required=False,
-        payment_method=body.payment_method,
-        payment_reference=body.payment_reference,
+        payment_method=order_payment_method,
+        payment_reference=(body.payment_reference if body.payments is None else None),
         paid_at=now,
-        cash_tendered_cents=body.cash_tendered_cents,
-        change_due_cents=change_due_cents,
+        cash_tendered_cents=(body.cash_tendered_cents if body.payments is None else None),
+        change_due_cents=(change_due_cents if body.payments is None else None),
         till_session_id=till_session.id,
         idempotency_key=body.idempotency_key,
         created_by_user_id=user.user_id,
@@ -755,8 +1204,55 @@ async def create_pos_order(
             old_status=None,
             new_status=initial_status.value,
             changed_by_user_id=user.user_id,
-            reason=f"POS checkout — paid by {body.payment_method}",
+            reason=(
+                f"POS checkout — paid by SPLIT ({'+'.join(p.payment_method for p in body.payments)})"
+                if body.payments is not None
+                else f"POS checkout — paid by {body.payment_method}"
+            ),
         ))
+
+        # ── Payment allocations — every order gets >= 1 row (unified
+        #    design): a legacy single-method sale gets exactly one, a split
+        #    sale gets one per entry. The financial source of truth for a
+        #    split sale from here on is these rows, never Order's own
+        #    payment_method/cash_tendered_cents/payment_reference columns
+        #    (left null for a split sale — see the Order(...) comment above).
+        if body.payments is not None:
+            for p in body.payments:
+                alloc = POSPaymentAllocation(
+                    order_id=order.id,
+                    business_id=user.business_id,
+                    till_session_id=till_session.id,
+                    payment_method=p.payment_method,
+                    amount_cents=p.amount_cents,
+                    created_by_user_id=user.user_id,
+                    created_at=now,
+                )
+                if p.payment_method == "CASH":
+                    alloc.cash_tendered_cents = p.cash_tendered_cents
+                    alloc.change_due_cents = p.cash_tendered_cents - p.amount_cents
+                elif p.payment_method == "PAY_BY_LINK":
+                    intent = next(i for i in pay_by_link_intents if i.id == p.payment_intent_id)
+                    alloc.provider = intent.provider
+                    alloc.payment_link_intent_id = intent.id
+                    alloc.payment_reference = intent.provider_reference
+                    alloc.paid_at = intent.paid_at
+                else:  # CARD / OTHER
+                    alloc.payment_reference = p.payment_reference
+                db.add(alloc)
+        else:
+            db.add(POSPaymentAllocation(
+                order_id=order.id,
+                business_id=user.business_id,
+                till_session_id=till_session.id,
+                payment_method=body.payment_method,
+                amount_cents=total_cents,
+                cash_tendered_cents=(body.cash_tendered_cents if body.payment_method == "CASH" else None),
+                change_due_cents=(change_due_cents if body.payment_method == "CASH" else None),
+                payment_reference=body.payment_reference,
+                created_by_user_id=user.user_id,
+                created_at=now,
+            ))
 
         if body.discount_cents > 0:
             db.add(AuditEvent(
@@ -946,9 +1442,23 @@ async def _require_open_till_for_cash_reversal(db: AsyncSession, business_id: uu
     next cash-up (`close_till`'s expected-cash calculation only nets
     refunds against whichever session happens to be OPEN when it closes).
     Non-cash reversals (card/other) never touch a physical drawer, so they
-    are unaffected.
+    are unaffected. A SPLIT order (migration 0055) counts as a cash
+    reversal too if ANY of its allocations was CASH — a Cash+Card split
+    still hands physical cash back out of the same drawer for its cash
+    portion.
     """
-    if order.payment_method != POSPaymentMethod.CASH.value:
+    has_cash = order.payment_method == POSPaymentMethod.CASH.value
+    if not has_cash and order.payment_method == "SPLIT":
+        alloc_result = await db.execute(
+            select(POSPaymentAllocation.id)
+            .where(
+                POSPaymentAllocation.order_id == order.id,
+                POSPaymentAllocation.payment_method == "CASH",
+            )
+            .limit(1)
+        )
+        has_cash = alloc_result.scalar_one_or_none() is not None
+    if not has_cash:
         return
     # Locked FOR UPDATE — same row/lock close_till() takes on this session.
     # Without this, a cash refund committing just after close_till has
@@ -998,8 +1508,49 @@ async def refund_pos_order(
         raise AppError("REFUND_EXCEEDS_TOTAL", "Refund amount cannot exceed the order total", 422)
 
     is_full_refund = amount_cents == order.total_cents
+
+    # Split payments (migration 0055) — how much of THIS refund is physical
+    # cash, for till reconciliation. A full refund/void is always
+    # deterministic (the order's own cash allocation(s)); a partial refund
+    # of a split order mixing cash and non-cash methods is genuinely
+    # ambiguous (which method's money is being handed back is a real-world
+    # fact only the manager at the till knows) so it's required explicitly
+    # in exactly that one case — never guessed.
+    if is_full_refund:
+        cash_refund_cents = await _compute_cash_portion(db, order, amount_cents)
+    elif order.payment_method == "SPLIT":
+        alloc_result = await db.execute(
+            select(POSPaymentAllocation.payment_method, POSPaymentAllocation.amount_cents)
+            .where(POSPaymentAllocation.order_id == order.id)
+        )
+        allocations = alloc_result.all()
+        cash_allocated = sum(a for m, a in allocations if m == "CASH")
+        non_cash_allocated = sum(a for m, a in allocations if m != "CASH")
+        if cash_allocated > 0 and non_cash_allocated > 0:
+            if body.cash_refund_cents is None:
+                raise AppError(
+                    "CASH_REFUND_PORTION_REQUIRED",
+                    "This order was paid by a mix of cash and non-cash methods — "
+                    "specify cash_refund_cents for a partial refund so till "
+                    "cash-up stays accurate",
+                    422,
+                )
+            if body.cash_refund_cents > amount_cents or body.cash_refund_cents > cash_allocated:
+                raise AppError(
+                    "CASH_REFUND_PORTION_INVALID",
+                    "cash_refund_cents cannot exceed the refund amount or the order's cash allocation",
+                    422,
+                )
+            cash_refund_cents = body.cash_refund_cents
+        else:
+            # All-cash or all-non-cash split — unambiguous even though partial.
+            cash_refund_cents = min(cash_allocated, amount_cents)
+    else:
+        cash_refund_cents = await _compute_cash_portion(db, order, amount_cents)
+
     order.payment_status = "REFUNDED" if is_full_refund else "PARTIALLY_REFUNDED"
     order.refund_amount_cents = amount_cents
+    order.refund_cash_cents = cash_refund_cents
     order.refund_reference = body.reason
     order.refunded_at = datetime.now(timezone.utc)
 
@@ -1044,6 +1595,7 @@ async def refund_pos_order(
         target_id=order.id,
         diff_json={
             "amount_cents": amount_cents,
+            "cash_refund_cents": cash_refund_cents,
             "reason": body.reason,
             "restore_stock": body.restore_stock,
             "stock_lines_reversed": reversed_lines,
@@ -1073,8 +1625,14 @@ async def void_pos_order(
     order = await _load_pos_order_for_reversal(db, user.business_id, order_id)
     await _require_open_till_for_cash_reversal(db, user.business_id, order)
 
+    # Always a full reversal, so the cash portion is unambiguous — unlike a
+    # partial refund, there's no "which method's money is this" question
+    # (see refund_pos_order's own comment).
+    cash_refund_cents = await _compute_cash_portion(db, order, order.total_cents)
+
     order.payment_status = "VOIDED"
     order.refund_amount_cents = order.total_cents
+    order.refund_cash_cents = cash_refund_cents
     order.refund_reference = body.reason
     order.refunded_at = datetime.now(timezone.utc)
     order.status = OrderStatus.CANCELLED.value
@@ -1123,6 +1681,7 @@ async def void_pos_order(
         target_type="order",
         target_id=order.id,
         diff_json={
+            "cash_refund_cents": cash_refund_cents,
             "reason": body.reason,
             "stock_lines_reversed": reversed_lines,
             "loyalty_points_restored": loyalty_points_restored,
@@ -1304,38 +1863,60 @@ async def close_till(
     if session.status != "OPEN":
         raise AppError("TILL_ALREADY_CLOSED", "This till session has already been closed", 422)
 
-    # Linked directly via Order.till_session_id (set at checkout) rather than
-    # the old opened_at/closed_at timestamp-window heuristic — exact, and
-    # unaffected by clock skew or a sale that's paid slightly before/after
-    # the session boundary. Deliberately includes REFUNDED/PARTIALLY_REFUNDED/
-    # VOIDED orders too, not just PAID ones: the cash physically went into
-    # this drawer at sale time regardless of what happened to it later — the
-    # separate cash_refunds query below is what nets that back out, scoped to
-    # whichever session the refund itself happened in (see its own comment;
-    # excluding non-PAID orders here would silently under-count sales and
-    # then also subtract the refund, double-reversing the same transaction).
-    cash_result = await db.execute(
-        select(Order.total_cents).where(
+    # Split payments (migration 0055): every order created after this
+    # migration gets >= 1 pos_payment_allocations row, including an
+    # ordinary single-CASH sale — so cash collected is summed from
+    # allocations (exact, works for a Cash+Card split too), scoped to this
+    # till session via the allocation's OWN till_session_id (set at
+    # checkout, same column Order.till_session_id uses). An allocation
+    # row, once it exists, is never deleted by a later refund/void — the
+    # cash physically went into this drawer at sale time regardless of
+    # what happened to it later, exactly like the legacy query below.
+    alloc_cash_result = await db.execute(
+        select(func.coalesce(func.sum(POSPaymentAllocation.amount_cents), 0)).where(
+            POSPaymentAllocation.till_session_id == session.id,
+            POSPaymentAllocation.payment_method == "CASH",
+        )
+    )
+    allocation_cash_cents = alloc_cash_result.scalar_one_or_none() or 0
+
+    # Legacy fallback: orders in this session with ZERO allocation rows at
+    # all. Every order created after migration 0055 gets >= 1 allocation
+    # row, so an order with none is, by construction, from before this
+    # feature shipped — same Order.total_cents/payment_method query as
+    # before this migration, unchanged.
+    legacy_cash_result = await db.execute(
+        select(Order.total_cents)
+        .outerjoin(POSPaymentAllocation, POSPaymentAllocation.order_id == Order.id)
+        .where(
             Order.till_session_id == session.id,
             Order.payment_method == "CASH",
             Order.payment_status.in_(["PAID", "REFUNDED", "PARTIALLY_REFUNDED", "VOIDED"]),
+            POSPaymentAllocation.id.is_(None),
         )
     )
-    cash_sales_cents = sum(cash_result.scalars().all())
+    legacy_cash_cents = sum(legacy_cash_result.scalars().all())
 
-    # NOT filtered by till_session_id: that column records which session rang
-    # the ORIGINAL sale up, but the cash physically leaves THIS drawer at
-    # refund time, which may be a later session than the one that took the
-    # original sale (e.g. a next-day refund). Only one till session can ever
-    # be OPEN at once, so "refunded after this session opened" unambiguously
-    # means "refunded during this session" for the currently-open session
-    # being closed.
+    cash_sales_cents = allocation_cash_cents + legacy_cash_cents
+
+    # NOT filtered by till_session_id: Order.till_session_id records which
+    # session rang the ORIGINAL sale up, but the cash physically leaves
+    # THIS drawer at refund time, which may be a later session than the
+    # one that took the original sale (e.g. a next-day refund). Only one
+    # till session can ever be OPEN at once, so "refunded after this
+    # session opened" unambiguously means "refunded during this session"
+    # for the currently-open session being closed.
+    #
+    # Uses Order.refund_cash_cents (migration 0055) instead of the old
+    # payment_method=="CASH" filter — populated for BOTH a legacy
+    # single-CASH order (today's exact behaviour) and a split order's cash
+    # allocation(s) by refund_pos_order/void_pos_order; a non-cash
+    # refund/void leaves it NULL/0 and contributes nothing here.
     cash_refund_result = await db.execute(
-        select(Order.refund_amount_cents).where(
+        select(Order.refund_cash_cents).where(
             Order.business_id == user.business_id,
-            Order.payment_method == "CASH",
             Order.payment_status.in_(["REFUNDED", "PARTIALLY_REFUNDED", "VOIDED"]),
-            Order.refund_amount_cents.is_not(None),
+            Order.refund_cash_cents.is_not(None),
             Order.refunded_at >= session.opened_at,
         )
     )

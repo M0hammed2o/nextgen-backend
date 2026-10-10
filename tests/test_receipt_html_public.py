@@ -139,3 +139,62 @@ class TestNotFoundPage:
 
     def test_stable_across_calls(self):
         assert render_not_found_html() == render_not_found_html()
+
+
+class TestSplitPaymentBreakdown:
+    """
+    Split payments (migration 0055) — this renderer was missed in the
+    original pass (its file list only covered JSON/ESC-POS/plain-text/
+    WhatsApp) even though the task required every real receipt renderer,
+    including the public customer-facing page, to show a split breakdown.
+    """
+
+    def _allocation(self, **overrides):
+        defaults = dict(
+            payment_method="CASH", amount_cents=15000,
+            cash_tendered_cents=None, change_due_cents=None,
+            payment_reference=None, provider=None,
+        )
+        defaults.update(overrides)
+        return types.SimpleNamespace(**defaults)
+
+    def test_legacy_single_cash_order_unchanged(self):
+        doc = build_receipt_document(_order(payment_method="CASH"), _business())
+        html = render_public_receipt_html(doc)
+        assert "Cash tendered" in html
+        assert "Change" in html
+
+    def test_split_order_shows_one_line_per_allocation_with_cash_sublines(self):
+        order = _order(
+            payment_method="SPLIT", total_cents=30000,
+            cash_tendered_cents=None, change_due_cents=None, payment_reference=None,
+        )
+        order.payment_allocations = [
+            self._allocation(payment_method="CASH", amount_cents=15000,
+                              cash_tendered_cents=20000, change_due_cents=5000),
+            self._allocation(payment_method="PAY_BY_LINK", amount_cents=15000,
+                              provider="YOCO", payment_reference="chr_abc123"),
+        ]
+        doc = build_receipt_document(order, _business())
+        html = render_public_receipt_html(doc)
+
+        assert "Cash" in html
+        assert "R150.00" in html
+        assert "Cash tendered" in html and "R200.00" in html
+        assert "Change" in html and "R50.00" in html
+        assert "Pay by Link (Yoco)" in html
+        # Never the raw provider transaction reference or any internal id.
+        assert "chr_abc123" not in html
+
+    def test_split_order_never_leaks_payment_method_single_line(self):
+        """A SPLIT order must not ALSO print the generic single-method
+        "Payment method" row — only the per-allocation breakdown."""
+        order = _order(payment_method="SPLIT", total_cents=30000,
+                        cash_tendered_cents=None, change_due_cents=None, payment_reference=None)
+        order.payment_allocations = [
+            self._allocation(payment_method="CASH", amount_cents=15000, cash_tendered_cents=15000),
+            self._allocation(payment_method="CARD", amount_cents=15000, payment_reference="term-1"),
+        ]
+        doc = build_receipt_document(order, _business())
+        html = render_public_receipt_html(doc)
+        assert "Payment method" not in html
