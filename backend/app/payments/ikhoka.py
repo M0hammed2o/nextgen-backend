@@ -53,8 +53,24 @@ def _sign(path: str, compact_body: str, app_secret: str) -> str:
 
 class IKhokaProvider(PaymentProvider):
 
-    async def create_payment_link(self, order, business) -> str | None:
-        """POST to iKhoka payment API and return the hosted paylinkUrl."""
+    async def create_payment_link(
+        self,
+        order,
+        business,
+        *,
+        amount_cents: int | None = None,
+        external_reference: str | None = None,
+    ) -> str | None:
+        """
+        POST to iKhoka payment API and return the hosted paylinkUrl.
+
+        Signature extended for consistency with PaymentProvider's interface
+        only — iKhoka is deliberately EXCLUDED from POS Pay-by-Link (its
+        webhook callback carries no amount/currency to verify against, see
+        handle_webhook below), so order=None is never passed here in
+        practice. amount_cents/external_reference are accepted but unused;
+        this method still requires a real `order`.
+        """
         from backend.app.core.crypto import decrypt_credential
         app_id = decrypt_credential(getattr(business, "payment_api_key", None))
         app_secret = decrypt_credential(getattr(business, "payment_api_secret", None))

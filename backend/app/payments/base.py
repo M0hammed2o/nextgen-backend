@@ -54,13 +54,60 @@ class ProviderHealthStatus:
         return cls(healthy=healthy, provider=provider, checked_at=datetime.now(timezone.utc), detail=detail)
 
 
+def resolve_amount_and_reference(
+    order, amount_cents: int | None, external_reference: str | None,
+) -> tuple[int, str]:
+    """
+    Shared helper for create_payment_link implementations.
+
+    When `order` is given (the existing WhatsApp-order payment flow),
+    amount_cents/external_reference default to order.total_cents/str(order.id)
+    exactly as every provider did before this parameter existed — that
+    flow's output is unaffected, byte-for-byte, whether or not the caller
+    passes these kwargs explicitly.
+
+    When `order` is None (the POS Pay-by-Link intent path — a payment link
+    created before any order exists), both amount_cents and
+    external_reference are mandatory, since there is no order to derive a
+    fallback from. Raises ValueError if either is missing in that case.
+    """
+    if order is None:
+        if amount_cents is None or external_reference is None:
+            raise ValueError(
+                "create_payment_link: amount_cents and external_reference are "
+                "both required when order is None"
+            )
+        return amount_cents, external_reference
+    return (
+        amount_cents if amount_cents is not None else order.total_cents,
+        external_reference if external_reference is not None else str(order.id),
+    )
+
+
 class PaymentProvider(ABC):
     """Base interface for all payment providers."""
 
     @abstractmethod
-    async def create_payment_link(self, order, business) -> str | None:
+    async def create_payment_link(
+        self,
+        order,
+        business,
+        *,
+        amount_cents: int | None = None,
+        external_reference: str | None = None,
+    ) -> str | None:
         """
-        Generate a payment link for the given order.
+        Generate a payment link for the given order, or — when `order` is
+        None — for a standalone amount/reference supplied directly by the
+        caller (the POS Pay-by-Link intent path, where a payment link is
+        created before any order exists).
+
+        order: Order | None. When None, amount_cents and external_reference
+        MUST both be supplied (implementations should use
+        `resolve_amount_and_reference()` above, which raises ValueError
+        otherwise). When an order is given and these kwargs are omitted,
+        they default to order.total_cents/str(order.id) exactly as before
+        this parameter was introduced.
 
         Returns:
             URL string on success, None if provider unavailable.

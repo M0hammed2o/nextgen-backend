@@ -26,7 +26,12 @@ import logging
 
 import httpx
 
-from backend.app.payments.base import PaymentProvider, ProviderHealthStatus, RefundResult
+from backend.app.payments.base import (
+    PaymentProvider,
+    ProviderHealthStatus,
+    RefundResult,
+    resolve_amount_and_reference,
+)
 
 logger = logging.getLogger("nextgen.payments.yoco")
 
@@ -36,21 +41,42 @@ _PAYMENTS_URL = "https://payments.yoco.com/api/payments"
 
 class YocoProvider(PaymentProvider):
 
-    async def create_payment_link(self, order, business) -> str | None:
-        """Call Yoco Checkouts API and return the hosted payment URL."""
+    async def create_payment_link(
+        self,
+        order,
+        business,
+        *,
+        amount_cents: int | None = None,
+        external_reference: str | None = None,
+    ) -> str | None:
+        """
+        Call Yoco Checkouts API and return the hosted payment URL.
+
+        order=None is the POS Pay-by-Link intent path — amount_cents and
+        external_reference are then mandatory (see resolve_amount_and_reference)
+        and are used in place of order.total_cents/str(order.id). The order's
+        own orderNumber metadata field and log label degrade to a generic
+        "POS payment" description since there is no order to describe.
+        """
         from backend.app.core.crypto import decrypt_credential
         api_key = decrypt_credential(getattr(business, "payment_api_key", None))
         if not api_key:
             logger.warning("Yoco: no api_key configured for business %s", getattr(business, "id", "?"))
             return None
 
+        resolved_amount, resolved_reference = resolve_amount_and_reference(
+            order, amount_cents, external_reference
+        )
+        label = order.order_number if order is not None else "POS payment"
+
+        metadata = {"orderId": resolved_reference}
+        if order is not None:
+            metadata["orderNumber"] = order.order_number
+
         payload = {
-            "amount": order.total_cents,
+            "amount": resolved_amount,
             "currency": getattr(business, "currency", "ZAR"),
-            "metadata": {
-                "orderId": str(order.id),
-                "orderNumber": order.order_number,
-            },
+            "metadata": metadata,
         }
 
         try:
@@ -67,16 +93,16 @@ class YocoProvider(PaymentProvider):
                 data = resp.json()
                 # Yoco returns "url" or "redirectUrl" depending on API version
                 url = data.get("url") or data.get("redirectUrl")
-                logger.info("Yoco checkout created: order=%s", order.order_number)
+                logger.info("Yoco checkout created: order=%s", label)
                 return url
         except httpx.HTTPStatusError as exc:
             logger.error(
                 "Yoco API %s error for order %s: %s",
-                exc.response.status_code, order.order_number, exc.response.text,
+                exc.response.status_code, label, exc.response.text,
             )
             return None
         except Exception:
-            logger.exception("Yoco create_payment_link failed for order %s", order.order_number)
+            logger.exception("Yoco create_payment_link failed for order %s", label)
             return None
 
     async def verify_payment(self, order, business) -> bool:

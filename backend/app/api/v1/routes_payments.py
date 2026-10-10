@@ -26,6 +26,7 @@ from backend.app.db.session import get_db
 from fastapi import Depends
 from shared.models.business import Business
 from shared.models.order import Order, OrderEvent
+from shared.models.pos_payment import POSPaymentLinkIntent
 
 logger = logging.getLogger("nextgen.payments.webhooks")
 
@@ -185,6 +186,103 @@ async def _mark_order_paid(
             logger.exception("Failed to send payment confirmation WhatsApp for order %s", order.order_number)
 
 
+_POS_INTENT_PREFIX = "pos_intent:"
+
+
+async def _mark_intent_paid(
+    db: AsyncSession,
+    intent_ref: str,
+    business_id: uuid.UUID,
+    provider_name: str,
+    *,
+    provider_reference: str | None,
+    amount_cents: int | None,
+    currency: str | None,
+) -> None:
+    """
+    Mark a POS Pay-by-Link intent (`POSPaymentLinkIntent`) PAID.
+
+    Mirrors `_mark_order_paid`'s structure/discipline (never raise on a bad
+    webhook delivery, tenant-scope every lookup, verify amount/currency
+    before trusting the provider's say-so) but is scoped to exactly the
+    intent row — no `Order` exists yet for a POS intent at this point, so
+    this function never touches one, and it never sends any WhatsApp
+    message (the Staff app learns PAID via its own polling of
+    `GET /v1/business/pos/payment-intents/{id}`).
+
+    intent_ref is the raw string after the webhook routing branch strips
+    the "pos_intent:" prefix — parsed to a UUID here (not by the caller) so
+    a malformed id is this function's problem to log-and-return on, never
+    the caller's to raise on.
+    """
+    try:
+        parsed_id = uuid.UUID(str(intent_ref))
+    except (ValueError, AttributeError):
+        logger.warning("%s webhook: invalid POS payment intent id %r", provider_name, intent_ref)
+        return
+
+    result = await db.execute(
+        select(POSPaymentLinkIntent)
+        .where(
+            POSPaymentLinkIntent.id == parsed_id,
+            POSPaymentLinkIntent.business_id == business_id,
+        )
+        .with_for_update()
+    )
+    intent = result.scalar_one_or_none()
+    if not intent:
+        logger.warning(
+            "%s webhook: POS payment intent %s not found for business %s",
+            provider_name, parsed_id, business_id,
+        )
+        return
+
+    if intent.status in ("PAID", "CONSUMED"):
+        # Duplicate webhook delivery (providers retry). First-write-wins:
+        # a matching reference is a benign idempotent no-op; a mismatching
+        # one is logged as a potential anomaly but still never re-processed.
+        if provider_reference and intent.provider_reference == provider_reference:
+            logger.debug(
+                "%s webhook: POS payment intent %s already %s with matching "
+                "reference — idempotent no-op",
+                provider_name, parsed_id, intent.status,
+            )
+        else:
+            logger.warning(
+                "%s webhook: POS payment intent %s already %s with reference %r — "
+                "incoming reference %r does not match; NOT re-processing "
+                "(first-write-wins)",
+                provider_name, parsed_id, intent.status, intent.provider_reference, provider_reference,
+            )
+        return
+
+    if intent.status != "PENDING":
+        # FAILED/EXPIRED/CANCELLED — never resurrect a dead intent.
+        logger.warning(
+            "%s webhook: POS payment intent %s is %s (not PENDING) — not transitioning",
+            provider_name, parsed_id, intent.status,
+        )
+        return
+
+    amount_ok = amount_cents is not None and int(amount_cents) == int(intent.amount_cents)
+    currency_ok = currency is None or str(currency).upper() == (intent.currency or "ZAR").upper()
+    if not amount_ok or not currency_ok:
+        logger.warning(
+            "%s webhook: POS payment intent %s AMOUNT/CURRENCY MISMATCH — expected "
+            "%d cents %s, provider reported %r cents %r. NOT marking paid.",
+            provider_name, parsed_id, intent.amount_cents, intent.currency, amount_cents, currency,
+        )
+        return
+
+    from datetime import datetime, timezone
+    intent.status = "PAID"
+    intent.provider_reference = provider_reference
+    intent.paid_at = datetime.now(timezone.utc)
+    await db.commit()
+
+    logger.info("%s webhook: POS payment intent %s marked PAID", provider_name, parsed_id)
+
+
 async def _load_business(db: AsyncSession, business_id: uuid.UUID) -> Business | None:
     result = await db.execute(select(Business).where(Business.id == business_id))
     return result.scalar_one_or_none()
@@ -228,10 +326,18 @@ async def yoco_webhook(
     result = await provider.handle_webhook(payload)
 
     if result.get("paid") and result.get("order_id"):
-        await _mark_order_paid(
-            db, result["order_id"], business_id, "Yoco", result.get("reference"),
-            amount_cents=result.get("amount_cents"), currency=result.get("currency"),
-        )
+        order_ref = str(result["order_id"])
+        if order_ref.startswith(_POS_INTENT_PREFIX):
+            await _mark_intent_paid(
+                db, order_ref[len(_POS_INTENT_PREFIX):], business_id, "Yoco",
+                provider_reference=result.get("reference"),
+                amount_cents=result.get("amount_cents"), currency=result.get("currency"),
+            )
+        else:
+            await _mark_order_paid(
+                db, result["order_id"], business_id, "Yoco", result.get("reference"),
+                amount_cents=result.get("amount_cents"), currency=result.get("currency"),
+            )
 
     return {"received": True}
 
@@ -275,10 +381,18 @@ async def payfast_webhook(
     result = await provider.handle_webhook(params)
 
     if result.get("paid") and result.get("order_id"):
-        await _mark_order_paid(
-            db, result["order_id"], business_id, "PayFast", result.get("reference"),
-            amount_cents=result.get("amount_cents"), currency=result.get("currency"),
-        )
+        order_ref = str(result["order_id"])
+        if order_ref.startswith(_POS_INTENT_PREFIX):
+            await _mark_intent_paid(
+                db, order_ref[len(_POS_INTENT_PREFIX):], business_id, "PayFast",
+                provider_reference=result.get("reference"),
+                amount_cents=result.get("amount_cents"), currency=result.get("currency"),
+            )
+        else:
+            await _mark_order_paid(
+                db, result["order_id"], business_id, "PayFast", result.get("reference"),
+                amount_cents=result.get("amount_cents"), currency=result.get("currency"),
+            )
 
     # PayFast expects a 200 OK with no body
     return {"received": True}
@@ -326,14 +440,27 @@ async def ikhoka_webhook(
     result = await provider.handle_webhook(payload)
 
     if result.get("paid") and result.get("order_id"):
-        # KNOWN GAP: iKhoka's callback payload carries no amount/currency —
-        # see backend/app/payments/ikhoka.py's handle_webhook docstring.
-        # amount_cents/currency will be None here; _mark_order_paid skips
-        # that check rather than inventing a value to compare against.
-        await _mark_order_paid(
-            db, result["order_id"], business_id, "iKhoka", result.get("reference"),
-            amount_cents=result.get("amount_cents"), currency=result.get("currency"),
-        )
+        order_ref = str(result["order_id"])
+        if order_ref.startswith(_POS_INTENT_PREFIX):
+            # iKhoka is excluded from POS Pay-by-Link (see module docstring
+            # KNOWN GAP below) so this branch should be unreachable in
+            # practice — kept for structural consistency with the other
+            # three handlers and defence-in-depth, not because iKhoka can
+            # actually originate a "pos_intent:" reference today.
+            await _mark_intent_paid(
+                db, order_ref[len(_POS_INTENT_PREFIX):], business_id, "iKhoka",
+                provider_reference=result.get("reference"),
+                amount_cents=result.get("amount_cents"), currency=result.get("currency"),
+            )
+        else:
+            # KNOWN GAP: iKhoka's callback payload carries no amount/currency —
+            # see backend/app/payments/ikhoka.py's handle_webhook docstring.
+            # amount_cents/currency will be None here; _mark_order_paid skips
+            # that check rather than inventing a value to compare against.
+            await _mark_order_paid(
+                db, result["order_id"], business_id, "iKhoka", result.get("reference"),
+                amount_cents=result.get("amount_cents"), currency=result.get("currency"),
+            )
 
     return {"received": True}
 
@@ -376,12 +503,25 @@ async def stitch_webhook(
     result = await provider.handle_webhook(payload)
 
     if result.get("paid") and result.get("order_id"):
-        # KNOWN GAP: Stitch's payment_initiation_request.complete payload as
-        # implemented here carries no amount — see
-        # backend/app/payments/stitch.py's handle_webhook docstring.
-        await _mark_order_paid(
-            db, result["order_id"], business_id, "Stitch", result.get("reference"),
-            amount_cents=result.get("amount_cents"), currency=result.get("currency"),
-        )
+        order_ref = str(result["order_id"])
+        if order_ref.startswith(_POS_INTENT_PREFIX):
+            # Stitch is excluded from POS Pay-by-Link (see module docstring
+            # KNOWN GAP below) so this branch should be unreachable in
+            # practice — kept for structural consistency with the other
+            # three handlers and defence-in-depth, not because Stitch can
+            # actually originate a "pos_intent:" reference today.
+            await _mark_intent_paid(
+                db, order_ref[len(_POS_INTENT_PREFIX):], business_id, "Stitch",
+                provider_reference=result.get("reference"),
+                amount_cents=result.get("amount_cents"), currency=result.get("currency"),
+            )
+        else:
+            # KNOWN GAP: Stitch's payment_initiation_request.complete payload as
+            # implemented here carries no amount — see
+            # backend/app/payments/stitch.py's handle_webhook docstring.
+            await _mark_order_paid(
+                db, result["order_id"], business_id, "Stitch", result.get("reference"),
+                amount_cents=result.get("amount_cents"), currency=result.get("currency"),
+            )
 
     return {"received": True}

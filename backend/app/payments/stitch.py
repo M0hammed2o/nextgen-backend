@@ -123,13 +123,27 @@ def _resolve_bank_id(bank_name: str | None) -> str:
 
 class StitchProvider(PaymentProvider):
 
-    async def create_payment_link(self, order, business) -> str | None:
+    async def create_payment_link(
+        self,
+        order,
+        business,
+        *,
+        amount_cents: int | None = None,
+        external_reference: str | None = None,
+    ) -> str | None:
         """
         Create a Stitch payment initiation request and return the payment URL.
 
         The URL is sent to the customer via WhatsApp. They open it in their
         browser, select their bank, and authorise the payment — funds land
         directly in the business's linked bank account.
+
+        Signature extended for consistency with PaymentProvider's interface
+        only — Stitch is deliberately EXCLUDED from POS Pay-by-Link (its
+        webhook event carries no amount to verify against, see
+        handle_webhook below), so order=None is never passed here in
+        practice. amount_cents/external_reference are accepted but unused;
+        this method still requires a real `order`.
         """
         from backend.app.core.crypto import decrypt_credential
         client_secret = decrypt_credential(getattr(business, "payment_api_key", None))

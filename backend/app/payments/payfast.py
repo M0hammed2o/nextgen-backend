@@ -27,7 +27,12 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 import httpx
 
-from backend.app.payments.base import PaymentProvider, ProviderHealthStatus, RefundResult
+from backend.app.payments.base import (
+    PaymentProvider,
+    ProviderHealthStatus,
+    RefundResult,
+    resolve_amount_and_reference,
+)
 
 logger = logging.getLogger("nextgen.payments.payfast")
 
@@ -69,13 +74,26 @@ def _build_signature(params: dict, passphrase: str | None) -> str:
 
 class PayFastProvider(PaymentProvider):
 
-    async def create_payment_link(self, order, business) -> str | None:
+    async def create_payment_link(
+        self,
+        order,
+        business,
+        *,
+        amount_cents: int | None = None,
+        external_reference: str | None = None,
+    ) -> str | None:
         """
         Build a signed PayFast payment URL.
 
         PayFast works via a redirect — we construct a URL with signed params
         and send it to the customer. They click it, pay on PayFast's hosted
         page, and PayFast POSTs the result to our notify_url.
+
+        order=None is the POS Pay-by-Link intent path — amount_cents and
+        external_reference are then mandatory (see resolve_amount_and_reference)
+        and are used in place of order.total_cents/str(order.id) for the
+        amount and m_payment_id fields; item_name degrades to a generic
+        "POS payment" description since there is no order to describe.
         """
         from backend.app.core.crypto import decrypt_credential
         merchant_key = decrypt_credential(getattr(business, "payment_api_key", None))
@@ -92,22 +110,28 @@ class PayFastProvider(PaymentProvider):
         from backend.app.core.config import get_settings
         cfg = get_settings()
 
+        resolved_amount, resolved_reference = resolve_amount_and_reference(
+            order, amount_cents, external_reference
+        )
+        item_name = f"Order {order.order_number}" if order is not None else "POS payment"
+        label = order.order_number if order is not None else resolved_reference
+
         params: dict[str, str] = {
             "merchant_id": str(merchant_id),
             "merchant_key": str(merchant_key),
             "return_url": cfg.PAYMENT_RETURN_URL,
             "cancel_url": cfg.PAYMENT_CANCEL_URL,
             "notify_url": f"{cfg.BACKEND_PUBLIC_URL}/v1/payments/webhooks/payfast/{business.id}",
-            "amount": f"{order.total_cents / 100:.2f}",
-            "item_name": f"Order {order.order_number}",
-            "m_payment_id": str(order.id),
+            "amount": f"{resolved_amount / 100:.2f}",
+            "item_name": item_name,
+            "m_payment_id": resolved_reference,
             "email_confirmation": "1",
         }
 
         params["signature"] = _build_signature(params, passphrase)
 
         url = f"{_LIVE_URL}?{urllib.parse.urlencode(params)}"
-        logger.info("PayFast link built for order %s", order.order_number)
+        logger.info("PayFast link built for order %s", label)
         return url
 
     async def verify_payment(self, order, business) -> bool:
