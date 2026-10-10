@@ -235,6 +235,23 @@ async def test_legacy_cash_checkout_creates_exactly_one_allocation():
     assert allocs[0].change_due_cents == 5000
 
 
+async def test_legacy_checkout_fully_covered_by_loyalty_reward_creates_zero_allocations():
+    """
+    Regression (found via the real-Postgres integration suite): a loyalty
+    reward whose value clamps the discount so total_cents == 0 must not
+    try to insert a zero-amount allocation row — ck_pos_payment_allocations_
+    amount_positive would reject it, and semantically no money changed
+    hands at all, so there is nothing to record.
+    """
+    user = make_user()
+    body = make_request(payment_method="CASH", cash_tendered_cents=0)
+    resolved_items = [make_resolved_item(line_total_cents=0)]
+    order, db = await _run(body, user, resolved_items=resolved_items)
+
+    assert order.total_cents == 0
+    assert allocations_of(db) == []
+
+
 async def test_legacy_card_checkout_creates_exactly_one_allocation_no_cash_fields():
     user = make_user()
     body = make_request(payment_method="CARD")

@@ -1211,12 +1211,20 @@ async def create_pos_order(
             ),
         ))
 
-        # ── Payment allocations — every order gets >= 1 row (unified
-        #    design): a legacy single-method sale gets exactly one, a split
-        #    sale gets one per entry. The financial source of truth for a
-        #    split sale from here on is these rows, never Order's own
-        #    payment_method/cash_tendered_cents/payment_reference columns
-        #    (left null for a split sale — see the Order(...) comment above).
+        # ── Payment allocations — every order with real money owed gets >= 1
+        #    row (unified design): a legacy single-method sale gets exactly
+        #    one, a split sale gets one per entry. The financial source of
+        #    truth for a split sale from here on is these rows, never
+        #    Order's own payment_method/cash_tendered_cents/payment_reference
+        #    columns (left null for a split sale — see the Order(...) comment
+        #    above). EXCEPTION: a legacy sale fully covered by a loyalty
+        #    reward has total_cents == 0 — no money actually changed hands,
+        #    so it gets ZERO allocation rows rather than a zero-amount one,
+        #    which would violate ck_pos_payment_allocations_amount_positive
+        #    (an allocation row's whole meaning is "real money was
+        #    collected"). The split path can never hit this: each entry's
+        #    amount_cents is already constrained > 0 by
+        #    POSPaymentAllocationRequest, so >= 2 of them can never sum to 0.
         if body.payments is not None:
             for p in body.payments:
                 alloc = POSPaymentAllocation(
@@ -1240,7 +1248,7 @@ async def create_pos_order(
                 else:  # CARD / OTHER
                     alloc.payment_reference = p.payment_reference
                 db.add(alloc)
-        else:
+        elif total_cents > 0:
             db.add(POSPaymentAllocation(
                 order_id=order.id,
                 business_id=user.business_id,
