@@ -366,6 +366,7 @@ async def test_external_sales_status_gross_uses_shared_sale_predicate(db, test_b
     db.add_all([real_sale, never_a_sale])
     await db.commit()
 
+    test_business.delivery_reconciliation_enabled = True  # migration 0054 gate
     status = await external_sales_status(user=owner, db=db)
     uber = next(p for p in status["platforms"] if p["platform"] == "UBER_EATS")
     assert uber["total_orders_all_time"] == 1, "a CANCELLED/never-paid order must not count as a sale"

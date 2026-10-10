@@ -16,6 +16,16 @@ Preview never writes. Commit is the only endpoint that creates anything, and
 it refuses outright while any stock-affecting item is unmapped — accuracy
 over convenience, because a silently skipped item understates usage forever
 and the manager reads the gap as loss.
+
+Every route here (preview/commit/status/batches/mappings) is gated on
+`Business.delivery_reconciliation_enabled` via `_require_delivery_reconciliation_enabled`
+(migration 0054) — DELIBERATELY SEPARATE from `delivery_platforms_enabled`,
+which gates the live marketplace integrations in routes_delivery.py instead;
+the two files share no endpoints, tables, or entitlement. `/channels` is the
+one exception: it is general cross-channel sales analytics (already gated on
+`advanced_analytics_enabled`), not a CSV-reconciliation operation, so it is
+deliberately NOT gated on `delivery_reconciliation_enabled` too — doing so
+would conflate two unrelated commercial entitlements.
 """
 
 import uuid
@@ -77,6 +87,40 @@ async def _business(db: AsyncSession, business_id: uuid.UUID) -> Business:
     if not business:
         raise NotFoundError("Business")
     return business
+
+
+def _require_delivery_reconciliation_enabled(business: Business) -> None:
+    """
+    Server-side entitlement gate for CSV/manual delivery-order reconciliation
+    (migration 0054, `Business.delivery_reconciliation_enabled`) — the
+    commercial module every route in THIS file belongs to.
+
+    DELIBERATELY SEPARATE from `delivery_platforms_enabled` (the live
+    marketplace integrations — Uber Eats direct order injection, Mr D
+    connection), enforced independently by
+    `routes_delivery.py::_require_delivery_module_enabled`. The two systems
+    share no endpoints and no tables: this file's `ExternalImportBatch`/
+    `ExternalProductMapping` are CSV-workflow-only, distinct from
+    `routes_delivery.py`'s own connection/mapping models. A tenant can have
+    either entitlement, both, or neither — this check must never be
+    satisfied by `delivery_platforms_enabled` alone, and vice versa.
+
+    Same AppError shape as `require_advanced_analytics_enabled`
+    (backend/app/analytics/revenue.py) and `_require_loyalty_enabled`
+    (routes_loyalty.py) — 409, not 403: this is a commercial module being
+    off, not a permissions failure.
+
+    Previously unenforced here deliberately (see migration 0054's
+    docstring): production had zero tenants relying on CSV reconciliation
+    at the time, so there was nothing to retroactively cut off. Now
+    confirmed and enforced.
+    """
+    if not business.delivery_reconciliation_enabled:
+        raise AppError(
+            "DELIVERY_RECONCILIATION_NOT_ENABLED",
+            "Delivery reconciliation is not enabled for this business",
+            409,
+        )
 
 
 def _summary_payload(summary: ResolutionSummary) -> dict:
@@ -144,6 +188,7 @@ async def preview_external_orders(
     if platform not in PLATFORM_TO_ORDER_SOURCE:
         raise AppError("UNKNOWN_PLATFORM", f"Unknown platform {platform!r}", 422)
     business = await _business(db, user.business_id)
+    _require_delivery_reconciliation_enabled(business)
 
     rows = await _read_rows(file)
     adapted = adapt_rows(rows, platform=platform, mapping_override=parse_mapping(mapping))
@@ -206,6 +251,7 @@ async def commit_external_orders(
     if platform not in PLATFORM_TO_ORDER_SOURCE:
         raise AppError("UNKNOWN_PLATFORM", f"Unknown platform {platform!r}", 422)
     business = await _business(db, user.business_id)
+    _require_delivery_reconciliation_enabled(business)
 
     rows = await _read_rows(file)
     adapted = adapt_rows(rows, platform=platform, mapping_override=parse_mapping(mapping))
@@ -338,6 +384,8 @@ async def external_sales_status(
     sales have not been imported, expected stock is overstated by exactly
     those sales, and a manager who does not know that reads the gap as loss.
     """
+    business = await _business(db, user.business_id)
+    _require_delivery_reconciliation_enabled(business)
     now = datetime.now(timezone.utc)
     out = []
 
@@ -417,6 +465,8 @@ async def list_batches(
     user: AuthUser = Depends(require_owner_or_manager),
     db: AsyncSession = Depends(get_db),
 ):
+    business = await _business(db, user.business_id)
+    _require_delivery_reconciliation_enabled(business)
     rows = (
         await db.execute(
             select(ExternalImportBatch)
@@ -466,6 +516,8 @@ async def list_mappings(
     user: AuthUser = Depends(require_owner_or_manager),
     db: AsyncSession = Depends(get_db),
 ):
+    business = await _business(db, user.business_id)
+    _require_delivery_reconciliation_enabled(business)
     stmt = select(ExternalProductMapping).where(
         ExternalProductMapping.business_id == user.business_id
     )
@@ -524,6 +576,9 @@ async def upsert_mapping(
     on this restaurant's menu, which is what keeps ONE canonical recipe
     across every channel.
     """
+    business = await _business(db, user.business_id)
+    _require_delivery_reconciliation_enabled(business)
+
     if not body.is_ignored:
         if body.kind == ExternalMappingKind.ITEM.value and not body.menu_item_id:
             raise AppError(
@@ -611,6 +666,8 @@ async def delete_mapping(
     user: AuthUser = Depends(require_owner_or_manager),
     db: AsyncSession = Depends(get_db),
 ):
+    business = await _business(db, user.business_id)
+    _require_delivery_reconciliation_enabled(business)
     mapping = (
         await db.execute(
             select(ExternalProductMapping).where(

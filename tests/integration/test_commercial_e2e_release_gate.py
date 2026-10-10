@@ -171,6 +171,11 @@ async def test_full_commercial_e2e_release_gate(db, _invoicing_configured):
             # above; this business exercises loyalty program config +
             # checkout redemption further down, so it must be entitled.
             loyalty_enabled=True,
+            # migration 0054 — DELIBERATELY SEPARATE from
+            # delivery_platforms_enabled above: gates the CSV/manual
+            # reconciliation importer exercised further down in this same
+            # test ("Delivery CSV import"), now enforced server-side.
+            delivery_reconciliation_enabled=True,
         ),
         user=super_auth, db=db,
     )
@@ -181,6 +186,7 @@ async def test_full_commercial_e2e_release_gate(db, _invoicing_configured):
     assert biz.delivery_platforms_enabled is True
     assert biz.advanced_analytics_enabled is True
     assert biz.loyalty_enabled is True
+    assert biz.delivery_reconciliation_enabled is True
 
     # ══ Owner created ══════════════════════════════════════════════════════
     owner_login = await create_business_owner(
