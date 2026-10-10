@@ -87,3 +87,34 @@ def build_payment_timeout_message(order) -> str:
         f"Payment was not received within the required time. "
         f"Please place a new order if you still wish to proceed. 🙏"
     )
+
+
+def build_pos_payment_request_message(intent, business, payment_link_url: str) -> str:
+    """
+    Build the WhatsApp message body for a POS split-payment pay-by-link
+    request (backend/app/payments/pos_link_whatsapp.py::send_pos_payment_link
+    is the only caller).
+
+    `intent` is a POSPaymentLinkIntent (shared/models/pos_payment.py) created
+    BEFORE any final order exists — it has no human-readable order/till
+    reference, only UUIDs (intent.id, intent.till_session_id, the nullable
+    intent.order_id). Per this feature's own requirement, the raw UUID must
+    never appear in a customer-facing message, and no other reference is
+    available on the intent itself, so this message omits a reference line
+    entirely rather than inventing one — unlike build_payment_message(order,
+    business) above, which has a real order.order_number to show.
+    """
+    # intent.currency (NOT NULL, default "ZAR") is the authoritative currency
+    # for this specific amount — not business.currency, which is only a
+    # tenant-level default and could in principle diverge.
+    currency = getattr(intent, "currency", None) or getattr(business, "currency", "ZAR")
+    amount = format_currency(intent.amount_cents, currency)
+    restaurant_name = getattr(business, "name", "") or "the restaurant"
+
+    lines = [
+        f"*{restaurant_name}*\n",
+        f"💰 *Amount due: {amount}*\n",
+        f"Pay securely: {payment_link_url}\n",
+        "Once payment is confirmed, your cashier will complete the sale. 🙏",
+    ]
+    return "\n".join(lines)
