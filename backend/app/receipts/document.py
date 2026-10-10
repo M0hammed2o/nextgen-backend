@@ -117,6 +117,37 @@ class ReceiptTotals:
 
 
 @dataclass
+class ReceiptPaymentAllocation:
+    """
+    One settled POSPaymentAllocation row (migration 0055, split payments —
+    see docs/SPLIT_PAYMENTS_CONTRACT.md), rendered the same raw+display
+    pattern as every other money field on this document.
+
+    `method` is the human-readable label to print — "Cash", "Card", "Other",
+    or "Pay by Link (Yoco)"/"Pay by Link (PayFast)" for PAY_BY_LINK (the
+    provider name is folded into the label here so every renderer can just
+    print `method` without re-deriving it). `provider` carries the raw
+    provider code (YOCO | PAYFAST) separately for any structured consumer
+    that wants it. `reference` is the provider's own transaction reference
+    for CARD/OTHER/PAY_BY_LINK — NEVER a raw payment-link URL or an internal
+    UUID (payment_link_intent_id, order id, etc.); see
+    build_receipt_document()'s docstring for why.
+    """
+
+    method: str = ""
+    amount_cents: int = 0
+    amount_display: str = ""
+    # CASH only.
+    cash_tendered_cents: int | None = None
+    cash_tendered_display: str | None = None
+    change_due_cents: int | None = None
+    change_due_display: str | None = None
+    reference: str | None = None
+    # PAY_BY_LINK only — raw provider code (YOCO | PAYFAST).
+    provider: str | None = None
+
+
+@dataclass
 class ReceiptPayment:
     method: str | None = None
     status: str | None = None
@@ -127,6 +158,12 @@ class ReceiptPayment:
     reference: str | None = None
     refund_amount_cents: int | None = None
     refund_amount_display: str | None = None
+    # Split payments (migration 0055). Populated ONLY when
+    # order.payment_method == "SPLIT" — every other field above stays
+    # exactly as it is today (None/unset) in that case. None/empty for
+    # every single-method order, including every legacy order with zero
+    # POSPaymentAllocation rows — see build_receipt_document()'s docstring.
+    allocations: list["ReceiptPaymentAllocation"] | None = None
 
 
 @dataclass
@@ -227,6 +264,25 @@ def _localise(issued_at: datetime | None, business) -> str | None:
     return local.strftime("%Y-%m-%d %H:%M")
 
 
+_ALLOCATION_METHOD_LABELS = {"CASH": "Cash", "CARD": "Card", "OTHER": "Other"}
+_PAY_BY_LINK_PROVIDER_LABELS = {"YOCO": "Yoco", "PAYFAST": "PayFast"}
+
+
+def _allocation_method_label(payment_method: str, provider: str | None) -> str:
+    """
+    Human-readable label for one POSPaymentAllocation, printed on a receipt.
+
+    PAY_BY_LINK folds the provider name in ("Pay by Link (Yoco)") so every
+    renderer can print this one string without re-deriving anything — and,
+    critically, without ever needing the provider's own transaction id or
+    the payment link URL, neither of which belongs on a customer receipt.
+    """
+    if payment_method == "PAY_BY_LINK":
+        provider_label = _PAY_BY_LINK_PROVIDER_LABELS.get((provider or "").upper())
+        return f"Pay by Link ({provider_label})" if provider_label else "Pay by Link"
+    return _ALLOCATION_METHOD_LABELS.get(payment_method, payment_method or "")
+
+
 def _vat_rate_display(order, business) -> tuple[int | None, bool | None]:
     """
     Decide whether the tenant's LIVE VAT rate/inclusive setting can be
@@ -295,7 +351,9 @@ def build_receipt_document(
     selected_options_snapshot, add_ons_snapshot, removed_ingredients_snapshot,
     unit_price_cents, line_total_cents, discount_cents, discount_reason,
     tax_cents, total_cents, cash_tendered_cents, change_due_cents,
-    refund_amount_cents) rather than from the live menu or a recomputation,
+    refund_amount_cents, and — for a split sale only, migration 0055 —
+    order.payment_allocations, itself immutable once inserted) rather than
+    from the live menu or a recomputation,
     so reprinting a month-old receipt shows what was actually sold and
     charged, not what the menu or business settings say today. The one
     exception, documented in _vat_rate_display()'s docstring, is the VAT
@@ -414,11 +472,45 @@ def build_receipt_document(
     )
 
     payment_status = getattr(order, "payment_status", None)
+    order_payment_method = getattr(order, "payment_method", None)
     cash_tendered = getattr(order, "cash_tendered_cents", None)
     change_due = getattr(order, "change_due_cents", None)
     refund_amount = getattr(order, "refund_amount_cents", None)
+
+    # Split payments (migration 0055): a genuinely split sale carries its
+    # real breakdown on order.payment_allocations instead of the single-
+    # method columns above (which checkout already leaves null for a SPLIT
+    # order — see shared/models/pos_payment.py's own docstring), so this
+    # branch ADDS allocations rather than needing to blank anything out.
+    # Every other order (including every legacy order with zero allocation
+    # rows) takes the untouched path below exactly as it did before this
+    # field existed.
+    allocations: list[ReceiptPaymentAllocation] | None = None
+    if order_payment_method == "SPLIT":
+        allocations = []
+        for alloc in getattr(order, "payment_allocations", None) or []:
+            alloc_method = getattr(alloc, "payment_method", None)
+            alloc_amount = int(getattr(alloc, "amount_cents", 0) or 0)
+            alloc_cash_tendered = getattr(alloc, "cash_tendered_cents", None)
+            alloc_change_due = getattr(alloc, "change_due_cents", None)
+            allocations.append(
+                ReceiptPaymentAllocation(
+                    method=_allocation_method_label(alloc_method, getattr(alloc, "provider", None)),
+                    amount_cents=alloc_amount,
+                    amount_display=money(alloc_amount),
+                    cash_tendered_cents=alloc_cash_tendered,
+                    cash_tendered_display=money(alloc_cash_tendered) if alloc_cash_tendered is not None else None,
+                    change_due_cents=alloc_change_due,
+                    change_due_display=money(alloc_change_due) if alloc_change_due is not None else None,
+                    # CARD/OTHER/PAY_BY_LINK transaction reference only — never
+                    # the payment_link_intent_id or any other internal UUID.
+                    reference=getattr(alloc, "payment_reference", None),
+                    provider=getattr(alloc, "provider", None),
+                )
+            )
+
     payment = ReceiptPayment(
-        method=getattr(order, "payment_method", None),
+        method=order_payment_method,
         status=payment_status,
         cash_tendered_cents=cash_tendered,
         cash_tendered_display=money(cash_tendered) if cash_tendered is not None else None,
@@ -427,6 +519,7 @@ def build_receipt_document(
         reference=getattr(order, "payment_reference", None),
         refund_amount_cents=refund_amount,
         refund_amount_display=money(refund_amount) if refund_amount else None,
+        allocations=allocations,
     )
 
     issued = getattr(order, "created_at", None)

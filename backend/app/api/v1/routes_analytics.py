@@ -18,13 +18,14 @@ routes_external_orders.py's `/business/external-orders/channels` and is gated
 the same way.
 """
 
+from collections import defaultdict
 from decimal import ROUND_HALF_UP, Decimal
 
 from datetime import date, datetime, timedelta, timezone as tz
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import case, exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.analytics.revenue import (
@@ -44,6 +45,7 @@ from backend.app.core.rbac import AuthUser, require_owner_or_manager
 from backend.app.db.session import get_db
 from shared.models.analytics import DailyUsage
 from shared.models.order import Order, OrderItem
+from shared.models.pos_payment import POSPaymentAllocation
 from shared.utils.time import local_midnight_to_utc, today_date_for_business
 
 router = APIRouter(prefix="/business/analytics", tags=["analytics"])
@@ -405,45 +407,180 @@ async def get_payment_method_breakdown(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Advanced Analytics. Cash-vs-card (and every other recorded
-    Order.payment_method) revenue split — reuses IS_SALE/refunds_cents_expr/
-    sale_timestamp_expr exactly as routes_external_orders.py's channel
-    report does, rather than writing a second "what counts as a sale" rule.
-    A NULL payment_method (e.g. an order that never reached a recorded
-    payment method) is bucketed as UNKNOWN rather than silently dropped.
+    Advanced Analytics. Payment-mix report, MONEY BY ALLOCATION, never by
+    order (migration 0055 / docs/SPLIT_PAYMENTS_CONTRACT.md) — a genuinely
+    split POS sale (`Order.payment_method == "SPLIT"`) must never surface as
+    a fake "SPLIT" revenue category. Every POS order created after the
+    split-payments migration carries >= 1 `POSPaymentAllocation` row,
+    INCLUDING an ordinary single-method sale (the unified design — see
+    `shared/models/pos_payment.py`), so:
+
+      - An order with >= 1 allocation row is bucketed by
+        `POSPaymentAllocation.payment_method` / `amount_cents` — always
+        exact, since allocations sum to the order's own `total_cents` by
+        construction.
+      - An order with ZERO allocation rows — every order placed BEFORE this
+        feature shipped (permanent, never backfilled — see
+        `shared/models/pos_payment.py`'s own docstring) plus any non-POS
+        order (e.g. WhatsApp) that never goes through the allocation path —
+        falls back to TODAY'S EXACT PRE-EXISTING BEHAVIOUR: bucketed by
+        `Order.payment_method` / `total_cents`.
+
+    Both branches reuse the exact same IS_SALE / sale_timestamp_expr /
+    business_id predicates as every other analytics endpoint — this never
+    redefines "what counts as a sale".
+
+    Refunds: a legacy order's refund is netted exactly as before
+    (`refunds_cents_expr()`-equivalent sum of `Order.refund_amount_cents`).
+    A split order's refund is exact for the CASH bucket only —
+    `Order.refund_cash_cents` (migration 0055) records precisely how much of
+    the refund was physical cash — and DELIBERATELY APPROXIMATE for
+    everything else: whatever refund remains
+    (`refund_amount_cents - refund_cash_cents`) is spread PROPORTIONALLY
+    across that order's own non-cash allocations by their relative
+    `amount_cents` share. This is disclosed, not invented precision: the
+    manager records how much cash came back, but not which specific
+    card/pay-by-link/other allocation the provider actually reversed.
+
+    Worked example (2-way split, Cash R150 + Card R150, order total R300):
+    a R100 refund with `refund_cash_cents=40` -> CASH bucket refund = R40
+    (exact), remaining R60 has nowhere else to go but the one non-cash
+    allocation (Card, 100% of the non-cash total) -> Card bucket refund =
+    R60. With a 3rd allocation (e.g. +PAY_BY_LINK R? each sharing the
+    non-cash total), the remaining refund splits proportionally to each
+    non-cash allocation's own amount_cents.
+
+    VAT has no per-allocation column at all (`Order.tax_cents` is a single
+    per-order figure) — a split order's VAT is spread proportionally across
+    its allocations by the SAME amount_cents share, purely as a reporting
+    convention: unlike the refund case this is not standing in for an
+    unknowable fact (the VAT total itself is always exactly `Order.tax_cents`,
+    summed across buckets) — it is just a choice of which bucket displays
+    which slice of it.
+
+    A NULL `Order.payment_method` (legacy order that never reached a
+    recorded payment method) is bucketed as UNKNOWN exactly as before. The
+    literal string "SPLIT" is never emitted as a bucket key — by
+    construction a SPLIT order always carries allocation rows and so never
+    reaches the legacy branch, but the legacy branch also defensively
+    coalesces a (should-never-happen, data-integrity-violation) "SPLIT"
+    value to UNKNOWN rather than ever surfacing it as a fake category.
     """
     await require_advanced_analytics_enabled(db, user.business_id)
     since = datetime.now(tz.utc) - timedelta(days=days)
 
-    method_expr = func.coalesce(Order.payment_method, "UNKNOWN")
-    rows = (
+    sale_filter = (
+        Order.business_id == user.business_id,
+        sale_timestamp_expr() >= since,
+        IS_SALE,
+    )
+    has_allocations = exists(
+        select(POSPaymentAllocation.id).where(POSPaymentAllocation.order_id == Order.id)
+    )
+
+    # method -> running totals, combined across both branches below.
+    buckets: dict[str, dict[str, int]] = defaultdict(
+        lambda: {"order_count": 0, "gross_cents": 0, "vat_cents": 0, "refunds_cents": 0}
+    )
+
+    # ── Legacy / non-allocation orders: today's exact pre-existing query ────
+    # Defensive coalesce: "SPLIT" can only ever land on an Order that also
+    # has allocation rows (and so never reaches this NOT EXISTS branch at
+    # all) — the case() below is a belt-and-braces guard against ever
+    # emitting a fake "SPLIT" bucket if that invariant were somehow violated.
+    legacy_method_expr = case(
+        (Order.payment_method == "SPLIT", "UNKNOWN"),
+        else_=func.coalesce(Order.payment_method, "UNKNOWN"),
+    )
+    legacy_rows = (
         await db.execute(
             select(
-                method_expr,
-                func.count(),
-                func.coalesce(func.sum(Order.total_cents), 0),
-                func.coalesce(func.sum(Order.tax_cents), 0),
-                refunds_cents_expr(),
+                legacy_method_expr.label("method"),
+                func.count().label("order_count"),
+                func.coalesce(func.sum(Order.total_cents), 0).label("gross_cents"),
+                func.coalesce(func.sum(Order.tax_cents), 0).label("vat_cents"),
+                refunds_cents_expr().label("refunds_cents"),
             )
-            .where(
-                Order.business_id == user.business_id,
-                sale_timestamp_expr() >= since,
-                IS_SALE,
+            .where(*sale_filter, ~has_allocations)
+            .group_by(legacy_method_expr)
+        )
+    ).all()
+    for row in legacy_rows:
+        b = buckets[row.method]
+        b["order_count"] += int(row.order_count or 0)
+        b["gross_cents"] += int(row.gross_cents or 0)
+        b["vat_cents"] += int(row.vat_cents or 0)
+        b["refunds_cents"] += int(row.refunds_cents or 0)
+
+    # ── Allocation-based orders: >= 1 POSPaymentAllocation row ──────────────
+    # One row per (order, allocation) — small per-order fan-out (almost
+    # always 1-3 rows), aggregated in Python below because the proportional
+    # refund/VAT spread needs each order's OWN total_cents/tax_cents/
+    # refund_amount_cents/refund_cash_cents alongside its sibling
+    # allocations, which a single SQL GROUP BY payment_method cannot express.
+    alloc_rows = (
+        await db.execute(
+            select(
+                POSPaymentAllocation.order_id,
+                POSPaymentAllocation.payment_method,
+                POSPaymentAllocation.amount_cents,
+                Order.total_cents,
+                Order.tax_cents,
+                Order.refund_amount_cents,
+                Order.refund_cash_cents,
             )
-            .group_by(method_expr)
+            .join(Order, POSPaymentAllocation.order_id == Order.id)
+            .where(*sale_filter)
         )
     ).all()
 
+    rows_by_order = defaultdict(list)
+    for row in alloc_rows:
+        rows_by_order[row.order_id].append(row)
+
+    for order_rows in rows_by_order.values():
+        first = order_rows[0]
+        order_total = int(first.total_cents or 0)
+        order_tax = int(first.tax_cents or 0)
+        refund_total = int(first.refund_amount_cents or 0)
+        refund_cash = int(first.refund_cash_cents or 0)
+        refund_non_cash_remaining = max(0, refund_total - refund_cash)
+        non_cash_total = sum(
+            int(r.amount_cents or 0) for r in order_rows if r.payment_method != "CASH"
+        )
+
+        for r in order_rows:
+            amount = int(r.amount_cents or 0)
+            b = buckets[r.payment_method]
+            b["order_count"] += 1
+            b["gross_cents"] += amount
+
+            # VAT: proportional bucketing convention (see docstring) — never
+            # divides by zero (an allocation's amount_cents is CHECKed > 0,
+            # and order_total is the sum of all of this order's allocations).
+            if order_total:
+                b["vat_cents"] += round(order_tax * amount / order_total)
+
+            # Refunds: CASH gets exactly what was actually recorded as a
+            # cash refund (capped at this allocation's own amount so a
+            # refund_cash_cents typo/over-entry can never push a bucket's
+            # refund above its own gross). Everything else shares the
+            # remaining refund proportionally — see docstring.
+            if r.payment_method == "CASH":
+                b["refunds_cents"] += min(refund_cash, amount)
+            elif non_cash_total:
+                b["refunds_cents"] += round(refund_non_cash_remaining * amount / non_cash_total)
+
     methods = [
         PaymentMethodBreakdown(
-            payment_method=payment_method,
-            order_count=int(count or 0),
-            gross_cents=int(gross or 0),
-            vat_cents=int(vat or 0),
-            refunds_cents=int(refunds or 0),
-            net_cents=int(gross or 0) - int(refunds or 0),
+            payment_method=method,
+            order_count=b["order_count"],
+            gross_cents=b["gross_cents"],
+            vat_cents=b["vat_cents"],
+            refunds_cents=b["refunds_cents"],
+            net_cents=b["gross_cents"] - b["refunds_cents"],
         )
-        for payment_method, count, gross, vat, refunds in rows
+        for method, b in buckets.items()
     ]
     methods.sort(key=lambda m: -m.gross_cents)
 

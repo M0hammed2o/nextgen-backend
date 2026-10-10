@@ -290,12 +290,25 @@ def render_text(document: ReceiptDocument) -> str:
     out.append(divider(cols, "="))
 
     payment = document.payment
-    if payment.method:
-        out.append(two_column("Paid by", payment.method, cols))
-    if payment.cash_tendered_cents is not None:
-        out.append(two_column("Cash", money(payment.cash_tendered_cents), cols))
-    if payment.change_due_cents is not None:
-        out.append(two_column("Change", money(payment.change_due_cents), cols))
+    if payment.allocations:
+        # Split payment (migration 0055): one line per settled allocation,
+        # each showing its own method label + the portion of the total it
+        # settled, with CASH's tendered/change sub-lines indented beneath
+        # its own line (never the order-level single-method fields below,
+        # which checkout leaves null for a SPLIT order anyway).
+        for alloc in payment.allocations:
+            out.append(two_column(alloc.method, alloc.amount_display, cols))
+            if alloc.cash_tendered_display:
+                out.append(two_column("  Cash tendered", alloc.cash_tendered_display, cols))
+            if alloc.change_due_display:
+                out.append(two_column("  Change", alloc.change_due_display, cols))
+    else:
+        if payment.method:
+            out.append(two_column("Paid by", payment.method, cols))
+        if payment.cash_tendered_cents is not None:
+            out.append(two_column("Cash", money(payment.cash_tendered_cents), cols))
+        if payment.change_due_cents is not None:
+            out.append(two_column("Change", money(payment.change_due_cents), cols))
     if payment.refund_amount_cents:
         out.append(two_column("Refunded", money(payment.refund_amount_cents), cols))
 
