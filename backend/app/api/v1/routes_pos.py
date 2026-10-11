@@ -128,13 +128,24 @@ class POSOrderCreateRequest(BaseModel):
 
     # ── Payment (Phase 2 — paid at checkout, not after fulfilment) ────────
     # Exactly ONE of (payment_method) or (payments) must be given — see
-    # validate_payment_shape below. `payments` (>= 2 entries) is the new
-    # split-payment shape (migration 0055); everything else about this
-    # endpoint is unchanged for the legacy single-payment shape.
+    # validate_payment_shape below. `payments` is the new split-payment shape
+    # (migration 0055); everything else about this endpoint is unchanged for
+    # the legacy single-payment shape.
+    #
+    # min_length=1, not 2: PAY_BY_LINK is only ever expressed through this
+    # array (the legacy `payment_method` field only accepts CASH/CARD/OTHER
+    # — a payment-link intent has no equivalent top-level field), and the
+    # Staff app's own "Pay by Link" option — used on its own, covering the
+    # WHOLE sale, not combined with anything else — therefore sends exactly
+    # one entry here. Requiring >= 2 made a standalone Pay-by-Link sale
+    # impossible to complete even after the customer had actually paid
+    # (BUG-0127: the intent reached PAID with no way to ever consume it into
+    # an order). A single-entry array is processed by exactly the same
+    # per-allocation code below as any larger one — nothing assumes N >= 2.
     payment_method: str | None = Field(default=None, pattern=r"^(CASH|CARD|OTHER)$")
     cash_tendered_cents: int | None = Field(default=None, ge=0)
     payment_reference: str | None = Field(default=None, max_length=255)
-    payments: list[POSPaymentAllocationRequest] | None = Field(default=None, min_length=2)
+    payments: list[POSPaymentAllocationRequest] | None = Field(default=None, min_length=1)
 
     # A client-generated key; retrying the same checkout with the same key
     # returns the original order instead of ringing up a second sale.

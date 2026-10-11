@@ -313,11 +313,28 @@ async def test_split_payment_method_disabled_at_business_rejected():
     assert exc.value.code == "PAYMENT_METHOD_NOT_ACCEPTED"
 
 
-async def test_payments_array_requires_at_least_two_entries():
+async def test_payments_array_accepts_a_single_entry():
+    """
+    Regression for BUG-0127: `payments` must allow exactly one entry, since
+    that's the only shape a standalone Pay-by-Link sale (the whole bill
+    covered by one payment link, not combined with anything else) can ever
+    take — the legacy `payment_method` field has no PAY_BY_LINK value.
+    Requiring >= 2 here made a standalone Pay-by-Link sale impossible to
+    complete even after the customer had actually paid.
+    """
+    POSOrderCreateRequest(
+        items=[POSOrderItemRequest(menu_item_id=uuid.uuid4(), quantity=1)],
+        payments=[POSPaymentAllocationRequest(
+            payment_method="PAY_BY_LINK", amount_cents=100, payment_intent_id=uuid.uuid4(),
+        )],
+    )
+
+
+async def test_payments_array_rejects_zero_entries():
     with pytest.raises(ValueError):
         POSOrderCreateRequest(
             items=[POSOrderItemRequest(menu_item_id=uuid.uuid4(), quantity=1)],
-            payments=[POSPaymentAllocationRequest(payment_method="CASH", amount_cents=100, cash_tendered_cents=100)],
+            payments=[],
         )
 
 
@@ -335,6 +352,32 @@ async def test_payment_method_and_payments_are_mutually_exclusive():
 
 
 # ── Split: Pay by Link ────────────────────────────────────────────────────────
+
+async def test_standalone_pay_by_link_single_entry_checkout_succeeds():
+    """
+    Regression for BUG-0127: a sale paid ENTIRELY by Pay by Link (not
+    combined with anything else — the Staff app's own "Pay by Link" option
+    used on its own) must be completable via a single-entry `payments`
+    array, since the legacy `payment_method` field has no PAY_BY_LINK value
+    for it to use instead.
+    """
+    user = make_user()
+    intent = make_intent(user.business_id, amount_cents=30000, status="PAID")
+    body = make_request(payments=[
+        POSPaymentAllocationRequest(payment_method="PAY_BY_LINK", amount_cents=30000, payment_intent_id=intent.id),
+    ])
+    order, db = await _run(body, user, extra_results=[FakeResult(scalar=intent)])
+
+    assert order.payment_method == "SPLIT"
+    assert intent.status == "CONSUMED"
+    assert intent.order_id == order.id
+
+    allocs = allocations_of(db)
+    assert len(allocs) == 1
+    assert allocs[0].payment_method == "PAY_BY_LINK"
+    assert allocs[0].amount_cents == 30000
+    assert allocs[0].payment_link_intent_id == intent.id
+
 
 async def test_split_pay_by_link_happy_path_consumes_intent_and_creates_allocation():
     user = make_user()
