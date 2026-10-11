@@ -28,7 +28,7 @@ from __future__ import annotations
 import json
 import urllib.parse
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -118,6 +118,7 @@ def make_intent(business_id, **overrides):
     i.status = "PENDING"
     i.provider_reference = None
     i.paid_at = None
+    i.expires_at = datetime.now(timezone.utc) + timedelta(minutes=15)
     for k, v in overrides.items():
         setattr(i, k, v)
     return i
@@ -466,6 +467,33 @@ async def test_payfast_webhook_pos_intent_dead_status_not_resurrected():
 
     assert intent.status == "EXPIRED"
     assert db.commits == 0
+
+
+async def test_payfast_webhook_pos_intent_past_expiry_not_marked_paid_even_while_still_pending():
+    """
+    Regression for BUG-0128: `expires_at` is otherwise only enforced lazily
+    (routes_pos.py's _maybe_expire, which only runs on the next GET/resend/
+    cancel) -- a PENDING intent nobody has "looked at" since it went stale
+    must still be refused by the one point that actually finalizes money,
+    not just left to whichever happens first. A correctly-signed,
+    correct-amount webhook arriving after expires_at must transition the
+    intent to EXPIRED, never to PAID.
+    """
+    business = make_business()
+    intent = make_intent(
+        business.id, amount_cents=25000, currency="ZAR", status="PENDING",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+    )
+    intent_ref = f"pos_intent:{intent.id}"
+    body = _payfast_pos_body(intent_ref, "250.00", "secret")
+    db = FakeDB([FakeResult(scalar=business), FakeResult(scalar=intent)])
+
+    with patch("backend.app.api.v1.routes_payments.decrypt_credential", return_value="secret"):
+        await payfast_webhook(business_id=business.id, request=FakeRequest(body), db=db)
+
+    assert intent.status == "EXPIRED"
+    assert intent.paid_at is None
+    assert db.commits == 1  # the EXPIRED transition itself is persisted
 
 
 async def test_payfast_webhook_invalid_signature_rejected_before_pos_intent_logic():

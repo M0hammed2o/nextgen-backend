@@ -561,15 +561,29 @@ async def send_template_message(
         resolved_business_id = business_id or getattr(business, "id", None)
         if resolved_business_id is not None:
             try:
-                db.add(Message(
-                    business_id=resolved_business_id,
-                    customer_id=customer_id,
-                    direction="OUTBOUND",
-                    text=f"[Template: {template_name}]",
-                    wa_message_id=wa_message_id,
-                    intent=intent,
-                ))
-                await db.flush()
+                # BUG-0129: a bare try/except around this flush, with no
+                # rollback, left the session's transaction aborted on any
+                # failure (e.g. a unique-constraint hit) — every subsequent
+                # operation on it in the SAME request (including a caller's
+                # own later db.commit(), such as the POS Pay-by-Link resend
+                # endpoint's) would then raise too, turning "couldn't log
+                # message history" into an unrelated 500 and silently
+                # discarding whatever state the caller sets afterwards
+                # (e.g. intent.whatsapp_status = "SENT") even though the
+                # send itself succeeded. A SAVEPOINT isolates this one
+                # write's failure without discarding anything else already
+                # pending in the caller's own transaction (e.g.
+                # send_digital_receipt's own DigitalReceipt row).
+                async with db.begin_nested():
+                    db.add(Message(
+                        business_id=resolved_business_id,
+                        customer_id=customer_id,
+                        direction="OUTBOUND",
+                        text=f"[Template: {template_name}]",
+                        wa_message_id=wa_message_id,
+                        intent=intent,
+                    ))
+                    await db.flush()
             except Exception:
                 logger.exception(
                     "Failed to persist message-history row for template send "

@@ -29,6 +29,18 @@ def _mock_client(status_code: int, json_body: dict | None = None, text: str = ""
     return mock_client
 
 
+class FakeNestedTransaction:
+    """Minimal stand-in for AsyncSession.begin_nested()'s async context manager."""
+    def __init__(self, db):
+        self._db = db
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False  # never swallow — same as a real SAVEPOINT on error
+
+
 class FakeDB:
     def __init__(self):
         self.added = []
@@ -39,6 +51,17 @@ class FakeDB:
 
     async def flush(self):
         self.flushed += 1
+
+    def begin_nested(self):
+        return FakeNestedTransaction(self)
+
+
+class FakeDBFlushFails(FakeDB):
+    """A Message-history flush that always fails, to prove the failure is
+    isolated to its own SAVEPOINT rather than aborting the whole session."""
+    async def flush(self):
+        self.flushed += 1
+        raise RuntimeError("simulated unique-constraint violation on wa_message_id")
 
 
 class TestPayloadShape:
@@ -103,6 +126,33 @@ class TestMessageHistoryLogging:
         assert message.direction == "OUTBOUND"
         assert message.wa_message_id == "wamid.abc"
         assert message.intent == "receipt"
+
+    async def test_message_history_flush_failure_isolated_to_its_own_savepoint(self):
+        """
+        Regression for BUG-0129: a failure writing the Message-history row
+        must not abort the caller's own session/transaction. Before the
+        fix, this flush failure (uncaught by a rollback) would leave the
+        session unusable for anything the caller does next -- e.g. a POS
+        Pay-by-Link resend endpoint's own db.commit() right after this
+        call would then also fail, turning "couldn't log history" into an
+        unrelated 500 and silently discarding the caller's own pending
+        state (e.g. intent.whatsapp_status = "SENT").
+        """
+        client = _mock_client(200, {"messages": [{"id": "wamid.abc"}]})
+        db = FakeDBFlushFails()
+        with patch("backend.app.bot.whatsapp_sender.httpx.AsyncClient", return_value=client):
+            wamid, info = await send_template_message(
+                phone_number_id="PNID",
+                recipient_wa_id="27821234567",
+                template_name="nextgen_receipt_ready",
+                db=db,
+                business_id=uuid.uuid4(),
+                intent="receipt",
+            )
+        # The send itself still succeeded -- the history-logging failure
+        # must never mask a real wamid from a caller that needs it.
+        assert wamid == "wamid.abc"
+        assert info is None
 
     async def test_no_db_write_attempted_when_db_not_given(self):
         client = _mock_client(200, {"messages": [{"id": "wamid.xyz"}]})

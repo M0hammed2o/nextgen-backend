@@ -264,6 +264,25 @@ async def _mark_intent_paid(
         )
         return
 
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    if intent.expires_at <= now:
+        # BUG-0128: `expires_at` is otherwise only enforced lazily (on the
+        # next GET/resend/cancel — see routes_pos.py's _maybe_expire), so a
+        # webhook could otherwise arrive for a PENDING intent nobody has
+        # "looked at" since it went stale and still mark it PAID, letting a
+        # customer complete a payment on a link this platform already
+        # considers dead. The one point that actually finalizes money must
+        # enforce the TTL itself, not rely on a read that may never happen.
+        intent.status = "EXPIRED"
+        await db.commit()
+        logger.warning(
+            "%s webhook: POS payment intent %s had already expired (expires_at=%s) "
+            "— marking EXPIRED instead of PAID, not transitioning to PAID",
+            provider_name, parsed_id, intent.expires_at,
+        )
+        return
+
     amount_ok = amount_cents is not None and int(amount_cents) == int(intent.amount_cents)
     currency_ok = currency is None or str(currency).upper() == (intent.currency or "ZAR").upper()
     if not amount_ok or not currency_ok:
@@ -274,10 +293,9 @@ async def _mark_intent_paid(
         )
         return
 
-    from datetime import datetime, timezone
     intent.status = "PAID"
     intent.provider_reference = provider_reference
-    intent.paid_at = datetime.now(timezone.utc)
+    intent.paid_at = now
     await db.commit()
 
     logger.info("%s webhook: POS payment intent %s marked PAID", provider_name, parsed_id)
