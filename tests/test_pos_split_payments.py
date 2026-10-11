@@ -487,3 +487,58 @@ async def test_split_pay_by_link_already_consumed_same_idempotency_key_replays()
     assert result.id == original_order.id
     # No new allocation/order was created on the replay path.
     assert allocations_of(db) == []
+
+
+# ── Loyalty redemption + split payment together ─────────────────────────────
+# Never exercised by the browser release gate (no scenario there used
+# customer_phone/loyalty_reward_id) -- covered here instead. The loyalty
+# discount is computed BEFORE the payment-validation block runs, so
+# total_cents is already net of it by the time SUM(payments) is checked;
+# this pins that ordering with the release gate's own worked example
+# (Subtotal R500, reward -R50, final R450, split as Cash R150 + Card R300).
+
+async def test_loyalty_redemption_discount_applies_before_split_sum_is_checked():
+    user = make_user(role="STAFF")
+    program = types.SimpleNamespace(
+        is_enabled=True, min_redemption_points=0, silver_tier_points=500, gold_tier_points=2000,
+    )
+    customer = types.SimpleNamespace(
+        id=uuid.uuid4(), business_id=user.business_id, loyalty_points_balance=500,
+        loyalty_tier="BRONZE", wa_id=None, phone_number="+27821234567", display_name=None,
+    )
+    reward = types.SimpleNamespace(
+        id=uuid.uuid4(), business_id=user.business_id, name="E2E R50 Off",
+        points_cost=50, is_active=True, value_cents=5000,
+    )
+    body = make_request(
+        payments=[
+            POSPaymentAllocationRequest(payment_method="CASH", amount_cents=15000, cash_tendered_cents=15000),
+            POSPaymentAllocationRequest(payment_method="CARD", amount_cents=30000),
+        ],
+        idempotency_key="loyalty-split-1",
+    )
+    body = body.model_copy(update={"loyalty_reward_id": reward.id, "customer_phone": "0821234567"})
+
+    till = make_till(user.business_id)
+    business = make_business()
+    db = FakeDB([
+        FakeResult(scalar=None),      # idempotency lookup
+        FakeResult(scalar=till),
+        FakeResult(scalar=business),
+        FakeResult(scalar=program),   # loyalty program lookup
+        FakeResult(scalar=customer),  # get_or_create_customer_by_phone
+        FakeResult(scalar=reward),    # reward lookup
+        FakeResult(scalar=customer),  # redeem_reward_for_checkout's FOR UPDATE lock
+        FakeResult(row=(1, "ZAR")),   # order-number increment
+    ])
+    with patch.object(routes_pos, "resolve_pos_items", AsyncMock(return_value=[make_resolved_item(line_total_cents=50000)])):
+        with patch("backend.app.db.session.get_redis", AsyncMock(side_effect=Exception("no redis in tests"))):
+            order = await create_pos_order(body=body, user=user, db=db)
+
+    assert order.loyalty_discount_cents == 5000
+    assert order.total_cents == 45000  # 50000 subtotal - 5000 reward = R450, matching the split sum
+    assert order.payment_method == "SPLIT"
+
+    allocs = allocations_of(db)
+    assert len(allocs) == 2
+    assert sum(a.amount_cents for a in allocs) == 45000
