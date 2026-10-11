@@ -398,6 +398,15 @@ class POSPaymentIntentResponse(BaseModel):
     expires_at: datetime
     created_at: datetime
     paid_at: datetime | None
+    # Financial-safety closeout: none of these are secrets like the raw
+    # payment-link URL — a provider transaction reference, a till/cashier
+    # id, and whether this intent is already attached to an order are
+    # exactly what a manager/cashier resolving a paid-but-unconsumed intent
+    # needs to see. Defaults keep every existing response shape additive.
+    provider_reference: str | None = None
+    till_session_id: uuid.UUID | None = None
+    created_by_user_id: uuid.UUID | None = None
+    order_id: uuid.UUID | None = None
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -439,7 +448,104 @@ def _intent_to_response(intent: POSPaymentLinkIntent) -> POSPaymentIntentRespons
         expires_at=intent.expires_at,
         created_at=intent.created_at,
         paid_at=intent.paid_at,
+        provider_reference=intent.provider_reference,
+        till_session_id=intent.till_session_id,
+        created_by_user_id=intent.created_by_user_id,
+        order_id=intent.order_id,
     )
+
+
+async def _flag_pay_by_link_provider_refund_pending(
+    db: AsyncSession, order: Order, amount_cents: int, cash_refund_cents: int,
+) -> int:
+    """
+    Financial-safety closeout (Issue 3): NextGen has no verified-safe way to
+    call a real Yoco/PayFast refund API from this till-native refund flow
+    (see docs/SPLIT_PAYMENTS_CONTRACT.md) — recording a refund here must
+    never be allowed to imply the customer's actual Pay-by-Link payment was
+    returned. If any non-cash portion of this refund/void could touch a
+    PAY_BY_LINK allocation, flag it PENDING_MANUAL so the Manager Dashboard
+    shows an explicit "provider refund still required" state instead of a
+    bare "refunded." A manager confirms the real provider-side refund
+    separately via confirm_pos_order_provider_refund below — never set
+    automatically.
+
+    Returns the number of allocations flagged (0 if none — the common case
+    for a cash/card-only order).
+    """
+    non_cash_refunded_cents = amount_cents - cash_refund_cents
+    if non_cash_refunded_cents <= 0:
+        return 0
+    result = await db.execute(
+        select(POSPaymentAllocation).where(
+            POSPaymentAllocation.order_id == order.id,
+            POSPaymentAllocation.payment_method == "PAY_BY_LINK",
+            POSPaymentAllocation.provider_refund_status.is_(None),
+        )
+    )
+    allocations = result.scalars().all()
+    for alloc in allocations:
+        alloc.provider_refund_status = "PENDING_MANUAL"
+    return len(allocations)
+
+
+@router.post("/orders/{order_id}/confirm-provider-refund", response_model=OrderResponse)
+async def confirm_pos_order_provider_refund(
+    order_id: uuid.UUID,
+    user: AuthUser = Depends(require_owner_or_manager),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    A manager's explicit statement that the REAL Yoco/PayFast refund for
+    this order's Pay-by-Link allocation(s) has actually been completed
+    outside NextGen (in the provider's own dashboard) — see
+    _flag_pay_by_link_provider_refund_pending's docstring. Never inferred,
+    never automatic; idempotent (confirming twice is a no-op, not an error,
+    so a double-tap can't fail or double-log).
+    """
+    result = await db.execute(
+        select(Order)
+        .where(Order.id == order_id, Order.business_id == user.business_id)
+        .with_for_update()
+    )
+    order = result.scalar_one_or_none()
+    if not order:
+        raise NotFoundError("Order", str(order_id))
+
+    alloc_result = await db.execute(
+        select(POSPaymentAllocation).where(
+            POSPaymentAllocation.order_id == order.id,
+            POSPaymentAllocation.payment_method == "PAY_BY_LINK",
+            POSPaymentAllocation.provider_refund_status == "PENDING_MANUAL",
+        )
+    )
+    allocations = alloc_result.scalars().all()
+    if not allocations:
+        raise AppError(
+            "NO_PENDING_PROVIDER_REFUND",
+            "This order has no Pay-by-Link refund awaiting provider confirmation",
+            422,
+        )
+
+    now = datetime.now(timezone.utc)
+    for alloc in allocations:
+        alloc.provider_refund_status = "CONFIRMED"
+        alloc.provider_refund_confirmed_at = now
+        alloc.provider_refund_confirmed_by_user_id = user.user_id
+
+    db.add(AuditEvent(
+        scope=AuditScope.BUSINESS.value,
+        business_id=user.business_id,
+        actor_user_id=user.user_id,
+        action="order.pos.provider_refund_confirmed",
+        target_type="order",
+        target_id=order.id,
+        diff_json={"allocation_ids": [str(a.id) for a in allocations]},
+    ))
+
+    await db.commit()
+    await db.refresh(order)
+    return OrderResponse.model_validate(order)
 
 
 async def _compute_cash_portion(db: AsyncSession, order: Order, requested_cents: int) -> int:
@@ -749,6 +855,43 @@ async def create_pos_payment_intent(
     await db.commit()
     await db.refresh(intent)
     return _intent_to_response(intent)
+
+
+@router.get("/payment-intents/unconsumed-paid", response_model=list[POSPaymentIntentResponse])
+async def list_unconsumed_paid_pos_payment_intents(
+    user: AuthUser = Depends(require_staff_or_above),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Financial-safety closeout (Issue 2): a Pay-by-Link intent that reached
+    PAID but was never consumed into an order (the cashier backed out of
+    the payment screen, the browser crashed, etc.) is real, received money
+    with nowhere to go — it must never silently disappear. The Staff app
+    polls this on load/till-open and shows a persistent "Payment received
+    but sale not completed" warning with a resume path for anything it
+    returns; see docs/SPLIT_PAYMENTS_CONTRACT.md.
+
+    Registered BEFORE GET /payment-intents/{intent_id} below — FastAPI
+    matches path routes in registration order, and "unconsumed-paid" would
+    otherwise be swallowed by {intent_id} and fail UUID validation.
+
+    Deliberately business-wide, not scoped to the currently-open till — the
+    till that created the intent may since have been closed (or a new one
+    opened), but the money doesn't stop being real just because the till
+    session changed. Ordered oldest-first so the longest-stuck payment is
+    the one a cashier/manager sees first.
+    """
+    result = await db.execute(
+        select(POSPaymentLinkIntent)
+        .where(
+            POSPaymentLinkIntent.business_id == user.business_id,
+            POSPaymentLinkIntent.status == "PAID",
+            POSPaymentLinkIntent.order_id.is_(None),
+        )
+        .order_by(POSPaymentLinkIntent.paid_at.asc())
+    )
+    intents = result.scalars().all()
+    return [_intent_to_response(i) for i in intents]
 
 
 @router.get("/payment-intents/{intent_id}", response_model=POSPaymentIntentResponse)
@@ -1137,6 +1280,24 @@ async def create_pos_order(
     # and these per-order fields are left null — the real breakdown lives
     # only in the pos_payment_allocations rows created below (unified
     # design, see shared/models/pos_payment.py's module docstring).
+    #
+    # DECISION (financial-safety closeout, Issue 5): a `payments[]` checkout
+    # with exactly one PAY_BY_LINK entry (the standalone-Pay-by-Link case,
+    # BUG-0127) is ALSO labelled "SPLIT" here, not "PAY_BY_LINK" — reviewed
+    # and deliberately left as-is, not an oversight. "SPLIT" is the literal
+    # string every other reader of this column already keys off to decide
+    # "read the real breakdown from pos_payment_allocations instead of my
+    # own single-method fields": receipts/document.py::build_receipt_
+    # document, the Manager Dashboard's order-detail breakdown block, and
+    # (for a legacy-fallback order) till cash-up / refund's own
+    # _compute_cash_portion / _require_open_till_for_cash_reversal.
+    # Introducing a second string with the identical meaning would require
+    # touching every one of those to also recognise it, multiplying
+    # regression risk across several files purely for a cosmetic label —
+    # exactly the "risky compatibility change merely for aesthetics" this
+    # task explicitly said not to make. Every actual money question
+    # (amount, provider, till impact, refund honesty) is already answered
+    # correctly from the allocation row itself regardless of this label.
     order_payment_method = "SPLIT" if body.payments is not None else body.payment_method
 
     order = Order(
@@ -1573,6 +1734,10 @@ async def refund_pos_order(
     order.refund_reference = body.reason
     order.refunded_at = datetime.now(timezone.utc)
 
+    pay_by_link_flagged = await _flag_pay_by_link_provider_refund_pending(
+        db, order, amount_cents, cash_refund_cents,
+    )
+
     # Money going back does not mean food came back. A refunded pizza that
     # was made and handed over is gone, and restoring its ingredients would
     # invent stock that does not physically exist — so this only happens
@@ -1620,6 +1785,7 @@ async def refund_pos_order(
             "stock_lines_reversed": reversed_lines,
             "restore_loyalty_points": body.restore_loyalty_points,
             "loyalty_points_restored": loyalty_points_restored,
+            "pay_by_link_allocations_pending_provider_refund": pay_by_link_flagged,
         },
     ))
 
@@ -1657,6 +1823,10 @@ async def void_pos_order(
     order.status = OrderStatus.CANCELLED.value
     order.cancelled_reason = body.reason
     order.cancelled_by_user_id = user.user_id
+
+    pay_by_link_flagged = await _flag_pay_by_link_provider_refund_pending(
+        db, order, order.total_cents, cash_refund_cents,
+    )
 
     # A void means the sale should never have happened, so the ingredients
     # go back. Reversal mirrors the ORIGINAL ledger rows rather than
@@ -1704,6 +1874,7 @@ async def void_pos_order(
             "reason": body.reason,
             "stock_lines_reversed": reversed_lines,
             "loyalty_points_restored": loyalty_points_restored,
+            "pay_by_link_allocations_pending_provider_refund": pay_by_link_flagged,
         },
     ))
 

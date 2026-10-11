@@ -125,8 +125,35 @@ class POSPaymentAllocation(Base, UUIDPrimaryKeyMixin):
         DateTime(timezone=True),
         nullable=False,
         default=lambda: datetime.now(timezone.utc),
-        comment="Immutable — a row here is never updated after insert, only "
-                "ever read; no updated_at column is needed.",
+        comment="Immutable as far as the ORIGINAL settlement fields above go "
+                "— never updated after insert, only ever read. The three "
+                "provider_refund_* fields below (migration 0056) are the one "
+                "deliberate exception: they record what happened to this "
+                "allocation's money AFTER the fact (a refund), not the "
+                "original settlement itself.",
+    )
+
+    # ── Provider-refund honesty (migration 0056) ────────────────────────────
+    # PAY_BY_LINK only. NextGen has no verified-safe way to call a real
+    # Yoco/PayFast refund API from this till-native refund flow (see
+    # docs/SPLIT_PAYMENTS_CONTRACT.md) — refunding this allocation in
+    # NextGen's own records must never be allowed to imply the customer's
+    # actual provider payment was returned. PENDING_MANUAL is set the
+    # moment a refund/void touches this allocation; CONFIRMED only once a
+    # manager explicitly states the real Yoco/PayFast refund was completed
+    # (routes_pos.py::confirm_pos_order_provider_refund) — never set
+    # automatically.
+    provider_refund_status: Mapped[str | None] = mapped_column(
+        String(16), nullable=True,
+        comment="PAY_BY_LINK only — NULL (never refunded) | PENDING_MANUAL "
+                "(refunded in NextGen, provider refund not yet confirmed) | "
+                "CONFIRMED (manager confirmed the real provider refund happened).",
+    )
+    provider_refund_confirmed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    provider_refund_confirmed_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True,
     )
 
     order = relationship("Order", back_populates="payment_allocations")

@@ -20,7 +20,13 @@ from backend.app.api.v1.routes_pos import (
     POSOrderCreateRequest,
     POSOrderItemRequest,
     POSPaymentAllocationRequest,
+    POSRefundRequest,
+    POSVoidRequest,
+    confirm_pos_order_provider_refund,
     create_pos_order,
+    list_unconsumed_paid_pos_payment_intents,
+    refund_pos_order,
+    void_pos_order,
 )
 from backend.app.core.errors import AppError, NotFoundError
 from backend.app.core.rbac import AuthUser
@@ -32,16 +38,28 @@ from backend.app.pos.pricing import ResolvedPOSItem
 
 # ── Fakes (same conventions as tests/test_pos_orders.py) ─────────────────────
 
+class FakeScalars:
+    def __init__(self, items):
+        self._items = items
+
+    def all(self):
+        return self._items
+
+
 class FakeResult:
-    def __init__(self, scalar=None, row=None):
+    def __init__(self, scalar=None, row=None, items=None):
         self._scalar = scalar
         self._row = row
+        self._items = items
 
     def scalar_one_or_none(self):
         return self._scalar
 
     def one_or_none(self):
         return self._row
+
+    def scalars(self):
+        return FakeScalars(self._items or [])
 
 
 class FakeDB:
@@ -214,6 +232,7 @@ def make_fake_order(user, **overrides):
         accepted_at=now, ready_at=None, completed_at=None,
         special_instructions=None, cancelled_reason=None, items=[],
         created_at=now, updated_at=now,
+        loyalty_reward_id=None, refund_cash_cents=None,
     )
     defaults.update(overrides)
     return types.SimpleNamespace(**defaults)
@@ -542,3 +561,111 @@ async def test_loyalty_redemption_discount_applies_before_split_sum_is_checked()
     allocs = allocations_of(db)
     assert len(allocs) == 2
     assert sum(a.amount_cents for a in allocs) == 45000
+
+
+# ── Financial-safety closeout: paid-unconsumed intents listing ──────────────
+
+async def test_list_unconsumed_paid_intents_returns_scalars_result():
+    user = make_user()
+    intent = make_intent(user.business_id, amount_cents=12000, status="PAID")
+    db = FakeDB([FakeResult(items=[intent])])
+    results = await list_unconsumed_paid_pos_payment_intents(user=user, db=db)
+    assert len(results) == 1
+    assert results[0].id == intent.id
+    assert results[0].amount_cents == 12000
+    assert results[0].order_id is None
+
+
+async def test_list_unconsumed_paid_intents_empty_when_none_pending():
+    user = make_user()
+    db = FakeDB([FakeResult(items=[])])
+    results = await list_unconsumed_paid_pos_payment_intents(user=user, db=db)
+    assert results == []
+
+
+# ── Financial-safety closeout: Pay-by-Link provider-refund honesty ──────────
+
+def make_allocation(**overrides):
+    defaults = dict(
+        id=uuid.uuid4(), payment_method="PAY_BY_LINK", amount_cents=30000,
+        provider="YOCO", provider_refund_status=None,
+    )
+    defaults.update(overrides)
+    return POSPaymentAllocation(**defaults)
+
+
+async def test_full_refund_of_standalone_pay_by_link_order_flags_provider_refund_pending():
+    user = make_user()
+    order = make_fake_order(user, payment_method="SPLIT", total_cents=30000)
+    pay_by_link_alloc = make_allocation(amount_cents=30000)
+    db = FakeDB([
+        FakeResult(scalar=order),      # order lock
+        FakeResult(scalar=None),       # no CASH allocation -> no till lock needed
+        FakeResult(scalar=0),          # _compute_cash_portion: no cash in this order
+        FakeResult(items=[pay_by_link_alloc]),  # _flag_pay_by_link_provider_refund_pending
+    ])
+    result = await refund_pos_order(order_id=order.id, body=POSRefundRequest(), user=user, db=db)
+    assert result.payment_status == "REFUNDED"
+    assert pay_by_link_alloc.provider_refund_status == "PENDING_MANUAL"
+
+
+async def test_cash_only_refund_never_flags_provider_refund():
+    """A pure-CASH legacy order has no PAY_BY_LINK allocation to flag — the
+    new query must never even run when the whole refund is cash (non_cash_
+    refunded_cents <= 0), proven here by queuing zero extra FakeResults."""
+    user = make_user()
+    order = make_fake_order(user, payment_method="CASH", total_cents=12000)
+    db = FakeDB([FakeResult(scalar=order), FakeResult(scalar=make_till(user.business_id))])
+    result = await refund_pos_order(order_id=order.id, body=POSRefundRequest(), user=user, db=db)
+    assert result.payment_status == "REFUNDED"
+
+
+async def test_void_of_pay_by_link_order_flags_provider_refund_pending():
+    user = make_user()
+    order = make_fake_order(user, payment_method="SPLIT", total_cents=30000)
+    pay_by_link_alloc = make_allocation(amount_cents=30000)
+    db = FakeDB([
+        FakeResult(scalar=order),      # order lock
+        FakeResult(scalar=None),       # no CASH allocation -> no till lock needed
+        FakeResult(scalar=0),          # _compute_cash_portion: no cash in this order
+        FakeResult(items=[pay_by_link_alloc]),  # _flag_pay_by_link_provider_refund_pending
+        FakeResult(scalar=types.SimpleNamespace(inventory_enabled=False)),  # business lookup
+    ])
+    result = await void_pos_order(order_id=order.id, body=POSVoidRequest(reason="Mistake"), user=user, db=db)
+    assert result.payment_status == "VOIDED"
+    assert pay_by_link_alloc.provider_refund_status == "PENDING_MANUAL"
+
+
+async def test_confirm_provider_refund_happy_path():
+    user = make_user(role="OWNER")
+    order = make_fake_order(user)
+    pending_alloc = make_allocation(amount_cents=30000, provider_refund_status="PENDING_MANUAL")
+    db = FakeDB([
+        FakeResult(scalar=order),
+        FakeResult(items=[pending_alloc]),
+    ])
+    result = await confirm_pos_order_provider_refund(order_id=order.id, user=user, db=db)
+    assert pending_alloc.provider_refund_status == "CONFIRMED"
+    assert pending_alloc.provider_refund_confirmed_at is not None
+    assert pending_alloc.provider_refund_confirmed_by_user_id == user.user_id
+    assert db.commits == 1
+
+
+async def test_confirm_provider_refund_when_nothing_pending_rejected():
+    user = make_user(role="OWNER")
+    order = make_fake_order(user)
+    db = FakeDB([
+        FakeResult(scalar=order),
+        FakeResult(items=[]),  # nothing PENDING_MANUAL
+    ])
+    with pytest.raises(AppError) as exc:
+        await confirm_pos_order_provider_refund(order_id=order.id, user=user, db=db)
+    assert exc.value.code == "NO_PENDING_PROVIDER_REFUND"
+    assert db.commits == 0
+
+
+async def test_confirm_provider_refund_unknown_order_is_404():
+    user = make_user(role="OWNER")
+    db = FakeDB([FakeResult(scalar=None)])
+    with pytest.raises(NotFoundError):
+        await confirm_pos_order_provider_refund(order_id=uuid.uuid4(), user=user, db=db)

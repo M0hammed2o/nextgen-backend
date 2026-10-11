@@ -72,6 +72,14 @@ class PaymentAllocationResponse(BaseModel):
     payment_reference: str | None = None
     provider: str | None = None
     paid_at: datetime | None = None
+    # Financial-safety closeout (migration 0056). PAY_BY_LINK only — NULL
+    # unless this allocation's order has been refunded/voided. See
+    # shared/models/pos_payment.py's own comment for the full reasoning:
+    # NextGen has no verified-safe way to call a real provider refund API
+    # from the till-native refund flow, so this is never set to CONFIRMED
+    # automatically — only by a manager's explicit confirmation.
+    provider_refund_status: str | None = None
+    provider_refund_confirmed_at: datetime | None = None
     model_config = {"from_attributes": True}
 
 

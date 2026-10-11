@@ -23,6 +23,14 @@ from shared.enums import OrderSource
 from shared.models.order import Order
 
 
+class FakeScalars:
+    def __init__(self, items):
+        self._items = items
+
+    def all(self):
+        return self._items
+
+
 class FakeResult:
     def __init__(self, scalar=None, items=None):
         self._scalar = scalar
@@ -33,6 +41,9 @@ class FakeResult:
 
     def all(self):
         return self._items or []
+
+    def scalars(self):
+        return FakeScalars(self._items or [])
 
 
 class FakeDB:
@@ -305,6 +316,7 @@ async def test_full_refund_restores_points_by_default():
 
     db = FakeDB([
         FakeResult(scalar=order),
+        FakeResult(items=[]),  # _flag_pay_by_link_provider_refund_pending: no PAY_BY_LINK allocations on this legacy order
         FakeResult(scalar=txn),
         FakeResult(scalar=None),
         FakeResult(scalar=_loyalty_program()),
@@ -321,7 +333,7 @@ async def test_full_refund_with_restore_loyalty_points_false_skips_reversal():
     user = make_user()
     reward_id = uuid.uuid4()
     order = make_pos_order(user.business_id, total_cents=5000, payment_method="CARD", loyalty_reward_id=reward_id)
-    db = FakeDB([FakeResult(scalar=order)])  # no loyalty-reversal FakeResults queued at all
+    db = FakeDB([FakeResult(scalar=order), FakeResult(items=[])])  # no loyalty-reversal FakeResults queued at all
 
     result = await refund_pos_order(
         order_id=order.id, body=POSRefundRequest(restore_loyalty_points=False), user=user, db=db,
@@ -336,7 +348,7 @@ async def test_partial_refund_never_touches_points_even_with_flag_true():
     user = make_user()
     reward_id = uuid.uuid4()
     order = make_pos_order(user.business_id, total_cents=5000, payment_method="CARD", loyalty_reward_id=reward_id)
-    db = FakeDB([FakeResult(scalar=order)])  # no loyalty-reversal FakeResults queued
+    db = FakeDB([FakeResult(scalar=order), FakeResult(items=[])])  # no loyalty-reversal FakeResults queued
 
     result = await refund_pos_order(
         order_id=order.id,
@@ -349,7 +361,7 @@ async def test_partial_refund_never_touches_points_even_with_flag_true():
 async def test_refund_with_no_redemption_does_not_touch_loyalty():
     user = make_user()
     order = make_pos_order(user.business_id, total_cents=5000, payment_method="CARD", loyalty_reward_id=None)
-    db = FakeDB([FakeResult(scalar=order)])
+    db = FakeDB([FakeResult(scalar=order), FakeResult(items=[])])
 
     result = await refund_pos_order(order_id=order.id, body=POSRefundRequest(), user=user, db=db)
     assert result.payment_status == "REFUNDED"
@@ -421,7 +433,7 @@ async def test_card_refund_does_not_require_open_till():
     user = make_user()
     order = make_pos_order(user.business_id, total_cents=5000, payment_method="CARD")
     # No till FakeResult queued at all — proves the till lookup is skipped entirely.
-    db = FakeDB([FakeResult(scalar=order)])
+    db = FakeDB([FakeResult(scalar=order), FakeResult(items=[])])
 
     result = await refund_pos_order(order_id=order.id, body=POSRefundRequest(), user=user, db=db)
     assert result.payment_status == "REFUNDED"
@@ -430,7 +442,7 @@ async def test_card_refund_does_not_require_open_till():
 async def test_card_void_does_not_require_open_till():
     user = make_user()
     order = make_pos_order(user.business_id, total_cents=5000, payment_method="CARD")
-    db = FakeDB([FakeResult(scalar=order), FakeResult(scalar=make_business_for_reversal())])
+    db = FakeDB([FakeResult(scalar=order), FakeResult(items=[]), FakeResult(scalar=make_business_for_reversal())])
 
     result = await void_pos_order(order_id=order.id, body=POSVoidRequest(reason="Mistake"), user=user, db=db)
     assert result.payment_status == "VOIDED"
@@ -656,6 +668,7 @@ async def test_void_on_split_order_requires_open_till_when_it_has_a_cash_allocat
         FakeResult(scalar=order),      # order lock
         FakeResult(scalar=None),       # _require_open_till_for_cash_reversal's existence check: no CASH allocation -> no till lock needed
         FakeResult(scalar=None),       # _compute_cash_portion's own sum query: still 0
+        FakeResult(items=[]),          # _flag_pay_by_link_provider_refund_pending: no PAY_BY_LINK allocations
         FakeResult(scalar=make_business_for_reversal()),
     ])
     result = await void_pos_order(order_id=order.id, body=POSVoidRequest(reason="Mistake"), user=user, db=db)
@@ -671,6 +684,7 @@ async def test_void_on_split_order_with_cash_allocation_computes_cash_portion():
         FakeResult(scalar=uuid.uuid4()),                 # has a CASH allocation -> open till required
         _open_till_result(),                             # till lock
         FakeResult(scalar=10000),                         # _compute_cash_portion: sum of CASH allocations
+        FakeResult(items=[]),                             # _flag_pay_by_link_provider_refund_pending: no PAY_BY_LINK allocations
         FakeResult(scalar=make_business_for_reversal()),  # business lookup for inventory reversal
     ])
     await void_pos_order(order_id=order.id, body=POSVoidRequest(reason="Mistake"), user=user, db=db)
@@ -686,6 +700,7 @@ async def test_full_refund_on_split_order_computes_cash_portion_from_allocations
         FakeResult(scalar=uuid.uuid4()), # has a CASH allocation -> open till required
         _open_till_result(),             # till lock
         FakeResult(scalar=10000),        # _compute_cash_portion (full refund): sum of CASH allocations
+        FakeResult(items=[]),            # _flag_pay_by_link_provider_refund_pending: no PAY_BY_LINK allocations
     ])
     result = await refund_pos_order(order_id=order.id, body=POSRefundRequest(), user=user, db=db)
     assert result.payment_status == "REFUNDED"
