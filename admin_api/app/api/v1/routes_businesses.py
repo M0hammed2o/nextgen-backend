@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -348,6 +348,23 @@ class WhatsAppTestSendResponse(BaseModel):
 @router.get("", response_model=None)
 async def list_businesses(
     is_active: bool | None = None,
+    # Deliberately a plain default (not `Query(default=None, ...)`): every
+    # other route function in this file that's exercised by direct-call
+    # integration tests (bypassing FastAPI's dependency resolution, the
+    # prevailing pattern in tests/integration/) relies on a plain Python
+    # default for the same reason `is_active` above has one -- a `Query(...)`
+    # object is only ever resolved to its real default by FastAPI's own
+    # request-parsing layer. Calling this function directly with `search`
+    # omitted would otherwise pass the literal `Query` descriptor through as
+    # `search`'s value instead of `None`.
+    #
+    # Case-insensitive substring match against name, slug or business_code,
+    # applied server-side BEFORE pagination. Without this, a business
+    # created a while ago (e.g. while a sales partner's onboarding was still
+    # in progress) can be pushed past page 1 of the default created_at-
+    # sorted list by newer businesses, and is then unfindable by a client
+    # that only filters the single already-fetched page (see KNOWN_BUGS.md).
+    search: str | None = None,
     page: int = Query(default=1, ge=1),
     per_page: int = Query(default=25, ge=1, le=100),
     user: AuthUser = Depends(require_onboarding_role),
@@ -355,7 +372,9 @@ async def list_businesses(
 ) -> list[BusinessAdminResponse] | list[BusinessOnboarderResponse]:
     """SUPER_ADMIN sees every business. ONBOARDER sees only businesses they
     personally onboarded whose onboarding isn't complete yet — see
-    get_business_scoped's docstring for the full rule."""
+    get_business_scoped's docstring for the full rule. `search`, when given,
+    is applied on top of that same scope — an ONBOARDER can never use it to
+    find a business outside their own allow-list."""
     query = select(Business)
     if is_active is not None:
         query = query.where(Business.is_active == is_active)
@@ -363,6 +382,15 @@ async def list_businesses(
         query = query.where(
             Business.onboarded_by_admin_id == user.user_id,
             Business.onboarding_completed_at.is_(None),
+        )
+    if search and search.strip():
+        term = f"%{search.strip()[:255]}%"
+        query = query.where(
+            or_(
+                Business.name.ilike(term),
+                Business.slug.ilike(term),
+                Business.business_code.ilike(term),
+            )
         )
     query = query.order_by(Business.created_at.desc())
     query = query.offset((page - 1) * per_page).limit(per_page)
