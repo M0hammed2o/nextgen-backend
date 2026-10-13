@@ -548,7 +548,7 @@ async def _handle_message(
                 else "Here's our menu 👇\n\nLet me know what you'd like to order! 😊"
             )
             try:
-                await whatsapp_sender.send_image_message(
+                _menu_wamid = await whatsapp_sender.send_image_message(
                     phone_number_id=business.whatsapp_phone_number_id,
                     recipient_wa_id=customer.wa_id,
                     image_url=menu_image_url,
@@ -556,8 +556,21 @@ async def _handle_message(
                     db=db,
                     business=business,
                 )
-                # Image + caption covers everything — no separate text menu needed.
-                return "", False, None, None, None
+                if _menu_wamid:
+                    # Image + caption covers everything — no separate text menu needed.
+                    return "", False, None, None, None
+                # send_image_message() returns None on a Meta-API-level failure
+                # (bad/unreachable URL, rejected payload, timeout) WITHOUT raising
+                # — it only ever signals that via its return value (BUG-0146).
+                # Treat "no wamid" exactly like the except branch below: fall
+                # through to the text menu rather than returning an empty
+                # response the customer never sees anything for.
+                logger.warning(
+                    "PIPELINE_IMAGE_SEND_FAILED: send_image_message returned no "
+                    "wamid, falling back to text menu. business_id=%s",
+                    business.id,
+                )
+                # Falls through to the text menu below.
             except Exception:
                 logger.exception(
                     "PIPELINE_IMAGE_SEND_FAIL: failed to send menu image, "
