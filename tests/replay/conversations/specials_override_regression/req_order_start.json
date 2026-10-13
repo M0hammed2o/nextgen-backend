@@ -1,0 +1,28 @@
+{
+  "id": "specials_override_order_start",
+  "title": "Explicit order request begins the existing ordering process, not a specials pitch",
+  "category": "specials_override_regression",
+  "tags": ["specials", "intent_routing", "ordering", "regression"],
+  "specials": [
+    {"title": "2-for-1 Burgers", "description": "Mondays only"}
+  ],
+  "turns": [
+    {
+      "message": "I want to order two pizzas",
+      "llm": {
+        "action": "add_items",
+        "message": "Added 2x Margherita Pizza to your order! Anything else?",
+        "items": [
+          {"name": "Margherita Pizza", "quantity": 2}
+        ]
+      },
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Margherita Pizza", "quantity": 2}
+        ],
+        "response_not_contains": ["today's specials", "2-for-1 burgers"]
+      }
+    }
+  ]
+}

@@ -257,11 +257,15 @@ class ReplayRunner:
         business: FakeBusiness,
         customer: FakeCustomer,
         menu_items: list[FakeMenuItem],
+        specials: list | None = None,
     ) -> None:
         self.conv = conv
         self.business = business
         self.customer = customer
         self.menu_items = menu_items
+        # Defaults to [] — identical to the previously-hardcoded behavior, so
+        # every pre-existing conversation JSON that never set this is unaffected.
+        self.specials = specials if specials is not None else []
 
         self.session = ReplaySession()
         self.scripted_llm = ScriptedLLMProvider()
@@ -503,7 +507,7 @@ class ReplayRunner:
           with patch("backend.app.bot.pipeline._load_menu",
                    return_value=([], self.menu_items)):
             with patch("backend.app.bot.pipeline._load_specials",
-                       return_value=[]):
+                       return_value=self.specials):
                 with patch("backend.app.bot.pipeline._load_conversation_history",
                            return_value=[]):
                     with patch("backend.app.bot.pipeline.usage_tracker.check_daily_limit"):

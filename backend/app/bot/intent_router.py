@@ -34,18 +34,25 @@ _PATTERNS: list[tuple[re.Pattern, MessageIntent]] = [
         r"what should i (get|order|try|have)|worth trying)\b", re.I
     ), MessageIntent.RECOMMENDATION),
 
-    # Menu requests — recommendation phrases handled above
+    # Specials — intercept BEFORE menu. The menu pattern below uses a broad
+    # "what ... have/sell/serve" catch-all (needed to catch "what do you have")
+    # which also incidentally matches "What specials do you have?" (it contains
+    # "what" ... "have"). An explicit specials/deal/promo/discount word is a
+    # more specific signal than that generic catch-all, so it must win —
+    # otherwise a customer asking specifically about specials gets the full
+    # menu instead (BUG: specials/menu intents misclassified against each
+    # other depending on phrasing; see KNOWN_BUGS.md).
+    (re.compile(
+        r"\b(special|specials|deal|deals|promo|promotion|discount|"
+        r"today.?s.*special|weekly.*special)\b", re.I
+    ), MessageIntent.SPECIALS_REQUEST),
+
+    # Menu requests — recommendation and specials phrases handled above
     (re.compile(
         r"\b(menu|food|eat|"
         r"what\s+(do\s+you\s+(have|sell|serve)|.*(have|sell|serve))|"
         r"what.*available|price list|show me|items|catalog|catalogue)\b", re.I
     ), MessageIntent.MENU_REQUEST),
-
-    # Specials
-    (re.compile(
-        r"\b(special|specials|deal|deals|promo|promotion|discount|"
-        r"today.?s.*special|weekly.*special)\b", re.I
-    ), MessageIntent.SPECIALS_REQUEST),
 
     # Hours
     (re.compile(

@@ -1,0 +1,21 @@
+{
+  "id": "specials_override_hours_unconfigured",
+  "title": "Hours question with no hours configured acknowledges unavailable, never invents a time",
+  "category": "specials_override_regression",
+  "tags": ["specials", "intent_routing", "hours", "regression"],
+  "business": {
+    "business_hours": null
+  },
+  "specials": [
+    {"title": "2-for-1 Burgers", "description": "Mondays only"}
+  ],
+  "turns": [
+    {
+      "message": "What time do you close?",
+      "expect": {
+        "response_contains": ["contact us"],
+        "response_not_contains": ["today's specials", "2-for-1 burgers", ":00"]
+      }
+    }
+  ]
+}

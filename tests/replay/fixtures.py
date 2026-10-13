@@ -237,10 +237,31 @@ SA_MENU: list[FakeMenuItem] = [
     # Phase 8: Latte with PRICED milk options and coffee add-ons
     FakeMenuItem("Latte",  4500, category_name="Coffee",
                  options_json=_PRICED_MILK_OPTIONS, add_ons=_COFFEE_ADD_ONS),
+    # Pizzas — added for the specials/menu-intent-override regression suite
+    # (tests/test_bot_specials_override_regression.py). Added-only: no existing
+    # replay conversation references these names, so existing totals/assertions
+    # are unaffected.
+    FakeMenuItem("Margherita Pizza", 9000, category_name="Pizza"),
+    FakeMenuItem("Pepperoni Pizza",  10500, category_name="Pizza"),
 ]
 
 # Quick lookup: name → FakeMenuItem
 SA_MENU_MAP: dict[str, FakeMenuItem] = {i.name.lower(): i for i in SA_MENU}
+
+
+class FakeSpecial:
+    """Duck-typed Special. Matches every attribute responses.py/prompt_builder.py read."""
+
+    def __init__(self, **kw):
+        self.id = uuid.uuid4()
+        self.title = kw.get("title", "Special")
+        self.description = kw.get("description", None)
+        self.is_active = kw.get("is_active", True)
+        self.sort_order = kw.get("sort_order", 0)
+        self.image_url = kw.get("image_url", None)
+        self.days_of_week = kw.get("days_of_week", None)
+        self.start_at = kw.get("start_at", None)
+        self.end_at = kw.get("end_at", None)
 
 
 def make_business(overrides: dict | None = None) -> FakeBusiness:

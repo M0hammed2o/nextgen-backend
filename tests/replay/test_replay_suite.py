@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.replay.fixtures import SA_MENU, make_business, make_customer
+from tests.replay.fixtures import SA_MENU, FakeSpecial, make_business, make_customer
 from tests.replay.framework import ReplayRunner
 
 # ── Conversation discovery ────────────────────────────────────────────────────
@@ -72,10 +72,15 @@ async def test_conversation_replay(conversation: dict) -> None:
     # Allow per-conversation menu overrides; default to full SA_MENU
     menu_items = SA_MENU
 
+    # Allow per-conversation specials; default to none (matches every
+    # pre-existing conversation JSON, which has no "specials" key).
+    specials = [FakeSpecial(**spec) for spec in conversation.get("specials", [])]
+
     runner = ReplayRunner(
         conv=conversation,
         business=business,
         customer=customer,
         menu_items=menu_items,
+        specials=specials,
     )
     await runner.run()

@@ -1,0 +1,62 @@
+{
+  "id": "specials_override_core_flow",
+  "title": "Specials never override menu/price/dietary/follow-up intent (BUG: specials-override regression)",
+  "category": "specials_override_regression",
+  "tags": ["specials", "intent_routing", "regression"],
+  "business": {
+    "greeting_text": "Welcome to NextGen Smash Burgers! 🍔"
+  },
+  "specials": [
+    {
+      "title": "2-for-1 Burgers",
+      "description": "Buy one Classic Smash Burger, get one free — Mondays only"
+    }
+  ],
+  "turns": [
+    {
+      "message": "Hi",
+      "expect": {
+        "state": "GREETING",
+        "response_contains": ["Welcome to NextGen Smash Burgers"]
+      }
+    },
+    {
+      "message": "Show me your pizzas",
+      "expect": {
+        "state": "BROWSING_MENU",
+        "response_contains": ["Margherita Pizza", "Pepperoni Pizza", "R90.00"],
+        "response_not_contains": ["today's specials", "2-for-1 burgers"]
+      }
+    },
+    {
+      "message": "How much is the Margherita?",
+      "llm": {
+        "action": "chitchat",
+        "message": "That item is priced at R90.00.",
+        "items": []
+      },
+      "expect": {
+        "response_contains": ["R90.00"],
+        "response_not_contains": ["today's specials", "2-for-1 burgers"]
+      }
+    },
+    {
+      "message": "And do you have vegetarian options?",
+      "llm": {
+        "action": "chitchat",
+        "message": "Yes, we have a vegetarian-friendly option on our menu you can order.",
+        "items": []
+      },
+      "expect": {
+        "response_contains": ["vegetarian"],
+        "response_not_contains": ["today's specials", "2-for-1 burgers"]
+      }
+    },
+    {
+      "message": "What specials do you have?",
+      "expect": {
+        "response_contains": ["Today's Specials", "2-for-1 Burgers"]
+      }
+    }
+  ]
+}
