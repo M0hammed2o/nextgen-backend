@@ -83,6 +83,107 @@ def menu_response(
     return "\n".join(lines)
 
 
+# Meta's WhatsApp Cloud API hard limit on a single text message body is
+# 4096 characters. This stays comfortably under that so formatting
+# (markdown, emoji) never pushes a message over the real limit.
+WHATSAPP_TEXT_SAFE_MAX_CHARS = 4000
+
+
+def build_menu_messages(
+    categories: list[MenuCategory],
+    items: list[MenuItem],
+    currency: str = "ZAR",
+    max_chars: int = WHATSAPP_TEXT_SAFE_MAX_CHARS,
+) -> list[str]:
+    """
+    Same content and formatting as menu_response(), but split into one or
+    more WhatsApp-safe text messages when the full menu would exceed
+    max_chars (BUG-0147). Deliberately independent of menu_response()'s own
+    line-joining — this function never touches menu_response() or changes
+    its behaviour, so every existing caller/test of menu_response() is
+    unaffected.
+
+    Splits only at category or item boundaries: a price or description line
+    is never separated from the item it belongs to. If a single category's
+    items don't fit in one message on their own, it is further split
+    between items (still keeping each item with its own description),
+    re-emitting a "(cont.)" category header in the follow-on message so
+    context isn't lost. Returns exactly one message (the whole menu) in the
+    common case where it already fits under max_chars.
+    """
+    if not items:
+        return ["Our menu is currently being updated. Please check back soon!"]
+
+    cat_map: dict[str | None, list[MenuItem]] = {}
+    for cat in categories:
+        cat_map[str(cat.id)] = []
+    for item in items:
+        if not item.is_active or item.is_deleted:
+            continue
+        key = str(item.category_id) if item.category_id else None
+        cat_map.setdefault(key, []).append(item)
+
+    def _item_unit(item: MenuItem) -> list[str]:
+        price = format_currency(item.price_cents, currency)
+        unit = [f"  • {item.name} — {price}"]
+        if item.description:
+            unit.append(f"    _{item.description}_")
+        return unit
+
+    sections: list[tuple[str, list[list[str]]]] = []
+    sorted_cats = sorted(categories, key=lambda c: c.sort_order)
+    for cat in sorted_cats:
+        cat_items = cat_map.get(str(cat.id), [])
+        if not cat_items:
+            continue
+        units = [_item_unit(item) for item in sorted(cat_items, key=lambda i: i.sort_order)]
+        sections.append((f"*{cat.name}*", units))
+
+    uncategorized = cat_map.get(None, [])
+    if uncategorized:
+        sections.append(("*Other*", [_item_unit(item) for item in uncategorized]))
+
+    header = "📋 *Our Menu*"
+    footer = "To order, just tell me what you'd like! 🍽️"
+
+    messages: list[str] = []
+    current: list[str] = [header]
+    current_len = len(header)
+
+    def _flush() -> None:
+        nonlocal current, current_len
+        if current:
+            messages.append("\n".join(current))
+        current = []
+        current_len = 0
+
+    for section_header, units in sections:
+        header_len = len(section_header) + 1
+        if current and current_len + header_len > max_chars:
+            _flush()
+        current.append(section_header)
+        current_len += header_len
+
+        for unit in units:
+            unit_text = "\n".join(unit)
+            unit_len = len(unit_text) + 1
+            if current and current_len + unit_len > max_chars:
+                _flush()
+                cont_header = f"{section_header} (cont.)"
+                current = [cont_header]
+                current_len = len(cont_header) + 1
+            current.extend(unit)
+            current_len += unit_len
+
+    footer_len = len(footer) + 1
+    if current and current_len + footer_len > max_chars:
+        _flush()
+    current.append(footer)
+    _flush()
+
+    return messages
+
+
 def get_todays_active_specials(specials: list[Special]) -> list[Special]:
     """Filter a list of specials to those active today."""
     today_name = date.today().strftime("%a").lower()[:3]

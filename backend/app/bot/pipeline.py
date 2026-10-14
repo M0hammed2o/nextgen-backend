@@ -547,6 +547,14 @@ async def _handle_message(
                 if _has_active_order
                 else "Here's our menu 👇\n\nLet me know what you'd like to order! 😊"
             )
+            # BUG-0147: a menu image must NEVER suppress the text menu, even
+            # when Meta's API accepts the submission (returns a wamid) — a
+            # synchronous "accepted" response is not proof of delivery; the
+            # actual outcome only arrives later via an async status webhook
+            # that this pipeline doesn't act on (see _handle_status_update in
+            # routes_webhook.py). So this call is now fire-and-forget: log
+            # the outcome for observability, but always fall through to
+            # building and sending the real text menu below, unconditionally.
             try:
                 _menu_wamid = await whatsapp_sender.send_image_message(
                     phone_number_id=business.whatsapp_phone_number_id,
@@ -557,46 +565,71 @@ async def _handle_message(
                     business=business,
                 )
                 if _menu_wamid:
-                    # Image + caption covers everything — no separate text menu needed.
-                    return "", False, None, None, None
-                # send_image_message() returns None on a Meta-API-level failure
-                # (bad/unreachable URL, rejected payload, timeout) WITHOUT raising
-                # — it only ever signals that via its return value (BUG-0146).
-                # Treat "no wamid" exactly like the except branch below: fall
-                # through to the text menu rather than returning an empty
-                # response the customer never sees anything for.
-                logger.warning(
-                    "PIPELINE_IMAGE_SEND_FAILED: send_image_message returned no "
-                    "wamid, falling back to text menu. business_id=%s",
-                    business.id,
-                )
-                # Falls through to the text menu below.
+                    logger.info(
+                        "PIPELINE_IMAGE_SEND_ACCEPTED: business_id=%s, wamid=%s "
+                        "(accepted by Meta -- not proof of delivery; text menu "
+                        "follows regardless)",
+                        business.id, _menu_wamid,
+                    )
+                else:
+                    logger.warning(
+                        "PIPELINE_IMAGE_SEND_FAILED: send_image_message returned "
+                        "no wamid. business_id=%s", business.id,
+                    )
             except Exception:
                 logger.exception(
-                    "PIPELINE_IMAGE_SEND_FAIL: failed to send menu image, "
-                    "falling back to text menu. business_id=%s",
-                    business.id,
+                    "PIPELINE_IMAGE_SEND_FAIL: failed to send menu image. "
+                    "business_id=%s", business.id,
                 )
-                # Falls through to the text menu below.
         elif menu_image_url:
             logger.warning(
                 "PIPELINE_IMAGE_SKIP: not a direct image URL, including as link. url=%s",
                 menu_image_url,
             )
 
-        text = responses.menu_response(categories, items, business.currency)
+        menu_messages = responses.build_menu_messages(categories, items, business.currency)
+        first_chunk = menu_messages[0]
         if _has_active_order:
-            text = (
+            first_chunk = (
                 "Here's the full menu! Your current order is still saved 🛒\n\n"
-                + text
+                + first_chunk
                 + '\n\nJust tell me what you\'d like to add, or say *"done"* to confirm your order.'
             )
         else:
             header = "Here's our menu 😊"
             if menu_image_url and not _direct_image:
                 header += f"\n📷 View menu image: {menu_image_url}"
-            text = header + "\n\n" + text + "\n\nLet me know what you'd like to order! 😊"
-        return text, False, None, None, None
+            first_chunk = header + "\n\n" + first_chunk + "\n\nLet me know what you'd like to order! 😊"
+
+        # BUG-0147: large menus that don't fit one WhatsApp message are split
+        # safely at category/item boundaries by build_menu_messages() above.
+        # Any chunk beyond the first is sent directly here (mirroring how
+        # the menu image above is already sent outside the normal
+        # return-value path) rather than returned, so the caller's single
+        # response-text slot isn't overloaded into sending duplicates. Each
+        # send's actual result is checked and logged -- never assumed.
+        for extra_chunk in menu_messages[1:]:
+            try:
+                chunk_wamid = await whatsapp_sender.send_text_message(
+                    db=db,
+                    business_id=business.id,
+                    customer_wa_id=customer.wa_id,
+                    phone_number_id=business.whatsapp_phone_number_id,
+                    text=extra_chunk,
+                    business=business,
+                )
+                if not chunk_wamid:
+                    logger.warning(
+                        "PIPELINE_MENU_CHUNK_SEND_FAILED: business_id=%s, "
+                        "chunk_len=%d", business.id, len(extra_chunk),
+                    )
+            except Exception:
+                logger.exception(
+                    "PIPELINE_MENU_CHUNK_SEND_EXCEPTION: business_id=%s",
+                    business.id,
+                )
+
+        return first_chunk, False, None, None, None
 
     if intent == MessageIntent.SPECIALS_REQUEST:
         logger.warning("HANDLE_BRANCH: SPECIALS_REQUEST → specials_response")
