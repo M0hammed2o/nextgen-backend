@@ -188,7 +188,11 @@ class TestLargeMenuChunking:
                     assert idx > 0 and "—" in lines[idx - 1]
 
     @pytest.mark.asyncio
-    async def test_large_menu_sends_extra_chunks_directly_with_result_checked(self):
+    async def test_large_menu_sends_every_chunk_directly_in_order_when_all_succeed(self):
+        """When a menu is split into N chunks, ALL N are sent directly
+        (including the first -- unlike the single-chunk case) in strict
+        sequential order, and nothing extra is returned through the normal
+        reply path (which would otherwise duplicate chunk 1)."""
         business = _business_with_image(None)
         items = []
         for i in range(200):
@@ -196,19 +200,38 @@ class TestLargeMenuChunking:
             item.description = "A very long description " * 10
             items.append(item)
 
+        from backend.app.bot.responses import build_menu_messages
+        expected_chunk_count = len(build_menu_messages([], items, "ZAR"))
+        assert expected_chunk_count > 1, "test setup must actually trigger chunking"
+
+        sent_texts: list[str] = []
+
+        async def _record_and_succeed(**kwargs):
+            sent_texts.append(kwargs["text"])
+            return "wamid.CHUNK"
+
         with patch(
             "backend.app.bot.pipeline.whatsapp_sender.send_text_message",
-            new=AsyncMock(return_value="wamid.CHUNK"),
+            side_effect=_record_and_succeed,
         ) as mock_text_chunks:
             text, *_ = await _run_menu_request(business, items)
 
-        assert text != ""
-        # At least one extra chunk had to be sent directly beyond the first,
-        # which flows back through the normal return value.
-        assert mock_text_chunks.await_count >= 1
+        # Nothing returned through the normal path -- every chunk, including
+        # the first, was already sent directly above.
+        assert text == ""
+        assert mock_text_chunks.await_count == expected_chunk_count
+        # Sent in the exact order build_menu_messages() produced them. The
+        # first sent chunk carries pipeline.py's own "Here's our menu"
+        # wrapper around the raw first chunk; the rest are verbatim.
+        raw_chunks = build_menu_messages([], items, "ZAR")
+        assert raw_chunks[0] in sent_texts[0]
+        assert sent_texts[1:] == raw_chunks[1:]
 
     @pytest.mark.asyncio
-    async def test_large_menu_logs_but_does_not_crash_when_a_chunk_send_fails(self):
+    async def test_large_menu_stops_sending_further_chunks_after_one_fails_to_preserve_order(self):
+        """If an early chunk's send fails (queued for a delayed outbox
+        retry), later chunks must NOT be sent ahead of it -- that would let
+        the customer see chunk 3 before chunk 1 ever arrives."""
         business = _business_with_image(None)
         items = []
         for i in range(200):
@@ -216,14 +239,51 @@ class TestLargeMenuChunking:
             item.description = "A very long description " * 10
             items.append(item)
 
+        call_count = 0
+
+        async def _fail_on_second_call(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                return None  # simulates a failed immediate send
+            return "wamid.CHUNK"
+
         with patch(
             "backend.app.bot.pipeline.whatsapp_sender.send_text_message",
-            new=AsyncMock(return_value=None),
+            side_effect=_fail_on_second_call,
         ) as mock_text_chunks:
             text, *_ = await _run_menu_request(business, items)
 
-        assert text != ""
-        assert mock_text_chunks.await_count >= 1
+        assert text == ""
+        # Sending stopped at the failure -- call 3+ never happened.
+        assert mock_text_chunks.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_large_menu_stops_sending_further_chunks_after_an_exception(self):
+        business = _business_with_image(None)
+        items = []
+        for i in range(200):
+            item = FakeMenuItem(f"Specialty Pizza Number {i:03d}", 9900 + i)
+            item.description = "A very long description " * 10
+            items.append(item)
+
+        call_count = 0
+
+        async def _raise_on_second_call(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise RuntimeError("network blew up mid-menu")
+            return "wamid.CHUNK"
+
+        with patch(
+            "backend.app.bot.pipeline.whatsapp_sender.send_text_message",
+            side_effect=_raise_on_second_call,
+        ) as mock_text_chunks:
+            text, *_ = await _run_menu_request(business, items)
+
+        assert text == ""
+        assert mock_text_chunks.await_count == 2
 
 
 # ── 4. No cross-tenant menu leakage ─────────────────────────────────────────

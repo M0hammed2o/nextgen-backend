@@ -601,35 +601,52 @@ async def _handle_message(
                 header += f"\n📷 View menu image: {menu_image_url}"
             first_chunk = header + "\n\n" + first_chunk + "\n\nLet me know what you'd like to order! 😊"
 
-        # BUG-0147: large menus that don't fit one WhatsApp message are split
-        # safely at category/item boundaries by build_menu_messages() above.
-        # Any chunk beyond the first is sent directly here (mirroring how
-        # the menu image above is already sent outside the normal
-        # return-value path) rather than returned, so the caller's single
-        # response-text slot isn't overloaded into sending duplicates. Each
-        # send's actual result is checked and logged -- never assumed.
-        for extra_chunk in menu_messages[1:]:
+        if len(menu_messages) == 1:
+            # Common case (the overwhelming majority of real menus): one
+            # chunk, unchanged behaviour -- returned through the normal
+            # path so it's still persisted to conversation history and
+            # counted in usage tracking exactly like every other reply.
+            return first_chunk, False, None, None, None
+
+        # Rare case: a large menu that needed splitting. Every chunk,
+        # INCLUDING the first, is now sent directly here in strict order --
+        # not via the return-value path -- and sending stops the moment one
+        # chunk's immediate send fails. This guarantees the customer never
+        # receives chunk N+1 before chunk N: if chunk N's synchronous send
+        # fails, it is queued for a delayed outbox retry (BUG-0147), and we
+        # do not race ahead and send later chunks out of order while an
+        # earlier one is still pending. Each send's actual result is
+        # checked and logged -- never assumed. (This trades away this one
+        # reply's conversation-history persistence for a correct-order
+        # guarantee -- the same trade-off this handler's menu-image send
+        # already makes.)
+        for chunk in [first_chunk, *menu_messages[1:]]:
             try:
                 chunk_wamid = await whatsapp_sender.send_text_message(
                     db=db,
                     business_id=business.id,
                     customer_wa_id=customer.wa_id,
                     phone_number_id=business.whatsapp_phone_number_id,
-                    text=extra_chunk,
+                    text=chunk,
                     business=business,
                 )
-                if not chunk_wamid:
-                    logger.warning(
-                        "PIPELINE_MENU_CHUNK_SEND_FAILED: business_id=%s, "
-                        "chunk_len=%d", business.id, len(extra_chunk),
-                    )
             except Exception:
                 logger.exception(
                     "PIPELINE_MENU_CHUNK_SEND_EXCEPTION: business_id=%s",
                     business.id,
                 )
+                break
+            if not chunk_wamid:
+                logger.warning(
+                    "PIPELINE_MENU_CHUNK_SEND_FAILED: business_id=%s, "
+                    "chunk_len=%d -- stopping here to preserve order "
+                    "(remaining chunks not sent; this one will retry via "
+                    "the outbox worker)",
+                    business.id, len(chunk),
+                )
+                break
 
-        return first_chunk, False, None, None, None
+        return "", False, None, None, None
 
     if intent == MessageIntent.SPECIALS_REQUEST:
         logger.warning("HANDLE_BRANCH: SPECIALS_REQUEST → specials_response")
