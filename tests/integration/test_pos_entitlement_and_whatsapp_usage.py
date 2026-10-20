@@ -388,6 +388,54 @@ async def test_usage_alert_job_fires_once_per_threshold_per_period(_db_or_skip):
         await _cleanup(db, order_ids=order_ids, business_ids=business_ids)
 
 
+async def test_usage_alerts_route_includes_business_name(_db_or_skip, db):
+    """GET /admin/usage-alerts (admin_api/app/api/v1/routes_usage.py::
+    list_usage_alerts) -- exercises the actual route function, not just the
+    cron job that writes the rows. Added to reconcile a real contract gap:
+    a parallel frontend session assumed a `business_name` field would be
+    present; the route originally returned bare UUIDs only. Proves the fix
+    (a join to Business.name) actually works against a real business row,
+    not just that it type-checks."""
+    biz = await _make_standalone_business(db, name_prefix="WA Usage Alert Name Biz")
+    business_id = biz.id
+    biz.whatsapp_order_allowance = 10
+    await db.commit()
+    await db.refresh(biz)
+    expected_name = biz.name
+
+    alert = UsageAlert(
+        business_id=business_id,
+        billing_period_started_at=biz.billing_period_started_at,
+        threshold_crossed=80,
+        orders_used=8,
+        orders_allowance=10,
+    )
+    db.add(alert)
+    await db.commit()
+
+    try:
+        from admin_api.app.api.v1.routes_usage import list_usage_alerts
+
+        super_admin = _admin_auth(uuid.uuid4(), "SUPER_ADMIN")
+        # page/per_page must be passed explicitly: calling a route function
+        # directly (bypassing FastAPI's own request handling) does not
+        # resolve Query(default=...) objects to their defaults -- the same
+        # trap already documented elsewhere in this file/repo.
+        results = await list_usage_alerts(
+            business_id=business_id, page=1, per_page=50, user=super_admin, db=db,
+        )
+
+        assert len(results) == 1
+        assert results[0].business_id == business_id
+        assert results[0].business_name == expected_name
+        assert results[0].threshold_crossed == 80
+        assert results[0].orders_used == 8
+        assert results[0].orders_allowance == 10
+    finally:
+        await db.execute(delete(UsageAlert).where(UsageAlert.business_id == business_id))
+        await _cleanup(db, order_ids=[], business_ids=[business_id])
+
+
 # ── 5. Cross-tenant isolation for the new Customers endpoints ──────────────
 
 async def test_customers_endpoints_are_tenant_isolated(_db_or_skip, test_business):

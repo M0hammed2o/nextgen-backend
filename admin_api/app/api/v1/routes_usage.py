@@ -86,12 +86,16 @@ async def get_usage(
 class UsageAlertResponse(BaseModel):
     id: uuid.UUID
     business_id: uuid.UUID
+    # Additive, reconciled against the admin-suite frontend's own
+    # reasonable UX expectation (an alert list naming a UUID alone isn't
+    # useful) -- a plain join, no new query shape for the ONBOARDER-scoped
+    # case below, which already joins Business for its own filter.
+    business_name: str
     billing_period_started_at: datetime
     threshold_crossed: int
     orders_used: int
     orders_allowance: int
     created_at: datetime
-    model_config = {"from_attributes": True}
 
 
 @router.get(
@@ -113,18 +117,37 @@ async def list_usage_alerts(
     scoping as GET /admin/businesses/{id}/usage (get_business_commercial_scoped):
     an ONBOARDER sees alerts only for businesses they personally onboarded,
     regardless of handover status; SUPER_ADMIN is unrestricted.
+
+    tier/pct_used are deliberately NOT included here — they're both
+    directly derivable client-side from threshold_crossed and
+    orders_used/orders_allowance, and computing them twice (here and in
+    get_whatsapp_order_usage) would risk the two ever disagreeing.
     """
-    query = select(UsageAlert).order_by(UsageAlert.created_at.desc())
+    query = (
+        select(UsageAlert, Business.name)
+        .join(Business, Business.id == UsageAlert.business_id)
+        .order_by(UsageAlert.created_at.desc())
+    )
     if user.role == AdminRole.ONBOARDER:
-        query = query.join(Business, Business.id == UsageAlert.business_id).where(
-            Business.onboarded_by_admin_id == user.user_id
-        )
+        query = query.where(Business.onboarded_by_admin_id == user.user_id)
     if business_id:
         query = query.where(UsageAlert.business_id == business_id)
     query = query.offset((page - 1) * per_page).limit(per_page)
 
     result = await db.execute(query)
-    return [UsageAlertResponse.model_validate(a) for a in result.scalars().all()]
+    return [
+        UsageAlertResponse(
+            id=alert.id,
+            business_id=alert.business_id,
+            business_name=business_name,
+            billing_period_started_at=alert.billing_period_started_at,
+            threshold_crossed=alert.threshold_crossed,
+            orders_used=alert.orders_used,
+            orders_allowance=alert.orders_allowance,
+            created_at=alert.created_at,
+        )
+        for alert, business_name in result.all()
+    ]
 
 
 @router.get("/audit", response_model=list[AuditEventResponse])
