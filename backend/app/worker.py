@@ -602,6 +602,95 @@ async def log_stale_whatsapp_connections(ctx: dict) -> None:
             logger.exception("Stale WhatsApp connection sweep failed.")
 
 
+# ── Cron: WhatsApp order-usage threshold alerts (migration 0057_pos_entitlement) ──
+
+_USAGE_ALERT_THRESHOLDS = (100, 90, 80)  # checked highest-first, see below
+
+
+async def check_whatsapp_usage_alerts(ctx: dict) -> None:
+    """
+    Daily, monitoring/reporting ONLY. For every business with a
+    `whatsapp_order_allowance` configured, computes WhatsApp order usage
+    (`backend/app/billing/whatsapp_usage.py`, itself a read-only query over
+    `orders`/`businesses` — no bot-pipeline code is imported or called
+    anywhere in this job) and records a `UsageAlert` row the first time
+    EACH threshold is newly crossed for the business's CURRENT billing
+    period.
+
+    "Newly crossed" means: for every threshold (100/90/80, checked
+    highest-first) the business's current usage has reached, that does
+    NOT already have a `UsageAlert` row for this exact
+    (business_id, billing_period_started_at, threshold) combination, write
+    one. A business whose usage jumps straight past more than one
+    threshold between two daily runs (e.g. 70% -> 95%) gets every one of
+    them recorded in this same run (80 AND 90), not just the highest —
+    this job only ever fires once per threshold per billing period, never
+    repeatedly, because each threshold's own "already recorded?" check is
+    what stops it on every later run. The table's own unique constraint
+    (`uq_usage_alerts_business_period_threshold`, migration 0057) is the
+    actual backstop against a double write under any retry/overlap — this
+    job's own "already recorded?" check is the normal-path short-circuit,
+    not the sole guarantee.
+
+    Never interrupts, blocks, or mutates anything in the bot pipeline or
+    the `orders`/`businesses` tables themselves — purely additive reads
+    plus a new table write.
+    """
+    from backend.app.billing.whatsapp_usage import get_whatsapp_order_usage
+    from shared.models.usage_alert import UsageAlert
+
+    async with ctx["session_factory"]() as db:
+        try:
+            result = await db.execute(
+                select(Business).where(Business.whatsapp_order_allowance.isnot(None))
+            )
+            businesses = result.scalars().all()
+            new_alerts = 0
+            for business in businesses:
+                usage = await get_whatsapp_order_usage(db, business)
+                if usage.pct_used is None:
+                    continue
+                for threshold in _USAGE_ALERT_THRESHOLDS:
+                    if usage.pct_used < threshold:
+                        continue
+                    already_recorded = (
+                        await db.execute(
+                            select(UsageAlert.id).where(
+                                UsageAlert.business_id == business.id,
+                                UsageAlert.billing_period_started_at == business.billing_period_started_at,
+                                UsageAlert.threshold_crossed == threshold,
+                            )
+                        )
+                    ).scalar_one_or_none()
+                    if already_recorded:
+                        # Already recorded for this exact period+threshold —
+                        # every lower threshold is therefore also already
+                        # recorded (they're always written together, in
+                        # descending order, within a single run), so nothing
+                        # left to do for this business this run.
+                        break
+                    db.add(UsageAlert(
+                        business_id=business.id,
+                        billing_period_started_at=business.billing_period_started_at,
+                        threshold_crossed=threshold,
+                        orders_used=usage.orders_used,
+                        orders_allowance=usage.orders_allowance,
+                    ))
+                    new_alerts += 1
+                    # Deliberately NOT a `break` here: a business whose usage
+                    # jumped straight past multiple thresholds between two
+                    # daily runs (e.g. 70% -> 95%) gets every newly-crossed
+                    # threshold recorded in this same run (80 AND 90), not
+                    # just the highest — each one is checked/inserted
+                    # independently against its own already_recorded query.
+            if new_alerts:
+                await db.commit()
+                logger.warning("WhatsApp usage-alert sweep: recorded %d new alert(s).", new_alerts)
+        except Exception:
+            await db.rollback()
+            logger.exception("WhatsApp usage-alert sweep failed — rolled back.")
+
+
 # ── Worker Settings ───────────────────────────────────────────────────────────
 
 _settings = get_settings()
@@ -693,6 +782,16 @@ class WorkerSettings:
             delivery_accept_deadline_watchdog,
             second={0, 30},
             run_at_startup=True,
+        ),
+        # WhatsApp order-usage threshold alerts (migration 0057_pos_entitlement)
+        # — monitoring/reporting only, once daily, off-peak alongside the
+        # stale-WhatsApp-connection sweep above.
+        cron(
+            check_whatsapp_usage_alerts,
+            hour=3,
+            minute=30,
+            second=0,
+            run_at_startup=False,
         ),
     ]
 

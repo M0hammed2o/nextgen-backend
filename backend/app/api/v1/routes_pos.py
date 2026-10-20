@@ -29,7 +29,12 @@ from backend.app.api.v1.routes_orders import OrderResponse
 from backend.app.core.config import get_settings
 from backend.app.core.errors import AppError, NotFoundError
 from backend.app.core.ownership import require_owned
-from backend.app.core.rbac import AuthUser, require_owner_or_manager, require_staff_or_above
+from backend.app.core.rbac import (
+    AuthUser,
+    require_owner_or_manager,
+    require_pos_enabled,
+    require_staff_or_above,
+)
 from backend.app.db.session import get_db
 from backend.app.inventory.ledger import post_sale_consumption, reverse_sale_consumption
 from backend.app.pos.pricing import POSAddOnSelection, POSItemInput, resolve_pos_items
@@ -374,6 +379,13 @@ class POSSettingsResponse(BaseModel):
     # pay_by_link_enabled to be true — that comparison happens client-side.
     pay_by_link_enabled: bool = False
 
+    # POS entitlement itself (migration 0057_pos_entitlement). Exposed on
+    # THIS route deliberately — the one POS route a WhatsApp-only tenant
+    # (pos_enabled=False) can still reach — so the Staff PWA can detect
+    # "POS is off for this tenant" and adjust its own nav/till UI, instead
+    # of discovering it only by having every other POS call come back 409.
+    pos_enabled: bool = True
+
 
 class POSPaymentIntentCreateRequest(BaseModel):
     amount_cents: int = Field(gt=0)
@@ -489,7 +501,10 @@ async def _flag_pay_by_link_provider_refund_pending(
     return len(allocations)
 
 
-@router.post("/orders/{order_id}/confirm-provider-refund", response_model=OrderResponse)
+@router.post(
+    "/orders/{order_id}/confirm-provider-refund", response_model=OrderResponse,
+    dependencies=[Depends(require_pos_enabled)],
+)
 async def confirm_pos_order_provider_refund(
     order_id: uuid.UUID,
     user: AuthUser = Depends(require_owner_or_manager),
@@ -711,6 +726,7 @@ async def get_pos_settings(
     if not business:
         raise NotFoundError("Business")
     return POSSettingsResponse(
+        pos_enabled=business.pos_enabled,
         digital_receipts_enabled=business.digital_receipts_enabled,
         cash_enabled=business.pos_cash_enabled,
         card_enabled=business.pos_card_enabled,
@@ -776,7 +792,10 @@ def _maybe_expire(intent: POSPaymentLinkIntent) -> bool:
     return False
 
 
-@router.post("/payment-intents", response_model=POSPaymentIntentResponse, status_code=201)
+@router.post(
+    "/payment-intents", response_model=POSPaymentIntentResponse, status_code=201,
+    dependencies=[Depends(require_pos_enabled)],
+)
 async def create_pos_payment_intent(
     body: POSPaymentIntentCreateRequest,
     user: AuthUser = Depends(require_staff_or_above),
@@ -857,7 +876,10 @@ async def create_pos_payment_intent(
     return _intent_to_response(intent)
 
 
-@router.get("/payment-intents/unconsumed-paid", response_model=list[POSPaymentIntentResponse])
+@router.get(
+    "/payment-intents/unconsumed-paid", response_model=list[POSPaymentIntentResponse],
+    dependencies=[Depends(require_pos_enabled)],
+)
 async def list_unconsumed_paid_pos_payment_intents(
     user: AuthUser = Depends(require_staff_or_above),
     db: AsyncSession = Depends(get_db),
@@ -894,7 +916,10 @@ async def list_unconsumed_paid_pos_payment_intents(
     return [_intent_to_response(i) for i in intents]
 
 
-@router.get("/payment-intents/{intent_id}", response_model=POSPaymentIntentResponse)
+@router.get(
+    "/payment-intents/{intent_id}", response_model=POSPaymentIntentResponse,
+    dependencies=[Depends(require_pos_enabled)],
+)
 async def get_pos_payment_intent(
     intent_id: uuid.UUID,
     user: AuthUser = Depends(require_staff_or_above),
@@ -907,7 +932,10 @@ async def get_pos_payment_intent(
     return _intent_to_response(intent)
 
 
-@router.post("/payment-intents/{intent_id}/resend", response_model=POSPaymentIntentResponse)
+@router.post(
+    "/payment-intents/{intent_id}/resend", response_model=POSPaymentIntentResponse,
+    dependencies=[Depends(require_pos_enabled)],
+)
 async def resend_pos_payment_intent(
     intent_id: uuid.UUID,
     user: AuthUser = Depends(require_staff_or_above),
@@ -951,7 +979,10 @@ async def resend_pos_payment_intent(
     return _intent_to_response(intent)
 
 
-@router.post("/payment-intents/{intent_id}/cancel", response_model=POSPaymentIntentResponse)
+@router.post(
+    "/payment-intents/{intent_id}/cancel", response_model=POSPaymentIntentResponse,
+    dependencies=[Depends(require_pos_enabled)],
+)
 async def cancel_pos_payment_intent(
     intent_id: uuid.UUID,
     user: AuthUser = Depends(require_staff_or_above),
@@ -973,7 +1004,10 @@ async def cancel_pos_payment_intent(
 
 # ── Order creation / checkout ─────────────────────────────────────────────────
 
-@router.post("/orders", response_model=OrderResponse, status_code=201)
+@router.post(
+    "/orders", response_model=OrderResponse, status_code=201,
+    dependencies=[Depends(require_pos_enabled)],
+)
 async def create_pos_order(
     body: POSOrderCreateRequest,
     user: AuthUser = Depends(require_staff_or_above),
@@ -1665,7 +1699,10 @@ async def _require_open_till_for_cash_reversal(db: AsyncSession, business_id: uu
         )
 
 
-@router.post("/orders/{order_id}/refund", response_model=OrderResponse)
+@router.post(
+    "/orders/{order_id}/refund", response_model=OrderResponse,
+    dependencies=[Depends(require_pos_enabled)],
+)
 async def refund_pos_order(
     order_id: uuid.UUID,
     body: POSRefundRequest,
@@ -1794,7 +1831,10 @@ async def refund_pos_order(
     return OrderResponse.model_validate(order)
 
 
-@router.post("/orders/{order_id}/void", response_model=OrderResponse)
+@router.post(
+    "/orders/{order_id}/void", response_model=OrderResponse,
+    dependencies=[Depends(require_pos_enabled)],
+)
 async def void_pos_order(
     order_id: uuid.UUID,
     body: POSVoidRequest,
@@ -1885,7 +1925,10 @@ async def void_pos_order(
 
 # ── Digital receipt ──────────────────────────────────────────────────────────
 
-@router.post("/orders/{order_id}/receipt", response_model=POSReceiptResponse)
+@router.post(
+    "/orders/{order_id}/receipt", response_model=POSReceiptResponse,
+    dependencies=[Depends(require_pos_enabled)],
+)
 async def request_pos_receipt(
     order_id: uuid.UUID,
     body: POSReceiptRequest,
@@ -1966,7 +2009,10 @@ async def request_pos_receipt(
 
 # ── Till (cash-up) ───────────────────────────────────────────────────────────
 
-@router.get("/till/current", response_model=TillSessionResponse | None)
+@router.get(
+    "/till/current", response_model=TillSessionResponse | None,
+    dependencies=[Depends(require_pos_enabled)],
+)
 async def get_current_till(
     user: AuthUser = Depends(require_staff_or_above),
     db: AsyncSession = Depends(get_db),
@@ -1986,7 +2032,10 @@ async def get_current_till(
     return TillSessionResponse.model_validate(session) if session else None
 
 
-@router.post("/till/open", response_model=TillSessionResponse, status_code=201)
+@router.post(
+    "/till/open", response_model=TillSessionResponse, status_code=201,
+    dependencies=[Depends(require_pos_enabled)],
+)
 async def open_till(
     body: TillOpenRequest,
     user: AuthUser = Depends(require_staff_or_above),
@@ -2023,7 +2072,10 @@ async def open_till(
     return TillSessionResponse.model_validate(session)
 
 
-@router.post("/till/{session_id}/close", response_model=TillSessionResponse)
+@router.post(
+    "/till/{session_id}/close", response_model=TillSessionResponse,
+    dependencies=[Depends(require_pos_enabled)],
+)
 async def close_till(
     session_id: uuid.UUID,
     body: TillCloseRequest,
@@ -2149,7 +2201,10 @@ async def close_till(
     return response
 
 
-@router.get("/till/sessions", response_model=list[TillSessionHistoryEntry])
+@router.get(
+    "/till/sessions", response_model=list[TillSessionHistoryEntry],
+    dependencies=[Depends(require_pos_enabled)],
+)
 async def list_till_sessions(
     limit: int = Query(50, ge=1, le=200),
     user: AuthUser = Depends(require_owner_or_manager),

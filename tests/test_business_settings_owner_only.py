@@ -102,6 +102,7 @@ def make_business(business_id, **overrides):
         pos_cash_enabled=True, pos_card_enabled=True, pos_payfast_enabled=False,
         pos_yoco_enabled=False, pos_ikhoka_enabled=False, pos_direct_eft_enabled=False,
         pos_other_payment_enabled=False, pos_table_number_required=False,
+        pos_enabled=True,
     )
     for k, v in overrides.items():
         setattr(b, k, v)

@@ -487,6 +487,7 @@ async def test_pos_settings_reflects_business_config():
     import types
     user = make_user(role="STAFF")
     business = types.SimpleNamespace(
+        pos_enabled=True,
         pos_cash_enabled=True, pos_card_enabled=False,
         pos_payfast_enabled=False, pos_yoco_enabled=True, pos_ikhoka_enabled=False,
         pos_direct_eft_enabled=False, pos_other_payment_enabled=False,
@@ -548,6 +549,7 @@ async def test_pos_settings_stocktake_tab_needs_the_inventory_module():
     import types
     user = make_user(role="STAFF")
     business = types.SimpleNamespace(
+        pos_enabled=True,
         pos_cash_enabled=True, pos_card_enabled=True,
         pos_payfast_enabled=False, pos_yoco_enabled=False, pos_ikhoka_enabled=False,
         pos_direct_eft_enabled=False, pos_other_payment_enabled=False,
@@ -587,6 +589,7 @@ def _pos_settings_business(loyalty_enabled: bool):
     varying only loyalty_enabled -- see test_pos_settings_loyalty_enabled_*
     below (UI V2.1 follow-up Part B1: a real field, not an API-error probe)."""
     return types.SimpleNamespace(
+        pos_enabled=True,
         pos_cash_enabled=True, pos_card_enabled=True,
         pos_payfast_enabled=False, pos_yoco_enabled=False, pos_ikhoka_enabled=False,
         pos_direct_eft_enabled=False, pos_other_payment_enabled=False,
