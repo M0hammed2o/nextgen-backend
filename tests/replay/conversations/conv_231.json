@@ -1,41 +1,39 @@
 {
   "id": "conv_231",
-  "title": "CX state protection — multi-message casual session stays conversational",
-  "category": "cx_state_protection",
-  "tags": ["det", "llm", "cx", "protection"],
+  "title": "Hallucinated quantity-correction confirmation is blocked, not shown to the customer",
+  "category": "cart_mutation",
+  "tags": ["llm", "quantity_correction", "chitchat", "hallucination_guard", "regression_baseline"],
 
-  "notes": "Several conversational messages in sequence. Bot must never jump into ordering mode, ask for a name, or request pickup/delivery mode without an explicit order.",
+  "notes": "The actual production bug this guards against: a quantity correction ('No the coke is going to be 3 cokes not one') has none of ORDER_ADD's trigger words, so intent_router returns None/UNKNOWN -- outside the _ORDER_INTENTS set the earlier mutation guard checks. If the LLM then returns a non-mutating action (chitchat) with a prose 'confirmation' describing a cart state that was never actually applied, the customer used to see that fake total while the real cart (and the eventual persisted order) stayed unchanged -- exactly what was reported against the real Mochachos order BO-000001. This fixture scripts that exact failure mode and asserts the new guard (pipeline.py's catch-all chitchat block) intercepts it: the cart stays at quantity 1, and the customer is asked to restate the change rather than shown a fabricated total.",
 
   "turns": [
     {
-      "message": "Hello",
+      "message": "I'll have a Classic Smash Burger, Chips and a Coke",
       "expect": {
-        "state": "GREETING",
-        "cart": [],
-        "response_contains": ["welcome"],
-        "response_not_contains": ["your name", "phone", "pickup", "delivery"]
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Classic Smash Burger", "quantity": 1},
+          {"name": "Chips", "quantity": 1},
+          {"name": "Coca-Cola (330ml)", "quantity": 1}
+        ]
       }
     },
     {
-      "message": "How are you?",
+      "message": "No the coke is going to be 3 cokes not one",
       "llm": {
         "action": "chitchat",
-        "message": "I'm doing great, thank you for asking! How can I help you today?",
+        "message": "Got it! Updated to 3x Coca-Cola (330ml). Your total is now R170.00.",
         "items": []
       },
       "expect": {
-        "state": "GREETING",
-        "cart": [],
-        "response_not_contains": ["your name", "phone", "pickup", "delivery", "total"]
-      }
-    },
-    {
-      "message": "What time do you close?",
-      "expect": {
-        "state": "GREETING",
-        "cart": [],
-        "response_contains": ["contact", "hours"],
-        "response_not_contains": ["your name", "phone", "pickup", "delivery", "total"]
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Classic Smash Burger", "quantity": 1},
+          {"name": "Chips", "quantity": 1},
+          {"name": "Coca-Cola (330ml)", "quantity": 1}
+        ],
+        "response_contains": ["catch", "quantity"],
+        "response_not_contains": ["R170", "170.00", "Updated"]
       }
     }
   ]
