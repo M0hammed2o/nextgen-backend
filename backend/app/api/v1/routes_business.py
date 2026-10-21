@@ -200,6 +200,11 @@ class BusinessSettingsResponse(BaseModel):
     pos_direct_eft_enabled: bool = False
     pos_other_payment_enabled: bool = False
     pos_table_number_required: bool = False
+    # POS module entitlement (migration 0057_pos_entitlement) — same
+    # platform-admin-writable / business-plane READ-ONLY pattern as
+    # inventory_enabled/digital_receipts_enabled above. Gates every route
+    # in routes_pos.py except GET /business/pos/settings.
+    pos_enabled: bool = True
 
     model_config = {"from_attributes": False}
 
@@ -296,6 +301,7 @@ class BusinessSettingsResponse(BaseModel):
             pos_direct_eft_enabled=b.pos_direct_eft_enabled,
             pos_other_payment_enabled=b.pos_other_payment_enabled,
             pos_table_number_required=b.pos_table_number_required,
+            pos_enabled=b.pos_enabled,
         )
 
 
@@ -465,6 +471,49 @@ async def get_business_settings(
     response.monthly_orders_used = quota.used
     response.monthly_orders_remaining = quota.remaining
     return await _attach_brand_urls(db, business, response)
+
+
+class WhatsAppOrderUsageResponse(BaseModel):
+    """
+    `Business.whatsapp_order_allowance`-scoped usage (migration
+    0057_pos_entitlement) — deliberately separate from the ALL-CHANNEL
+    monthly_order_quota exposed on BusinessSettingsResponse above. See
+    backend/app/billing/whatsapp_usage.py for exactly which Order rows
+    count towards `orders_used` vs. `orders_total_all_statuses`.
+    """
+    period_start: str
+    orders_used: int
+    orders_total_all_statuses: int
+    orders_allowance: int | None
+    orders_remaining: int | None
+    pct_used: float | None
+    tier: str | None
+
+
+@router.get("/usage/whatsapp-orders", response_model=WhatsAppOrderUsageResponse)
+async def get_whatsapp_order_usage_route(
+    user: AuthUser = Depends(require_owner_or_manager),
+    db: AsyncSession = Depends(get_db),
+):
+    """WhatsApp-channel order usage for the current billing period, scoped
+    strictly to the caller's own business (user.business_id from the JWT —
+    never client input)."""
+    result = await db.execute(select(Business).where(Business.id == user.business_id))
+    business = result.scalar_one_or_none()
+    if not business:
+        raise NotFoundError("Business")
+
+    from backend.app.billing.whatsapp_usage import get_whatsapp_order_usage
+    usage = await get_whatsapp_order_usage(db, business)
+    return WhatsAppOrderUsageResponse(
+        period_start=usage.period_start,
+        orders_used=usage.orders_used,
+        orders_total_all_statuses=usage.orders_total_all_statuses,
+        orders_allowance=usage.orders_allowance,
+        orders_remaining=usage.orders_remaining,
+        pct_used=usage.pct_used,
+        tier=usage.tier,
+    )
 
 
 @router.put("/settings", response_model=BusinessSettingsResponse)

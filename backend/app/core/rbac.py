@@ -229,3 +229,50 @@ require_staff_or_above = require_business_access(["STAFF", "MANAGER", "OWNER"])
 
 # Super Admin only (for admin_api)
 require_super_admin = require_role(["SUPER_ADMIN"])
+
+
+async def require_pos_enabled(
+    user: AuthUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """
+    POS/till entitlement gate (migration 0057_pos_entitlement).
+
+    Deliberately the ONE shared home for this check, unlike the existing
+    copy-pasted-per-file `_require_X_enabled(db, business_id)` pattern
+    (`routes_inventory.py`, `routes_loyalty.py`, `routes_recipes.py`,
+    `routes_stocktake.py`, `routes_wastage.py`, `routes_whatsapp_connect.py`
+    all independently re-implement the same shape) — a prior audit flagged
+    that pattern and asked that this new flag not repeat it. Used as
+    `dependencies=[Depends(require_pos_enabled)]` on every route in
+    `routes_pos.py` except `GET /business/pos/settings` (the Staff PWA
+    reads that one as general tenant config, not just POS config).
+
+    Fail-closed: re-reads `Business.pos_enabled` fresh from the DB on
+    every single call — never trusts a cached/stale value (the JWT itself
+    carries no entitlement claims at all, by design). A business row that
+    can't be found is treated exactly like POS being off, never as
+    "allowed by default".
+    """
+    if not user.business_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "NO_BUSINESS_CONTEXT",
+                "message": "This endpoint requires a business-scoped user",
+            },
+        )
+
+    from shared.models.business import Business
+    result = await db.execute(
+        select(Business.pos_enabled).where(Business.id == user.business_id)
+    )
+    pos_enabled = result.scalar_one_or_none()
+    if not pos_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "POS_NOT_ENABLED",
+                "message": "POS is not enabled for this business",
+            },
+        )

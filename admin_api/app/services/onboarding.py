@@ -141,89 +141,105 @@ async def compute_go_live_checks(db: AsyncSession, business: Business) -> GoLive
         detail=f"{active_categories} active categor{'y' if active_categories == 1 else 'ies'}, {active_items} active item(s)",
     ))
 
-    # ── VAT / receipt settings ──────────────────────────────────────────────
-    # Real-browser fix (Wave 0A): this used to pass for a completely
-    # untouched tenant, because BOTH of its old signals are true by default
-    # on a freshly created business — vat_registered defaults False (so
-    # vat_ok was trivially True) and receipt_paper_width_mm is NOT NULL with
-    # a server default of 80mm (so paper_ok was trivially True even though
-    # nobody had ever opened receipt settings). Paper width is no longer
-    # used as evidence of configuration for exactly that reason. Now
-    # requires actual evidence the owner touched receipt settings (a
-    # trading name, or any receipt_config_json at all), and — if
-    # VAT-registered — a real VAT number AND a non-zero rate (a 0% VAT tax
-    # invoice is invalid; see routes_business.py's matching VAT_RATE_REQUIRED
-    # validation on PUT /settings).
-    receipt_config = business.receipt_config_json or {}
-    receipt_configured = bool(receipt_config.get("trading_name")) or bool(receipt_config)
-    if business.vat_registered:
-        vat_ok = bool(business.vat_number) and business.vat_rate_basis_points > 0
-    else:
-        vat_ok = True
-
-    if vat_ok and receipt_configured:
-        detail = "VAT and receipt settings are configured"
-        status = STATUS_PASS
-    elif not vat_ok:
-        if not business.vat_number:
-            detail = "Business is marked VAT-registered but has no VAT number set"
+    # ── POS-dependent checks (only if the POS module is switched on) ───────
+    # migration 0057_pos_entitlement: a WhatsApp-only tenant (pos_enabled
+    # False) has no till at all, so every check below that assumes one
+    # (VAT/receipt settings being the till's own receipt config, a POS
+    # payment method, an opened till session, a rung-up POS test order,
+    # the receipt-print test, and the cash-up test further below) is
+    # structurally inapplicable rather than failing — same STATUS_NA
+    # pattern already used for inventory_enabled/is_whatsapp_enabled below.
+    # This is what lets an ONBOARDER complete go-live for a WhatsApp-only
+    # tenant without needing SUPER_ADMIN's force=true override.
+    if business.pos_enabled:
+        # ── VAT / receipt settings ──────────────────────────────────────────
+        # Real-browser fix (Wave 0A): this used to pass for a completely
+        # untouched tenant, because BOTH of its old signals are true by default
+        # on a freshly created business — vat_registered defaults False (so
+        # vat_ok was trivially True) and receipt_paper_width_mm is NOT NULL with
+        # a server default of 80mm (so paper_ok was trivially True even though
+        # nobody had ever opened receipt settings). Paper width is no longer
+        # used as evidence of configuration for exactly that reason. Now
+        # requires actual evidence the owner touched receipt settings (a
+        # trading name, or any receipt_config_json at all), and — if
+        # VAT-registered — a real VAT number AND a non-zero rate (a 0% VAT tax
+        # invoice is invalid; see routes_business.py's matching VAT_RATE_REQUIRED
+        # validation on PUT /settings).
+        receipt_config = business.receipt_config_json or {}
+        receipt_configured = bool(receipt_config.get("trading_name")) or bool(receipt_config)
+        if business.vat_registered:
+            vat_ok = bool(business.vat_number) and business.vat_rate_basis_points > 0
         else:
-            detail = "Business is marked VAT-registered but its VAT rate is 0% — a tax invoice needs a real rate"
-        status = STATUS_FAIL
-    else:
-        detail = "Receipt settings have not been configured yet (e.g. trading name)"
-        status = STATUS_FAIL
-    checks.append(GoLiveCheck(key="vat_receipt", label="VAT & receipt settings", status=status, detail=detail))
+            vat_ok = True
 
-    # ── At least one POS payment method enabled ─────────────────────────────
-    pos_methods = [
-        business.pos_cash_enabled, business.pos_card_enabled, business.pos_payfast_enabled,
-        business.pos_yoco_enabled, business.pos_ikhoka_enabled, business.pos_direct_eft_enabled,
-        business.pos_other_payment_enabled,
-    ]
-    checks.append(GoLiveCheck(
-        key="pos_payment_method", label="POS payment method",
-        status=STATUS_PASS if any(pos_methods) else STATUS_FAIL,
-        detail="At least one till payment method is enabled" if any(pos_methods)
-               else "No till payment method is enabled — the till cannot take a sale",
-    ))
+        if vat_ok and receipt_configured:
+            detail = "VAT and receipt settings are configured"
+            status = STATUS_PASS
+        elif not vat_ok:
+            if not business.vat_number:
+                detail = "Business is marked VAT-registered but has no VAT number set"
+            else:
+                detail = "Business is marked VAT-registered but its VAT rate is 0% — a tax invoice needs a real rate"
+            status = STATUS_FAIL
+        else:
+            detail = "Receipt settings have not been configured yet (e.g. trading name)"
+            status = STATUS_FAIL
+        checks.append(GoLiveCheck(key="vat_receipt", label="VAT & receipt settings", status=status, detail=detail))
 
-    # ── A till session has been opened at least once ───────────────────────
-    till_opened = int((await db.execute(
-        select(func.count()).select_from(TillSession).where(TillSession.business_id == business_id)
-    )).scalar() or 0)
-    checks.append(GoLiveCheck(
-        key="till_session", label="Till opened",
-        status=STATUS_PASS if till_opened else STATUS_FAIL,
-        detail=f"{till_opened} till session(s) opened" if till_opened else "The till has never been opened",
-    ))
-
-    # ── At least one POS test order + a receipt document can be built ──────
-    pos_order_result = await db.execute(
-        select(Order).where(
-            Order.business_id == business_id, Order.source == OrderSource.POS.value,
-        ).order_by(Order.created_at.desc()).limit(1)
-    )
-    pos_order = pos_order_result.scalar_one_or_none()
-    if not pos_order:
+        # ── At least one POS payment method enabled ─────────────────────────
+        pos_methods = [
+            business.pos_cash_enabled, business.pos_card_enabled, business.pos_payfast_enabled,
+            business.pos_yoco_enabled, business.pos_ikhoka_enabled, business.pos_direct_eft_enabled,
+            business.pos_other_payment_enabled,
+        ]
         checks.append(GoLiveCheck(
-            key="pos_test_order", label="POS test order",
-            status=STATUS_FAIL, detail="No POS order has been rung up yet",
+            key="pos_payment_method", label="POS payment method",
+            status=STATUS_PASS if any(pos_methods) else STATUS_FAIL,
+            detail="At least one till payment method is enabled" if any(pos_methods)
+                   else "No till payment method is enabled — the till cannot take a sale",
         ))
+
+        # ── A till session has been opened at least once ───────────────────
+        till_opened = int((await db.execute(
+            select(func.count()).select_from(TillSession).where(TillSession.business_id == business_id)
+        )).scalar() or 0)
+        checks.append(GoLiveCheck(
+            key="till_session", label="Till opened",
+            status=STATUS_PASS if till_opened else STATUS_FAIL,
+            detail=f"{till_opened} till session(s) opened" if till_opened else "The till has never been opened",
+        ))
+
+        # ── At least one POS test order + a receipt document can be built ──
+        pos_order_result = await db.execute(
+            select(Order).where(
+                Order.business_id == business_id, Order.source == OrderSource.POS.value,
+            ).order_by(Order.created_at.desc()).limit(1)
+        )
+        pos_order = pos_order_result.scalar_one_or_none()
+        if not pos_order:
+            checks.append(GoLiveCheck(
+                key="pos_test_order", label="POS test order",
+                status=STATUS_FAIL, detail="No POS order has been rung up yet",
+            ))
+        else:
+            try:
+                from backend.app.receipts.document import build_receipt_document
+                await db.refresh(pos_order, attribute_names=["items"])
+                build_receipt_document(pos_order, business, order_items=pos_order.items)
+                checks.append(GoLiveCheck(
+                    key="pos_test_order", label="POS test order",
+                    status=STATUS_PASS, detail="A POS order exists and its receipt renders correctly",
+                ))
+            except Exception as exc:  # noqa: BLE001 — intentionally broad: any receipt-build failure fails this check
+                checks.append(GoLiveCheck(
+                    key="pos_test_order", label="POS test order",
+                    status=STATUS_FAIL, detail=f"A POS order exists but its receipt failed to build: {exc}",
+                ))
     else:
-        try:
-            from backend.app.receipts.document import build_receipt_document
-            await db.refresh(pos_order, attribute_names=["items"])
-            build_receipt_document(pos_order, business, order_items=pos_order.items)
-            checks.append(GoLiveCheck(
-                key="pos_test_order", label="POS test order",
-                status=STATUS_PASS, detail="A POS order exists and its receipt renders correctly",
-            ))
-        except Exception as exc:  # noqa: BLE001 — intentionally broad: any receipt-build failure fails this check
-            checks.append(GoLiveCheck(
-                key="pos_test_order", label="POS test order",
-                status=STATUS_FAIL, detail=f"A POS order exists but its receipt failed to build: {exc}",
-            ))
+        checks.append(GoLiveCheck(key="vat_receipt", label="VAT & receipt settings", status=STATUS_NA, detail="POS is off for this business"))
+        checks.append(GoLiveCheck(key="pos_payment_method", label="POS payment method", status=STATUS_NA, detail="POS is off for this business"))
+        checks.append(GoLiveCheck(key="till_session", label="Till opened", status=STATUS_NA, detail="POS is off for this business"))
+        checks.append(GoLiveCheck(key="pos_test_order", label="POS test order", status=STATUS_NA, detail="POS is off for this business"))
 
     # ── Inventory (only if the module is switched on) ──────────────────────
     if business.inventory_enabled:
@@ -355,43 +371,50 @@ async def compute_go_live_checks(db: AsyncSession, business: Business) -> GoLive
         "the system cannot infer this, see POST .../onboarding/confirm",
     ))
 
-    # ── Receipt test: a real receipt renders AND a human confirmed the ─────
-    # physical print (the print itself happens in a browser — invisible to
-    # the server — so this check is deliberately BOTH a real-data check
-    # (pos_test_order, above) AND a manual confirmation, not either alone.
-    receipt_print_confirmed = "receipt_print" in confirmations
-    receipt_renders = any(c.key == "pos_test_order" and c.status == STATUS_PASS for c in checks)
-    if receipt_renders and receipt_print_confirmed:
+    # ── Receipt test / Cash-up test (POS-dependent, see pos_enabled gate ────
+    # above) — a WhatsApp-only tenant has no till at all, so both are N/A.
+    if business.pos_enabled:
+        # Receipt test: a real receipt renders AND a human confirmed the
+        # physical print (the print itself happens in a browser — invisible
+        # to the server — so this check is deliberately BOTH a real-data
+        # check (pos_test_order, above) AND a manual confirmation, not
+        # either alone.
+        receipt_print_confirmed = "receipt_print" in confirmations
+        receipt_renders = any(c.key == "pos_test_order" and c.status == STATUS_PASS for c in checks)
+        if receipt_renders and receipt_print_confirmed:
+            checks.append(GoLiveCheck(
+                key="receipt_test", label="Receipt print test",
+                status=STATUS_PASS,
+                detail="A receipt renders correctly and a human confirmed the physical print",
+            ))
+        elif receipt_renders:
+            checks.append(GoLiveCheck(
+                key="receipt_test", label="Receipt print test",
+                status=STATUS_WARN,
+                detail="A receipt renders correctly, but no one has confirmed the physical print test",
+            ))
+        else:
+            checks.append(GoLiveCheck(
+                key="receipt_test", label="Receipt print test",
+                status=STATUS_FAIL, detail="No receipt has been built from a real POS order yet",
+            ))
+
+        # Cashup test: at least one CLOSED till session (distinct from the
+        # existing till_session check above, which only requires one ever opened)
+        closed_till_count = int((await db.execute(
+            select(func.count()).select_from(TillSession).where(
+                TillSession.business_id == business_id, TillSession.status == "CLOSED",
+            )
+        )).scalar() or 0)
         checks.append(GoLiveCheck(
-            key="receipt_test", label="Receipt print test",
-            status=STATUS_PASS,
-            detail="A receipt renders correctly and a human confirmed the physical print",
-        ))
-    elif receipt_renders:
-        checks.append(GoLiveCheck(
-            key="receipt_test", label="Receipt print test",
-            status=STATUS_WARN,
-            detail="A receipt renders correctly, but no one has confirmed the physical print test",
+            key="cashup_test", label="Cash-up test",
+            status=STATUS_PASS if closed_till_count else STATUS_FAIL,
+            detail=f"{closed_till_count} closed till session(s)" if closed_till_count
+                   else "No till session has been closed (cashed up) yet",
         ))
     else:
-        checks.append(GoLiveCheck(
-            key="receipt_test", label="Receipt print test",
-            status=STATUS_FAIL, detail="No receipt has been built from a real POS order yet",
-        ))
-
-    # ── Cashup test: at least one CLOSED till session (distinct from the ───
-    # existing till_session check above, which only requires one ever opened)
-    closed_till_count = int((await db.execute(
-        select(func.count()).select_from(TillSession).where(
-            TillSession.business_id == business_id, TillSession.status == "CLOSED",
-        )
-    )).scalar() or 0)
-    checks.append(GoLiveCheck(
-        key="cashup_test", label="Cash-up test",
-        status=STATUS_PASS if closed_till_count else STATUS_FAIL,
-        detail=f"{closed_till_count} closed till session(s)" if closed_till_count
-               else "No till session has been closed (cashed up) yet",
-    ))
+        checks.append(GoLiveCheck(key="receipt_test", label="Receipt print test", status=STATUS_NA, detail="POS is off for this business"))
+        checks.append(GoLiveCheck(key="cashup_test", label="Cash-up test", status=STATUS_NA, detail="POS is off for this business"))
 
     # ── WhatsApp test: a real outbound message reached SENT, or a human ────
     # confirmed a manual test send (the test-send endpoint has no DB

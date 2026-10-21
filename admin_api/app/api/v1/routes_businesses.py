@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -91,6 +91,13 @@ class BusinessCreate(BaseModel):
                      "When false, the business is created as ACTIVE with no trial — for "
                      "a client invoiced/paying from day one with no trial period.",
     )
+    # POS/WhatsApp-only entitlement (migration 0057_pos_entitlement) —
+    # SUPER_ADMIN only, same "platform decision, not a tenant toggle"
+    # rationale as every other module flag. Deliberately NOT added to
+    # ONBOARDER_PATCH_ALLOWED_FIELDS below; see the matching
+    # _DEFAULT_DAILY_LIMITS-style ONBOARDER guard in create_business.
+    pos_enabled: bool = True
+    whatsapp_order_allowance: int | None = Field(default=None, ge=0)
 
 
 class BusinessUpdate(BaseModel):
@@ -147,6 +154,13 @@ class BusinessUpdate(BaseModel):
     staff_live_orders_tab_enabled: bool | None = None
     staff_wastage_tab_enabled: bool | None = None
     staff_stocktake_tab_enabled: bool | None = None
+    # POS/WhatsApp-only entitlement (migration 0057_pos_entitlement) — same
+    # "platform decision, not a tenant toggle" rationale as every module
+    # flag above. Deliberately NOT added to ONBOARDER_PATCH_ALLOWED_FIELDS:
+    # restaurant owners and sales partners must never flip this themselves,
+    # since it is a billing-tier concept.
+    pos_enabled: bool | None = None
+    whatsapp_order_allowance: int | None = Field(default=None, ge=0)
 
 
 class LimitsUpdate(BaseModel):
@@ -217,6 +231,11 @@ class BusinessAdminResponse(BaseModel):
     staff_live_orders_tab_enabled: bool
     staff_wastage_tab_enabled: bool
     staff_stocktake_tab_enabled: bool
+    # POS/WhatsApp-only entitlement (migration 0057_pos_entitlement) —
+    # exposed in the SAME commit as the migration/model, per this repo's
+    # BUG-0003/BUG-0072 discipline.
+    pos_enabled: bool = True
+    whatsapp_order_allowance: int | None = None
     onboarded_by_admin_id: uuid.UUID | None
     onboarding_completed_at: datetime | None
     # Populated only by POST /admin/businesses when owner_email was provided —
@@ -278,6 +297,11 @@ class BusinessOnboarderResponse(BaseModel):
     staff_live_orders_tab_enabled: bool
     staff_wastage_tab_enabled: bool
     staff_stocktake_tab_enabled: bool
+    # Read-only here too, same rationale as the other entitlement flags
+    # above (visible so an onboarder knows to escalate, not
+    # onboarder-actionable — absent from ONBOARDER_PATCH_ALLOWED_FIELDS).
+    pos_enabled: bool = True
+    whatsapp_order_allowance: int | None = None
     onboarded_by_admin_id: uuid.UUID | None
     onboarding_completed_at: datetime | None
     owner_temporary_password: str | None = None
@@ -415,6 +439,15 @@ async def create_business(
         for field, default in _DEFAULT_DAILY_LIMITS.items():
             if getattr(body, field) != default:
                 raise AppError("FIELD_NOT_ALLOWED", f"ONBOARDER cannot set {field}", 403)
+        # Same "NOT limits" invariant as above — pos_enabled/
+        # whatsapp_order_allowance are billing-tier concepts, never a
+        # sales partner's own call.
+        if body.pos_enabled is not True:
+            raise AppError("FIELD_NOT_ALLOWED", "ONBOARDER cannot set pos_enabled", 403)
+        if body.whatsapp_order_allowance is not None:
+            raise AppError(
+                "FIELD_NOT_ALLOWED", "ONBOARDER cannot set whatsapp_order_allowance", 403,
+            )
 
     # Auto-generate slug from name if not provided
     import re as _re
@@ -928,6 +961,92 @@ async def get_onboarding_status(
     return OnboardingStatusResponse(
         business_id=biz.id, business_name=biz.name,
         setup=setup, go_live=go_live, ready=go_live.ready,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# NEW: WhatsApp-only subscription usage/cost summary (migration 0057_pos_entitlement)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class BusinessUsageResponse(BaseModel):
+    """
+    Everything a SUPER_ADMIN/ONBOARDER needs to see about a single
+    business's usage for the current billing period, in one call:
+    WhatsApp-channel order usage (billing-relevant), AI/LLM cost (already
+    real — DailyUsage.llm_* — no new instrumentation needed), and WhatsApp
+    message counts (also already real — DailyUsage.in/outbound_messages).
+    `whatsapp_messaging_cost_rand` is always null — Meta messaging cost is
+    not metered anywhere in this system, and this field exists specifically
+    so nothing ever fabricates a cost figure here.
+    """
+    business_id: uuid.UUID
+    period_start: str
+    whatsapp_orders_used: int
+    whatsapp_orders_total_all_statuses: int
+    whatsapp_orders_allowance: int | None
+    whatsapp_orders_remaining: int | None
+    whatsapp_orders_pct_used: float | None
+    whatsapp_orders_tier: str | None
+    ai_llm_calls: int
+    ai_llm_tokens: int
+    ai_llm_cost_cents: int
+    whatsapp_inbound_messages: int
+    whatsapp_outbound_messages: int
+    whatsapp_messaging_cost_rand: None = None
+    whatsapp_messaging_cost_note: str = "Meta messaging cost is not metered anywhere in this system."
+
+
+@router.get(
+    "/{business_id}/usage",
+    response_model=BusinessUsageResponse,
+    summary="WhatsApp order usage + AI/messaging usage for a business, current billing period",
+)
+async def get_business_usage(
+    business_id: uuid.UUID,
+    user: AuthUser = Depends(require_onboarding_role),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Uses `get_business_commercial_scoped` (not `get_business_scoped`) —
+    this is usage/cost reporting, the same "NextGen's own commercial data"
+    bucket `BusinessOnboarderResponse`'s docstring already describes, so an
+    ONBOARDER's visibility into their own client's usage deliberately does
+    NOT end at handover, mirroring every other commercial (trial/invoice)
+    route in this file rather than the plain onboarding-configuration
+    scoping used by GET .../onboarding above.
+    """
+    biz = await get_business_commercial_scoped(business_id, user, db)
+
+    from backend.app.billing.whatsapp_usage import get_whatsapp_order_usage
+    usage = await get_whatsapp_order_usage(db, biz)
+
+    from shared.models.analytics import DailyUsage
+    period_start_date = biz.billing_period_started_at.date()
+    daily_result = await db.execute(
+        select(
+            func.coalesce(func.sum(DailyUsage.llm_calls), 0),
+            func.coalesce(func.sum(DailyUsage.llm_tokens), 0),
+            func.coalesce(func.sum(DailyUsage.llm_cost_cents), 0),
+            func.coalesce(func.sum(DailyUsage.inbound_messages), 0),
+            func.coalesce(func.sum(DailyUsage.outbound_messages), 0),
+        ).where(DailyUsage.business_id == biz.id, DailyUsage.day >= period_start_date)
+    )
+    llm_calls, llm_tokens, llm_cost_cents, inbound, outbound = daily_result.one()
+
+    return BusinessUsageResponse(
+        business_id=biz.id,
+        period_start=usage.period_start,
+        whatsapp_orders_used=usage.orders_used,
+        whatsapp_orders_total_all_statuses=usage.orders_total_all_statuses,
+        whatsapp_orders_allowance=usage.orders_allowance,
+        whatsapp_orders_remaining=usage.orders_remaining,
+        whatsapp_orders_pct_used=usage.pct_used,
+        whatsapp_orders_tier=usage.tier,
+        ai_llm_calls=int(llm_calls),
+        ai_llm_tokens=int(llm_tokens),
+        ai_llm_cost_cents=int(llm_cost_cents),
+        whatsapp_inbound_messages=int(inbound),
+        whatsapp_outbound_messages=int(outbound),
     )
 
 

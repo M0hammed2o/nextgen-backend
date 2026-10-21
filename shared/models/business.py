@@ -445,6 +445,38 @@ class Business(Base, UUIDPrimaryKeyMixin, TimestampMixin):
                 "enforces that independently of this display flag."
     )
 
+    # ── POS / WhatsApp-only subscription entitlement (migration 0057) ────
+    # Master switch, same pattern as inventory_enabled/digital_receipts_enabled.
+    # TRUE for every existing tenant (server_default true, no backfill needed)
+    # so today's POS behaviour is completely unaffected. A tenant on the new
+    # "WhatsApp Only" package (see admin_api's PlanTier/plan handling) gets
+    # this set to False, which gates every route in routes_pos.py except
+    # GET /business/pos/settings (the Staff PWA reads that one as general
+    # tenant config, not just POS config — see backend/app/core/rbac.py's
+    # require_pos_enabled, the single shared dependency for this gate).
+    # Platform-admin-writable, business-plane READ-ONLY (same pattern as
+    # every other Commercial V1 entitlement flag above).
+    pos_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=True, nullable=False, server_default="true",
+        comment="Master switch for the POS/till module. When false, every "
+                "route in routes_pos.py (except GET .../pos/settings) "
+                "refuses with 409 POS_NOT_ENABLED. Defaults TRUE for every "
+                "existing tenant — this column changes nothing until a "
+                "SUPER_ADMIN explicitly sets it False for a WhatsApp-only "
+                "package deal."
+    )
+    whatsapp_order_allowance: Mapped[int | None] = mapped_column(
+        Integer, nullable=True,
+        comment="A WhatsApp-specific monthly order allowance, distinct from "
+                "the existing ALL-CHANNEL monthly_order_quota above. NULL "
+                "(the default for every tenant, including existing "
+                "combined POS+WhatsApp tenants) means 'no separate "
+                "WhatsApp-specific allowance configured' — deliberately "
+                "never reinterprets monthly_order_quota's existing meaning. "
+                "Only meaningful once set (e.g. for a WhatsApp Only "
+                "package) — see backend/app/billing/whatsapp_usage.py."
+    )
+
     # ── Stocktake schedule ───────────────────────────────────────────────
     # How often the owner expects a count. This is guidance shown to staff and
     # used to flag an overdue count — it never blocks a count, because a

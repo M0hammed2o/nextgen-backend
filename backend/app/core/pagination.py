@@ -20,6 +20,11 @@ class PaginationMeta(BaseModel):
     per_page: int
     next_cursor: str | None = None
     has_more: bool = False
+    # Offset-pagination convenience field (routes_customers.py and any
+    # future page-number-paginated route) — None for cursor-paginated
+    # responses, where it has no meaning. Computed, never independently
+    # settable, so it can never disagree with total/per_page.
+    total_pages: int | None = None
 
 
 class PaginatedResponse(BaseModel):

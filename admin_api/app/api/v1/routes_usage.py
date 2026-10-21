@@ -10,11 +10,14 @@ from pydantic import BaseModel
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from admin_api.app.core.deps import require_super_admin
+from admin_api.app.core.deps import require_onboarding_role, require_super_admin
 from backend.app.core.rbac import AuthUser
 from backend.app.db.session import get_db
+from shared.models.admin import AdminRole
 from shared.models.analytics import DailyUsage
 from shared.models.audit import AuditEvent
+from shared.models.business import Business
+from shared.models.usage_alert import UsageAlert
 
 router = APIRouter(prefix="/admin", tags=["admin-usage"])
 
@@ -77,6 +80,73 @@ async def get_usage(
             total_revenue_cents=row.total_revenue_cents or 0,
         )
         for row in result.all()
+    ]
+
+
+class UsageAlertResponse(BaseModel):
+    id: uuid.UUID
+    business_id: uuid.UUID
+    # Additive, reconciled against the admin-suite frontend's own
+    # reasonable UX expectation (an alert list naming a UUID alone isn't
+    # useful) -- a plain join, no new query shape for the ONBOARDER-scoped
+    # case below, which already joins Business for its own filter.
+    business_name: str
+    billing_period_started_at: datetime
+    threshold_crossed: int
+    orders_used: int
+    orders_allowance: int
+    created_at: datetime
+
+
+@router.get(
+    "/usage-alerts",
+    response_model=list[UsageAlertResponse],
+    summary="WhatsApp order-usage threshold alerts (migration 0057_pos_entitlement)",
+)
+async def list_usage_alerts(
+    business_id: uuid.UUID | None = None,
+    page: int = Query(default=1, ge=1),
+    per_page: int = Query(default=50, ge=1, le=100),
+    user: AuthUser = Depends(require_onboarding_role),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Monitoring/reporting ONLY — written exclusively by
+    backend/app/worker.py::check_whatsapp_usage_alerts (daily cron), never
+    by any request handler. Respects the SAME ONBOARDER-assigned-business
+    scoping as GET /admin/businesses/{id}/usage (get_business_commercial_scoped):
+    an ONBOARDER sees alerts only for businesses they personally onboarded,
+    regardless of handover status; SUPER_ADMIN is unrestricted.
+
+    tier/pct_used are deliberately NOT included here — they're both
+    directly derivable client-side from threshold_crossed and
+    orders_used/orders_allowance, and computing them twice (here and in
+    get_whatsapp_order_usage) would risk the two ever disagreeing.
+    """
+    query = (
+        select(UsageAlert, Business.name)
+        .join(Business, Business.id == UsageAlert.business_id)
+        .order_by(UsageAlert.created_at.desc())
+    )
+    if user.role == AdminRole.ONBOARDER:
+        query = query.where(Business.onboarded_by_admin_id == user.user_id)
+    if business_id:
+        query = query.where(UsageAlert.business_id == business_id)
+    query = query.offset((page - 1) * per_page).limit(per_page)
+
+    result = await db.execute(query)
+    return [
+        UsageAlertResponse(
+            id=alert.id,
+            business_id=alert.business_id,
+            business_name=business_name,
+            billing_period_started_at=alert.billing_period_started_at,
+            threshold_crossed=alert.threshold_crossed,
+            orders_used=alert.orders_used,
+            orders_allowance=alert.orders_allowance,
+            created_at=alert.created_at,
+        )
+        for alert, business_name in result.all()
     ]
 
 
