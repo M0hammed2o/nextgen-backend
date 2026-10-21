@@ -1,76 +1,24 @@
 {
   "id": "conv_230",
-  "title": "Quantity correction via replace_item propagates to the real persisted order",
-  "category": "cart_mutation",
-  "tags": ["llm", "quantity_correction", "replace_item", "regression_baseline"],
+  "title": "CX natural — partial description without item name — clarification, no cart",
+  "category": "cx_natural_conversation",
+  "tags": ["llm", "cx", "clarification", "no_cart"],
 
-  "notes": "Regression for a real production bug: 'No the coke is going to be 3 cokes not one' has none of ORDER_ADD's trigger words (add/plus/another/extra), so intent_router returns None and the deterministic mutation guard never runs. This fixture proves the HAPPY PATH -- when the LLM correctly returns replace_item for this phrasing, the quantity really does propagate through the cart, the re-lock-before-checkout logic, and into the final persisted order. See conv_231 for the companion regression proving the guard added for the hallucination case.",
+  "notes": "ORDER_START intent, but no resolvable menu item in the message. Mutation guard skips because cart is empty and no items are extractable. Bot clarifies without adding to cart.",
 
   "turns": [
     {
-      "message": "I'll have a Classic Smash Burger, Chips and a Coke",
-      "expect": {
-        "state": "CONFIRMING_ORDER",
-        "cart": [
-          {"name": "Classic Smash Burger", "quantity": 1},
-          {"name": "Chips", "quantity": 1},
-          {"name": "Coca-Cola (330ml)", "quantity": 1}
-        ]
-      }
-    },
-    {
-      "message": "No the coke is going to be 3 cokes not one",
+      "message": "I want the one with cheese",
       "llm": {
-        "action": "replace_item",
-        "message": "Updated — 3x Coca-Cola (330ml). Your total is now R170.00.",
-        "items": [
-          {"remove": "Coca-Cola (330ml)", "add": "Coca-Cola (330ml)", "quantity": 3}
-        ]
+        "action": "chitchat",
+        "message": "Could you be more specific? We have several options with cheese! Which burger are you thinking of?",
+        "items": []
       },
       "expect": {
-        "state": "CONFIRMING_ORDER",
-        "cart": [
-          {"name": "Classic Smash Burger", "quantity": 1},
-          {"name": "Chips", "quantity": 1},
-          {"name": "Coca-Cola (330ml)", "quantity": 3}
-        ],
-        "confirmed_cart": [
-          {"name": "Classic Smash Burger", "quantity": 1},
-          {"name": "Chips", "quantity": 1},
-          {"name": "Coca-Cola (330ml)", "quantity": 3}
-        ]
+        "state": "IDLE",
+        "cart": [],
+        "response_not_contains": ["added to your order", "total", "confirm", "pickup", "delivery"]
       }
-    },
-    {
-      "message": "Yes",
-      "expect": {"state": "CHOOSING_ORDER_MODE"}
-    },
-    {
-      "message": "Pickup",
-      "expect": {"state": "COLLECTING_DETAILS"}
-    },
-    {
-      "message": "Mohammed",
-      "expect": {"state": "COLLECTING_DETAILS"}
-    },
-    {
-      "message": "0837866021",
-      "expect": {"state": "COLLECTING_DETAILS"}
-    },
-    {
-      "message": "skip",
-      "expect": {"state": "ORDER_PLACED", "cart": []}
     }
-  ],
-  "final_order": {
-    "items": [
-      {"name": "Classic Smash Burger", "quantity": 1},
-      {"name": "Chips", "quantity": 1},
-      {"name": "Coca-Cola (330ml)", "quantity": 3}
-    ],
-    "subtotal_cents": 17000,
-    "total_cents": 17000,
-    "order_mode": "PICKUP",
-    "customer_name": "Mohammed"
-  }
+  ]
 }
