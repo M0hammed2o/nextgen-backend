@@ -2297,7 +2297,70 @@ def _extract_items_from_chunk(
             global_consumed_names.add(name_lower)
             break
 
+    # BO-000004 guard (second manifestation, deterministic path): a matched
+    # item's name might ALSO be a valid enabled option value belonging to
+    # ANOTHER matched item in this same chunk -- e.g. a combo's
+    # included-drink choice, "Sprite", colliding with the standalone
+    # "Sprite (330ml)" product. When that happens, the standalone match is
+    # almost always the customer selecting an option on the other item, not
+    # ordering it separately -- fold it into that item's modifier instead of
+    # keeping it as its own charged line. Only runs when 2+ items matched in
+    # this chunk, so the overwhelming single-match case is untouched.
+    if len(matched) > 1:
+        _folded_matched: list[tuple] = []
+        for _cand_item, _cand_qty, _cand_mod in matched:
+            _folded = False
+            for _other_item, _oq, _om in matched:
+                if _other_item is _cand_item:
+                    continue
+                if _is_enabled_option_value(_other_item, _cand_item.name):
+                    _target_idx = next(
+                        (i for i, e in enumerate(_folded_matched) if e[0] is _other_item), None
+                    )
+                    if _target_idx is not None:
+                        _ti, _tq, _tm = _folded_matched[_target_idx]
+                        _new_mod = f"{_tm}, {_cand_item.name}" if _tm else _cand_item.name
+                        _folded_matched[_target_idx] = (_ti, _tq, _new_mod)
+                    _folded = True
+                    break
+            if not _folded:
+                _folded_matched.append((_cand_item, _cand_qty, _cand_mod))
+        matched = _folded_matched
+
     return matched
+
+
+def _is_enabled_option_value(item, candidate_name: str) -> bool:
+    """
+    True if candidate_name exactly matches (case-insensitive) an enabled
+    option's name in any of item's option groups. Used only by the
+    collision guard above -- never invents a match, only confirms one
+    against the item's own real options_json.
+    """
+    options_json = getattr(item, "options_json", None) or {}
+    for group in options_json.get("option_groups", []):
+        for opt in group.get("options", []):
+            if opt.get("is_enabled", True) and opt["name"].lower() == candidate_name.lower():
+                return True
+    return False
+
+
+def _parse_stated_total_cents(text: str) -> int | None:
+    """
+    Best-effort: find a stated 'Total: R123.45' (or similar) in
+    LLM-generated text. Returns None if no clear total is present --
+    callers must treat None as "nothing to check against", never as zero,
+    so a single-item proposal with no stated total (e.g. "I'll add an Ice
+    Coffee for you at R75 -- shall I proceed?") is completely unaffected.
+    """
+    import re as _re_tot
+    _m = _re_tot.search(r"total[^R\d]{0,10}R\s?([\d,]+\.\d{2})", text, _re_tot.I)
+    if not _m:
+        return None
+    try:
+        return round(float(_m.group(1).replace(",", "")) * 100)
+    except ValueError:
+        return None
 
 
 def _extract_items_from_message(
@@ -3634,6 +3697,34 @@ async def _handle_with_llm(
         _prop_msg = parsed.message or ""
         _prop_extracted = _extract_items_from_message(_prop_msg, items)
         if _prop_extracted:
+            # BO-000004 guard: the LLM's own text can describe more (or
+            # different) items than _extract_items_from_message actually
+            # resolved from it -- e.g. a combo explained in terms of its
+            # already-included chips/drink, where only the included-component
+            # words happen to match real catalog names and the combo itself
+            # (and any invented item name) is silently dropped. If the LLM
+            # stated a total that doesn't match the sum of what was actually
+            # extracted, the proposal is unreliable: never save it or show
+            # the mismatched text -- ask the customer to restate the order
+            # instead of silently offering to commit the wrong items.
+            _prop_sum_cents = sum(
+                _pi.price_cents * _qty for _pi, _qty, _mod in _prop_extracted
+            )
+            _stated_total_cents = _parse_stated_total_cents(_prop_msg)
+            if _stated_total_cents is not None and abs(_stated_total_cents - _prop_sum_cents) > 1:
+                logger.warning(
+                    "PROPOSED_ITEMS_TOTAL_MISMATCH: stated=%d extracted_sum=%d "
+                    "extracted_count=%d -- refusing to save/show. session_id=%s",
+                    _stated_total_cents, _prop_sum_cents, len(_prop_extracted), session.id,
+                )
+                return (
+                    "Sorry, I couldn't confirm that order accurately. Could you "
+                    "tell me exactly what you'd like, one item at a time? \U0001F60A",
+                    True,
+                    llm_response.total_tokens,
+                    llm_response.cost_cents,
+                    llm_response.provider,
+                )
             import copy as _copy_prop
             state_machine.set_context(session, "proposed_items", [
                 {

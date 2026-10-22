@@ -1,0 +1,24 @@
+{
+  "id": "conv_324",
+  "title": "BO-000004 guard: a chitchat proposal whose stated total disagrees with what was extracted is never saved or shown",
+  "category": "cart_mutation",
+  "tags": ["llm", "combo", "hallucination_guard", "regression_baseline"],
+
+  "notes": "End-to-end reproduction of the real production bug (order BO-000004): an empty-cart, non-order-intent customer message gets a chitchat reply from the LLM describing an elaborate, fabricated order (a combo plus an invented item) with a stated total that does not match what _extract_items_from_message actually resolves from that same text. Before the fix, this fabricated summary was shown verbatim to the customer and the mismatched fragments were silently saved as proposed_items, ready to commit on the next 'Yes'. After the fix (pipeline.py's proposed-order-capture block, see KNOWN_BUGS.md BUG-0151), the stated-total-vs-extracted-sum mismatch is caught and the fabricated text is never shown or saved -- the customer gets a plain clarification request instead, and the cart stays empty.",
+
+  "turns": [
+    {
+      "message": "What's good here today?",
+      "llm": {
+        "action": "chitchat",
+        "message": "1. Smash Burger Combo — R120.00\n- Includes a burger, Chips and a drink\n2. Six Chicken Strips with Chilli Mayo — R99.90\nTotal: R284.60",
+        "items": []
+      },
+      "expect": {
+        "cart": [],
+        "response_contains": ["tell me exactly"],
+        "response_not_contains": ["R284.60", "Smash Burger Combo", "Chicken Strips"]
+      }
+    }
+  ]
+}
