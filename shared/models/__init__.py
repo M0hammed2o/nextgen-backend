@@ -25,6 +25,7 @@ from shared.models.inventory import (
 )
 from shared.models.loyalty import LoyaltyProgram, LoyaltyReward, LoyaltyTransaction
 from shared.models.menu import MenuAddOn, MenuCategory, MenuItem
+from shared.models.menu_image import BusinessMenuImage
 from shared.models.message import Message
 from shared.models.order import Order, OrderEvent, OrderItem
 from shared.models.pos_payment import POSPaymentAllocation, POSPaymentLinkIntent
@@ -49,6 +50,7 @@ __all__ = [
     "AuditEvent",
     "BillingInvoice",
     "Business",
+    "BusinessMenuImage",
     "BusinessUser",
     "CommercialInvoice",
     "CommercialInvoiceLine",
