@@ -168,6 +168,31 @@ _FLAT_WHITE_OPTIONS = {
     ]
 }
 
+# Combo included-drink choice — all options are price_delta_cents=0 because
+# the drink is already bundled into the combo's own price. Used by the
+# combo-pricing regression conversations (conv_321/322/323) added to pin the
+# BO-000004 production bug: a combo's included components must never be
+# charged twice, and letting the customer pick WHICH included drink they get
+# must never add a separate beverage charge.
+_COMBO_DRINK_CHOICE_OPTIONS = {
+    "option_groups": [
+        {
+            "id": "included_drink",
+            "name": "Included Drink",
+            "required": True,
+            "min_selections": 1,
+            "max_selections": 1,
+            "sort_order": 0,
+            "is_enabled": True,
+            "options": [
+                {"id": "coke",   "name": "Coca-Cola", "price_delta_cents": 0, "sort_order": 0, "is_enabled": True},
+                {"id": "sprite", "name": "Sprite",     "price_delta_cents": 0, "sort_order": 1, "is_enabled": True},
+                {"id": "water",  "name": "Still Water","price_delta_cents": 0, "sort_order": 2, "is_enabled": True},
+            ],
+        },
+    ]
+}
+
 # Phase 8: Priced milk options — used by new pricing replay conversations.
 # Full Cream = no charge, Soy/Oat = +R10, Almond = +R15.
 _PRICED_MILK_OPTIONS = {
@@ -243,6 +268,12 @@ SA_MENU: list[FakeMenuItem] = [
     # are unaffected.
     FakeMenuItem("Margherita Pizza", 9000, category_name="Pizza"),
     FakeMenuItem("Pepperoni Pizza",  10500, category_name="Pizza"),
+    # Combo — added-only, for the combo-pricing regression suite
+    # (conv_321/322/323). A combo is modelled exactly like production's real
+    # Mochachos combos: ONE flat-priced item whose included components
+    # (burger, chips, drink) exist only in descriptive text, never as
+    # separate cart lines. See _COMBO_DRINK_CHOICE_OPTIONS above.
+    FakeMenuItem("Smash Burger Combo", 12000, options_json=_COMBO_DRINK_CHOICE_OPTIONS),
 ]
 
 # Quick lookup: name → FakeMenuItem

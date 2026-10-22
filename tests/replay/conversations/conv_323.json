@@ -1,0 +1,77 @@
+{
+  "id": "conv_323",
+  "title": "Combo plus a genuinely separate paid side — included components still not swallowed or double counted",
+  "category": "pricing",
+  "tags": [
+    "llm",
+    "combo",
+    "pricing",
+    "regression_baseline"
+  ],
+  "notes": "Companion to conv_321: proves the fix direction for the BO-000004 class of bug does not overcorrect into merging every order into one line. A combo (which already includes chips) ordered alongside a genuinely separate paid side (Onion Rings) must produce TWO cart lines and a total that is the plain sum of both — the combo's bundled chips must not block, and must not be confused with, an explicitly separate paid item.",
+  "turns": [
+    {
+      "message": "I'll have the Smash Burger Combo with Coca-Cola, and also a side of Onion Rings",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Smash Burger Combo",
+            "quantity": 1
+          },
+          {
+            "name": "Onion Rings",
+            "quantity": 1
+          }
+        ]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Lerato",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0833334444",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "skip",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Smash Burger Combo",
+        "quantity": 1
+      },
+      {
+        "name": "Onion Rings",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 15000,
+    "total_cents": 15000,
+    "order_mode": "PICKUP",
+    "customer_name": "Lerato"
+  }
+}
