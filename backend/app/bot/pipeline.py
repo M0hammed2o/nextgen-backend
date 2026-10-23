@@ -2185,6 +2185,78 @@ def _detect_modifier_reversal(
     return None
 
 
+def _detect_quantity_correction(
+    msg_text: str,
+    cart: list[dict],
+) -> tuple[dict, int] | None:
+    """
+    Detect a natural-language quantity correction for an item ALREADY in the
+    cart -- the BO-000001 phrasing: "make it 3 Buddies instead of 1", "no the
+    coke is going to be 3 cokes not one", "actually make that 2 not 1".
+
+    This is NOT the same thing as a new addition ("I'll have 3 Buddies") --
+    it only fires when a correction-signal phrase (instead of / rather than /
+    not N / going to be) is present, AND exactly one cart line's CURRENT
+    quantity matches the "old" number in the message. That second condition
+    is the real safety net: it means this never guesses which item or
+    quantity was meant -- if the numbers don't line up with reality, it
+    falls straight through to the existing (LLM / guard) handling, same as
+    before this function existed. No item-name matching is attempted here on
+    purpose -- requiring an exact quantity match on a real cart line is a
+    stronger, simpler signal than fuzzy name matching would be.
+
+    Returns (cart_item, new_quantity) or None.
+
+    Examples that match (cart has exactly one line with quantity=1):
+      "make it 3 Buddies instead of 1"              -> (that line, 3)
+      "no the coke is going to be 3 cokes not one"  -> (that line, 3)
+      "actually make that 2 not 1"                   -> (that line, 2)
+
+    Examples that should NOT match:
+      "I'll have 3 burgers"               -> None (no correction-signal phrase)
+      "make it 3 instead of 1" when every cart line's quantity is 2 -> None
+      "make it 3 instead of 1" when TWO cart lines both have quantity 1 -> None (ambiguous)
+    """
+    import re as _re
+    if not cart:
+        return None
+
+    msg_lower = msg_text.strip().lower()
+
+    _CORRECTION_SIGNAL_RE = _re.compile(
+        r"\binstead\s+of\b|\brather\s+than\b|\bgoing\s+to\s+be\b|"
+        r"\bnot\s+(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b",
+        _re.I,
+    )
+    if not _CORRECTION_SIGNAL_RE.search(msg_lower):
+        return None
+
+    _WORD_NUMS = {
+        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+        "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    }
+    _numbers = list(_re.finditer(
+        r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b", msg_lower, _re.I
+    ))
+    if len(_numbers) < 2:
+        return None
+
+    def _val(tok: str) -> int:
+        tok = tok.lower()
+        return int(tok) if tok.isdigit() else _WORD_NUMS.get(tok, 0)
+
+    new_qty = _val(_numbers[0].group(1))
+    old_qty = _val(_numbers[-1].group(1))
+    if new_qty <= 0 or old_qty <= 0 or new_qty == old_qty or new_qty > 20:
+        return None
+
+    candidates = [ci for ci in cart if ci["quantity"] == old_qty]
+    if len(candidates) != 1:
+        return None
+
+    return candidates[0], new_qty
+
+
 def _parse_quantity_before(msg_lower: str, item_start: int) -> int:
     """Return the quantity token immediately before the item match, defaulting to 1."""
     prefix = msg_lower[:item_start].rstrip()
@@ -3002,6 +3074,51 @@ async def _handle_with_llm(
                     f"Got it ✅ {_rev_target['name']} will include {_rev_word}.\n\n{confirm_msg}",
                     False, None, None, None,
                 )
+
+    # ── Deterministic quantity correction (BO-000001: "make it 3 Buddies
+    #    instead of 1") ──────────────────────────────────────────────────────
+    # Fires for any intent (including None/UNKNOWN -- this exact phrasing has
+    # none of ORDER_ADD's trigger words, so intent_router never classifies it
+    # as an order intent at all). Must run before the LLM so a chitchat-style
+    # non-mutating reply can never be the only thing that happens for a
+    # correction this unambiguous. See _detect_quantity_correction's own
+    # docstring for exactly how conservative the match is.
+    _qty_cart = state_machine.get_cart(session)
+    if _qty_cart:
+        _qty_fix = _detect_quantity_correction(norm_text, _qty_cart)
+        if _qty_fix:
+            _qty_target, _qty_new = _qty_fix
+            _live_cart = state_machine.get_cart(session)
+            for _ci in _live_cart:
+                if _ci is _qty_target or (
+                    _ci["menu_item_id"] == _qty_target["menu_item_id"]
+                    and _ci.get("selected_options") == _qty_target.get("selected_options")
+                    and _ci.get("add_ons") == _qty_target.get("add_ons")
+                    and _ci.get("special_instructions") == _qty_target.get("special_instructions")
+                    and _ci["quantity"] == _qty_target["quantity"]
+                ):
+                    _ci["quantity"] = _qty_new
+                    _ci["line_total_cents"] = _ci["price_cents"] * _qty_new
+                    break
+            state_machine.set_cart(session, _live_cart)
+            import copy as _copy
+            state_machine.set_context(session, "confirmed_cart", _copy.deepcopy(_live_cart))
+            logger.warning(
+                "DET_QUANTITY_CORRECTION: %r quantity -> %d, session_id=%s",
+                _qty_target["name"], _qty_new, session.id,
+            )
+            order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
+            total = state_machine.cart_total_cents(session)
+            summary = state_machine.cart_summary_text(session, business.currency)
+            confirm_msg = responses.ask_confirmation_response(
+                summary, total, 0, order_mode, business.currency
+            )
+            if order_mode == "DELIVERY":
+                confirm_msg += "\n_Delivery fee will be confirmed by our team._"
+            return (
+                f"Updated ✅ {_qty_new}x {_qty_target['name']}.\n\n{confirm_msg}",
+                False, None, None, None,
+            )
 
     # ── Quantity-modifier split ("1 no tomato" with 2x CSB → split cart item) ──
     # Handles multi-message modifier assignment:
