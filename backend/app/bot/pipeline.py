@@ -2185,6 +2185,156 @@ def _detect_modifier_reversal(
     return None
 
 
+def _detect_quantity_correction(
+    msg_text: str,
+    cart: list[dict],
+    menu_items: list | None = None,
+) -> tuple[dict, int] | None:
+    """
+    Detect a natural-language quantity correction for an item ALREADY in the
+    cart -- the BO-000001 phrasing: "make it 3 Buddies instead of 1", "no the
+    coke is going to be 3 cokes not one", "actually make that 2 not 1".
+
+    This is NOT the same thing as a new addition ("I'll have 3 Buddies") --
+    it only fires when a correction-signal phrase (instead of / rather than /
+    not N / going to be) is present, AND exactly one cart line's CURRENT
+    quantity matches the "old" number in the message. That second condition
+    is the real safety net: it means this never guesses which item or
+    quantity was meant -- if the numbers don't line up with reality, it
+    falls straight through to the existing (LLM / guard) handling, same as
+    before this function existed.
+
+    When MORE than one cart line shares that "old" quantity (e.g. one Coke,
+    one burger, one chips, all quantity 1), this is ambiguous by quantity
+    alone -- but if the message also clearly NAMES one of those items (via
+    the exact same real _extract_items_from_message matching used
+    everywhere else, never a bespoke heuristic), that narrows it safely.
+    `menu_items` is optional specifically so quantity-only disambiguation
+    still works even when a caller has no catalog handy; passing it enables
+    the name-based narrowing. Still returns None, never guesses, if the
+    name match doesn't narrow it to exactly one line.
+
+    Returns (cart_item, new_quantity) or None.
+
+    Examples that match (cart has exactly one line with quantity=1):
+      "make it 3 Buddies instead of 1"              -> (that line, 3)
+      "no the coke is going to be 3 cokes not one"  -> (that line, 3)
+      "actually make that 2 not 1"                   -> (that line, 2)
+
+    Examples that match only with menu_items supplied (cart has one Coke,
+    one burger, one chips -- all quantity 1):
+      "make the coke 3 instead of 1"  -> (the Coke line, 3) -- name narrows it
+
+    Examples that should NOT match:
+      "I'll have 3 burgers"               -> None (no correction-signal phrase)
+      "make it 3 instead of 1" when every cart line's quantity is 2 -> None
+      "make it 3 instead of 1" with two ambiguous lines and no name in the
+        message, or a name that matches more than one of them -> None
+    """
+    import re as _re
+    if not cart:
+        return None
+
+    msg_lower = msg_text.strip().lower()
+
+    _CORRECTION_SIGNAL_RE = _re.compile(
+        r"\binstead\s+of\b|\brather\s+than\b|\bgoing\s+to\s+be\b|"
+        r"\bnot\s+(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b",
+        _re.I,
+    )
+    if not _CORRECTION_SIGNAL_RE.search(msg_lower):
+        return None
+
+    _WORD_NUMS = {
+        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+        "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    }
+    _numbers = list(_re.finditer(
+        r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b", msg_lower, _re.I
+    ))
+    if len(_numbers) < 2:
+        return None
+
+    def _val(tok: str) -> int:
+        tok = tok.lower()
+        return int(tok) if tok.isdigit() else _WORD_NUMS.get(tok, 0)
+
+    new_qty = _val(_numbers[0].group(1))
+    old_qty = _val(_numbers[-1].group(1))
+    if new_qty <= 0 or old_qty <= 0 or new_qty == old_qty or new_qty > 20:
+        return None
+
+    candidates = [ci for ci in cart if ci["quantity"] == old_qty]
+    if len(candidates) == 1:
+        return candidates[0], new_qty
+    if len(candidates) > 1 and menu_items:
+        named = _extract_items_from_message(msg_text, menu_items)
+        named_ids = {str(mi.id) for mi, _q, _m in named}
+        named_candidates = [ci for ci in candidates if ci["menu_item_id"] in named_ids]
+        if len(named_candidates) == 1:
+            return named_candidates[0], new_qty
+    return None
+
+
+def _detect_named_quantity_set(
+    msg_text: str,
+    cart: list[dict],
+    menu_items: list,
+) -> tuple[dict, int] | None:
+    """
+    Detect "make the Coke three" / "change the coke to 3" / "set the burger
+    to 2" -- a correction verb naming an item already in the cart, with a
+    single new quantity and no "instead of X" needed, because naming the
+    item IS the disambiguating signal.
+
+    Deliberately conservative, same philosophy as _detect_quantity_correction:
+    requires (a) a correction verb (make/change/set/update) and the absence
+    of addition-signal words (add/also/another/extra/plus) so this can never
+    hijack a genuine new order, (b) the named item resolves, via the same
+    real _extract_items_from_message matching used everywhere else, to
+    EXACTLY ONE real menu item, (c) that item appears as EXACTLY ONE cart
+    line, (d) exactly one quantity number in the whole message. Any
+    ambiguity on any of these returns None -- never guesses.
+
+    Returns (cart_item, new_quantity) or None.
+    """
+    import re as _re
+    if not cart or not menu_items:
+        return None
+
+    msg_lower = msg_text.strip().lower()
+
+    if not _re.search(r"\b(make|change|set|update)\b", msg_lower):
+        return None
+    if _re.search(r"\b(add|also|another|extra|plus)\b", msg_lower):
+        return None
+
+    _WORD_NUMS = {
+        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+        "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    }
+    _numbers = list(_re.finditer(
+        r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b", msg_lower, _re.I
+    ))
+    if len(_numbers) != 1:
+        return None
+    tok = _numbers[0].group(1).lower()
+    new_qty = int(tok) if tok.isdigit() else _WORD_NUMS.get(tok, 0)
+    if new_qty <= 0 or new_qty > 20:
+        return None
+
+    named = _extract_items_from_message(msg_text, menu_items)
+    if len(named) != 1:
+        return None
+    target_item = named[0][0]
+
+    matching_lines = [ci for ci in cart if ci["menu_item_id"] == str(target_item.id)]
+    if len(matching_lines) != 1:
+        return None
+
+    return matching_lines[0], new_qty
+
+
 def _parse_quantity_before(msg_lower: str, item_start: int) -> int:
     """Return the quantity token immediately before the item match, defaulting to 1."""
     prefix = msg_lower[:item_start].rstrip()
@@ -2297,7 +2447,70 @@ def _extract_items_from_chunk(
             global_consumed_names.add(name_lower)
             break
 
+    # BO-000004 guard (second manifestation, deterministic path): a matched
+    # item's name might ALSO be a valid enabled option value belonging to
+    # ANOTHER matched item in this same chunk -- e.g. a combo's
+    # included-drink choice, "Sprite", colliding with the standalone
+    # "Sprite (330ml)" product. When that happens, the standalone match is
+    # almost always the customer selecting an option on the other item, not
+    # ordering it separately -- fold it into that item's modifier instead of
+    # keeping it as its own charged line. Only runs when 2+ items matched in
+    # this chunk, so the overwhelming single-match case is untouched.
+    if len(matched) > 1:
+        _folded_matched: list[tuple] = []
+        for _cand_item, _cand_qty, _cand_mod in matched:
+            _folded = False
+            for _other_item, _oq, _om in matched:
+                if _other_item is _cand_item:
+                    continue
+                if _is_enabled_option_value(_other_item, _cand_item.name):
+                    _target_idx = next(
+                        (i for i, e in enumerate(_folded_matched) if e[0] is _other_item), None
+                    )
+                    if _target_idx is not None:
+                        _ti, _tq, _tm = _folded_matched[_target_idx]
+                        _new_mod = f"{_tm}, {_cand_item.name}" if _tm else _cand_item.name
+                        _folded_matched[_target_idx] = (_ti, _tq, _new_mod)
+                    _folded = True
+                    break
+            if not _folded:
+                _folded_matched.append((_cand_item, _cand_qty, _cand_mod))
+        matched = _folded_matched
+
     return matched
+
+
+def _is_enabled_option_value(item, candidate_name: str) -> bool:
+    """
+    True if candidate_name exactly matches (case-insensitive) an enabled
+    option's name in any of item's option groups. Used only by the
+    collision guard above -- never invents a match, only confirms one
+    against the item's own real options_json.
+    """
+    options_json = getattr(item, "options_json", None) or {}
+    for group in options_json.get("option_groups", []):
+        for opt in group.get("options", []):
+            if opt.get("is_enabled", True) and opt["name"].lower() == candidate_name.lower():
+                return True
+    return False
+
+
+def _parse_stated_total_cents(text: str) -> int | None:
+    """
+    Best-effort: find a stated 'Total: R123.45' (or similar) in
+    LLM-generated text. Returns None if no clear total is present --
+    callers must treat None as "nothing to check against", never as zero,
+    so a single-item proposal with no stated total (e.g. "I'll add an Ice
+    Coffee for you at R75 -- shall I proceed?") is completely unaffected.
+    """
+    import re as _re_tot
+    _m = _re_tot.search(r"total[^R\d]{0,10}R\s?([\d,]+\.\d{2})", text, _re_tot.I)
+    if not _m:
+        return None
+    try:
+        return round(float(_m.group(1).replace(",", "")) * 100)
+    except ValueError:
+        return None
 
 
 def _extract_items_from_message(
@@ -2939,6 +3152,54 @@ async def _handle_with_llm(
                     f"Got it ✅ {_rev_target['name']} will include {_rev_word}.\n\n{confirm_msg}",
                     False, None, None, None,
                 )
+
+    # ── Deterministic quantity correction (BO-000001: "make it 3 Buddies
+    #    instead of 1") ──────────────────────────────────────────────────────
+    # Fires for any intent (including None/UNKNOWN -- this exact phrasing has
+    # none of ORDER_ADD's trigger words, so intent_router never classifies it
+    # as an order intent at all). Must run before the LLM so a chitchat-style
+    # non-mutating reply can never be the only thing that happens for a
+    # correction this unambiguous. See _detect_quantity_correction's own
+    # docstring for exactly how conservative the match is.
+    _qty_cart = state_machine.get_cart(session)
+    if _qty_cart:
+        _qty_fix = (
+            _detect_quantity_correction(norm_text, _qty_cart, items)
+            or _detect_named_quantity_set(norm_text, _qty_cart, items)
+        )
+        if _qty_fix:
+            _qty_target, _qty_new = _qty_fix
+            _live_cart = state_machine.get_cart(session)
+            for _ci in _live_cart:
+                if _ci is _qty_target or (
+                    _ci["menu_item_id"] == _qty_target["menu_item_id"]
+                    and _ci.get("selected_options") == _qty_target.get("selected_options")
+                    and _ci.get("add_ons") == _qty_target.get("add_ons")
+                    and _ci.get("special_instructions") == _qty_target.get("special_instructions")
+                    and _ci["quantity"] == _qty_target["quantity"]
+                ):
+                    _ci["quantity"] = _qty_new
+                    _ci["line_total_cents"] = _ci["price_cents"] * _qty_new
+                    break
+            state_machine.set_cart(session, _live_cart)
+            import copy as _copy
+            state_machine.set_context(session, "confirmed_cart", _copy.deepcopy(_live_cart))
+            logger.warning(
+                "DET_QUANTITY_CORRECTION: %r quantity -> %d, session_id=%s",
+                _qty_target["name"], _qty_new, session.id,
+            )
+            order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
+            total = state_machine.cart_total_cents(session)
+            summary = state_machine.cart_summary_text(session, business.currency)
+            confirm_msg = responses.ask_confirmation_response(
+                summary, total, 0, order_mode, business.currency
+            )
+            if order_mode == "DELIVERY":
+                confirm_msg += "\n_Delivery fee will be confirmed by our team._"
+            return (
+                f"Updated ✅ {_qty_new}x {_qty_target['name']}.\n\n{confirm_msg}",
+                False, None, None, None,
+            )
 
     # ── Quantity-modifier split ("1 no tomato" with 2x CSB → split cart item) ──
     # Handles multi-message modifier assignment:
@@ -3661,6 +3922,34 @@ async def _handle_with_llm(
         _prop_msg = parsed.message or ""
         _prop_extracted = _extract_items_from_message(_prop_msg, items)
         if _prop_extracted:
+            # BO-000004 guard: the LLM's own text can describe more (or
+            # different) items than _extract_items_from_message actually
+            # resolved from it -- e.g. a combo explained in terms of its
+            # already-included chips/drink, where only the included-component
+            # words happen to match real catalog names and the combo itself
+            # (and any invented item name) is silently dropped. If the LLM
+            # stated a total that doesn't match the sum of what was actually
+            # extracted, the proposal is unreliable: never save it or show
+            # the mismatched text -- ask the customer to restate the order
+            # instead of silently offering to commit the wrong items.
+            _prop_sum_cents = sum(
+                _pi.price_cents * _qty for _pi, _qty, _mod in _prop_extracted
+            )
+            _stated_total_cents = _parse_stated_total_cents(_prop_msg)
+            if _stated_total_cents is not None and abs(_stated_total_cents - _prop_sum_cents) > 1:
+                logger.warning(
+                    "PROPOSED_ITEMS_TOTAL_MISMATCH: stated=%d extracted_sum=%d "
+                    "extracted_count=%d -- refusing to save/show. session_id=%s",
+                    _stated_total_cents, _prop_sum_cents, len(_prop_extracted), session.id,
+                )
+                return (
+                    "Sorry, I couldn't confirm that order accurately. Could you "
+                    "tell me exactly what you'd like, one item at a time? \U0001F60A",
+                    True,
+                    llm_response.total_tokens,
+                    llm_response.cost_cents,
+                    llm_response.provider,
+                )
             import copy as _copy_prop
             state_machine.set_context(session, "proposed_items", [
                 {

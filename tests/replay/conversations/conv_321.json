@@ -1,0 +1,74 @@
+{
+  "id": "conv_321",
+  "title": "Combo with included chips and drink — no duplicate charge for included components",
+  "category": "pricing",
+  "tags": [
+    "llm",
+    "combo",
+    "pricing",
+    "regression_baseline"
+  ],
+  "notes": "Regression for the BO-000004 production bug: a combo's included chips and drink were charged a second time as standalone cart lines even though they are already bundled into the combo's own price. This fixture pins the HAPPY PATH where the chosen included-drink name (Coca-Cola) does not collide with the exact name of any standalone catalog item (SA_MENU's standalone sodas are 'Coca-Cola (330ml)'/'Coca-Cola (500ml)', not a bare 'Coca-Cola') — the deterministic matcher correctly returns one line. It deliberately does NOT cover the case where the chosen drink name exactly collides with a standalone item's name (e.g. 'Sprite') — that is a second, distinct, confirmed-still-open bug in the deterministic extractor itself, pinned separately in tests/test_bo_000004_combo_hallucination.py::test_option_value_colliding_with_standalone_item_name_is_not_double_added. See conv_323 for the companion case proving a genuinely separate paid side is correctly kept as its own line.",
+  "turns": [
+    {
+      "message": "I'll have the Smash Burger Combo with Coca-Cola",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {
+            "name": "Smash Burger Combo",
+            "quantity": 1
+          }
+        ],
+        "response_not_contains": [
+          "R240",
+          "R147.90",
+          "R148.90"
+        ]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {
+        "state": "CHOOSING_ORDER_MODE"
+      }
+    },
+    {
+      "message": "Pickup",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "Zinhle",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "0831112222",
+      "expect": {
+        "state": "COLLECTING_DETAILS"
+      }
+    },
+    {
+      "message": "skip",
+      "expect": {
+        "state": "ORDER_PLACED",
+        "cart": []
+      }
+    }
+  ],
+  "final_order": {
+    "items": [
+      {
+        "name": "Smash Burger Combo",
+        "quantity": 1
+      }
+    ],
+    "subtotal_cents": 12000,
+    "total_cents": 12000,
+    "order_mode": "PICKUP",
+    "customer_name": "Zinhle"
+  }
+}
