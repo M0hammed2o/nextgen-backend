@@ -703,6 +703,17 @@ async def _handle_message(
 
     if intent == MessageIntent.MENU_REQUEST:
         menu_image_url = getattr(business, "menu_image_url", None)
+        # Generic "show me the menu" (no specific product/page named, no
+        # "next page" -- those are handled earlier by _handle_image_request
+        # and never reach here) falls back to the first active multi-page
+        # menu-image page when a business has adopted that feature instead
+        # of the single menu_image_url field. A business using neither, or
+        # already using the single field, is completely unaffected.
+        if not menu_image_url:
+            _fallback_pages = await _load_business_menu_pages(db, business.id)
+            if _fallback_pages:
+                menu_image_url = _fallback_pages[0]["image_url"]
+                state_machine.set_context(session, "last_shown_menu_page", _fallback_pages[0]["name"])
         logger.warning(
             "HANDLE_BRANCH: MENU_REQUEST → menu_response (has_image=%s, state=%s)",
             bool(menu_image_url),
@@ -2722,6 +2733,22 @@ def _extract_items_from_message(
     those tokens are appended to the previous match's modifier rather than
     being dropped. This handles "burger with extra cheese and extra patty"
     where the "and" split would otherwise discard "extra patty".
+
+    Multi-part combo names (BUG found 2026-10-23): a combo named like the
+    real Mochachos catalog's "Quarter Chicken, Beeg Chips and a Buddy"
+    contains "," and " and " IN ITS OWN NAME. Splitting the message on
+    those separators before matching (the step right below) would cut the
+    combo's own name into fragments that then wrongly match the cheaper
+    standalone items it happens to share words with ("Quarter Chicken",
+    "Chips") instead of the combo itself — confirmed directly: typing the
+    combo's exact printed name used to extract exactly those two wrong
+    items, silently, with no LLM involved to catch it. Fixed by matching
+    any item whose OWN name contains a separator character against the
+    WHOLE, unsplit message FIRST (still longest-name-first, so a longer
+    combo name wins over a shorter one sharing a prefix) and excising a
+    match from the text before the normal chunk-based pass ever runs on
+    what's left -- so the combo's name is never a pre-split casualty of
+    its own commas/ands.
     """
     import re as _re
     active = [i for i in menu_items if i.is_active and not i.is_deleted]
@@ -2731,11 +2758,35 @@ def _extract_items_from_message(
     # Longest names first
     active_sorted = sorted(active, key=lambda i: len(i.name), reverse=True)
 
-    # Split on natural item separators
-    chunks = _re.split(r"\band\b|\balso\b|,", msg_text, flags=_re.I)
-
     all_matched: list[tuple] = []
     consumed_names: set[str] = set()
+
+    # ── Multi-part name pre-pass (see docstring) ────────────────────────────
+    _multi_part_items = [i for i in active_sorted if "," in i.name or " and " in i.name.lower()]
+    _working_text = msg_text
+    for item in _multi_part_items:
+        name_lower = item.name.lower()
+        working_lower = _working_text.lower()
+        idx = working_lower.find(name_lower)
+        if idx == -1:
+            continue
+        before_ok = idx == 0 or not working_lower[idx - 1].isalpha()
+        end = idx + len(name_lower)
+        after_ok = end == len(working_lower) or not working_lower[end].isalpha()
+        if not (before_ok and after_ok):
+            continue
+        qty = _parse_quantity_before(working_lower, idx)
+        modifier = _extract_modifier_from_suffix(working_lower[end:])
+        all_matched.append((item, qty, modifier))
+        consumed_names.add(name_lower)
+        # Excise the matched span (spaces, so offsets of anything else in
+        # the string are unaffected) so the chunk pass below can never
+        # re-match fragments of this combo's own name.
+        _working_text = _working_text[:idx] + (" " * (end - idx)) + _working_text[end:]
+
+    # Split on natural item separators
+    chunks = _re.split(r"\band\b|\balso\b|,", _working_text, flags=_re.I)
+
     for chunk in chunks:
         chunk_matches = _extract_items_from_chunk(chunk, active_sorted, consumed_names)
         if chunk_matches:

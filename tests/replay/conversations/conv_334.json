@@ -1,0 +1,50 @@
+{
+  "id": "conv_334",
+  "title": "Realistic Mochachos conversation: combo with spice level, through to the real persisted order",
+  "category": "pricing",
+  "tags": ["mochachos_realistic", "deterministic", "regression_baseline"],
+
+  "notes": "Real Mochachos combo name/price ('Quarter Chicken, Beeg Chips and a Buddy', R109.90) and a required Spice Level option group, exactly matching the live catalog structure. The combo's own name contains commas and 'and', which the deterministic chunker (_extract_items_from_message) used to split on BEFORE matching -- confirmed directly this session: typing the combo's exact printed name deterministically mismatched to 'Quarter Chicken' + 'Chips' as two wrong, cheaper standalone items, never the combo, with no LLM involved to catch it (a real, reproducible ordering defect, found and fixed 2026-10-23 via a multi-part-name pre-pass in _extract_items_from_message). No 'llm' key here on purpose: this now resolves fully deterministically, proving the fix.",
+
+  "turns": [
+    {
+      "message": "Can I get the Quarter Chicken, Beeg Chips and a Buddy combo, hot spice please",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Quarter Chicken, Beeg Chips and a Buddy", "quantity": 1}
+        ],
+        "response_not_contains": ["Buddy 440ml", "R35.00", "R28.90"]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Thandeka",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0837778888",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "skip",
+      "expect": {"state": "ORDER_PLACED", "cart": []}
+    }
+  ],
+  "final_order": {
+    "items": [
+      {"name": "Quarter Chicken, Beeg Chips and a Buddy", "quantity": 1}
+    ],
+    "subtotal_cents": 10990,
+    "total_cents": 10990,
+    "order_mode": "PICKUP",
+    "customer_name": "Thandeka"
+  }
+}

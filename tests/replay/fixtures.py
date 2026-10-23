@@ -199,6 +199,30 @@ _COMBO_DRINK_CHOICE_OPTIONS = {
     ]
 }
 
+# Real Mochachos Spice Level structure (Lemon & Herb/Mild/Hot/Extra Hot/
+# Dynamite, all price_delta_cents=0) -- used by the realistic Mochachos
+# end-to-end conversations below (conv_334+).
+_MOCHACHOS_SPICE_LEVEL_OPTIONS = {
+    "option_groups": [
+        {
+            "id": "spice-level",
+            "name": "Spice Level",
+            "required": True,
+            "min_selections": 1,
+            "max_selections": 1,
+            "sort_order": 0,
+            "is_enabled": True,
+            "options": [
+                {"id": "lemon-herb", "name": "Lemon and Herb", "price_delta_cents": 0, "sort_order": 0, "is_enabled": True},
+                {"id": "mild", "name": "Mild", "price_delta_cents": 0, "sort_order": 1, "is_enabled": True},
+                {"id": "hot", "name": "Hot", "price_delta_cents": 0, "sort_order": 2, "is_enabled": True},
+                {"id": "extra-hot", "name": "Extra Hot", "price_delta_cents": 0, "sort_order": 3, "is_enabled": True},
+                {"id": "dynamite", "name": "Dynamite", "price_delta_cents": 0, "sort_order": 4, "is_enabled": True},
+            ],
+        },
+    ]
+}
+
 # Phase 8: Priced milk options — used by new pricing replay conversations.
 # Full Cream = no charge, Soy/Oat = +R10, Almond = +R15.
 _PRICED_MILK_OPTIONS = {
@@ -294,6 +318,18 @@ SA_MENU: list[FakeMenuItem] = [
     FakeMenuItem(
         "The Nightcap", 14000, category_name="Secret Creations",
         description="A late-night favourite — ask your server for details.",
+    ),
+    # Real Mochachos item names/prices (as currently live, not the pending
+    # Westville correction) — added-only, for the realistic end-to-end
+    # Mochachos customer-conversation suite (conv_334+). Not used by any
+    # pre-existing fixture, so nothing above is affected.
+    FakeMenuItem("Quarter Chicken", 5990, category_name="Flame-Grilled Chicken",
+                 options_json=_MOCHACHOS_SPICE_LEVEL_OPTIONS),
+    FakeMenuItem("Buddy 440ml", 2890, category_name="Drinks"),
+    FakeMenuItem(
+        "Quarter Chicken, Beeg Chips and a Buddy", 10990, category_name="Combos",
+        description="Quarter chicken, chips, 440ml soft drink",
+        options_json=_MOCHACHOS_SPICE_LEVEL_OPTIONS,
     ),
 ]
 
