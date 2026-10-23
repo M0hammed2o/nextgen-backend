@@ -312,6 +312,7 @@ from backend.app.api.v1.routes_loyalty import router as loyalty_router
 from backend.app.api.v1.routes_specials import router as specials_router
 from backend.app.api.v1.routes_analytics import router as analytics_router
 from backend.app.api.v1.routes_assets import router as assets_router
+from backend.app.api.v1.routes_menu_images import router as menu_images_router
 from backend.app.api.v1.routes_staff import router as staff_router
 from backend.app.api.v1.routes_export import router as export_router
 from backend.app.api.v1.routes_payments import router as payments_router
@@ -360,6 +361,7 @@ app.include_router(loyalty_router, prefix=PREFIX)
 app.include_router(specials_router, prefix=PREFIX)
 app.include_router(analytics_router, prefix=PREFIX)
 app.include_router(assets_router, prefix=PREFIX)
+app.include_router(menu_images_router, prefix=PREFIX)
 app.include_router(staff_router, prefix=PREFIX)
 app.include_router(export_router, prefix=PREFIX)
 app.include_router(payments_router, prefix=PREFIX)

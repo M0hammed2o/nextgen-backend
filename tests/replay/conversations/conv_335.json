@@ -1,0 +1,66 @@
+{
+  "id": "conv_335",
+  "title": "Realistic Mochachos conversation: named-item quantity correction mid-order, through to the real persisted order",
+  "category": "cart_mutation",
+  "tags": ["mochachos_realistic", "deterministic", "regression_baseline"],
+
+  "notes": "Real Mochachos item names/prices (Quarter Chicken R59.90, Buddy 440ml R28.90). Both start at quantity 1 (ambiguous by quantity alone), so correcting the Quarter Chicken specifically exercises the new named-item disambiguation in _detect_quantity_correction -- resolved deterministically, through to the final persisted order. Phrasing deliberately avoids intent_router.is_cart_correction's own, separate, pre-existing patterns (e.g. 'actually make it...') -- found while writing this fixture that a message matching BOTH is_cart_correction and the new quantity-correction detector takes the older, pre-existing cart-clear-and-rebuild-via-LLM path, since that check runs earlier in pipeline.py. Not a defect (that path still produces a correct result, just via the LLM rather than deterministically) and not changed here, to avoid altering existing, working, documented behaviour. Also found: the real catalog's 'Buddy' has no alias entry (unlike 'coke'/'cola'/'sprite'), so correcting it by that bare word alone would need the full 'Buddy 440ml' name or the LLM -- noted in WORKLOG.md as a minor, separate, out-of-scope observation, not fixed here.",
+
+  "turns": [
+    {
+      "message": "Hi, I'll have a Quarter Chicken, mild, and a Buddy 440ml",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Quarter Chicken", "quantity": 1},
+          {"name": "Buddy 440ml", "quantity": 1}
+        ]
+      }
+    },
+    {
+      "message": "no wait, make the quarter chicken 2 instead of 1",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Quarter Chicken", "quantity": 2},
+          {"name": "Buddy 440ml", "quantity": 1}
+        ],
+        "confirmed_cart": [
+          {"name": "Quarter Chicken", "quantity": 2},
+          {"name": "Buddy 440ml", "quantity": 1}
+        ],
+        "response_contains": ["2", "Quarter Chicken"]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Sipho",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0839990000",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "skip",
+      "expect": {"state": "ORDER_PLACED", "cart": []}
+    }
+  ],
+  "final_order": {
+    "items": [
+      {"name": "Quarter Chicken", "quantity": 2},
+      {"name": "Buddy 440ml", "quantity": 1}
+    ],
+    "subtotal_cents": 14870,
+    "total_cents": 14870,
+    "order_mode": "PICKUP",
+    "customer_name": "Sipho"
+  }
+}

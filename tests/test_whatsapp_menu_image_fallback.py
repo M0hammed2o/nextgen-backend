@@ -48,6 +48,9 @@ async def _run_menu_request(business, items):
     with patch(
         "backend.app.bot.pipeline._load_menu",
         new=AsyncMock(return_value=([], items)),
+    ), patch(
+        "backend.app.bot.pipeline._load_business_menu_pages",
+        new=AsyncMock(return_value=[]),
     ):
         return await _handle_message(
             db=AsyncMock(),

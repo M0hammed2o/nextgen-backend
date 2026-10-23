@@ -1,0 +1,41 @@
+{
+  "id": "conv_331",
+  "title": "WhatsApp image request: 'next page' pages through multiple menu-image pages in order, never the cart",
+  "category": "pricing",
+  "tags": ["menu_images", "deterministic", "regression_baseline"],
+
+  "notes": "First turn shows the first page (generic 'show me the menu' falls through to existing behaviour -- no business_menu_images match for a bare menu request -- so the customer asks for Secret Creations by name first). Second turn, 'next page', advances to the next page in sort order. Third turn proves the end of the list replies clearly rather than silently repeating or erroring.",
+
+  "menu_pages": [
+    {"name": "Secret Creations", "image_url": "https://example.test/assets/secret-creations.jpg"},
+    {"name": "Regular Menu Page 2", "image_url": "https://example.test/assets/menu-page-2.jpg"}
+  ],
+
+  "turns": [
+    {
+      "message": "show secret creations",
+      "expect": {
+        "state": "BROWSING_MENU",
+        "cart": [],
+        "response_contains": ["Secret Creations"]
+      }
+    },
+    {
+      "message": "next page",
+      "expect": {
+        "state": "BROWSING_MENU",
+        "cart": [],
+        "response_contains": ["Regular Menu Page 2"],
+        "response_not_contains": ["last page"]
+      }
+    },
+    {
+      "message": "next page",
+      "expect": {
+        "state": "BROWSING_MENU",
+        "cart": [],
+        "response_contains": ["last page"]
+      }
+    }
+  ]
+}

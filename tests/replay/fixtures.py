@@ -97,6 +97,8 @@ class FakeMenuItem:
         category_name: str = "Burgers",
         options_json: dict | None = None,
         add_ons: list[dict] | None = None,
+        description: str | None = None,
+        image_url: str | None = None,
     ):
         self.id = uuid.uuid4()
         self.name = name
@@ -106,7 +108,11 @@ class FakeMenuItem:
         self.options_json = options_json or {}
         self.category_id = None
         self.sort_order = 0
-        self.description = None
+        self.description = description
+        # image_url: MenuItem.image_url is a stored column, resolved once at
+        # write time from image_asset_id (routes_menu.py::_resolve_item_image)
+        # -- never re-derived live, so the fake just needs the plain string.
+        self.image_url = image_url
         # Phase 8: paid add-ons available on this item
         self.add_ons = add_ons or []
 
@@ -163,6 +169,55 @@ _FLAT_WHITE_OPTIONS = {
             "options": [
                 {"id": "extra_shot", "name": "Extra shot", "price_delta_cents": 0, "sort_order": 0, "is_enabled": True},
                 {"id": "decaf",      "name": "Decaf",      "price_delta_cents": 0, "sort_order": 1, "is_enabled": True},
+            ],
+        },
+    ]
+}
+
+# Combo included-drink choice — all options are price_delta_cents=0 because
+# the drink is already bundled into the combo's own price. Used by the
+# combo-pricing regression conversations (conv_321/322/323) added to pin the
+# BO-000004 production bug: a combo's included components must never be
+# charged twice, and letting the customer pick WHICH included drink they get
+# must never add a separate beverage charge.
+_COMBO_DRINK_CHOICE_OPTIONS = {
+    "option_groups": [
+        {
+            "id": "included_drink",
+            "name": "Included Drink",
+            "required": True,
+            "min_selections": 1,
+            "max_selections": 1,
+            "sort_order": 0,
+            "is_enabled": True,
+            "options": [
+                {"id": "coke",   "name": "Coca-Cola", "price_delta_cents": 0, "sort_order": 0, "is_enabled": True},
+                {"id": "sprite", "name": "Sprite",     "price_delta_cents": 0, "sort_order": 1, "is_enabled": True},
+                {"id": "water",  "name": "Still Water","price_delta_cents": 0, "sort_order": 2, "is_enabled": True},
+            ],
+        },
+    ]
+}
+
+# Real Mochachos Spice Level structure (Lemon & Herb/Mild/Hot/Extra Hot/
+# Dynamite, all price_delta_cents=0) -- used by the realistic Mochachos
+# end-to-end conversations below (conv_334+).
+_MOCHACHOS_SPICE_LEVEL_OPTIONS = {
+    "option_groups": [
+        {
+            "id": "spice-level",
+            "name": "Spice Level",
+            "required": True,
+            "min_selections": 1,
+            "max_selections": 1,
+            "sort_order": 0,
+            "is_enabled": True,
+            "options": [
+                {"id": "lemon-herb", "name": "Lemon and Herb", "price_delta_cents": 0, "sort_order": 0, "is_enabled": True},
+                {"id": "mild", "name": "Mild", "price_delta_cents": 0, "sort_order": 1, "is_enabled": True},
+                {"id": "hot", "name": "Hot", "price_delta_cents": 0, "sort_order": 2, "is_enabled": True},
+                {"id": "extra-hot", "name": "Extra Hot", "price_delta_cents": 0, "sort_order": 3, "is_enabled": True},
+                {"id": "dynamite", "name": "Dynamite", "price_delta_cents": 0, "sort_order": 4, "is_enabled": True},
             ],
         },
     ]
@@ -243,6 +298,39 @@ SA_MENU: list[FakeMenuItem] = [
     # are unaffected.
     FakeMenuItem("Margherita Pizza", 9000, category_name="Pizza"),
     FakeMenuItem("Pepperoni Pizza",  10500, category_name="Pizza"),
+    # Combo — added-only, for the combo-pricing regression suite
+    # (conv_321/322/323). A combo is modelled exactly like production's real
+    # Mochachos combos: ONE flat-priced item whose included components
+    # (burger, chips, drink) exist only in descriptive text, never as
+    # separate cart lines. See _COMBO_DRINK_CHOICE_OPTIONS above.
+    FakeMenuItem("Smash Burger Combo", 12000, options_json=_COMBO_DRINK_CHOICE_OPTIONS),
+    # Secret-menu-style items with a real image_url — added-only, for the
+    # WhatsApp image-request replay suite (conv_328+). "The Jawbreaker"
+    # matches the real Mochachos Secret Creations product name used
+    # throughout this feature's design discussion. "The Nightcap" has no
+    # image on purpose, to prove the same request path degrades to an
+    # accurate text-only reply rather than a broken/missing image.
+    FakeMenuItem(
+        "The Jawbreaker", 26000, category_name="Secret Creations",
+        description="Two beef patties, double cheese, jalapeños and our secret sauce.",
+        image_url="https://example.test/assets/the-jawbreaker.jpg",
+    ),
+    FakeMenuItem(
+        "The Nightcap", 14000, category_name="Secret Creations",
+        description="A late-night favourite — ask your server for details.",
+    ),
+    # Real Mochachos item names/prices (as currently live, not the pending
+    # Westville correction) — added-only, for the realistic end-to-end
+    # Mochachos customer-conversation suite (conv_334+). Not used by any
+    # pre-existing fixture, so nothing above is affected.
+    FakeMenuItem("Quarter Chicken", 5990, category_name="Flame-Grilled Chicken",
+                 options_json=_MOCHACHOS_SPICE_LEVEL_OPTIONS),
+    FakeMenuItem("Buddy 440ml", 2890, category_name="Drinks"),
+    FakeMenuItem(
+        "Quarter Chicken, Beeg Chips and a Buddy", 10990, category_name="Combos",
+        description="Quarter chicken, chips, 440ml soft drink",
+        options_json=_MOCHACHOS_SPICE_LEVEL_OPTIONS,
+    ),
 ]
 
 # Quick lookup: name → FakeMenuItem

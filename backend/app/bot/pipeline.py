@@ -396,6 +396,163 @@ async def _process(
         )
 
 
+async def _handle_image_request(
+    db: AsyncSession,
+    business: Business,
+    customer: Customer,
+    session,
+    norm_text: str,
+    *,
+    wants_next_page: bool,
+    has_show_signal: bool,
+) -> tuple[str, bool, int | None, int | None, str | None] | None:
+    """
+    Handle a specific image/photo request: a named product ("show me the
+    Jawbreaker"), a named menu-image page ("show secret creations"), or
+    paging through several ("next page"). Returns None when nothing here
+    applies, so the caller falls through to normal intent-based handling
+    unchanged -- this function never partially acts and never touches the
+    cart; every branch either fully replies and returns, or returns None.
+
+    A business with no business_menu_images rows (the common case) and no
+    uniquely-named product match in the message always returns None here.
+    """
+    categories, items = await _load_menu(db, business.id)
+    menu_pages = await _load_business_menu_pages(db, business.id)
+
+    # Same browsing-state transition as the generic MENU_REQUEST handler —
+    # don't pull a customer out of an active order to show them a photo.
+    # Applied only right before an actual match is returned below (never
+    # unconditionally here) -- a show-signal word with no matching product
+    # or page must fall through to normal handling with the session state
+    # completely untouched, not leave a stray transition behind.
+    _order_active_states = {
+        ConversationState.BUILDING_CART.value,
+        ConversationState.CONFIRMING_ORDER.value,
+        ConversationState.COLLECTING_DETAILS.value,
+    }
+
+    def _browse_transition() -> None:
+        if session.state not in _order_active_states:
+            state_machine.transition_state(session, ConversationState.BROWSING_MENU.value)
+
+    # 1) A specific real product named in the message — exactly the same
+    #    matching used everywhere else, never a bespoke heuristic. Only
+    #    acts when it resolves to EXACTLY one real item, so an ambiguous
+    #    mention returns None (let normal handling take it) instead of
+    #    guessing. Requires the show/photo signal (checked by the caller)
+    #    so "I'll have a Jawbreaker" is never hijacked into an info reply.
+    if has_show_signal:
+        named_product_matches = _extract_items_from_message(norm_text, items)
+        if len(named_product_matches) == 1:
+            prod_item = named_product_matches[0][0]
+            prod_image = getattr(prod_item, "image_url", None)
+            prod_lines = [f"*{prod_item.name}* — R{prod_item.price_cents / 100:.2f}"]
+            if getattr(prod_item, "description", None):
+                prod_lines.append(prod_item.description)
+            if prod_image:
+                try:
+                    await whatsapp_sender.send_image_message(
+                        phone_number_id=business.whatsapp_phone_number_id,
+                        recipient_wa_id=customer.wa_id,
+                        image_url=prod_image,
+                        caption="\n".join(prod_lines),
+                        db=db, business=business,
+                    )
+                    logger.info(
+                        "PIPELINE_PRODUCT_IMAGE_SENT: business_id=%s, item=%r",
+                        business.id, prod_item.name,
+                    )
+                except Exception:
+                    logger.exception(
+                        "PIPELINE_PRODUCT_IMAGE_FAIL: business_id=%s, item=%r",
+                        business.id, prod_item.name,
+                    )
+            # No image on file (or the send failed) — still give accurate
+            # info by text rather than silently falling through to the
+            # unrelated full-menu dump.
+            _browse_transition()
+            return (
+                "\n".join(prod_lines) + "\n\nWant to add it to your order? 😊",
+                False, None, None, None,
+            )
+
+        # 2) A named menu-image page — matched against THIS business's own
+        #    real, active page names, never a hardcoded category in the
+        #    shared intent router.
+        named_page = next(
+            (p for p in menu_pages if p["name"].lower() in norm_text.lower()), None
+        )
+        if named_page:
+            # Track "last shown page" regardless of send success -- a
+            # synchronous failure/exception here is not proof the customer
+            # won't still see it (BUG-0147's lesson: the sync call result is
+            # not proof of delivery either way), and losing pagination state
+            # on a transient send error is worse than occasionally advancing
+            # past a page that silently failed to deliver.
+            state_machine.set_context(session, "last_shown_menu_page", named_page["name"])
+            try:
+                await whatsapp_sender.send_image_message(
+                    phone_number_id=business.whatsapp_phone_number_id,
+                    recipient_wa_id=customer.wa_id,
+                    image_url=named_page["image_url"],
+                    caption=f"Here's our {named_page['name']} 👇",
+                    db=db, business=business,
+                )
+                logger.info(
+                    "PIPELINE_PAGE_IMAGE_SENT: business_id=%s, page=%r",
+                    business.id, named_page["name"],
+                )
+            except Exception:
+                logger.exception(
+                    "PIPELINE_PAGE_IMAGE_FAIL: business_id=%s, page=%r",
+                    business.id, named_page["name"],
+                )
+            _browse_transition()
+            return (
+                f"That's our {named_page['name']} 👆 Let me know if anything "
+                f"catches your eye! 😊",
+                False, None, None, None,
+            )
+
+    # 3) Paging through multiple pages ("next page") — only meaningful once
+    #    a page has actually been shown; starts from the first page if not.
+    if wants_next_page and menu_pages:
+        last_shown = state_machine.get_context(session, "last_shown_menu_page")
+        names = [p["name"] for p in menu_pages]
+        next_idx = (names.index(last_shown) + 1) if last_shown in names else 0
+        if next_idx < len(menu_pages):
+            next_page = menu_pages[next_idx]
+            # Same reasoning as the named-page branch above: track the
+            # advance regardless of send success.
+            state_machine.set_context(session, "last_shown_menu_page", next_page["name"])
+            try:
+                await whatsapp_sender.send_image_message(
+                    phone_number_id=business.whatsapp_phone_number_id,
+                    recipient_wa_id=customer.wa_id,
+                    image_url=next_page["image_url"],
+                    caption=f"{next_page['name']} 👇",
+                    db=db, business=business,
+                )
+            except Exception:
+                logger.exception(
+                    "PIPELINE_NEXT_PAGE_IMAGE_FAIL: business_id=%s, page=%r",
+                    business.id, next_page["name"],
+                )
+            more_hint = (
+                " Say \"next page\" for more! 😊" if next_idx + 1 < len(menu_pages) else ""
+            )
+            _browse_transition()
+            return (f"{next_page['name']} 👆{more_hint}", False, None, None, None)
+        _browse_transition()
+        return (
+            "That's the last page — let me know what you'd like to order! 😊",
+            False, None, None, None,
+        )
+
+    return None
+
+
 async def _handle_message(
     db: AsyncSession,
     business: Business,
@@ -421,6 +578,40 @@ async def _handle_message(
         current_state,
         msg_text[:80],
     )
+
+    # ── Specific image requests: a named product, a named menu-image page
+    #    (e.g. "Secret Creations"), or paging through several — "show me
+    #    the Jawbreaker" / "show secret creations" / "next page". Runs
+    #    regardless of classified intent (mirrors the quantity-correction
+    #    detectors below) because a business's own real page names are
+    #    dynamic data the shared, platform-wide intent_router.py cannot see
+    #    at all -- gated on an explicit show/photo/picture/image signal
+    #    word (or the specific "next page" phrase) so this can never hijack
+    #    a genuine order ("I'll have a Jawbreaker" has no such signal word
+    #    and flows through normal ordering unchanged). Read-only: never
+    #    touches the cart, and never sends more than one image per
+    #    request. Excluded while the customer is mid-checkout providing
+    #    details, where free text means something else entirely.
+    _img_req_states = {
+        ConversationState.COLLECTING_DETAILS.value,
+        ConversationState.CHOOSING_ORDER_MODE.value,
+    }
+    if current_state not in _img_req_states:
+        import re as _re_imgreq
+        _norm_lower_imgreq = norm_text.lower()
+        _wants_next_page = bool(_re_imgreq.search(
+            r"\bnext\s+page\b|\bmore\s+(photos|pictures|images)\b", _norm_lower_imgreq
+        ))
+        _has_show_signal = bool(_re_imgreq.search(
+            r"\b(show|photo|picture|pic|image)\b", _norm_lower_imgreq
+        ))
+        if _wants_next_page or _has_show_signal:
+            _img_result = await _handle_image_request(
+                db, business, customer, session, norm_text,
+                wants_next_page=_wants_next_page, has_show_signal=_has_show_signal,
+            )
+            if _img_result is not None:
+                return _img_result
 
     # ── Template responses (no LLM needed) ───────────────────────────────
 
@@ -512,6 +703,17 @@ async def _handle_message(
 
     if intent == MessageIntent.MENU_REQUEST:
         menu_image_url = getattr(business, "menu_image_url", None)
+        # Generic "show me the menu" (no specific product/page named, no
+        # "next page" -- those are handled earlier by _handle_image_request
+        # and never reach here) falls back to the first active multi-page
+        # menu-image page when a business has adopted that feature instead
+        # of the single menu_image_url field. A business using neither, or
+        # already using the single field, is completely unaffected.
+        if not menu_image_url:
+            _fallback_pages = await _load_business_menu_pages(db, business.id)
+            if _fallback_pages:
+                menu_image_url = _fallback_pages[0]["image_url"]
+                state_machine.set_context(session, "last_shown_menu_page", _fallback_pages[0]["name"])
         logger.warning(
             "HANDLE_BRANCH: MENU_REQUEST → menu_response (has_image=%s, state=%s)",
             bool(menu_image_url),
@@ -2185,6 +2387,156 @@ def _detect_modifier_reversal(
     return None
 
 
+def _detect_quantity_correction(
+    msg_text: str,
+    cart: list[dict],
+    menu_items: list | None = None,
+) -> tuple[dict, int] | None:
+    """
+    Detect a natural-language quantity correction for an item ALREADY in the
+    cart -- the BO-000001 phrasing: "make it 3 Buddies instead of 1", "no the
+    coke is going to be 3 cokes not one", "actually make that 2 not 1".
+
+    This is NOT the same thing as a new addition ("I'll have 3 Buddies") --
+    it only fires when a correction-signal phrase (instead of / rather than /
+    not N / going to be) is present, AND exactly one cart line's CURRENT
+    quantity matches the "old" number in the message. That second condition
+    is the real safety net: it means this never guesses which item or
+    quantity was meant -- if the numbers don't line up with reality, it
+    falls straight through to the existing (LLM / guard) handling, same as
+    before this function existed.
+
+    When MORE than one cart line shares that "old" quantity (e.g. one Coke,
+    one burger, one chips, all quantity 1), this is ambiguous by quantity
+    alone -- but if the message also clearly NAMES one of those items (via
+    the exact same real _extract_items_from_message matching used
+    everywhere else, never a bespoke heuristic), that narrows it safely.
+    `menu_items` is optional specifically so quantity-only disambiguation
+    still works even when a caller has no catalog handy; passing it enables
+    the name-based narrowing. Still returns None, never guesses, if the
+    name match doesn't narrow it to exactly one line.
+
+    Returns (cart_item, new_quantity) or None.
+
+    Examples that match (cart has exactly one line with quantity=1):
+      "make it 3 Buddies instead of 1"              -> (that line, 3)
+      "no the coke is going to be 3 cokes not one"  -> (that line, 3)
+      "actually make that 2 not 1"                   -> (that line, 2)
+
+    Examples that match only with menu_items supplied (cart has one Coke,
+    one burger, one chips -- all quantity 1):
+      "make the coke 3 instead of 1"  -> (the Coke line, 3) -- name narrows it
+
+    Examples that should NOT match:
+      "I'll have 3 burgers"               -> None (no correction-signal phrase)
+      "make it 3 instead of 1" when every cart line's quantity is 2 -> None
+      "make it 3 instead of 1" with two ambiguous lines and no name in the
+        message, or a name that matches more than one of them -> None
+    """
+    import re as _re
+    if not cart:
+        return None
+
+    msg_lower = msg_text.strip().lower()
+
+    _CORRECTION_SIGNAL_RE = _re.compile(
+        r"\binstead\s+of\b|\brather\s+than\b|\bgoing\s+to\s+be\b|"
+        r"\bnot\s+(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b",
+        _re.I,
+    )
+    if not _CORRECTION_SIGNAL_RE.search(msg_lower):
+        return None
+
+    _WORD_NUMS = {
+        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+        "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    }
+    _numbers = list(_re.finditer(
+        r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b", msg_lower, _re.I
+    ))
+    if len(_numbers) < 2:
+        return None
+
+    def _val(tok: str) -> int:
+        tok = tok.lower()
+        return int(tok) if tok.isdigit() else _WORD_NUMS.get(tok, 0)
+
+    new_qty = _val(_numbers[0].group(1))
+    old_qty = _val(_numbers[-1].group(1))
+    if new_qty <= 0 or old_qty <= 0 or new_qty == old_qty or new_qty > 20:
+        return None
+
+    candidates = [ci for ci in cart if ci["quantity"] == old_qty]
+    if len(candidates) == 1:
+        return candidates[0], new_qty
+    if len(candidates) > 1 and menu_items:
+        named = _extract_items_from_message(msg_text, menu_items)
+        named_ids = {str(mi.id) for mi, _q, _m in named}
+        named_candidates = [ci for ci in candidates if ci["menu_item_id"] in named_ids]
+        if len(named_candidates) == 1:
+            return named_candidates[0], new_qty
+    return None
+
+
+def _detect_named_quantity_set(
+    msg_text: str,
+    cart: list[dict],
+    menu_items: list,
+) -> tuple[dict, int] | None:
+    """
+    Detect "make the Coke three" / "change the coke to 3" / "set the burger
+    to 2" -- a correction verb naming an item already in the cart, with a
+    single new quantity and no "instead of X" needed, because naming the
+    item IS the disambiguating signal.
+
+    Deliberately conservative, same philosophy as _detect_quantity_correction:
+    requires (a) a correction verb (make/change/set/update) and the absence
+    of addition-signal words (add/also/another/extra/plus) so this can never
+    hijack a genuine new order, (b) the named item resolves, via the same
+    real _extract_items_from_message matching used everywhere else, to
+    EXACTLY ONE real menu item, (c) that item appears as EXACTLY ONE cart
+    line, (d) exactly one quantity number in the whole message. Any
+    ambiguity on any of these returns None -- never guesses.
+
+    Returns (cart_item, new_quantity) or None.
+    """
+    import re as _re
+    if not cart or not menu_items:
+        return None
+
+    msg_lower = msg_text.strip().lower()
+
+    if not _re.search(r"\b(make|change|set|update)\b", msg_lower):
+        return None
+    if _re.search(r"\b(add|also|another|extra|plus)\b", msg_lower):
+        return None
+
+    _WORD_NUMS = {
+        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+        "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    }
+    _numbers = list(_re.finditer(
+        r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b", msg_lower, _re.I
+    ))
+    if len(_numbers) != 1:
+        return None
+    tok = _numbers[0].group(1).lower()
+    new_qty = int(tok) if tok.isdigit() else _WORD_NUMS.get(tok, 0)
+    if new_qty <= 0 or new_qty > 20:
+        return None
+
+    named = _extract_items_from_message(msg_text, menu_items)
+    if len(named) != 1:
+        return None
+    target_item = named[0][0]
+
+    matching_lines = [ci for ci in cart if ci["menu_item_id"] == str(target_item.id)]
+    if len(matching_lines) != 1:
+        return None
+
+    return matching_lines[0], new_qty
+
+
 def _parse_quantity_before(msg_lower: str, item_start: int) -> int:
     """Return the quantity token immediately before the item match, defaulting to 1."""
     prefix = msg_lower[:item_start].rstrip()
@@ -2297,7 +2649,70 @@ def _extract_items_from_chunk(
             global_consumed_names.add(name_lower)
             break
 
+    # BO-000004 guard (second manifestation, deterministic path): a matched
+    # item's name might ALSO be a valid enabled option value belonging to
+    # ANOTHER matched item in this same chunk -- e.g. a combo's
+    # included-drink choice, "Sprite", colliding with the standalone
+    # "Sprite (330ml)" product. When that happens, the standalone match is
+    # almost always the customer selecting an option on the other item, not
+    # ordering it separately -- fold it into that item's modifier instead of
+    # keeping it as its own charged line. Only runs when 2+ items matched in
+    # this chunk, so the overwhelming single-match case is untouched.
+    if len(matched) > 1:
+        _folded_matched: list[tuple] = []
+        for _cand_item, _cand_qty, _cand_mod in matched:
+            _folded = False
+            for _other_item, _oq, _om in matched:
+                if _other_item is _cand_item:
+                    continue
+                if _is_enabled_option_value(_other_item, _cand_item.name):
+                    _target_idx = next(
+                        (i for i, e in enumerate(_folded_matched) if e[0] is _other_item), None
+                    )
+                    if _target_idx is not None:
+                        _ti, _tq, _tm = _folded_matched[_target_idx]
+                        _new_mod = f"{_tm}, {_cand_item.name}" if _tm else _cand_item.name
+                        _folded_matched[_target_idx] = (_ti, _tq, _new_mod)
+                    _folded = True
+                    break
+            if not _folded:
+                _folded_matched.append((_cand_item, _cand_qty, _cand_mod))
+        matched = _folded_matched
+
     return matched
+
+
+def _is_enabled_option_value(item, candidate_name: str) -> bool:
+    """
+    True if candidate_name exactly matches (case-insensitive) an enabled
+    option's name in any of item's option groups. Used only by the
+    collision guard above -- never invents a match, only confirms one
+    against the item's own real options_json.
+    """
+    options_json = getattr(item, "options_json", None) or {}
+    for group in options_json.get("option_groups", []):
+        for opt in group.get("options", []):
+            if opt.get("is_enabled", True) and opt["name"].lower() == candidate_name.lower():
+                return True
+    return False
+
+
+def _parse_stated_total_cents(text: str) -> int | None:
+    """
+    Best-effort: find a stated 'Total: R123.45' (or similar) in
+    LLM-generated text. Returns None if no clear total is present --
+    callers must treat None as "nothing to check against", never as zero,
+    so a single-item proposal with no stated total (e.g. "I'll add an Ice
+    Coffee for you at R75 -- shall I proceed?") is completely unaffected.
+    """
+    import re as _re_tot
+    _m = _re_tot.search(r"total[^R\d]{0,10}R\s?([\d,]+\.\d{2})", text, _re_tot.I)
+    if not _m:
+        return None
+    try:
+        return round(float(_m.group(1).replace(",", "")) * 100)
+    except ValueError:
+        return None
 
 
 def _extract_items_from_message(
@@ -2318,6 +2733,22 @@ def _extract_items_from_message(
     those tokens are appended to the previous match's modifier rather than
     being dropped. This handles "burger with extra cheese and extra patty"
     where the "and" split would otherwise discard "extra patty".
+
+    Multi-part combo names (BUG found 2026-10-23): a combo named like the
+    real Mochachos catalog's "Quarter Chicken, Beeg Chips and a Buddy"
+    contains "," and " and " IN ITS OWN NAME. Splitting the message on
+    those separators before matching (the step right below) would cut the
+    combo's own name into fragments that then wrongly match the cheaper
+    standalone items it happens to share words with ("Quarter Chicken",
+    "Chips") instead of the combo itself — confirmed directly: typing the
+    combo's exact printed name used to extract exactly those two wrong
+    items, silently, with no LLM involved to catch it. Fixed by matching
+    any item whose OWN name contains a separator character against the
+    WHOLE, unsplit message FIRST (still longest-name-first, so a longer
+    combo name wins over a shorter one sharing a prefix) and excising a
+    match from the text before the normal chunk-based pass ever runs on
+    what's left -- so the combo's name is never a pre-split casualty of
+    its own commas/ands.
     """
     import re as _re
     active = [i for i in menu_items if i.is_active and not i.is_deleted]
@@ -2327,11 +2758,35 @@ def _extract_items_from_message(
     # Longest names first
     active_sorted = sorted(active, key=lambda i: len(i.name), reverse=True)
 
-    # Split on natural item separators
-    chunks = _re.split(r"\band\b|\balso\b|,", msg_text, flags=_re.I)
-
     all_matched: list[tuple] = []
     consumed_names: set[str] = set()
+
+    # ── Multi-part name pre-pass (see docstring) ────────────────────────────
+    _multi_part_items = [i for i in active_sorted if "," in i.name or " and " in i.name.lower()]
+    _working_text = msg_text
+    for item in _multi_part_items:
+        name_lower = item.name.lower()
+        working_lower = _working_text.lower()
+        idx = working_lower.find(name_lower)
+        if idx == -1:
+            continue
+        before_ok = idx == 0 or not working_lower[idx - 1].isalpha()
+        end = idx + len(name_lower)
+        after_ok = end == len(working_lower) or not working_lower[end].isalpha()
+        if not (before_ok and after_ok):
+            continue
+        qty = _parse_quantity_before(working_lower, idx)
+        modifier = _extract_modifier_from_suffix(working_lower[end:])
+        all_matched.append((item, qty, modifier))
+        consumed_names.add(name_lower)
+        # Excise the matched span (spaces, so offsets of anything else in
+        # the string are unaffected) so the chunk pass below can never
+        # re-match fragments of this combo's own name.
+        _working_text = _working_text[:idx] + (" " * (end - idx)) + _working_text[end:]
+
+    # Split on natural item separators
+    chunks = _re.split(r"\band\b|\balso\b|,", _working_text, flags=_re.I)
+
     for chunk in chunks:
         chunk_matches = _extract_items_from_chunk(chunk, active_sorted, consumed_names)
         if chunk_matches:
@@ -2939,6 +3394,54 @@ async def _handle_with_llm(
                     f"Got it ✅ {_rev_target['name']} will include {_rev_word}.\n\n{confirm_msg}",
                     False, None, None, None,
                 )
+
+    # ── Deterministic quantity correction (BO-000001: "make it 3 Buddies
+    #    instead of 1") ──────────────────────────────────────────────────────
+    # Fires for any intent (including None/UNKNOWN -- this exact phrasing has
+    # none of ORDER_ADD's trigger words, so intent_router never classifies it
+    # as an order intent at all). Must run before the LLM so a chitchat-style
+    # non-mutating reply can never be the only thing that happens for a
+    # correction this unambiguous. See _detect_quantity_correction's own
+    # docstring for exactly how conservative the match is.
+    _qty_cart = state_machine.get_cart(session)
+    if _qty_cart:
+        _qty_fix = (
+            _detect_quantity_correction(norm_text, _qty_cart, items)
+            or _detect_named_quantity_set(norm_text, _qty_cart, items)
+        )
+        if _qty_fix:
+            _qty_target, _qty_new = _qty_fix
+            _live_cart = state_machine.get_cart(session)
+            for _ci in _live_cart:
+                if _ci is _qty_target or (
+                    _ci["menu_item_id"] == _qty_target["menu_item_id"]
+                    and _ci.get("selected_options") == _qty_target.get("selected_options")
+                    and _ci.get("add_ons") == _qty_target.get("add_ons")
+                    and _ci.get("special_instructions") == _qty_target.get("special_instructions")
+                    and _ci["quantity"] == _qty_target["quantity"]
+                ):
+                    _ci["quantity"] = _qty_new
+                    _ci["line_total_cents"] = _ci["price_cents"] * _qty_new
+                    break
+            state_machine.set_cart(session, _live_cart)
+            import copy as _copy
+            state_machine.set_context(session, "confirmed_cart", _copy.deepcopy(_live_cart))
+            logger.warning(
+                "DET_QUANTITY_CORRECTION: %r quantity -> %d, session_id=%s",
+                _qty_target["name"], _qty_new, session.id,
+            )
+            order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
+            total = state_machine.cart_total_cents(session)
+            summary = state_machine.cart_summary_text(session, business.currency)
+            confirm_msg = responses.ask_confirmation_response(
+                summary, total, 0, order_mode, business.currency
+            )
+            if order_mode == "DELIVERY":
+                confirm_msg += "\n_Delivery fee will be confirmed by our team._"
+            return (
+                f"Updated ✅ {_qty_new}x {_qty_target['name']}.\n\n{confirm_msg}",
+                False, None, None, None,
+            )
 
     # ── Quantity-modifier split ("1 no tomato" with 2x CSB → split cart item) ──
     # Handles multi-message modifier assignment:
@@ -3612,6 +4115,33 @@ async def _handle_with_llm(
             session.id,
             parsed.message[:80],
         )
+        # BUG: a quantity/item correction phrased without one of ORDER_ADD's
+        # trigger words ("add"/"plus"/"another"/"extra") — e.g. "no, make the
+        # buddy 3 not 1" — doesn't match any deterministic intent pattern, so
+        # intent_router.match_intent() returns None/UNKNOWN. That's OUTSIDE
+        # the _ORDER_INTENTS set the earlier guard (above) checks, so this
+        # catch-all is the ONLY place such a message is ever seen — and until
+        # now it only logged, never blocked, letting the LLM's prose "answer"
+        # (e.g. a hallucinated new total) reach the customer even though the
+        # cart above was never actually mutated. Reuse the exact same
+        # _has_menu_items signal the earlier guard uses: only block when the
+        # message plausibly references a real menu item (so genuine
+        # clarifying chitchat, e.g. "what spice levels do you have?", still
+        # passes through unchanged).
+        if _extract_items_from_message(msg_text, items):
+            logger.warning(
+                "CHITCHAT_CART_MUTATION_GUARD: blocking unmutated chitchat that "
+                "references a menu item while a cart is active. session_id=%s",
+                session.id,
+            )
+            return (
+                "Sorry, I didn't quite catch that change. Could you tell me exactly "
+                "which item and the new quantity? 😊",
+                True,
+                llm_response.total_tokens,
+                llm_response.cost_cents,
+                llm_response.provider,
+            )
 
     # ── Proposed-order capture ───────────────────────────────────────────────
     # When the LLM proposes items in a chitchat/ask_options message without
@@ -3634,6 +4164,34 @@ async def _handle_with_llm(
         _prop_msg = parsed.message or ""
         _prop_extracted = _extract_items_from_message(_prop_msg, items)
         if _prop_extracted:
+            # BO-000004 guard: the LLM's own text can describe more (or
+            # different) items than _extract_items_from_message actually
+            # resolved from it -- e.g. a combo explained in terms of its
+            # already-included chips/drink, where only the included-component
+            # words happen to match real catalog names and the combo itself
+            # (and any invented item name) is silently dropped. If the LLM
+            # stated a total that doesn't match the sum of what was actually
+            # extracted, the proposal is unreliable: never save it or show
+            # the mismatched text -- ask the customer to restate the order
+            # instead of silently offering to commit the wrong items.
+            _prop_sum_cents = sum(
+                _pi.price_cents * _qty for _pi, _qty, _mod in _prop_extracted
+            )
+            _stated_total_cents = _parse_stated_total_cents(_prop_msg)
+            if _stated_total_cents is not None and abs(_stated_total_cents - _prop_sum_cents) > 1:
+                logger.warning(
+                    "PROPOSED_ITEMS_TOTAL_MISMATCH: stated=%d extracted_sum=%d "
+                    "extracted_count=%d -- refusing to save/show. session_id=%s",
+                    _stated_total_cents, _prop_sum_cents, len(_prop_extracted), session.id,
+                )
+                return (
+                    "Sorry, I couldn't confirm that order accurately. Could you "
+                    "tell me exactly what you'd like, one item at a time? \U0001F60A",
+                    True,
+                    llm_response.total_tokens,
+                    llm_response.cost_cents,
+                    llm_response.provider,
+                )
             import copy as _copy_prop
             state_machine.set_context(session, "proposed_items", [
                 {
@@ -4671,6 +5229,50 @@ async def _load_menu(
         .order_by(MenuItem.sort_order)
     )
     return list(cats_result.scalars().all()), list(items_result.scalars().all())
+
+
+async def _load_business_menu_pages(db: AsyncSession, business_id: uuid.UUID) -> list[dict]:
+    """
+    Active multi-page menu-image pages for a business (shared.models.
+    menu_image.BusinessMenuImage, migration 0058), resolved to displayable
+    URLs the same way routes_menu_images.py does for the dashboard.
+
+    Returns [] for every business that hasn't adopted this feature (the
+    common case) -- callers must treat that as "fall back to the single
+    businesses.menu_image_url field, exactly as before this existed",
+    never as an error. Read-only: never touches the cart or any order
+    state, consistent with every other *_load_* helper in this module.
+    """
+    from backend.app.api.v1.routes_assets import asset_public_url
+    from shared.models.asset import Asset
+    from shared.models.menu_image import BusinessMenuImage
+
+    rows_result = await db.execute(
+        select(BusinessMenuImage)
+        .where(
+            BusinessMenuImage.business_id == business_id,
+            BusinessMenuImage.is_active.is_(True),
+        )
+        .order_by(BusinessMenuImage.sort_order, BusinessMenuImage.created_at)
+    )
+    rows = list(rows_result.scalars().all())
+    if not rows:
+        return []
+
+    assets_result = await db.execute(
+        select(Asset).where(
+            Asset.id.in_([r.asset_id for r in rows]), Asset.business_id == business_id
+        )
+    )
+    assets_by_id = {a.id: a for a in assets_result.scalars().all()}
+
+    pages = []
+    for r in rows:
+        asset = assets_by_id.get(r.asset_id)
+        if asset is None:
+            continue  # orphaned reference -- skip rather than send a broken link
+        pages.append({"name": r.name, "image_url": asset_public_url(asset.storage_path)})
+    return pages
 
 
 async def _load_specials(db: AsyncSession, business_id: uuid.UUID) -> list[Special]:

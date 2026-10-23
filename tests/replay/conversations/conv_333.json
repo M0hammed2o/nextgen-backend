@@ -1,0 +1,81 @@
+{
+  "id": "conv_333",
+  "title": "An image request mid-order (active cart, CONFIRMING_ORDER) never alters the cart and the order still completes correctly",
+  "category": "cart_mutation",
+  "tags": ["menu_images", "deterministic", "regression_baseline"],
+
+  "notes": "Explicit requirement: 'Ensure image requests never interfere with orders.' Customer builds a real cart, then asks to see a product photo and a named page mid-order, then confirms -- the cart, confirmed_cart, and final persisted order must be exactly what was built before the image requests, unaffected by either of them.",
+
+  "menu_pages": [
+    {"name": "Secret Creations", "image_url": "https://example.test/assets/secret-creations.jpg"}
+  ],
+
+  "turns": [
+    {
+      "message": "I'll have a coke and 2 chips",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Coca-Cola (330ml)", "quantity": 1},
+          {"name": "Chips", "quantity": 2}
+        ]
+      }
+    },
+    {
+      "message": "show me the Jawbreaker",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Coca-Cola (330ml)", "quantity": 1},
+          {"name": "Chips", "quantity": 2}
+        ],
+        "confirmed_cart": [
+          {"name": "Coca-Cola (330ml)", "quantity": 1},
+          {"name": "Chips", "quantity": 2}
+        ],
+        "response_contains": ["Jawbreaker"]
+      }
+    },
+    {
+      "message": "show secret creations",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Coca-Cola (330ml)", "quantity": 1},
+          {"name": "Chips", "quantity": 2}
+        ],
+        "response_contains": ["Secret Creations"]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Bongani",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0836667777",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "skip",
+      "expect": {"state": "ORDER_PLACED", "cart": []}
+    }
+  ],
+  "final_order": {
+    "items": [
+      {"name": "Coca-Cola (330ml)", "quantity": 1},
+      {"name": "Chips", "quantity": 2}
+    ],
+    "subtotal_cents": 9000,
+    "total_cents": 9000,
+    "order_mode": "PICKUP",
+    "customer_name": "Bongani"
+  }
+}

@@ -258,6 +258,7 @@ class ReplayRunner:
         customer: FakeCustomer,
         menu_items: list[FakeMenuItem],
         specials: list | None = None,
+        menu_pages: list[dict] | None = None,
     ) -> None:
         self.conv = conv
         self.business = business
@@ -266,6 +267,11 @@ class ReplayRunner:
         # Defaults to [] — identical to the previously-hardcoded behavior, so
         # every pre-existing conversation JSON that never set this is unaffected.
         self.specials = specials if specials is not None else []
+        # Multi-page menu-image pages (shared.models.menu_image.
+        # BusinessMenuImage, migration 0058) -- [] for every pre-existing
+        # conversation, identical to a business that never adopted the
+        # feature. See test_replay_suite.py's "menu_pages" conv-JSON key.
+        self.menu_pages = menu_pages if menu_pages is not None else []
 
         self.session = ReplaySession()
         self.scripted_llm = ScriptedLLMProvider()
@@ -506,8 +512,10 @@ class ReplayRunner:
                    return_value=_add_ons_map):
           with patch("backend.app.bot.pipeline._load_menu",
                    return_value=([], self.menu_items)):
-            with patch("backend.app.bot.pipeline._load_specials",
-                       return_value=self.specials):
+            with patch("backend.app.bot.pipeline._load_business_menu_pages",
+                       return_value=self.menu_pages):
+              with patch("backend.app.bot.pipeline._load_specials",
+                         return_value=self.specials):
                 with patch("backend.app.bot.pipeline._load_conversation_history",
                            return_value=[]):
                     with patch("backend.app.bot.pipeline.usage_tracker.check_daily_limit"):

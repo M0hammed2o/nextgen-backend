@@ -1,0 +1,25 @@
+{
+  "id": "conv_330",
+  "title": "WhatsApp image request: a named menu-image page (Secret Creations) sends that page's photo, never the whole menu",
+  "category": "pricing",
+  "tags": ["menu_images", "deterministic", "regression_baseline"],
+
+  "notes": "'show secret creations' matches this business's own real, active business_menu_images page name (injected via the 'menu_pages' conv-JSON key, not hardcoded anywhere in the shared intent router). Proves a single specific page is sent -- not every page at once ('avoid unnecessary image messages') -- and the cart stays untouched.",
+
+  "menu_pages": [
+    {"name": "Secret Creations", "image_url": "https://example.test/assets/secret-creations.jpg"},
+    {"name": "Regular Menu — Page 2", "image_url": "https://example.test/assets/menu-page-2.jpg"}
+  ],
+
+  "turns": [
+    {
+      "message": "show secret creations",
+      "expect": {
+        "state": "BROWSING_MENU",
+        "cart": [],
+        "response_contains": ["Secret Creations"],
+        "response_not_contains": ["Page 2", "added to your order", "total"]
+      }
+    }
+  ]
+}

@@ -1,0 +1,70 @@
+{
+  "id": "conv_326",
+  "title": "BO-000001: named-item quantity correction disambiguates when multiple cart lines share the same quantity",
+  "category": "cart_mutation",
+  "tags": ["quantity_correction", "deterministic", "regression_baseline"],
+
+  "notes": "Cart has one Coca-Cola, one Smash Burger Combo, and one Chips -- all quantity 1, making the plain quantity-only disambiguation in _detect_quantity_correction ambiguous by itself. 'make the coke 3 instead of 1' names the Coke explicitly, which narrows it to exactly one cart line via the same real item-matching used everywhere else (never a guess). No 'llm' key on the correction turn -- resolved deterministically.",
+
+  "turns": [
+    {
+      "message": "I'll have a coke, a Smash Burger Combo with Still Water, and chips",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Coca-Cola (330ml)", "quantity": 1},
+          {"name": "Smash Burger Combo", "quantity": 1},
+          {"name": "Chips", "quantity": 1}
+        ]
+      }
+    },
+    {
+      "message": "make the coke 3 instead of 1",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Coca-Cola (330ml)", "quantity": 3},
+          {"name": "Smash Burger Combo", "quantity": 1},
+          {"name": "Chips", "quantity": 1}
+        ],
+        "confirmed_cart": [
+          {"name": "Coca-Cola (330ml)", "quantity": 3},
+          {"name": "Smash Burger Combo", "quantity": 1},
+          {"name": "Chips", "quantity": 1}
+        ],
+        "response_contains": ["3", "Coca-Cola"]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Katlego",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0835556666",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "skip",
+      "expect": {"state": "ORDER_PLACED", "cart": []}
+    }
+  ],
+  "final_order": {
+    "items": [
+      {"name": "Coca-Cola (330ml)", "quantity": 3},
+      {"name": "Smash Burger Combo", "quantity": 1},
+      {"name": "Chips", "quantity": 1}
+    ],
+    "subtotal_cents": 21500,
+    "total_cents": 21500,
+    "order_mode": "PICKUP",
+    "customer_name": "Katlego"
+  }
+}

@@ -1,0 +1,69 @@
+{
+  "id": "conv_319",
+  "title": "Quantity correction propagates deterministically to the real persisted order",
+  "category": "cart_mutation",
+  "tags": ["quantity_correction", "deterministic", "regression_baseline"],
+
+  "notes": "Regression for a real production bug (BO-000001): 'No the coke is going to be 3 cokes not one' has none of ORDER_ADD's trigger words (add/plus/another/extra), so intent_router returns None and the deterministic mutation guard never runs. This fixture originally proved the HAPPY PATH via a scripted LLM replace_item response. Since _detect_quantity_correction was added (pipeline.py), this exact phrasing ('going to be N ... not M') is caught deterministically before the LLM is ever called -- no 'llm' key is present below on purpose; the replay framework's own DEAD LLM SCRIPT check would fail this test if the pipeline ever fell through to the LLM again for this message. The final persisted order is unchanged from before: the mechanism is just better now, not different in outcome. See conv_320 for the companion case that still needs the LLM-hallucination guard (a phrasing this deterministic check does not confidently resolve).",
+
+  "turns": [
+    {
+      "message": "I'll have a Classic Smash Burger, Chips and a Coke",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Classic Smash Burger", "quantity": 1},
+          {"name": "Chips", "quantity": 1},
+          {"name": "Coca-Cola (330ml)", "quantity": 1}
+        ]
+      }
+    },
+    {
+      "message": "No the coke is going to be 3 cokes not one",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Classic Smash Burger", "quantity": 1},
+          {"name": "Chips", "quantity": 1},
+          {"name": "Coca-Cola (330ml)", "quantity": 3}
+        ],
+        "confirmed_cart": [
+          {"name": "Classic Smash Burger", "quantity": 1},
+          {"name": "Chips", "quantity": 1},
+          {"name": "Coca-Cola (330ml)", "quantity": 3}
+        ]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Mohammed",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0837866021",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "skip",
+      "expect": {"state": "ORDER_PLACED", "cart": []}
+    }
+  ],
+  "final_order": {
+    "items": [
+      {"name": "Classic Smash Burger", "quantity": 1},
+      {"name": "Chips", "quantity": 1},
+      {"name": "Coca-Cola (330ml)", "quantity": 3}
+    ],
+    "subtotal_cents": 17000,
+    "total_cents": 17000,
+    "order_mode": "PICKUP",
+    "customer_name": "Mohammed"
+  }
+}

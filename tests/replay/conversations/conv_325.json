@@ -1,0 +1,66 @@
+{
+  "id": "conv_325",
+  "title": "BO-000001: natural quantity correction mutates the real cart deterministically, no LLM needed",
+  "category": "cart_mutation",
+  "tags": ["quantity_correction", "deterministic", "regression_baseline"],
+
+  "notes": "The real production bug (order BO-000001): 'make it 3 Buddies instead of 1' has none of ORDER_ADD's trigger words (add/plus/another/extra), so intent_router returns None/UNKNOWN. Previously this fell through entirely to the LLM, which sometimes failed to return a cart-mutating action at all. This fixture proves the new deterministic guard (_detect_quantity_correction, pipeline.py) now resolves this exact phrasing WITHOUT any LLM call -- no 'llm' key is present on the turn below; if the pipeline ever fell through to the LLM for this message, the replay framework's own DEAD LLM SCRIPT / unscripted-LLM-call integrity checks would fail this test.",
+
+  "turns": [
+    {
+      "message": "I'll have a coke and 2 chips",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Coca-Cola (330ml)", "quantity": 1},
+          {"name": "Chips", "quantity": 2}
+        ]
+      }
+    },
+    {
+      "message": "make it 3 cokes instead of 1",
+      "expect": {
+        "state": "CONFIRMING_ORDER",
+        "cart": [
+          {"name": "Coca-Cola (330ml)", "quantity": 3},
+          {"name": "Chips", "quantity": 2}
+        ],
+        "confirmed_cart": [
+          {"name": "Coca-Cola (330ml)", "quantity": 3},
+          {"name": "Chips", "quantity": 2}
+        ],
+        "response_contains": ["3", "Coca-Cola"]
+      }
+    },
+    {
+      "message": "Yes",
+      "expect": {"state": "CHOOSING_ORDER_MODE"}
+    },
+    {
+      "message": "Pickup",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "Naledi",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "0834445555",
+      "expect": {"state": "COLLECTING_DETAILS"}
+    },
+    {
+      "message": "skip",
+      "expect": {"state": "ORDER_PLACED", "cart": []}
+    }
+  ],
+  "final_order": {
+    "items": [
+      {"name": "Coca-Cola (330ml)", "quantity": 3},
+      {"name": "Chips", "quantity": 2}
+    ],
+    "subtotal_cents": 13000,
+    "total_cents": 13000,
+    "order_mode": "PICKUP",
+    "customer_name": "Naledi"
+  }
+}

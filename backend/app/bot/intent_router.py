@@ -47,11 +47,23 @@ _PATTERNS: list[tuple[re.Pattern, MessageIntent]] = [
         r"today.?s.*special|weekly.*special)\b", re.I
     ), MessageIntent.SPECIALS_REQUEST),
 
-    # Menu requests — recommendation and specials phrases handled above
+    # Menu requests — recommendation and specials phrases handled above.
+    # "next page" / "more photos" added so multi-page menu-image browsing
+    # (pipeline.py's MENU_REQUEST handler) is reachable without "show me" —
+    # a customer paging through images rarely repeats that phrase each time.
+    # Deliberately kept to "show me" (not bare "show") -- broadening to
+    # bare "show" also caught "show pizzas"/"show X" category-browse
+    # phrasing that needs the LLM's nuanced handling, not a menu dump (see
+    # conv_223). Matching a business's own named special-menu pages (e.g.
+    # "show secret creations", no "me") is business-specific, dynamic data
+    # that doesn't belong in this shared, platform-wide router at all --
+    # pipeline.py's MENU_REQUEST handler checks that directly, with the
+    # business's real page names loaded, before falling through to the LLM.
     (re.compile(
         r"\b(menu|food|eat|"
         r"what\s+(do\s+you\s+(have|sell|serve)|.*(have|sell|serve))|"
-        r"what.*available|price list|show me|items|catalog|catalogue)\b", re.I
+        r"what.*available|price list|show me|items|catalog|catalogue|"
+        r"next\s+page|more\s+(photos|pictures|images))\b", re.I
     ), MessageIntent.MENU_REQUEST),
 
     # Hours

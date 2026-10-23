@@ -1,0 +1,24 @@
+{
+  "id": "conv_332",
+  "title": "Generic 'show me the menu' falls back to the first multi-page menu-image page when the single menu_image_url field is unset",
+  "category": "pricing",
+  "tags": ["menu_images", "deterministic", "regression_baseline"],
+
+  "notes": "A business with no business.menu_image_url but with business_menu_images pages adopted (Mochachos Westville's real plan: Regular Menu Page 1/2 + Secret Creations) must still get an image on a plain, unnamed 'show me the menu' request -- the first page in sort order -- not silently nothing. Never sends every page at once ('avoid unnecessary image messages').",
+
+  "menu_pages": [
+    {"name": "Regular Menu Page 1", "image_url": "https://example.test/assets/menu-page-1.jpg"},
+    {"name": "Secret Creations", "image_url": "https://example.test/assets/secret-creations.jpg"}
+  ],
+
+  "turns": [
+    {
+      "message": "show me the menu",
+      "expect": {
+        "state": "BROWSING_MENU",
+        "cart": [],
+        "response_not_contains": ["Secret Creations"]
+      }
+    }
+  ]
+}
