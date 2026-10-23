@@ -19,7 +19,7 @@ Requires TEST_DATABASE_URL (see docker-compose.test.yml / TESTING.md).
 """
 import io
 import uuid
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -353,9 +353,19 @@ async def test_full_commercial_e2e_release_gate(db, _invoicing_configured):
     assert approved_wastage.approved_by_user_id == owner.user_id
 
     # ══ Delivery CSV import (GENERIC platform — no live Uber/Mr D call) ════
+    # Root cause of a real, reproducible failure (found 2026-10-23): this
+    # date was hardcoded to a fixed calendar date ("2026-09-20"). The
+    # get_summary(period="30d") assertion below is a genuine ROLLING
+    # window relative to whenever the test actually runs -- so a fixed
+    # past date silently ages out of that window as real time passes
+    # (confirmed: 2026-09-20 is outside the 30-day window as of
+    # 2026-10-23, which is exactly why total_orders read 2, not 3, with
+    # no code change anywhere — a test-data bug, not an analytics bug).
+    # Computed relative to "now" so this can never drift again.
+    _csv_order_date = (datetime.now(timezone.utc) - timedelta(days=3)).strftime("%Y-%m-%d %H:%M")
     csv_body = (
         "Order ID,Order Date,Item,Quantity,Price\r\n"
-        f"E2E-CSV-{unique},2026-09-20 12:00,Burger,2,160.00\r\n"
+        f"E2E-CSV-{unique},{_csv_order_date},Burger,2,160.00\r\n"
     ).encode()
     upload = UploadFile(io.BytesIO(csv_body), filename="e2e_import.csv")
     commit_result = await commit_external_orders(
