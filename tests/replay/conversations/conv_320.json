@@ -4,7 +4,7 @@
   "category": "cart_mutation",
   "tags": ["llm", "quantity_correction", "chitchat", "hallucination_guard", "regression_baseline"],
 
-  "notes": "The actual production bug this guards against: a quantity correction ('No the coke is going to be 3 cokes not one') has none of ORDER_ADD's trigger words, so intent_router returns None/UNKNOWN -- outside the _ORDER_INTENTS set the earlier mutation guard checks. If the LLM then returns a non-mutating action (chitchat) with a prose 'confirmation' describing a cart state that was never actually applied, the customer used to see that fake total while the real cart (and the eventual persisted order) stayed unchanged -- exactly what was reported against the real Mochachos order BO-000001. This fixture scripts that exact failure mode and asserts the new guard (pipeline.py's catch-all chitchat block) intercepts it: the cart stays at quantity 1, and the customer is asked to restate the change rather than shown a fabricated total.",
+  "notes": "The actual production bug this guards against: a quantity correction phrased ambiguously has none of ORDER_ADD's trigger words, so intent_router returns None/UNKNOWN -- outside the _ORDER_INTENTS set the earlier mutation guard checks. If the LLM then returns a non-mutating action (chitchat) with a prose 'confirmation' describing a cart state that was never actually applied, the customer used to see that fake total while the real cart (and the eventual persisted order) stayed unchanged -- exactly what was reported against the real Mochachos order BO-000001. This fixture scripts that exact failure mode and asserts the guard (pipeline.py's catch-all chitchat block) intercepts it: the cart stays at quantity 1, and the customer is asked to restate the change rather than shown a fabricated total. Message changed from the original 'No the coke is going to be 3 cokes not one' to 'hold on, the coke amount is wrong' -- the original phrasing is now resolved deterministically before ever reaching the LLM (see conv_319, and _detect_quantity_correction in pipeline.py), so it can no longer exercise this specific guard; this fixture needs a phrasing with no quantity numbers at all (so neither new deterministic detector, which both require at least one explicit number, can match) that still names a real item (so the catch-all guard's own _extract_items_from_message check still finds something to react to), confirmed via intent_router.match_intent() to still return None/UNKNOWN, so the LLM is still reached and the guard still has something real to catch.",
 
   "turns": [
     {
@@ -19,7 +19,7 @@
       }
     },
     {
-      "message": "No the coke is going to be 3 cokes not one",
+      "message": "hold on, the coke amount is wrong",
       "llm": {
         "action": "chitchat",
         "message": "Got it! Updated to 3x Coca-Cola (330ml). Your total is now R170.00.",

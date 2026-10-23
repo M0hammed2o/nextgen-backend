@@ -1,10 +1,10 @@
 {
   "id": "conv_319",
-  "title": "Quantity correction via replace_item propagates to the real persisted order",
+  "title": "Quantity correction propagates deterministically to the real persisted order",
   "category": "cart_mutation",
-  "tags": ["llm", "quantity_correction", "replace_item", "regression_baseline"],
+  "tags": ["quantity_correction", "deterministic", "regression_baseline"],
 
-  "notes": "Regression for a real production bug: 'No the coke is going to be 3 cokes not one' has none of ORDER_ADD's trigger words (add/plus/another/extra), so intent_router returns None and the deterministic mutation guard never runs. This fixture proves the HAPPY PATH -- when the LLM correctly returns replace_item for this phrasing, the quantity really does propagate through the cart, the re-lock-before-checkout logic, and into the final persisted order. See conv_231 for the companion regression proving the guard added for the hallucination case.",
+  "notes": "Regression for a real production bug (BO-000001): 'No the coke is going to be 3 cokes not one' has none of ORDER_ADD's trigger words (add/plus/another/extra), so intent_router returns None and the deterministic mutation guard never runs. This fixture originally proved the HAPPY PATH via a scripted LLM replace_item response. Since _detect_quantity_correction was added (pipeline.py), this exact phrasing ('going to be N ... not M') is caught deterministically before the LLM is ever called -- no 'llm' key is present below on purpose; the replay framework's own DEAD LLM SCRIPT check would fail this test if the pipeline ever fell through to the LLM again for this message. The final persisted order is unchanged from before: the mechanism is just better now, not different in outcome. See conv_320 for the companion case that still needs the LLM-hallucination guard (a phrasing this deterministic check does not confidently resolve).",
 
   "turns": [
     {
@@ -20,13 +20,6 @@
     },
     {
       "message": "No the coke is going to be 3 cokes not one",
-      "llm": {
-        "action": "replace_item",
-        "message": "Updated — 3x Coca-Cola (330ml). Your total is now R170.00.",
-        "items": [
-          {"remove": "Coca-Cola (330ml)", "add": "Coca-Cola (330ml)", "quantity": 3}
-        ]
-      },
       "expect": {
         "state": "CONFIRMING_ORDER",
         "cart": [
