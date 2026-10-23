@@ -3612,6 +3612,33 @@ async def _handle_with_llm(
             session.id,
             parsed.message[:80],
         )
+        # BUG: a quantity/item correction phrased without one of ORDER_ADD's
+        # trigger words ("add"/"plus"/"another"/"extra") — e.g. "no, make the
+        # buddy 3 not 1" — doesn't match any deterministic intent pattern, so
+        # intent_router.match_intent() returns None/UNKNOWN. That's OUTSIDE
+        # the _ORDER_INTENTS set the earlier guard (above) checks, so this
+        # catch-all is the ONLY place such a message is ever seen — and until
+        # now it only logged, never blocked, letting the LLM's prose "answer"
+        # (e.g. a hallucinated new total) reach the customer even though the
+        # cart above was never actually mutated. Reuse the exact same
+        # _has_menu_items signal the earlier guard uses: only block when the
+        # message plausibly references a real menu item (so genuine
+        # clarifying chitchat, e.g. "what spice levels do you have?", still
+        # passes through unchanged).
+        if _extract_items_from_message(msg_text, items):
+            logger.warning(
+                "CHITCHAT_CART_MUTATION_GUARD: blocking unmutated chitchat that "
+                "references a menu item while a cart is active. session_id=%s",
+                session.id,
+            )
+            return (
+                "Sorry, I didn't quite catch that change. Could you tell me exactly "
+                "which item and the new quantity? 😊",
+                True,
+                llm_response.total_tokens,
+                llm_response.cost_cents,
+                llm_response.provider,
+            )
 
     # ── Proposed-order capture ───────────────────────────────────────────────
     # When the LLM proposes items in a chitchat/ask_options message without
