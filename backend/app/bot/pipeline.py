@@ -2188,6 +2188,7 @@ def _detect_modifier_reversal(
 def _detect_quantity_correction(
     msg_text: str,
     cart: list[dict],
+    menu_items: list | None = None,
 ) -> tuple[dict, int] | None:
     """
     Detect a natural-language quantity correction for an item ALREADY in the
@@ -2201,9 +2202,17 @@ def _detect_quantity_correction(
     is the real safety net: it means this never guesses which item or
     quantity was meant -- if the numbers don't line up with reality, it
     falls straight through to the existing (LLM / guard) handling, same as
-    before this function existed. No item-name matching is attempted here on
-    purpose -- requiring an exact quantity match on a real cart line is a
-    stronger, simpler signal than fuzzy name matching would be.
+    before this function existed.
+
+    When MORE than one cart line shares that "old" quantity (e.g. one Coke,
+    one burger, one chips, all quantity 1), this is ambiguous by quantity
+    alone -- but if the message also clearly NAMES one of those items (via
+    the exact same real _extract_items_from_message matching used
+    everywhere else, never a bespoke heuristic), that narrows it safely.
+    `menu_items` is optional specifically so quantity-only disambiguation
+    still works even when a caller has no catalog handy; passing it enables
+    the name-based narrowing. Still returns None, never guesses, if the
+    name match doesn't narrow it to exactly one line.
 
     Returns (cart_item, new_quantity) or None.
 
@@ -2212,10 +2221,15 @@ def _detect_quantity_correction(
       "no the coke is going to be 3 cokes not one"  -> (that line, 3)
       "actually make that 2 not 1"                   -> (that line, 2)
 
+    Examples that match only with menu_items supplied (cart has one Coke,
+    one burger, one chips -- all quantity 1):
+      "make the coke 3 instead of 1"  -> (the Coke line, 3) -- name narrows it
+
     Examples that should NOT match:
       "I'll have 3 burgers"               -> None (no correction-signal phrase)
       "make it 3 instead of 1" when every cart line's quantity is 2 -> None
-      "make it 3 instead of 1" when TWO cart lines both have quantity 1 -> None (ambiguous)
+      "make it 3 instead of 1" with two ambiguous lines and no name in the
+        message, or a name that matches more than one of them -> None
     """
     import re as _re
     if not cart:
@@ -2251,10 +2265,74 @@ def _detect_quantity_correction(
         return None
 
     candidates = [ci for ci in cart if ci["quantity"] == old_qty]
-    if len(candidates) != 1:
+    if len(candidates) == 1:
+        return candidates[0], new_qty
+    if len(candidates) > 1 and menu_items:
+        named = _extract_items_from_message(msg_text, menu_items)
+        named_ids = {str(mi.id) for mi, _q, _m in named}
+        named_candidates = [ci for ci in candidates if ci["menu_item_id"] in named_ids]
+        if len(named_candidates) == 1:
+            return named_candidates[0], new_qty
+    return None
+
+
+def _detect_named_quantity_set(
+    msg_text: str,
+    cart: list[dict],
+    menu_items: list,
+) -> tuple[dict, int] | None:
+    """
+    Detect "make the Coke three" / "change the coke to 3" / "set the burger
+    to 2" -- a correction verb naming an item already in the cart, with a
+    single new quantity and no "instead of X" needed, because naming the
+    item IS the disambiguating signal.
+
+    Deliberately conservative, same philosophy as _detect_quantity_correction:
+    requires (a) a correction verb (make/change/set/update) and the absence
+    of addition-signal words (add/also/another/extra/plus) so this can never
+    hijack a genuine new order, (b) the named item resolves, via the same
+    real _extract_items_from_message matching used everywhere else, to
+    EXACTLY ONE real menu item, (c) that item appears as EXACTLY ONE cart
+    line, (d) exactly one quantity number in the whole message. Any
+    ambiguity on any of these returns None -- never guesses.
+
+    Returns (cart_item, new_quantity) or None.
+    """
+    import re as _re
+    if not cart or not menu_items:
         return None
 
-    return candidates[0], new_qty
+    msg_lower = msg_text.strip().lower()
+
+    if not _re.search(r"\b(make|change|set|update)\b", msg_lower):
+        return None
+    if _re.search(r"\b(add|also|another|extra|plus)\b", msg_lower):
+        return None
+
+    _WORD_NUMS = {
+        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+        "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    }
+    _numbers = list(_re.finditer(
+        r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b", msg_lower, _re.I
+    ))
+    if len(_numbers) != 1:
+        return None
+    tok = _numbers[0].group(1).lower()
+    new_qty = int(tok) if tok.isdigit() else _WORD_NUMS.get(tok, 0)
+    if new_qty <= 0 or new_qty > 20:
+        return None
+
+    named = _extract_items_from_message(msg_text, menu_items)
+    if len(named) != 1:
+        return None
+    target_item = named[0][0]
+
+    matching_lines = [ci for ci in cart if ci["menu_item_id"] == str(target_item.id)]
+    if len(matching_lines) != 1:
+        return None
+
+    return matching_lines[0], new_qty
 
 
 def _parse_quantity_before(msg_lower: str, item_start: int) -> int:
@@ -3085,7 +3163,10 @@ async def _handle_with_llm(
     # docstring for exactly how conservative the match is.
     _qty_cart = state_machine.get_cart(session)
     if _qty_cart:
-        _qty_fix = _detect_quantity_correction(norm_text, _qty_cart)
+        _qty_fix = (
+            _detect_quantity_correction(norm_text, _qty_cart, items)
+            or _detect_named_quantity_set(norm_text, _qty_cart, items)
+        )
         if _qty_fix:
             _qty_target, _qty_new = _qty_fix
             _live_cart = state_machine.get_cart(session)
