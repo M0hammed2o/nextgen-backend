@@ -1,0 +1,20 @@
+{
+  "id": "conv_328",
+  "title": "WhatsApp image request: a named product with a real photo sends the image and accurate info, never touches the cart",
+  "category": "pricing",
+  "tags": ["menu_images", "deterministic", "regression_baseline"],
+
+  "notes": "'show me the Jawbreaker' names a real product deterministically (same _extract_items_from_message matching used everywhere else). No 'llm' key -- resolved without any LLM call. Cart must stay empty: this is a read-only information/photo request, never an order action.",
+
+  "turns": [
+    {
+      "message": "show me the Jawbreaker",
+      "expect": {
+        "state": "BROWSING_MENU",
+        "cart": [],
+        "response_contains": ["Jawbreaker"],
+        "response_not_contains": ["added to your order", "total"]
+      }
+    }
+  ]
+}

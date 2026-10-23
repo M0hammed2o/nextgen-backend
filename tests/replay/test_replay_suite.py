@@ -76,11 +76,18 @@ async def test_conversation_replay(conversation: dict) -> None:
     # pre-existing conversation JSON, which has no "specials" key).
     specials = [FakeSpecial(**spec) for spec in conversation.get("specials", [])]
 
+    # Allow per-conversation multi-page menu-image pages; default to none
+    # (matches every pre-existing conversation JSON, which has no
+    # "menu_pages" key -- identical to a business that never adopted the
+    # feature). Each entry: {"name": "...", "image_url": "..."}.
+    menu_pages = conversation.get("menu_pages", [])
+
     runner = ReplayRunner(
         conv=conversation,
         business=business,
         customer=customer,
         menu_items=menu_items,
         specials=specials,
+        menu_pages=menu_pages,
     )
     await runner.run()

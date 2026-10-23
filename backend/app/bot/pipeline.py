@@ -396,6 +396,163 @@ async def _process(
         )
 
 
+async def _handle_image_request(
+    db: AsyncSession,
+    business: Business,
+    customer: Customer,
+    session,
+    norm_text: str,
+    *,
+    wants_next_page: bool,
+    has_show_signal: bool,
+) -> tuple[str, bool, int | None, int | None, str | None] | None:
+    """
+    Handle a specific image/photo request: a named product ("show me the
+    Jawbreaker"), a named menu-image page ("show secret creations"), or
+    paging through several ("next page"). Returns None when nothing here
+    applies, so the caller falls through to normal intent-based handling
+    unchanged -- this function never partially acts and never touches the
+    cart; every branch either fully replies and returns, or returns None.
+
+    A business with no business_menu_images rows (the common case) and no
+    uniquely-named product match in the message always returns None here.
+    """
+    categories, items = await _load_menu(db, business.id)
+    menu_pages = await _load_business_menu_pages(db, business.id)
+
+    # Same browsing-state transition as the generic MENU_REQUEST handler —
+    # don't pull a customer out of an active order to show them a photo.
+    # Applied only right before an actual match is returned below (never
+    # unconditionally here) -- a show-signal word with no matching product
+    # or page must fall through to normal handling with the session state
+    # completely untouched, not leave a stray transition behind.
+    _order_active_states = {
+        ConversationState.BUILDING_CART.value,
+        ConversationState.CONFIRMING_ORDER.value,
+        ConversationState.COLLECTING_DETAILS.value,
+    }
+
+    def _browse_transition() -> None:
+        if session.state not in _order_active_states:
+            state_machine.transition_state(session, ConversationState.BROWSING_MENU.value)
+
+    # 1) A specific real product named in the message — exactly the same
+    #    matching used everywhere else, never a bespoke heuristic. Only
+    #    acts when it resolves to EXACTLY one real item, so an ambiguous
+    #    mention returns None (let normal handling take it) instead of
+    #    guessing. Requires the show/photo signal (checked by the caller)
+    #    so "I'll have a Jawbreaker" is never hijacked into an info reply.
+    if has_show_signal:
+        named_product_matches = _extract_items_from_message(norm_text, items)
+        if len(named_product_matches) == 1:
+            prod_item = named_product_matches[0][0]
+            prod_image = getattr(prod_item, "image_url", None)
+            prod_lines = [f"*{prod_item.name}* — R{prod_item.price_cents / 100:.2f}"]
+            if getattr(prod_item, "description", None):
+                prod_lines.append(prod_item.description)
+            if prod_image:
+                try:
+                    await whatsapp_sender.send_image_message(
+                        phone_number_id=business.whatsapp_phone_number_id,
+                        recipient_wa_id=customer.wa_id,
+                        image_url=prod_image,
+                        caption="\n".join(prod_lines),
+                        db=db, business=business,
+                    )
+                    logger.info(
+                        "PIPELINE_PRODUCT_IMAGE_SENT: business_id=%s, item=%r",
+                        business.id, prod_item.name,
+                    )
+                except Exception:
+                    logger.exception(
+                        "PIPELINE_PRODUCT_IMAGE_FAIL: business_id=%s, item=%r",
+                        business.id, prod_item.name,
+                    )
+            # No image on file (or the send failed) — still give accurate
+            # info by text rather than silently falling through to the
+            # unrelated full-menu dump.
+            _browse_transition()
+            return (
+                "\n".join(prod_lines) + "\n\nWant to add it to your order? 😊",
+                False, None, None, None,
+            )
+
+        # 2) A named menu-image page — matched against THIS business's own
+        #    real, active page names, never a hardcoded category in the
+        #    shared intent router.
+        named_page = next(
+            (p for p in menu_pages if p["name"].lower() in norm_text.lower()), None
+        )
+        if named_page:
+            # Track "last shown page" regardless of send success -- a
+            # synchronous failure/exception here is not proof the customer
+            # won't still see it (BUG-0147's lesson: the sync call result is
+            # not proof of delivery either way), and losing pagination state
+            # on a transient send error is worse than occasionally advancing
+            # past a page that silently failed to deliver.
+            state_machine.set_context(session, "last_shown_menu_page", named_page["name"])
+            try:
+                await whatsapp_sender.send_image_message(
+                    phone_number_id=business.whatsapp_phone_number_id,
+                    recipient_wa_id=customer.wa_id,
+                    image_url=named_page["image_url"],
+                    caption=f"Here's our {named_page['name']} 👇",
+                    db=db, business=business,
+                )
+                logger.info(
+                    "PIPELINE_PAGE_IMAGE_SENT: business_id=%s, page=%r",
+                    business.id, named_page["name"],
+                )
+            except Exception:
+                logger.exception(
+                    "PIPELINE_PAGE_IMAGE_FAIL: business_id=%s, page=%r",
+                    business.id, named_page["name"],
+                )
+            _browse_transition()
+            return (
+                f"That's our {named_page['name']} 👆 Let me know if anything "
+                f"catches your eye! 😊",
+                False, None, None, None,
+            )
+
+    # 3) Paging through multiple pages ("next page") — only meaningful once
+    #    a page has actually been shown; starts from the first page if not.
+    if wants_next_page and menu_pages:
+        last_shown = state_machine.get_context(session, "last_shown_menu_page")
+        names = [p["name"] for p in menu_pages]
+        next_idx = (names.index(last_shown) + 1) if last_shown in names else 0
+        if next_idx < len(menu_pages):
+            next_page = menu_pages[next_idx]
+            # Same reasoning as the named-page branch above: track the
+            # advance regardless of send success.
+            state_machine.set_context(session, "last_shown_menu_page", next_page["name"])
+            try:
+                await whatsapp_sender.send_image_message(
+                    phone_number_id=business.whatsapp_phone_number_id,
+                    recipient_wa_id=customer.wa_id,
+                    image_url=next_page["image_url"],
+                    caption=f"{next_page['name']} 👇",
+                    db=db, business=business,
+                )
+            except Exception:
+                logger.exception(
+                    "PIPELINE_NEXT_PAGE_IMAGE_FAIL: business_id=%s, page=%r",
+                    business.id, next_page["name"],
+                )
+            more_hint = (
+                " Say \"next page\" for more! 😊" if next_idx + 1 < len(menu_pages) else ""
+            )
+            _browse_transition()
+            return (f"{next_page['name']} 👆{more_hint}", False, None, None, None)
+        _browse_transition()
+        return (
+            "That's the last page — let me know what you'd like to order! 😊",
+            False, None, None, None,
+        )
+
+    return None
+
+
 async def _handle_message(
     db: AsyncSession,
     business: Business,
@@ -421,6 +578,40 @@ async def _handle_message(
         current_state,
         msg_text[:80],
     )
+
+    # ── Specific image requests: a named product, a named menu-image page
+    #    (e.g. "Secret Creations"), or paging through several — "show me
+    #    the Jawbreaker" / "show secret creations" / "next page". Runs
+    #    regardless of classified intent (mirrors the quantity-correction
+    #    detectors below) because a business's own real page names are
+    #    dynamic data the shared, platform-wide intent_router.py cannot see
+    #    at all -- gated on an explicit show/photo/picture/image signal
+    #    word (or the specific "next page" phrase) so this can never hijack
+    #    a genuine order ("I'll have a Jawbreaker" has no such signal word
+    #    and flows through normal ordering unchanged). Read-only: never
+    #    touches the cart, and never sends more than one image per
+    #    request. Excluded while the customer is mid-checkout providing
+    #    details, where free text means something else entirely.
+    _img_req_states = {
+        ConversationState.COLLECTING_DETAILS.value,
+        ConversationState.CHOOSING_ORDER_MODE.value,
+    }
+    if current_state not in _img_req_states:
+        import re as _re_imgreq
+        _norm_lower_imgreq = norm_text.lower()
+        _wants_next_page = bool(_re_imgreq.search(
+            r"\bnext\s+page\b|\bmore\s+(photos|pictures|images)\b", _norm_lower_imgreq
+        ))
+        _has_show_signal = bool(_re_imgreq.search(
+            r"\b(show|photo|picture|pic|image)\b", _norm_lower_imgreq
+        ))
+        if _wants_next_page or _has_show_signal:
+            _img_result = await _handle_image_request(
+                db, business, customer, session, norm_text,
+                wants_next_page=_wants_next_page, has_show_signal=_has_show_signal,
+            )
+            if _img_result is not None:
+                return _img_result
 
     # ── Template responses (no LLM needed) ───────────────────────────────
 
@@ -4987,6 +5178,50 @@ async def _load_menu(
         .order_by(MenuItem.sort_order)
     )
     return list(cats_result.scalars().all()), list(items_result.scalars().all())
+
+
+async def _load_business_menu_pages(db: AsyncSession, business_id: uuid.UUID) -> list[dict]:
+    """
+    Active multi-page menu-image pages for a business (shared.models.
+    menu_image.BusinessMenuImage, migration 0058), resolved to displayable
+    URLs the same way routes_menu_images.py does for the dashboard.
+
+    Returns [] for every business that hasn't adopted this feature (the
+    common case) -- callers must treat that as "fall back to the single
+    businesses.menu_image_url field, exactly as before this existed",
+    never as an error. Read-only: never touches the cart or any order
+    state, consistent with every other *_load_* helper in this module.
+    """
+    from backend.app.api.v1.routes_assets import asset_public_url
+    from shared.models.asset import Asset
+    from shared.models.menu_image import BusinessMenuImage
+
+    rows_result = await db.execute(
+        select(BusinessMenuImage)
+        .where(
+            BusinessMenuImage.business_id == business_id,
+            BusinessMenuImage.is_active.is_(True),
+        )
+        .order_by(BusinessMenuImage.sort_order, BusinessMenuImage.created_at)
+    )
+    rows = list(rows_result.scalars().all())
+    if not rows:
+        return []
+
+    assets_result = await db.execute(
+        select(Asset).where(
+            Asset.id.in_([r.asset_id for r in rows]), Asset.business_id == business_id
+        )
+    )
+    assets_by_id = {a.id: a for a in assets_result.scalars().all()}
+
+    pages = []
+    for r in rows:
+        asset = assets_by_id.get(r.asset_id)
+        if asset is None:
+            continue  # orphaned reference -- skip rather than send a broken link
+        pages.append({"name": r.name, "image_url": asset_public_url(asset.storage_path)})
+    return pages
 
 
 async def _load_specials(db: AsyncSession, business_id: uuid.UUID) -> list[Special]:

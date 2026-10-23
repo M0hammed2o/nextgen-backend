@@ -1,0 +1,20 @@
+{
+  "id": "conv_329",
+  "title": "WhatsApp image request: an ordinary product with no photo on file replies with accurate text, not a broken image",
+  "category": "pricing",
+  "tags": ["menu_images", "deterministic", "regression_baseline"],
+
+  "notes": "Same request path as conv_328 ('show me the Jawbreaker'), proving item 3's requirement that the same image-request capability works for ordinary products too -- 'The Nightcap' has no image_url on file, so this must degrade to an accurate text reply (name, price, description) rather than attempting to send a missing/broken image or falling through to the unrelated full-menu dump.",
+
+  "turns": [
+    {
+      "message": "show me the Nightcap",
+      "expect": {
+        "state": "BROWSING_MENU",
+        "cart": [],
+        "response_contains": ["Nightcap", "140.00"],
+        "response_not_contains": ["added to your order", "total"]
+      }
+    }
+  ]
+}

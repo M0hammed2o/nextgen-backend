@@ -97,6 +97,8 @@ class FakeMenuItem:
         category_name: str = "Burgers",
         options_json: dict | None = None,
         add_ons: list[dict] | None = None,
+        description: str | None = None,
+        image_url: str | None = None,
     ):
         self.id = uuid.uuid4()
         self.name = name
@@ -106,7 +108,11 @@ class FakeMenuItem:
         self.options_json = options_json or {}
         self.category_id = None
         self.sort_order = 0
-        self.description = None
+        self.description = description
+        # image_url: MenuItem.image_url is a stored column, resolved once at
+        # write time from image_asset_id (routes_menu.py::_resolve_item_image)
+        # -- never re-derived live, so the fake just needs the plain string.
+        self.image_url = image_url
         # Phase 8: paid add-ons available on this item
         self.add_ons = add_ons or []
 
@@ -274,6 +280,21 @@ SA_MENU: list[FakeMenuItem] = [
     # (burger, chips, drink) exist only in descriptive text, never as
     # separate cart lines. See _COMBO_DRINK_CHOICE_OPTIONS above.
     FakeMenuItem("Smash Burger Combo", 12000, options_json=_COMBO_DRINK_CHOICE_OPTIONS),
+    # Secret-menu-style items with a real image_url — added-only, for the
+    # WhatsApp image-request replay suite (conv_328+). "The Jawbreaker"
+    # matches the real Mochachos Secret Creations product name used
+    # throughout this feature's design discussion. "The Nightcap" has no
+    # image on purpose, to prove the same request path degrades to an
+    # accurate text-only reply rather than a broken/missing image.
+    FakeMenuItem(
+        "The Jawbreaker", 26000, category_name="Secret Creations",
+        description="Two beef patties, double cheese, jalapeños and our secret sauce.",
+        image_url="https://example.test/assets/the-jawbreaker.jpg",
+    ),
+    FakeMenuItem(
+        "The Nightcap", 14000, category_name="Secret Creations",
+        description="A late-night favourite — ask your server for details.",
+    ),
 ]
 
 # Quick lookup: name → FakeMenuItem
