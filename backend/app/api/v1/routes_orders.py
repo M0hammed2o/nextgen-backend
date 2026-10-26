@@ -24,7 +24,13 @@ from backend.app.receipts.whatsapp_receipt import (
     send_digital_receipt,
 )
 from backend.app.utils.phone import normalize_sa_mobile
-from shared.enums import ORDER_STATUS_TRANSITIONS, AuditScope, OrderSource, OrderStatus
+from shared.enums import (
+    EXTERNAL_ORDER_SOURCES,
+    ORDER_STATUS_TRANSITIONS,
+    AuditScope,
+    OrderSource,
+    OrderStatus,
+)
 from backend.app.payments.registry import get_provider
 from shared.models.audit import AuditEvent
 from shared.models.business import Business
@@ -1017,6 +1023,15 @@ async def update_payment_status(
     if not order:
         raise NotFoundError("Order", str(order_id))
 
+    if order.source in EXTERNAL_ORDER_SOURCES:
+        raise AppError(
+            "EXTERNAL_ORDER_PAYMENT_LOCKED",
+            "This order's payment was collected by the delivery platform, not this "
+            "restaurant — its payment status/method can't be edited here. Contact "
+            "the platform (Uber Eats/Mr D) for payment disputes on marketplace orders.",
+            422,
+        )
+
     new_status = body.payment_status
     old_payment_status = order.payment_status
 
@@ -1209,6 +1224,15 @@ async def refund_order_payment(
     order = result.scalar_one_or_none()
     if not order:
         raise NotFoundError("Order", str(order_id))
+
+    if order.source in EXTERNAL_ORDER_SOURCES:
+        raise AppError(
+            "EXTERNAL_ORDER_PAYMENT_LOCKED",
+            "This order's payment was collected by the delivery platform, not this "
+            "restaurant's own payment provider — it can't be refunded here. Refunds "
+            "on marketplace orders go through the platform (Uber Eats/Mr D) directly.",
+            422,
+        )
 
     if body.confirm_manual:
         if order.payment_status in ("REFUNDED", "PARTIALLY_REFUNDED"):
