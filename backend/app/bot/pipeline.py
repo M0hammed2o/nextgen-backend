@@ -1718,6 +1718,14 @@ _ITEM_ALIASES: dict[str, str] = {
     "sprite": "sprite",      # matches "Sprite (330ml)", "Sprite (500ml)", etc.
     "fanta":  "fanta",       # future-proof
     "wings":  "wings",       # matches "Wings (6 pcs)", "Wings (12 pcs)", etc.
+    # Real Mochachos branded soft drink had no alias, unlike coke/sprite/
+    # fanta -- "a buddy" alone fell through to the LLM instead of matching
+    # deterministically. Target is "buddy 440ml", NOT bare "buddy" -- real
+    # combo names end in "...and a Buddy" (e.g. "Quarter Chicken, Beeg
+    # Chips and a Buddy"), and active_sorted tries longest names first, so
+    # a bare "buddy" target matches the combo's full name instead of the
+    # standalone drink (confirmed directly before this fix was committed).
+    "buddy":  "buddy 440ml",
 }
 
 
@@ -2590,8 +2598,18 @@ def _extract_items_from_chunk(
     # Use alias + optional 's' so "cokes" matches the "coke" alias, etc.
     # (?<!-) prevents "cola" from matching INSIDE "coca-cola" (hyphen creates a
     # word boundary so plain \b would otherwise fire mid-compound-word).
+    # For an alias ending in a consonant + "y" (e.g. "buddy"), standard
+    # English pluralizes to "-ies" ("buddies"), not "-ys" -- a bare "s?"
+    # suffix never matches that form at all. Found 2026-10-25 while testing
+    # "two chips and three buddies": "buddies" matched nothing, silently
+    # dropping the item. General rule, not a Mochachos-specific patch --
+    # applies to any current or future alias with this shape.
     for alias, target_substr in _ITEM_ALIASES.items():
-        for m in _re.finditer(rf"(?<!-)\b{_re.escape(alias)}s?\b", chunk_lower):
+        if len(alias) > 1 and alias[-1] == "y" and alias[-2] not in "aeiou":
+            _alias_pattern = rf"(?:{_re.escape(alias)}s?|{_re.escape(alias[:-1])}ies)"
+        else:
+            _alias_pattern = rf"{_re.escape(alias)}s?"
+        for m in _re.finditer(rf"(?<!-)\b{_alias_pattern}\b", chunk_lower):
             a_start, a_end = m.start(), m.end()
             span = set(range(a_start, a_end))
             if span & consumed_positions:
@@ -2860,6 +2878,43 @@ def _build_option_question(item_name: str, missing_groups: list[dict]) -> str:
     )
 
 
+def _split_distinct_per_unit_modifiers(item, qty: int, modifier: str | None) -> list[tuple[int, str | None]]:
+    """
+    Scenario D4: "2 chicken burgers, one mild and one hot" must become TWO
+    separate qty=1 cart lines (one Mild, one Hot), not one qty=2 line whose
+    special_instructions concatenates both option names together. Before
+    this, _capture_options_from_message correctly found BOTH option names
+    anywhere in the message and joined them ("Mild, Hot"), but the caller
+    then applied that single combined string to one qty=2 add_to_cart call
+    -- the two distinct per-unit choices were captured as text but never
+    actually split into separate line items. Found 2026-10-26 while
+    building fresh regression tests for the real reported quantity-
+    handling defects.
+
+    Returns [(qty, modifier)] unchanged in the normal case. Only splits
+    into qty separate (1, single_modifier) pairs when the modifier, split
+    on ",", yields EXACTLY as many pieces as the stated quantity, AND
+    every piece is a real, enabled option name from one of the item's own
+    option groups -- never splits a plain free-text modifier like "no
+    tomato, extra cheese" describing ONE unit, which legitimately stays a
+    single qty=N line.
+    """
+    if qty > 1 and modifier:
+        parts = [p.strip() for p in modifier.split(",")]
+        if len(parts) == qty:
+            options_json = getattr(item, "options_json", None) or {}
+            enabled_names = {
+                o["name"].lower()
+                for g in options_json.get("option_groups", [])
+                if g.get("is_enabled", True)
+                for o in g.get("options", [])
+                if o.get("is_enabled", True)
+            }
+            if enabled_names and all(p.lower() in enabled_names for p in parts):
+                return [(1, part) for part in parts]
+    return [(qty, modifier)]
+
+
 def _capture_options_from_message(item, norm_text: str) -> str | None:
     """
     Scan the full normalised message for option names belonging to this item.
@@ -2950,12 +3005,33 @@ async def _handle_with_llm(
         ConversationState.BROWSING_MENU.value,
         ConversationState.IDLE.value,
     }
+    # ── Bare "<quantity> <item>" with no ordering verb ("3 half chickens",
+    # "two chips and three buddies") ─────────────────────────────────────
+    # intent_router's ORDER_START pattern requires an explicit verb phrase
+    # ("can I get", "I want", "I'll have", etc.) -- a bare quantity+item
+    # statement matches no intent pattern at all (intent=None), so it
+    # NEVER reached deterministic extraction and went to the LLM for
+    # everything, every time, regardless of how unambiguous the item/
+    # quantity actually was. Real reported production defect (scenario D,
+    # "the latest reported production defect"), found 2026-10-26 while
+    # building fresh regression tests for it. Scoped to the same early,
+    # low-risk states as the ORDER_ADD det path (never COLLECTING_DETAILS,
+    # where a bare word is far more likely to be a name/phone number) plus
+    # GREETING, since a customer's first message straight after the
+    # greeting is commonly phrased this way. Safe by construction: if
+    # det_matches below finds nothing (because the message genuinely isn't
+    # about an item), this falls through to the LLM exactly as before --
+    # nothing here can misfire on its own.
+    _det_states_for_implicit_order = _det_states_for_add | {ConversationState.GREETING.value}
     _det_eligible = (
         intent == MessageIntent.ORDER_START
         and session.state != ConversationState.CHOOSING_OPTIONS.value
     ) or (
         intent == MessageIntent.ORDER_ADD
         and session.state in _det_states_for_add
+    ) or (
+        intent is None
+        and session.state in _det_states_for_implicit_order
     )
     if _det_eligible:
         det_matches = _extract_items_from_message(norm_text, items)
@@ -3097,19 +3173,20 @@ async def _handle_with_llm(
                     # If suffix extraction found no modifier, also check the full
                     # message for option names (catches "with oat milk" style phrasing).
                     _eff_mod = det_modifier or _capture_options_from_message(det_item, norm_text)
-                    state_machine.add_to_cart(
-                        session,
-                        menu_item_id=str(det_item.id),
-                        name=det_item.name,
-                        price_cents=det_item.price_cents,
-                        quantity=det_qty,
-                        options=None,
-                        special_instructions=_eff_mod,
-                    )
-                    label = f"{det_qty}x {det_item.name}"
-                    if _eff_mod:
-                        label += f" ({_eff_mod})"
-                    det_added.append(label)
+                    for _unit_qty, _unit_mod in _split_distinct_per_unit_modifiers(det_item, det_qty, _eff_mod):
+                        state_machine.add_to_cart(
+                            session,
+                            menu_item_id=str(det_item.id),
+                            name=det_item.name,
+                            price_cents=det_item.price_cents,
+                            quantity=_unit_qty,
+                            options=None,
+                            special_instructions=_unit_mod,
+                        )
+                        label = f"{_unit_qty}x {det_item.name}"
+                        if _unit_mod:
+                            label += f" ({_unit_mod})"
+                        det_added.append(label)
                 logger.warning(
                     "DET_MATCH: added %d item(s) deterministically: %r, session_id=%s",
                     len(det_added), det_added, session.id,
@@ -3209,9 +3286,27 @@ async def _handle_with_llm(
                 and not _is_reference_not_target(it.name, norm_text.lower())
             ]
             if _confirmed_removals:
+                # BUG (scenario D7): "Remove one half chicken" against a cart
+                # holding 2x Half Chicken removed the WHOLE line (cart_remaining
+                # dropped to 0) instead of decrementing to 1x -- _qty was
+                # already being parsed correctly above but never passed to
+                # remove_from_cart at all (which already supports a partial
+                # decrement via its own `quantity` param). Found 2026-10-26
+                # while building fresh regression tests for the real reported
+                # quantity-handling defects. Only pass a quantity through when
+                # the message contains an EXPLICIT count word/digit -- "remove
+                # the burger" (no count stated) must stay a full removal, only
+                # "remove one/two/2 burger(s)" should partially decrement.
+                import re as _re_rm
+                _explicit_qty_present = bool(_re_rm.search(
+                    r"\b(\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten)\b",
+                    norm_text.lower(),
+                ))
                 for _it, _qty in _confirmed_removals:
                     state_machine.remove_from_cart(
-                        session, _it.name, qualifier_hint=msg_text
+                        session, _it.name,
+                        quantity=_qty if _explicit_qty_present else None,
+                        qualifier_hint=msg_text,
                     )
                 # Also clear any stale pending/proposed context
                 state_machine.set_context(session, "pending_options", None)
