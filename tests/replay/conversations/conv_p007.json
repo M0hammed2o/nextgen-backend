@@ -9,11 +9,6 @@
   "turns": [
     {
       "message": "Latte with full cream please",
-      "llm": {
-        "action": "add_items",
-        "message": "Latte with Full Cream — R45.00 ✅",
-        "items": [{"name": "Latte", "quantity": 1, "options": {"Milk": "Full Cream"}, "add_ons": [], "special_instructions": ""}]
-      },
       "expect": {
         "state": "CONFIRMING_ORDER",
         "cart": [{"name": "Latte", "quantity": 1}],

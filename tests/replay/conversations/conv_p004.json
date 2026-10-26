@@ -9,11 +9,6 @@
   "turns": [
     {
       "message": "Classic Smash Burger no tomato",
-      "llm": {
-        "action": "add_items",
-        "message": "Classic Smash Burger with no tomato added ✅",
-        "items": [{"name": "Classic Smash Burger", "quantity": 1, "options": {}, "add_ons": [], "special_instructions": "no tomato"}]
-      },
       "expect": {
         "state": "CONFIRMING_ORDER",
         "cart": [{"name": "Classic Smash Burger", "quantity": 1, "special_instructions": "no tomato"}],

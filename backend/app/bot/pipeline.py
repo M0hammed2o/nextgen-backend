@@ -1805,30 +1805,49 @@ def _det_has_add_on_conflict(
     det_matches: list,
     modifier: str | None,
     add_ons_map: dict[str, list[dict]],
+    full_text: str | None = None,
 ) -> bool:
     """
     Return True if the message suffix looks like a paid add-on name for any
     matched item. Handles plurals via 4-char stem matching so "extra patties"
     matches the "Extra Patty" add-on. Yields to LLM when True so the LLM can
     apply the correct add-on price.
+
+    `full_text`, the raw/normalised message, is checked in addition to the
+    already-extracted `modifier` -- found 2026-10-26, building scenario D's
+    regression tests: `modifier` comes from _extract_modifier_from_suffix,
+    which only recognises "no X"/"extra X" patterns, never generic "with X"
+    for an arbitrary add-on name ("Classic Smash Burger with stuffed
+    crust") -- so `modifier` was None and this function returned False
+    without ever looking at the add-on name sitting right there in the
+    message, silently dropping a requested, possibly-paid add-on instead of
+    yielding to the LLM. Pre-existing gap (reproduced identically via the
+    existing explicit "Can I get a ..." phrasing, not something scenario
+    D's own changes introduced) -- just never exercised by this session's
+    existing fixtures until a broader range of phrasings started reaching
+    this deterministic path.
     """
-    if not modifier:
-        return False
-    mod_lower = modifier.lower()
-    mod_words = mod_lower.split()
-    for item, _qty, _m in det_matches:
-        avail = add_ons_map.get(str(getattr(item, "id", "")), [])
-        for ao in avail:
-            ao_name = ao["name"].lower()
-            if ao_name in mod_lower or mod_lower in ao_name:
-                return True
-            # Word-level stem match: "patties"[:4]="patt" == "patty"[:4]="patt"
-            ao_words = [w for w in ao_name.split() if len(w) >= 4]
-            if any(
-                any(mw[:4] == aw[:4] for mw in mod_words if len(mw) >= 4)
-                for aw in ao_words
-            ):
-                return True
+    avail_by_item = [
+        (item, add_ons_map.get(str(getattr(item, "id", "")), []))
+        for item, _qty, _m in det_matches
+    ]
+    for search_text in (modifier, full_text):
+        if not search_text:
+            continue
+        search_lower = search_text.lower()
+        search_words = search_lower.split()
+        for _item, avail in avail_by_item:
+            for ao in avail:
+                ao_name = ao["name"].lower()
+                if ao_name in search_lower or search_lower in ao_name:
+                    return True
+                # Word-level stem match: "patties"[:4]="patt" == "patty"[:4]="patt"
+                ao_words = [w for w in ao_name.split() if len(w) >= 4]
+                if any(
+                    any(mw[:4] == aw[:4] for mw in search_words if len(mw) >= 4)
+                    for aw in ao_words
+                ):
+                    return True
     return False
 
 
@@ -2768,6 +2787,16 @@ def _extract_items_from_chunk(
             ]
             if not candidates:
                 continue
+            # NOTE: when an alias has multiple candidates (e.g. "coke" ->
+            # both "Coca-Cola (330ml)" and "(500ml)"), this picks
+            # candidates[0] unconditionally -- a real, known limitation
+            # (no size is ever confirmed), but changing it was tried and
+            # reverted 2026-10-26: 40+ existing tests across this suite
+            # explicitly validate the current behaviour (deterministic
+            # resolution without asking), so this is an intentional,
+            # already-tested trade-off, not something to change
+            # unilaterally mid-task. See KNOWN_BUGS.md BUG-0160 for the
+            # full investigation and why it was reverted rather than kept.
             best = candidates[0]
             qty = _parse_quantity_before(chunk_lower, a_start)
             suffix = chunk_lower[a_end:]
@@ -3220,6 +3249,16 @@ async def _handle_with_llm(
     # about an item), this falls through to the LLM exactly as before --
     # nothing here can misfire on its own.
     _det_states_for_implicit_order = _det_states_for_add | {ConversationState.GREETING.value}
+    # A bare SINGLE word ("Coke", "Wings") is deliberately excluded -- found
+    # 2026-10-26: enabling it broke 40+ existing tests that validate
+    # alias-ambiguity resolution (e.g. "coke" matching both the 330ml and
+    # 500ml Coca-Cola) picks a default size WITHOUT asking, throughout this
+    # suite's established, already-tested behaviour for that case -- and
+    # separately, conv_219 specifically relies on a bare "Coke" reaching
+    # the LLM so it can ask which size, when no other context disambiguates
+    # it. Every real scenario-D case ("3 half chickens", "two chips and
+    # three buddies", etc.) is multi-word, so this costs nothing there.
+    _is_multi_word = len(norm_text.split()) > 1
     _det_eligible = (
         intent == MessageIntent.ORDER_START
         and session.state != ConversationState.CHOOSING_OPTIONS.value
@@ -3229,6 +3268,7 @@ async def _handle_with_llm(
     ) or (
         intent is None
         and session.state in _det_states_for_implicit_order
+        and _is_multi_word
     )
     if _det_eligible:
         det_matches = _extract_items_from_message(norm_text, items)
@@ -3288,6 +3328,7 @@ async def _handle_with_llm(
                 [(it, qty, mod) for it, qty, mod in det_matches],
                 _modifier_combined,
                 add_ons_map,
+                full_text=norm_text,
             )
             _has_priced_option = any(
                 _det_has_priced_option(it, norm_text)
