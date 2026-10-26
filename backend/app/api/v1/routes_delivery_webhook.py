@@ -43,6 +43,14 @@ Uber requires an ack; `WebhookGateResult.http_status` is 200 for every
 signature/tenant/entitlement failure gate (still logged with a specific
 `error_category`, never swallowed) and only a real internal enqueue failure
 returns something else, so a genuine paid order is never silently dropped.
+
+EMPTY RESPONSE BODY
+-----------------------
+Uber's webhook reference: "Your service should return an HTTP 200 response
+code with an empty response body". The body used to be a small JSON status
+object, which also told an unauthenticated caller whether its forged
+signature had been rejected. The outcome is in the log line and in
+`delivery_webhook_events.error_category`, not in the response.
 """
 
 from __future__ import annotations
@@ -75,9 +83,8 @@ settings = get_settings()
 async def delivery_webhook(
     provider: str,
     request: Request,
-    response: Response,
     db: AsyncSession = Depends(get_db),
-):
+) -> Response:
     """
     Receive an inbound delivery-marketplace webhook. See module docstring
     for the trust-boundary and rate-limit-scope rules this implements.
@@ -94,19 +101,14 @@ async def delivery_webhook(
         # No worker pool configured at all (e.g. a misconfigured deployment)
         # — this IS an internal failure, so 503 rather than a false 200 ack.
         logger.error("DELIVERY_WEBHOOK_NO_ARQ_POOL: provider=%s — cannot enqueue.", provider)
-        response.status_code = 503
-        return {"status": "service_unavailable"}
+        return Response(status_code=503)
 
     result = await ingest_delivery_webhook(
         db, provider=provider, raw_body=raw_body, headers=request.headers, arq_pool=arq_pool,
     )
 
-    response.status_code = result.http_status
     logger.warning(
         "DELIVERY_WEBHOOK_RESULT: provider=%s accepted=%s http_status=%d error_category=%s",
         provider, result.accepted, result.http_status, result.error_category,
     )
-    return {
-        "status": "accepted" if result.accepted else "rejected",
-        "error_category": result.error_category,
-    }
+    return Response(status_code=result.http_status)

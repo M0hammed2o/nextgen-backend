@@ -165,9 +165,36 @@ def _validate_production_secrets() -> None:
     # integration rather than writing a new bespoke if-block — that is the
     # actual fix for the "keeps recurring" problem, not just adding one more
     # line for Uber.
+    # Uber issues separate production and sandbox apps. Production
+    # credentials are required whenever webhooks are on, unless the
+    # deployment is EXPLICITLY declared sandbox-only
+    # (UBER_EATS_SANDBOX_ONLY_DEPLOYMENT=true) with a complete sandbox pair
+    # and no production value set at all — Uber's path to production
+    # approval runs through sandbox testing first, sometimes on the only
+    # deployment there is. Never implied by a missing variable: that would
+    # silently 200-ack every genuine production order as BAD_SIGNATURE
+    # (BUG-0089). A half-configured pair, in either environment, is fatal.
+    _uber_sandbox_ready = not (
+        _looks_like_placeholder(settings.UBER_EATS_SANDBOX_CLIENT_ID)
+        or _looks_like_placeholder(settings.UBER_EATS_SANDBOX_CLIENT_SECRET)
+    )
+    _uber_production_touched = bool(settings.UBER_EATS_CLIENT_ID or settings.UBER_EATS_CLIENT_SECRET)
+    _uber_sandbox_only = (
+        settings.UBER_EATS_SANDBOX_ONLY_DEPLOYMENT and _uber_sandbox_ready and not _uber_production_touched
+    )
+    _uber_requires_production = settings.UBER_EATS_WEBHOOK_ENABLED and not _uber_sandbox_only
+    if settings.UBER_EATS_WEBHOOK_ENABLED and _uber_sandbox_only:
+        logger.warning(
+            "UBER_EATS_SANDBOX_ONLY_DEPLOYMENT: no production Uber app configured — "
+            "production Uber webhooks cannot be verified on this deployment."
+        )
+    _uber_sandbox_touched = bool(
+        settings.UBER_EATS_SANDBOX_CLIENT_ID or settings.UBER_EATS_SANDBOX_CLIENT_SECRET
+    )
+    _uber_requires_sandbox_pair = settings.UBER_EATS_WEBHOOK_ENABLED and _uber_sandbox_touched
     _webhook_secret_requirements = (
         (
-            settings.UBER_EATS_WEBHOOK_ENABLED,
+            _uber_requires_production,
             settings.UBER_EATS_CLIENT_SECRET,
             "UBER_EATS_CLIENT_SECRET",
             "Uber Eats webhook signatures cannot be verified — every genuine, "
@@ -176,11 +203,25 @@ def _validate_production_secrets() -> None:
             "delivery_orders row is ever created for the watchdog to rescue)",
         ),
         (
-            settings.UBER_EATS_WEBHOOK_ENABLED,
+            _uber_requires_production,
             settings.UBER_EATS_CLIENT_ID,
             "UBER_EATS_CLIENT_ID",
             "the platform-wide Uber Eats operational token cannot be minted — "
             "every accepted order's fetch/accept/deny call would fail",
+        ),
+        (
+            _uber_requires_sandbox_pair,
+            settings.UBER_EATS_SANDBOX_CLIENT_SECRET,
+            "UBER_EATS_SANDBOX_CLIENT_SECRET",
+            "sandbox webhook signatures cannot be verified — every sandbox test "
+            "order would be discarded as BAD_SIGNATURE",
+        ),
+        (
+            _uber_requires_sandbox_pair,
+            settings.UBER_EATS_SANDBOX_CLIENT_ID,
+            "UBER_EATS_SANDBOX_CLIENT_ID",
+            "the sandbox operational token cannot be minted — every sandbox "
+            "test order's fetch/accept/deny call would fail",
         ),
     )
     for enabled, secret_value, secret_name, consequence in _webhook_secret_requirements:

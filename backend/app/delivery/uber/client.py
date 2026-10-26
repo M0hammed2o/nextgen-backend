@@ -1,26 +1,43 @@
 """
-Thin Uber Eats API HTTP client — one function per confirmed endpoint, no
+Thin Uber Eats API HTTP client — one function per documented endpoint, no
 business logic. `adapter.py` is the only caller; nothing here decides
 whether a call SHOULD be made (capability checks live in `base.py`).
 
-SSRF hardening: every function builds its URL from `settings.
-UBER_EATS_API_BASE_URL` plus a validated path segment — never from a
-webhook-supplied `resource_href`, which is never read anywhere in this
-module.
+Every function takes the environment's `api_base_url` explicitly
+(`environments.py`) — a sandbox order is never sent to production hosts or
+the reverse.
 
-Response-size cap: Get Order Details "can be very large" per the task brief
-— `_MAX_RESPONSE_BYTES` bounds it so a pathological/compromised response
-can't exhaust worker memory. gzip is handled transparently by httpx.
+SSRF hardening: every URL is built from that configured base URL plus a
+validated path segment — never from a webhook-supplied `resource_href`,
+which is never read anywhere in this module.
+
+Response-size cap: Get Order Details "may be very large" per Uber's own
+reference — `_MAX_RESPONSE_BYTES` bounds it so a pathological/compromised
+response can't exhaust worker memory. gzip is handled transparently by httpx.
+
+API VERSIONS USED (developer.uber.com/docs/eats, read 2026-10-26)
+-------------------------------------------------------------------
+Get order / accept / deny / cancel / store status / menus are Uber's
+documented, non-deprecated v1/v2 Eats endpoints (now labelled "Previous
+Version" beside a newer Order Fulfillment API; nothing is deprecated, and
+Uber's policy is 3 months' support after any deprecation notice). Marking an
+order ready for pickup exists ONLY in the newer API
+(`POST /v1/delivery/order/{id}/ready`), so that one call uses it. Which
+version Uber certifies a new integration against is an open question for
+Uber's integration team — see docs/UBER_EATS_INTEGRATION_2026-10.md.
 """
 
 from __future__ import annotations
 
+import json
+import re
+
 import httpx
 
-from backend.app.core.config import get_settings
 from backend.app.delivery.errors import DeliveryProviderError, DeliveryProviderTimeout
 
 _MAX_RESPONSE_BYTES = 10 * 1024 * 1024  # 10 MB
+_SAFE_ID = re.compile(r"[A-Za-z0-9-]{1,128}")
 _DEFAULT_TIMEOUT_SECONDS = 15.0
 
 
@@ -43,7 +60,6 @@ async def _get(http_client: httpx.AsyncClient, url: str, token: str) -> dict:
                     raise DeliveryProviderError(
                         "UBER_EATS", f"response exceeded {_MAX_RESPONSE_BYTES} bytes cap"
                     )
-            import json
             return json.loads(bytes(chunks) or b"{}")
     except httpx.TimeoutException as exc:
         raise DeliveryProviderTimeout(f"UBER_EATS GET {url} timed out") from exc
@@ -52,7 +68,8 @@ async def _get(http_client: httpx.AsyncClient, url: str, token: str) -> dict:
 
 
 async def _post(
-    http_client: httpx.AsyncClient, url: str, token: str, json_body: dict, *, expect_status: int = 204
+    http_client: httpx.AsyncClient, url: str, token: str, json_body: dict,
+    *, expect_status: tuple[int, ...] = (204,),
 ) -> None:
     try:
         response = await http_client.post(
@@ -62,7 +79,7 @@ async def _post(
         raise DeliveryProviderTimeout(f"UBER_EATS POST {url} timed out") from exc
     except httpx.HTTPError as exc:
         raise DeliveryProviderError("UBER_EATS", f"transport error: {exc}") from exc
-    if response.status_code != expect_status:
+    if response.status_code not in expect_status:
         raise DeliveryProviderError(
             "UBER_EATS", "POST request failed", status_code=response.status_code
         )
@@ -76,49 +93,70 @@ def _validated_order_id(order_id: str) -> str:
     malformed/tampered value ever reaching a URL, on top of the caller
     already never sourcing this from a webhook-supplied `resource_href`.
     """
-    if not order_id or not all(c.isalnum() or c == "-" for c in order_id):
+    # ASCII only: str.isalnum() also accepts characters such as "²" or "Ａ".
+    if not order_id or not _SAFE_ID.fullmatch(order_id):
         raise DeliveryProviderError("UBER_EATS", f"refusing to use unsafe order id: {order_id!r}")
     return order_id
 
 
-async def get_order_details(http_client: httpx.AsyncClient, token: str, order_id: str) -> dict:
-    settings = get_settings()
+async def get_order_details(
+    http_client: httpx.AsyncClient, token: str, order_id: str, *, api_base_url: str,
+) -> dict:
     order_id = _validated_order_id(order_id)
-    url = f"{settings.UBER_EATS_API_BASE_URL}/v2/eats/order/{order_id}"
-    return await _get(http_client, url, token)
+    return await _get(http_client, f"{api_base_url}/v2/eats/order/{order_id}", token)
 
 
 async def accept_pos_order(
-    http_client: httpx.AsyncClient, token: str, order_id: str, *, body: dict
+    http_client: httpx.AsyncClient, token: str, order_id: str, *, body: dict, api_base_url: str,
 ) -> None:
-    settings = get_settings()
     order_id = _validated_order_id(order_id)
-    url = f"{settings.UBER_EATS_API_BASE_URL}/v1/eats/orders/{order_id}/accept_pos_order"
-    await _post(http_client, url, token, body, expect_status=204)
+    url = f"{api_base_url}/v1/eats/orders/{order_id}/accept_pos_order"
+    await _post(http_client, url, token, body, expect_status=(204,))
 
 
 async def deny_pos_order(
-    http_client: httpx.AsyncClient, token: str, order_id: str, *, body: dict
+    http_client: httpx.AsyncClient, token: str, order_id: str, *, body: dict, api_base_url: str,
 ) -> None:
-    settings = get_settings()
     order_id = _validated_order_id(order_id)
-    url = f"{settings.UBER_EATS_API_BASE_URL}/v1/eats/orders/{order_id}/deny_pos_order"
-    await _post(http_client, url, token, body, expect_status=204)
+    url = f"{api_base_url}/v1/eats/orders/{order_id}/deny_pos_order"
+    await _post(http_client, url, token, body, expect_status=(204,))
 
 
-async def get_store_status(http_client: httpx.AsyncClient, token: str, store_id: str) -> dict:
-    settings = get_settings()
+async def cancel_order(
+    http_client: httpx.AsyncClient, token: str, order_id: str, *, body: dict, api_base_url: str,
+) -> None:
+    """
+    Restaurant-initiated cancel of an already-accepted order. Documented
+    response is `200 {}`; 204 is also accepted. A 404 means "already in a
+    terminal state, or never existed" — surfaced to the caller as an error
+    like any other non-2xx.
+    """
+    order_id = _validated_order_id(order_id)
+    url = f"{api_base_url}/v1/eats/orders/{order_id}/cancel"
+    await _post(http_client, url, token, body, expect_status=(200, 204))
+
+
+async def mark_order_ready(
+    http_client: httpx.AsyncClient, token: str, order_id: str, *, api_base_url: str,
+) -> None:
+    """Order Fulfillment API "Order Ready" — body `{}`, documented `200`."""
+    order_id = _validated_order_id(order_id)
+    url = f"{api_base_url}/v1/delivery/order/{order_id}/ready"
+    await _post(http_client, url, token, {}, expect_status=(200, 204))
+
+
+async def get_store_status(
+    http_client: httpx.AsyncClient, token: str, store_id: str, *, api_base_url: str,
+) -> dict:
     store_id = _validated_order_id(store_id)
-    url = f"{settings.UBER_EATS_API_BASE_URL}/v1/eats/store/{store_id}/status"
-    return await _get(http_client, url, token)
+    return await _get(http_client, f"{api_base_url}/v1/eats/store/{store_id}/status", token)
 
 
 async def set_store_status(
-    http_client: httpx.AsyncClient, token: str, store_id: str, *, body: dict
+    http_client: httpx.AsyncClient, token: str, store_id: str, *, body: dict, api_base_url: str,
 ) -> None:
-    settings = get_settings()
     store_id = _validated_order_id(store_id)
-    url = f"{settings.UBER_EATS_API_BASE_URL}/v1/eats/store/{store_id}/status"
+    url = f"{api_base_url}/v1/eats/store/{store_id}/status"
     try:
         response = await http_client.post(
             url, headers=_headers(token), json=body, timeout=_DEFAULT_TIMEOUT_SECONDS
@@ -133,19 +171,29 @@ async def set_store_status(
         )
 
 
+async def get_menu(
+    http_client: httpx.AsyncClient, token: str, store_id: str, *, api_base_url: str,
+) -> dict:
+    """
+    v2 Get Menu (scope `eats.store`) — READ ONLY. Feeds the mapping
+    screen's catalogue import; nothing in this codebase writes a menu back.
+    """
+    store_id = _validated_order_id(store_id)
+    return await _get(http_client, f"{api_base_url}/v2/eats/stores/{store_id}/menus", token)
+
+
 async def upsert_menu(
-    http_client: httpx.AsyncClient, token: str, store_id: str, *, menu_payload: dict
+    http_client: httpx.AsyncClient, token: str, store_id: str, *, menu_payload: dict, api_base_url: str,
 ) -> None:
     """
-    Menu upsert — signature-only for this change (see
-    docs/DELIVERY_PLATFORM_ARCHITECTURE.md §6/§8): no diff-preview/
-    confirmation pipeline calls this yet. Implemented as a thin, direct PUT
-    so the capability/adapter contract is real rather than a stub, but
-    nothing in this codebase invokes it today.
+    Menu upsert — signature-only (see docs/DELIVERY_PLATFORM_ARCHITECTURE.md
+    §6/§8): no diff-preview/confirmation pipeline calls this, because a
+    full-menu PUT has irreversible side effects on Uber's side (an alcohol
+    flag can never be unset via the API; a non-default menu_type forks the
+    menu permanently). Nothing in this codebase invokes it today.
     """
-    settings = get_settings()
     store_id = _validated_order_id(store_id)
-    url = f"{settings.UBER_EATS_API_BASE_URL}/v2/eats/stores/{store_id}/menus"
+    url = f"{api_base_url}/v2/eats/stores/{store_id}/menus"
     try:
         response = await http_client.put(
             url, headers=_headers(token), json=menu_payload, timeout=30.0

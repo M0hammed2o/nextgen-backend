@@ -86,6 +86,13 @@ _RAW_PAYLOAD_MAX_BYTES = 64 * 1024  # bound what we store, never the full 10MB o
 #: internally as defense-in-depth if this module's routing is ever bypassed).
 _CANCEL_EVENT_TYPES = frozenset({"orders.cancel", "orders.failure"})
 
+#: Uber: a scheduled order must be accepted "within 10 minutes of
+#: orders.scheduled.notification" — tighter than the normal 11.5-minute
+#: window, so its deadline is capped below 10 minutes INCLUDING the
+#: watchdog's grace period.
+_SCHEDULED_EVENT_TYPE = "orders.scheduled.notification"
+_SCHEDULED_ACCEPT_WINDOW_SECONDS = 600
+
 
 def _bounded_payload(raw_body: bytes) -> dict:
     import json
@@ -141,11 +148,15 @@ async def ingest_delivery_webhook(
     if adapter is None:  # pragma: no cover — is_webhook_enabled already guarantees this
         return WebhookGateResult(accepted=False, error_category="UNSUPPORTED_PROVIDER")
 
-    sig_valid = False
+    # The environment is PROVEN by which app secret verifies the signature
+    # (production and sandbox are separate Uber apps) — never taken from the
+    # unauthenticated `X-Environment` header, which only gets logged.
+    verified_environment = None
     try:
-        sig_valid = adapter.verify_webhook_signature(raw_body, headers)
+        verified_environment = adapter.verified_webhook_environment(raw_body, headers)
     except Exception:
         logger.exception("DELIVERY_WEBHOOK_SIGNATURE_CHECK_ERROR: provider=%s", provider)
+    sig_valid = verified_environment is not None
 
     envelope = None
     try:
@@ -154,6 +165,12 @@ async def ingest_delivery_webhook(
         logger.exception("DELIVERY_WEBHOOK_PARSE_ERROR: provider=%s", provider)
 
     reported_environment = headers.get("x-environment") or headers.get("X-Environment")
+    if sig_valid and reported_environment and reported_environment.lower() != verified_environment:
+        logger.warning(
+            "DELIVERY_WEBHOOK_ENV_HEADER_DISAGREES: provider=%s header=%r verified=%s — "
+            "trusting the signature, not the header.",
+            provider, reported_environment, verified_environment,
+        )
 
     if not sig_valid:
         # BUG-0088 fix: an unverified request must NEVER be able to occupy
@@ -190,18 +207,26 @@ async def ingest_delivery_webhook(
         await _insert_event_idempotent(
             db, provider=provider, event_id=str(uuid.uuid4()), external_store_id=None,
             event_type=None, raw_body=raw_body, signature_valid=True,
-            error_category="UNPARSEABLE_PAYLOAD", environment=reported_environment,
+            error_category="UNPARSEABLE_PAYLOAD", environment=verified_environment,
         )
         await db.commit()
         logger.warning("DELIVERY_WEBHOOK_UNPARSEABLE: provider=%s", provider)
         return WebhookGateResult(accepted=False, error_category="UNPARSEABLE_PAYLOAD")
 
     # ── Event-log idempotency: ON CONFLICT DO NOTHING on (provider, event_id) ──
+    # Production keeps Uber's raw event_id (unchanged from before environments
+    # existed); any other environment's ids live in their own namespace, so an
+    # event signed with the sandbox secret can never occupy a production
+    # event_id and get the genuine production delivery deduplicated away.
+    dedupe_event_id = (
+        envelope.event_id if verified_environment == "production"
+        else f"{verified_environment}:{envelope.event_id}"
+    )[:128]
     event_row, inserted = await _insert_event_idempotent(
-        db, provider=provider, event_id=envelope.event_id,
+        db, provider=provider, event_id=dedupe_event_id,
         external_store_id=envelope.external_store_id, event_type=envelope.event_type,
         raw_body=raw_body, signature_valid=True, error_category="PENDING",
-        environment=reported_environment,
+        environment=verified_environment,
     )
     if not inserted:
         await db.commit()
@@ -223,6 +248,28 @@ async def ingest_delivery_webhook(
             provider, envelope.external_store_id,
         )
         return WebhookGateResult(accepted=True, error_category="UNKNOWN_STORE")
+
+    # The environment PROVEN by the signature must be the connection's own.
+    # Checked here, before any delivery_orders row or job exists, for EVERY
+    # event type: a cancellation used to skip the worker's ENV_MISMATCH gate,
+    # so an event signed with the (weaker-held) sandbox secret could cancel a
+    # production order and reverse its stock. A mismatched event is logged and
+    # acknowledged, nothing else — it belongs to the other environment's app,
+    # which no NextGen connection here represents.
+    if verified_environment != connection.environment:
+        event_row.business_id = connection.business_id
+        event_row.error_category = "ENV_MISMATCH"
+        await db.commit()
+        logger.warning(
+            "DELIVERY_WEBHOOK_ENV_MISMATCH: provider=%s business=%s signed_for=%s "
+            "connection_environment=%s event_type=%s — ignored.",
+            provider, connection.business_id, verified_environment,
+            connection.environment, envelope.event_type,
+        )
+        return WebhookGateResult(
+            accepted=False, error_category="ENV_MISMATCH",
+            business_id=connection.business_id, delivery_connection_id=connection.id,
+        )
 
     # Known store from here on — business_id comes ONLY from `connection`,
     # never from the payload. All remaining checks (environment match,
@@ -259,6 +306,7 @@ async def ingest_delivery_webhook(
         external_order_id=envelope.external_order_id,
         external_store_id=envelope.external_store_id,
         raw_event_id=event_row.id,
+        event_type=envelope.event_type,
     )
 
     # BUG-0087 fix: the event-log/delivery-order rows are deliberately NOT
@@ -381,6 +429,7 @@ async def _insert_delivery_order_idempotent(
     external_order_id: str,
     external_store_id: str | None,
     raw_event_id: uuid.UUID,
+    event_type: str | None = None,
 ) -> None:
     """
     INSERT ... ON CONFLICT (business_id, provider, external_order_id) DO
@@ -389,9 +438,13 @@ async def _insert_delivery_order_idempotent(
     unconditionally for every event type.
     """
     settings = get_settings()
-    deadline = datetime.now(timezone.utc) + timedelta(
-        seconds=settings.DELIVERY_ACCEPT_DEADLINE_SECONDS
-    )
+    deadline_seconds = settings.DELIVERY_ACCEPT_DEADLINE_SECONDS
+    if event_type == _SCHEDULED_EVENT_TYPE:
+        deadline_seconds = min(
+            deadline_seconds,
+            _SCHEDULED_ACCEPT_WINDOW_SECONDS - settings.DELIVERY_DEADLINE_GRACE_SECONDS - 60,
+        )
+    deadline = datetime.now(timezone.utc) + timedelta(seconds=deadline_seconds)
     stmt = (
         pg_insert(DeliveryOrder)
         .values(

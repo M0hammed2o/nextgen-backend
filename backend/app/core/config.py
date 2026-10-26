@@ -397,27 +397,47 @@ class Settings(BaseSettings):
     # a per-merchant authorization_code-grant token wiped after activation.
     UBER_EATS_CLIENT_ID: str = ""
     UBER_EATS_CLIENT_SECRET: str = ""
-    # Sandbox hosts, confirmed from Uber's docs: test-api.uber.com /
-    # sandbox-auth.uber.com. BUG-0094 (KNOWN_BUGS.md): UBER_EATS_ENVIRONMENT
-    # is NOT actually wired to these defaults — grep-confirmed it is read by
-    # nothing anywhere in this codebase. A staging/sandbox deployment MUST
-    # set these two URLs explicitly; leaving only UBER_EATS_ENVIRONMENT set
-    # to "sandbox" silently keeps talking to PRODUCTION Uber.
+    # PRODUCTION hosts. A DeliveryConnection with environment="production"
+    # always uses these and the credentials above.
     UBER_EATS_API_BASE_URL: str = "https://api.uber.com"
     UBER_EATS_AUTH_BASE_URL: str = "https://auth.uber.com"
-    # production | sandbox. NOT itself read by the webhook's environment
-    # gate (BUG-0094) — the REAL gate is `_find_misconfiguration()` in
-    # order_service.py, which compares the inbound webhook's own reported
-    # `X-Environment` header against `DeliveryConnection.environment` (a
-    # per-connection DB value, not this global setting) and — also per
-    # BUG-0094 — currently passes when that header is absent rather than
-    # failing closed. That specific change was evaluated and NOT made in
-    # the 2026-09-23 remediation pass: Uber's own docs do not confirm this
-    # header is reliably sent on every delivery, so flipping it to fail-
-    # closed risks silently denying every genuine production order instead
-    # of closing a narrow gap — a materially worse outcome. Revisit only
-    # once the header's real-world presence is confirmed against live
-    # traffic or Uber's own webhook reference.
+    # SANDBOX app — Uber issues a separate test application (its own client
+    # id/secret) for sandbox work. A DeliveryConnection with
+    # environment="sandbox" always uses these, never the production ones, so
+    # one deployment can hold both without a test order ever touching the
+    # production app (and vice versa). Hosts per Uber's Sandbox guide
+    # (developer.uber.com/docs/eats/guides/sandbox, read 2026-10-26):
+    # "sandbox-login.uber.com -> test-api.uber.com ... Mixing domains will
+    # cause authentication failures." Uber's Getting Started page still says
+    # sandbox-auth.uber.com; the Sandbox guide is the one with a worked
+    # example, so it wins here — override this if Uber's integration team
+    # says otherwise.
+    UBER_EATS_SANDBOX_CLIENT_ID: str = ""
+    UBER_EATS_SANDBOX_CLIENT_SECRET: str = ""
+    UBER_EATS_SANDBOX_API_BASE_URL: str = "https://test-api.uber.com"
+    UBER_EATS_SANDBOX_AUTH_BASE_URL: str = "https://sandbox-login.uber.com"
+    # Comma-separated business UUIDs allowed to turn SANDBOX orders into real
+    # NextGen Orders (stock, reports). A sandbox order is a test, so it may
+    # only ever land in a dedicated test tenant — never a live restaurant's
+    # books. Empty (the default) means every sandbox order is actively
+    # denied exactly as before, which keeps the old behaviour for every
+    # existing deployment.
+    UBER_EATS_SANDBOX_ORDER_BUSINESS_IDS: str = ""
+    # Explicit opt-in for a deployment that carries ONLY the sandbox app (e.g.
+    # sandbox testing on the one production deployment before Uber issues
+    # production credentials). Without it, enabling webhooks in a non-dev
+    # environment requires the production pair — otherwise every genuine
+    # production order would fail signature verification and be 200-acked as
+    # BAD_SIGNATURE (the BUG-0089 silent-drop pattern). While it is on, no
+    # connection may be promoted to CONNECTED.
+    UBER_EATS_SANDBOX_ONLY_DEPLOYMENT: bool = False
+    # DEPRECATED, read by nothing (BUG-0094). Kept only so an existing
+    # deployment that still sets it does not fail validation. Environment is
+    # per connection (`DeliveryConnection.environment`), and an inbound
+    # webhook's environment is now proven by WHICH app secret verified its
+    # signature (backend/app/delivery/uber/adapter.py), not by the
+    # unauthenticated `X-Environment` header — see
+    # order_service._find_misconfiguration.
     UBER_EATS_ENVIRONMENT: str = "production"
     # Platform-wide kill switch, independent of any tenant's own
     # uber_eats_enabled entitlement — lets ops pull the plug on ALL Uber
@@ -451,7 +471,12 @@ class Settings(BaseSettings):
     # so a delivery order that's genuinely mid-processing (worker briefly
     # slow, not stuck) isn't denied on the very first cron tick after its
     # deadline technically passed.
-    DELIVERY_DEADLINE_GRACE_SECONDS: int = 90
+    #
+    # Was 90. 600 + 90 = 690s is EXACTLY Uber's 11.5-minute auto-cancel, and
+    # the 30s cron tick only fires at or after that — so the watchdog's
+    # "honest deny" always arrived after Uber had already auto-cancelled the
+    # order. 600 + 30 + one 30s tick <= 660s stays clear of 690s.
+    DELIVERY_DEADLINE_GRACE_SECONDS: int = 30
 
     # Retention (design doc §3 — the first table on this platform with a
     # defined retention policy): delivery_webhook_events.raw_payload_json is
