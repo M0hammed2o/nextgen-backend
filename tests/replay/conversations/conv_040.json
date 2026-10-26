@@ -75,7 +75,7 @@
       }
     },
     {
-      "message": "Take out the Coke (330ml)",
+      "message": "Take out the Coke",
       "expect": {
         "state": "CONFIRMING_ORDER",
         "cart": [

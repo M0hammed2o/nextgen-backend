@@ -26,7 +26,7 @@
       }
     },
     {
-      "message": "Remove the Coke (330ml)",
+      "message": "Remove the Coke",
       "expect": {
         "state": "CONFIRMING_ORDER",
         "cart": [

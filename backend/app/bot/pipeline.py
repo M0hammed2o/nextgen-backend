@@ -1124,13 +1124,18 @@ async def _handle_message(
         # Clear the cart, transition to BUILDING_CART, then call LLM with ORDER_START so that
         # real add_to_cart() logic executes and confirmed_cart is correctly locked afterward.
         if intent_router.is_cart_correction(norm_text):
+            import copy as _copy_cc
+            _cc_snapshot = (_copy_cc.deepcopy(session.context_json or {}), session.state)
             state_machine.clear_cart(session)
             state_machine.transition_state(session, ConversationState.BUILDING_CART.value)
             logger.warning(
                 "CART_CORRECTION: cleared cart, transitioning to BUILDING_CART, rebuilding via LLM. session_id=%s, msg=%r",
                 session.id, msg_text[:80],
             )
-            return await _handle_with_llm(db, business, customer, session, msg_text, intent=MessageIntent.ORDER_START, norm_text=norm_text)
+            return await _handle_with_llm(
+                db, business, customer, session, msg_text, intent=MessageIntent.ORDER_START,
+                norm_text=norm_text, pre_mutation_snapshot=_cc_snapshot,
+            )
 
         # "I only want X" / "Just the coke" — full order replacement.
         # Customer names a specific item as their complete order, replacing
@@ -1149,8 +1154,17 @@ async def _handle_message(
             and not _MOD_SIGNAL_RE.search(norm_text)
         ):
             _, _ow_items = await _load_menu(db, business.id)
-            _ow_matches = _extract_items_from_message(norm_text, _ow_items)
+            # ignore_price_ambiguity=True: this is only a gate deciding
+            # whether to clear the cart and route to the real item-resolution
+            # path (which applies BUG-0160's price-ambiguity check properly
+            # when it actually commits a price) -- not a price commitment
+            # itself. Missing this flag here meant "I only want the coke"
+            # against a multi-price Coke catalog never matched, silently
+            # skipping the whole full-order-replacement path.
+            _ow_matches = _extract_items_from_message(norm_text, _ow_items, ignore_price_ambiguity=True)
             if _ow_matches:
+                import copy as _copy_ow
+                _ow_snapshot = (_copy_ow.deepcopy(session.context_json or {}), session.state)
                 state_machine.clear_cart(session)
                 state_machine.transition_state(session, ConversationState.BUILDING_CART.value)
                 logger.warning(
@@ -1160,6 +1174,7 @@ async def _handle_message(
                 return await _handle_with_llm(
                     db, business, customer, session,
                     msg_text, intent=MessageIntent.ORDER_START, norm_text=norm_text,
+                    pre_mutation_snapshot=_ow_snapshot,
                 )
 
     # ── Choosing options state (e.g. "what size?") ──────────────────────
@@ -3166,6 +3181,30 @@ def _capture_options_from_message(item, norm_text: str) -> str | None:
     return ", ".join(found) if found else None
 
 
+def _restore_pre_mutation_snapshot(
+    session, pre_mutation_snapshot: tuple[dict, str] | None, reason: str,
+) -> None:
+    """Restore a cart/context snapshot a caller took before clearing the
+    cart in anticipation of an LLM rebuild that then didn't happen (the LLM
+    call failed, or its response was blocked as contradictory). No-op if no
+    snapshot was provided. See `_handle_with_llm`'s `pre_mutation_snapshot`
+    docstring for the full rationale -- found via independent verification,
+    2026-10-26 (R2): without this, CART_CORRECTION/ONLY_WANT could commit
+    an already-cleared cart with no indication to the customer."""
+    if pre_mutation_snapshot is None:
+        return
+    import copy as _copy_restore
+    from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+    pre_ctx, pre_state = pre_mutation_snapshot
+    session.context_json = _copy_restore.deepcopy(pre_ctx)
+    _flag_modified(session, "context_json")
+    session.state = pre_state
+    logger.warning(
+        "PRE_MUTATION_SNAPSHOT_RESTORED: reason=%s, restored state=%s, session_id=%s",
+        reason, pre_state, session.id,
+    )
+
+
 async def _handle_with_llm(
     db: AsyncSession,
     business: Business,
@@ -3174,12 +3213,23 @@ async def _handle_with_llm(
     msg_text: str,
     intent: MessageIntent | None = None,
     norm_text: str | None = None,
+    pre_mutation_snapshot: tuple[dict, str] | None = None,
 ) -> tuple[str, bool, int | None, int | None, str | None]:
     """Call LLM with conversation history, parse response, update cart/state.
 
     msg_text  — original text sent to LLM and stored in history
     norm_text — normalised text used for deterministic pre-LLM checks;
                 defaults to msg_text when not supplied
+    pre_mutation_snapshot — (context_json, state) captured by a caller that
+                already mutated the session (e.g. clear_cart + transition to
+                BUILDING_CART for CART_CORRECTION/ONLY_WANT) BEFORE calling
+                this function, expecting the LLM call below to rebuild it.
+                If the LLM call itself fails, that pre-mutation is restored
+                before returning the graceful fallback -- otherwise an
+                already-cleared cart would be committed with no indication
+                to the customer that anything was lost (found via
+                independent verification, 2026-10-26: "I only want the
+                Coke" with a failing LLM call silently emptied the cart).
     """
     if norm_text is None:
         norm_text = msg_text
@@ -3515,7 +3565,18 @@ async def _handle_with_llm(
 
         # ── Sub-case A: message also names a menu item + extraction found modifier ──
         # e.g. "Classic Smash Burger take out tomato"
-        _det_remove_matches = _extract_items_from_message(norm_text, items)
+        # ignore_price_ambiguity=True: both sub-cases below (A and A2) only
+        # identify an item ALREADY in the cart (A2) or a real menu-item name
+        # that disambiguates a removal-vs-order-with-modifier phrase (A) --
+        # neither commits a NEW price, so BUG-0160's ask-before-pricing gate
+        # must not apply here. Missing this was a real regression (found by
+        # independent verification, 2026-10-26): "Remove the Coke" against a
+        # catalog with both a 330ml and 500ml Coke no longer matched "coke"
+        # at all once BUG-0160 shipped, so the message fell through to the
+        # ingredient-modifier fallback below and incorrectly added "no coke"
+        # to an unrelated cart item while the real Coke stayed in the cart,
+        # still charged.
+        _det_remove_matches = _extract_items_from_message(norm_text, items, ignore_price_ambiguity=True)
         _with_modifier = [(it, qty, mod) for it, qty, mod in _det_remove_matches if mod]
         if _with_modifier:
             import copy as _copy
@@ -4107,6 +4168,7 @@ async def _handle_with_llm(
             "returning a graceful fallback instead of silence",
             business.id, session.id,
         )
+        _restore_pre_mutation_snapshot(session, pre_mutation_snapshot, reason="LLM_CALL_FAILED")
         return (
             "Sorry, I'm having trouble processing that right now. "
             "Please try again in a moment, or rephrase your message. 🙏",
@@ -4139,6 +4201,7 @@ async def _handle_with_llm(
             "msg_preview=%r",
             parsed.action, session.id, parsed.message[:80],
         )
+        _restore_pre_mutation_snapshot(session, pre_mutation_snapshot, reason="CONTRADICTORY_ACTION_GUARD")
         if parsed.action == "remove_item":
             retry_msg = "Sorry, I didn't catch which item to remove. Could you tell me the name of the item you'd like taken off? 😊"
         else:

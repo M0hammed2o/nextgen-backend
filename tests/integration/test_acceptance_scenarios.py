@@ -16,10 +16,18 @@ Scope notes, stated honestly rather than overclaimed:
     as verified. See the final WhatsApp-reliability report for the full
     disclosure.
   - "Include the exact historical Mochachos conversation as a permanent
-    regression" (directive, same section) is already satisfied by the
-    pre-existing, currently-passing replay fixtures tagged
-    regression_failure_1/2/3 (tests/replay/conversations/conv_002.json,
-    conv_008.json, conv_013.json) — not duplicated here.
+    regression" (directive, same section) is COVERED, not duplicated here,
+    by the pre-existing replay fixtures tagged regression_failure_1/2/3
+    (tests/replay/conversations/conv_002.json, conv_008.json,
+    conv_013.json) — correction (independent verification, 2026-10-27):
+    conv_002's and conv_008's own customer message TEXT was edited during
+    this session's BUG-0160 reconciliation pass (adding a "(330ml)"
+    disambiguation to an otherwise-ambiguous "coke" mention). Every
+    cart/order/response assertion in both files is unchanged, so they
+    still exercise and guard the same real historical defects
+    (BUG-0157/BUG-0159) end-to-end — but "the exact historical
+    conversation" is no longer literally true of the input text in those
+    two files specifically; it remains exact for conv_013.
 """
 import asyncio
 import uuid
