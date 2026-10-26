@@ -33,10 +33,12 @@ from backend.app.bot.pipeline import process_inbound_message
 from backend.app.bot.whatsapp_sender import send_notification_message
 from backend.app.core.config import WORKER_HEARTBEAT_REDIS_KEY, get_settings
 from backend.app.db.session import DATABASE_URL
+from backend.app.delivery.retention import delivery_webhook_retention_sweep
 from backend.app.delivery.order_service import (
     delivery_accept_deadline_watchdog,
     process_delivery_cancellation,
     process_delivery_order,
+    sync_delivery_order_status,
 )
 from shared.models.business import Business
 from shared.models.customer import Customer
@@ -714,6 +716,7 @@ class WorkerSettings:
         process_whatsapp_message,
         process_delivery_order,
         process_delivery_cancellation,
+        sync_delivery_order_status,
     ]
     on_startup = startup
     on_shutdown = shutdown
@@ -790,6 +793,15 @@ class WorkerSettings:
             check_whatsapp_usage_alerts,
             hour=3,
             minute=30,
+            second=0,
+            run_at_startup=False,
+        ),
+        # Delivery webhook event retention (redact at 30 days, delete at
+        # 400) — once daily, off-peak. See backend/app/delivery/retention.py.
+        cron(
+            delivery_webhook_retention_sweep,
+            hour=3,
+            minute=45,
             second=0,
             run_at_startup=False,
         ),

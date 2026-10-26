@@ -42,9 +42,11 @@ from backend.app.external_orders.adapters import (
 from backend.app.inventory.ledger import post_sale_consumption
 from shared.enums import (
     ExternalMappingKind,
+    ExternalPlatform,
     OrderStatus,
     PLATFORM_TO_ORDER_SOURCE,
 )
+from shared.models.delivery import DeliveryOrder
 from shared.models.external_orders import ExternalProductMapping
 from shared.models.menu import MenuAddOn, MenuItem
 from shared.models.order import Order, OrderEvent, OrderItem
@@ -55,6 +57,20 @@ from shared.pricing.engine import calculate_vat_cents
 #: touched this money, so it must never reach till cash-up — which it cannot,
 #: because these orders carry no till_session_id.
 EXTERNAL_PAYMENT_METHOD = "EXTERNAL_PLATFORM"
+
+#: A provider's short display code (Uber "BC953") is reused over time, so a
+#: report row carrying one only counts as the same sale as a live-API order
+#: placed within this window. Shared with backend/app/delivery/order_service.py,
+#: which applies the same rule in the other direction.
+LIVE_DISPLAY_ID_MATCH_WINDOW = timedelta(days=1)
+
+#: Which live-API provider (delivery_orders.provider) a report platform is.
+#: Mr D is deliberately absent: it has no live connection (no partner API —
+#: docs/MRD_API_ACCESS_2026-10.md), so a Mr D report can never collide with
+#: one. Add it here in the same change that ever enables a live Mr D path.
+_PLATFORM_TO_LIVE_PROVIDER = {
+    ExternalPlatform.UBER_EATS.value: "UBER_EATS",
+}
 
 
 def normalise_key(text: str) -> str:
@@ -94,6 +110,9 @@ class ResolvedOrder:
     is_duplicate: bool = False
     is_cancelled: bool = False
     in_closed_period: bool = False
+    #: Why it is a duplicate: "IMPORTED" (an earlier report import) or
+    #: "LIVE_API" (the live provider connection already booked this sale).
+    duplicate_source: str | None = None
 
     @property
     def unresolved_items(self) -> list[str]:
@@ -267,6 +286,8 @@ async def resolve_orders(
         ).all()
         existing_ids = {r[0] for r in rows}
 
+    live_orders = await _live_api_orders(db, business_id=business_id, platform=platform, incoming=incoming)
+
     for order in orders:
         resolved_lines: list[ResolvedLine] = []
 
@@ -350,6 +371,11 @@ async def resolve_orders(
             resolved_lines.append(resolved)
 
         placed = order.placed_at
+        duplicate_source = None
+        if order.external_order_id in existing_ids:
+            duplicate_source = "IMPORTED"
+        elif _matches_live_order(order.external_order_id, placed, live_orders):
+            duplicate_source = "LIVE_API"
         summary.orders.append(
             ResolvedOrder(
                 external_order_id=order.external_order_id,
@@ -357,13 +383,54 @@ async def resolve_orders(
                 status=order.status,
                 gross_cents=order.gross_cents,
                 lines=resolved_lines,
-                is_duplicate=order.external_order_id in existing_ids,
+                is_duplicate=duplicate_source is not None,
                 is_cancelled=looks_cancelled(order.status),
                 in_closed_period=bool(cutoff and placed and placed <= cutoff),
+                duplicate_source=duplicate_source,
             )
         )
 
     return summary
+
+
+async def _live_api_orders(
+    db: AsyncSession, *, business_id: uuid.UUID, platform: str, incoming: list[str],
+) -> list[DeliveryOrder]:
+    """
+    Live-API delivery orders that already booked a sale and whose provider
+    id OR short display code appears in this file. A provider report may
+    carry either; without this check, a restaurant using both the live
+    connection and a report import would get two Orders (and two stock
+    deductions) for one real sale. Tenant-scoped like every other read here.
+    """
+    provider = _PLATFORM_TO_LIVE_PROVIDER.get(platform)
+    if not provider or not incoming:
+        return []
+    return list((
+        await db.execute(
+            select(DeliveryOrder).where(
+                DeliveryOrder.business_id == business_id,
+                DeliveryOrder.provider == provider,
+                DeliveryOrder.order_id.isnot(None),
+                (DeliveryOrder.external_order_id.in_(incoming)) | (DeliveryOrder.display_id.in_(incoming)),
+            )
+        )
+    ).scalars().all())
+
+
+def _matches_live_order(
+    external_order_id: str, placed_at: datetime | None, live_orders: list[DeliveryOrder],
+) -> bool:
+    for live in live_orders:
+        if live.external_order_id == external_order_id:
+            return True
+        if live.display_id and live.display_id == external_order_id:
+            anchor = live.placed_at or live.created_at
+            if placed_at is None or anchor is None:
+                continue  # a reused short code with no time to compare is not proof
+            if abs(placed_at - anchor) <= LIVE_DISPLAY_ID_MATCH_WINDOW:
+                return True
+    return False
 
 
 # ── Posting ──────────────────────────────────────────────────────────────────

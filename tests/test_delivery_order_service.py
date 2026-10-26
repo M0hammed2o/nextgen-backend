@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from backend.app.delivery import order_service
 from backend.app.delivery.canonical import (
     CanonicalDeliveryLine,
     CanonicalDeliveryModifier,
@@ -438,6 +439,8 @@ class TestHandleOrderNeedsMapping:
         db.register_select(DeliveryOrder, ScalarResult(scalar=row))
         db.register_get(DeliveryConnection, connection)
         db.register_get(Business, business)
+        # Cross-path dedupe lookup: no sale already recorded for this order.
+        db.register_select(Order, ScalarResult(rows=[]))
         db.register_select(ExternalProductMapping, ScalarResult(rows=[]))
         db.register_select(MenuItem, ScalarResult(rows=[]))
         db.register_select(MenuAddOn, ScalarResult(rows=[]))
@@ -458,7 +461,12 @@ class TestHandleOrderNeedsMapping:
             )
 
         assert row.status == "NEEDS_MAPPING"
-        assert "Mystery Item" in row.unresolved_items_json
+        # The manager dashboard's "Map this item" deep link reads
+        # external_id/external_text off each entry — the provider's own id
+        # must survive, or there is nothing to map it by.
+        assert {
+            "kind": "ITEM", "external_id": "unmapped-1", "external_text": "Mystery Item",
+        } in row.unresolved_items_json
         fake_adapter.accept_order.assert_not_awaited()
         fake_adapter.deny_order.assert_not_awaited()
         assert not any(isinstance(o, Order) for o in db.added), "no Order must be created for an unmapped item"
@@ -478,6 +486,8 @@ class TestHandleOrderHappyPath:
         db.register_select(DeliveryOrder, ScalarResult(scalar=row))
         db.register_get(DeliveryConnection, connection)
         db.register_get(Business, business)
+        # Cross-path dedupe lookup: no sale already recorded for this order.
+        db.register_select(Order, ScalarResult(rows=[]))
         db.register_select(
             ExternalProductMapping,
             ScalarResult(rows=[ExternalProductMapping(
@@ -528,6 +538,8 @@ class TestHandleOrderHappyPath:
         db.register_select(DeliveryOrder, ScalarResult(scalar=row))
         db.register_get(DeliveryConnection, connection)
         db.register_get(Business, business)
+        # Cross-path dedupe lookup: no sale already recorded for this order.
+        db.register_select(Order, ScalarResult(rows=[]))
         db.register_select(
             ExternalProductMapping,
             ScalarResult(rows=[ExternalProductMapping(
@@ -558,8 +570,15 @@ class TestHandleOrderHappyPath:
         created_orders = [o for o in db.added if isinstance(o, Order)]
         assert len(created_orders) == 1
 
-    async def test_accept_call_failure_never_reverses_the_sale(self):
-        """'The food was made' honesty — a failed accept call must not un-sell the order."""
+    async def test_ambiguous_accept_failure_keeps_the_sale_and_parks_it_unconfirmed(self):
+        """
+        A failure with no HTTP status (transport blip) may or may not have
+        reached the provider. The sale stands and the kitchen gets it, but
+        the row goes to ACCEPT_UNCONFIRMED — a status the deadline watchdog
+        never scans. (Previously it stayed in FETCHING, which the watchdog
+        DOES scan, so ~10 minutes later it denied an order the kitchen was
+        already making.)
+        """
         business_id = uuid.uuid4()
         connection = _connection(business_id)
         business = _business(inventory_enabled=False)
@@ -570,6 +589,8 @@ class TestHandleOrderHappyPath:
         db.register_select(DeliveryOrder, ScalarResult(scalar=row))
         db.register_get(DeliveryConnection, connection)
         db.register_get(Business, business)
+        # Cross-path dedupe lookup: no sale already recorded for this order.
+        db.register_select(Order, ScalarResult(rows=[]))
         db.register_select(
             ExternalProductMapping,
             ScalarResult(rows=[ExternalProductMapping(
@@ -590,6 +611,7 @@ class TestHandleOrderHappyPath:
 
         with patch("backend.app.delivery.order_service.registry.get_provider", return_value=fake_adapter), \
              patch("backend.app.delivery.order_service.post_sale_consumption", new=AsyncMock()), \
+             patch("backend.app.delivery.order_service._ACCEPT_RETRY_DELAYS_SECONDS", (0, 0)), \
              patch("backend.app.delivery.order_service._publish_alert", new=AsyncMock()):
             await _handle_order(
                 db, provider="UBER_EATS", business_id=business_id,
@@ -599,7 +621,109 @@ class TestHandleOrderHappyPath:
         created_orders = [o for o in db.added if isinstance(o, Order)]
         assert len(created_orders) == 1, "the sale must stand even though the accept call failed"
         assert row.order_id == created_orders[0].id
+        assert row.status == "ACCEPT_UNCONFIRMED"
+        assert "ACCEPT_UNCONFIRMED" not in order_service.OPEN_STATUSES, "the watchdog must never deny it"
+        assert fake_adapter.accept_order.await_count == 3, "an ambiguous failure is retried before giving up"
+        assert db.rollbacks == 0
         assert db.commits == 1
+
+    async def test_definitive_accept_rejection_rolls_back_the_sale(self):
+        """
+        A 4xx is the provider saying no (e.g. the order was already
+        cancelled). Nothing was committed or shown to the kitchen yet, so the
+        Order/items/stock are rolled back together, the row is re-locked and
+        recorded FAILED — and there is no retry of a definitive answer.
+        """
+        business_id = uuid.uuid4()
+        connection = _connection(business_id)
+        business = _business(inventory_enabled=False)
+        row = _delivery_order(business_id, connection.id)
+        relocked = _delivery_order(business_id, connection.id)  # fresh load after rollback
+        menu_item = _menu_item(business_id)
+
+        db = TypedFakeDB()
+        db.register_select(DeliveryOrder, ScalarResult(scalar=row), ScalarResult(scalar=relocked))
+        db.register_get(DeliveryConnection, connection, connection)
+        db.register_get(Business, business)
+        db.register_select(Order, ScalarResult(rows=[]))
+        db.register_select(
+            ExternalProductMapping,
+            ScalarResult(rows=[ExternalProductMapping(
+                id=uuid.uuid4(), business_id=business_id, platform="UBER_EATS", kind="ITEM",
+                external_text=menu_item.name, external_key=menu_item.name.lower(),
+                external_id="uber-item-1", menu_item_id=menu_item.id, status="MAPPED",
+            )]),
+        )
+        db.register_select(MenuItem, ScalarResult(rows=[menu_item]))
+        db.register_select(MenuAddOn, ScalarResult(rows=[]))
+
+        canonical = _canonical_order(lines=[
+            CanonicalDeliveryLine(external_item_id="uber-item-1", title=menu_item.name, quantity=1, unit_price_cents=7500)
+        ])
+        fake_adapter = MagicMock()
+        fake_adapter.fetch_order = AsyncMock(return_value=canonical)
+        fake_adapter.accept_order = AsyncMock(
+            side_effect=DeliveryProviderError("UBER_EATS", "order no longer acceptable", status_code=409)
+        )
+
+        commits_before_rollback = []
+        original_rollback = db.rollback
+
+        async def _rollback():
+            commits_before_rollback.append(db.commits)
+            await original_rollback()
+
+        db.rollback = _rollback
+
+        with patch("backend.app.delivery.order_service.registry.get_provider", return_value=fake_adapter), \
+             patch("backend.app.delivery.order_service._publish_alert", new=AsyncMock()):
+            await _handle_order(
+                db, provider="UBER_EATS", business_id=business_id,
+                external_order_id="order-1", event_type=None,
+            )
+
+        assert commits_before_rollback == [0], "the Order must never have been committed"
+        assert fake_adapter.accept_order.await_count == 1, "a definitive 4xx is not retried"
+        assert relocked.status == "FAILED"
+        assert "refused our accept" in relocked.failure_reason
+        assert relocked.order_id is None
+        assert connection.status == "CONNECTED", "a 409 is about the order, not our credentials"
+
+    async def test_accept_rejected_for_bad_credentials_flags_the_connection(self):
+        """A 401/403 that survived the adapter's re-mint is a config problem for every order."""
+        business_id = uuid.uuid4()
+        connection = _connection(business_id)
+        business = _business(inventory_enabled=False)
+        row = _delivery_order(business_id, connection.id)
+        relocked = _delivery_order(business_id, connection.id)
+        menu_item = _menu_item(business_id)
+
+        db = TypedFakeDB()
+        db.register_select(DeliveryOrder, ScalarResult(scalar=row), ScalarResult(scalar=relocked))
+        db.register_get(DeliveryConnection, connection, connection)
+        db.register_get(Business, business)
+        db.register_select(Order, ScalarResult(rows=[]))
+        db.register_select(MenuItem, ScalarResult(rows=[menu_item]))
+        db.register_select(ExternalProductMapping, ScalarResult(rows=[]))
+        db.register_select(MenuAddOn, ScalarResult(rows=[]))
+
+        canonical = _canonical_order(lines=[
+            CanonicalDeliveryLine(external_item_id=None, title=menu_item.name, quantity=1, unit_price_cents=7500)
+        ])
+        fake_adapter = MagicMock()
+        fake_adapter.fetch_order = AsyncMock(return_value=canonical)
+        fake_adapter.accept_order = AsyncMock(
+            side_effect=DeliveryProviderError("UBER_EATS", "not order manager", status_code=403)
+        )
+        with patch("backend.app.delivery.order_service.registry.get_provider", return_value=fake_adapter), \
+             patch("backend.app.delivery.order_service._publish_alert", new=AsyncMock()):
+            await _handle_order(
+                db, provider="UBER_EATS", business_id=business_id,
+                external_order_id="order-1", event_type=None,
+            )
+        assert relocked.status == "FAILED"
+        assert connection.status == "ATTENTION_REQUIRED"
+        assert "403" in connection.error_reason
 
 
 # ── _handle_order — BUG-0091: a fetch failure must actively deny, never FAIL forever ──
@@ -669,7 +793,12 @@ class TestFetchErrorIsActivelyDenied:
 # ── _handle_order — BUG-0092: an unpriceable order must never book a sale ───
 
 class TestUnpriceableOrderIsDenied:
-    async def test_none_total_cents_denies_rather_than_booking_a_zero_value_sale(self):
+    async def test_no_sub_total_and_no_line_prices_denies_rather_than_booking_a_zero_value_sale(self):
+        """
+        The food sale is Uber's `sub_total` ("the total cost of each line
+        item") or, equivalently, the sum of the priced lines. With neither,
+        there is no honest value to book.
+        """
         business_id = uuid.uuid4()
         connection = _connection(business_id)
         business = _business(inventory_enabled=True)
@@ -687,7 +816,7 @@ class TestUnpriceableOrderIsDenied:
         canonical = CanonicalDeliveryOrder(
             provider="UBER_EATS", external_order_id="order-1", external_store_id="store-1",
             lines=[CanonicalDeliveryLine(
-                external_item_id="uber-item-1", title=menu_item.name, quantity=1, unit_price_cents=7500,
+                external_item_id="uber-item-1", title=menu_item.name, quantity=1, unit_price_cents=None,
             )],
             placed_at=datetime.now(timezone.utc),
             total_cents=None, subtotal_cents=None, tax_cents=0, fee_cents=1000,
@@ -774,6 +903,8 @@ class TestUnpriceableOrderIsDenied:
         db.register_select(DeliveryOrder, ScalarResult(scalar=row))
         db.register_get(DeliveryConnection, connection)
         db.register_get(Business, business)
+        # Cross-path dedupe lookup: no sale already recorded for this order.
+        db.register_select(Order, ScalarResult(rows=[]))
         db.register_select(
             ExternalProductMapping,
             ScalarResult(rows=[ExternalProductMapping(
@@ -824,6 +955,8 @@ class TestAutoAcceptGate:
         db.register_select(DeliveryOrder, ScalarResult(scalar=row))
         db.register_get(DeliveryConnection, connection)
         db.register_get(Business, business)
+        # Cross-path dedupe lookup: no sale already recorded for this order.
+        db.register_select(Order, ScalarResult(rows=[]))
         db.register_select(
             ExternalProductMapping,
             ScalarResult(rows=[ExternalProductMapping(
@@ -874,6 +1007,8 @@ class TestAutoAcceptGate:
         db.register_select(DeliveryOrder, ScalarResult(scalar=row))
         db.register_get(DeliveryConnection, connection)
         db.register_get(Business, business)
+        # Cross-path dedupe lookup: no sale already recorded for this order.
+        db.register_select(Order, ScalarResult(rows=[]))
         db.register_select(
             ExternalProductMapping,
             ScalarResult(rows=[ExternalProductMapping(
@@ -985,25 +1120,100 @@ class TestFetchTimeoutIsRetryable:
 # ── Cancellation ──────────────────────────────────────────────────────────────
 
 class TestCancellation:
-    async def test_cancellation_marks_row_and_linked_order_cancelled_without_reversing_stock(self):
+    async def test_cancellation_marks_row_and_linked_order_cancelled_via_the_platform_stock_rule(self):
+        """
+        A provider cancel now goes through the SAME stock rule as every other
+        cancel path (`inventory/cancellation.py::reverse_consumption_on_cancel`):
+        stock comes back only if the kitchen never started the order. It
+        previously skipped that rule entirely (the old docstring here said
+        "no stock-reversal call is made anywhere in this path").
+        """
         business_id = uuid.uuid4()
         order_id = uuid.uuid4()
         row = _delivery_order(business_id, uuid.uuid4(), status="ACCEPTED", order_id=order_id)
         order = Order(id=order_id, business_id=business_id, status="ACCEPTED", order_number="UE-order-1")
+        business = _business(inventory_enabled=True)
 
         db = TypedFakeDB()
         db.register_select(DeliveryOrder, ScalarResult(scalar=row))
         db.register_get(Order, order)
+        db.register_get(Business, business)
 
-        await _handle_cancellation(
-            db, provider="UBER_EATS", business_id=business_id, external_order_id="order-1"
-        )
+        with patch("backend.app.delivery.order_service.reverse_consumption_on_cancel", new=AsyncMock()) as mock_reverse, \
+             patch("backend.app.delivery.order_service._publish_order_cancelled", new=AsyncMock()) as mock_publish:
+            await _handle_cancellation(
+                db, provider="UBER_EATS", business_id=business_id, external_order_id="order-1"
+            )
 
         assert row.status == "CANCELLED"
         assert order.status == "CANCELLED"
         assert db.commits == 1
-        # No stock-reversal call is made anywhere in this path — a financial
-        # cancellation is not a production fact (DECISIONS.md).
+        mock_reverse.assert_awaited_once()
+        _, kwargs = mock_reverse.call_args
+        assert kwargs["previous_status"] == "ACCEPTED"
+        assert kwargs["inventory_enabled"] is True
+        assert kwargs["order_id"] == order.id
+        # The kitchen board must drop it like any other cancel — and be told.
+        mock_publish.assert_awaited_once()
+
+    async def test_cancel_of_an_order_in_preparation_keeps_stock_by_the_same_rule(self):
+        business_id = uuid.uuid4()
+        order_id = uuid.uuid4()
+        row = _delivery_order(business_id, uuid.uuid4(), status="ACCEPTED", order_id=order_id)
+        order = Order(id=order_id, business_id=business_id, status="IN_PROGRESS", order_number="UE-A1")
+        db = TypedFakeDB()
+        db.register_select(DeliveryOrder, ScalarResult(scalar=row))
+        db.register_get(Order, order)
+        db.register_get(Business, _business(inventory_enabled=True))
+
+        with patch("backend.app.delivery.order_service.reverse_consumption_on_cancel", new=AsyncMock()) as mock_reverse, \
+             patch("backend.app.delivery.order_service._publish_order_cancelled", new=AsyncMock()):
+            await _handle_cancellation(
+                db, provider="UBER_EATS", business_id=business_id, external_order_id="order-1"
+            )
+        # The rule itself decides "food already made -> keep the deduction";
+        # this path's job is to hand it the true previous status.
+        _, kwargs = mock_reverse.call_args
+        assert kwargs["previous_status"] == "IN_PROGRESS"
+        assert order.status == "CANCELLED"
+
+    async def test_cancel_after_hand_over_leaves_the_sale_as_recorded(self):
+        """Food already collected: the provider's cancel is a payout matter, not a kitchen one."""
+        business_id = uuid.uuid4()
+        order_id = uuid.uuid4()
+        row = _delivery_order(business_id, uuid.uuid4(), status="FULFILLED", order_id=order_id)
+        order = Order(id=order_id, business_id=business_id, status="COLLECTED", order_number="UE-A1")
+        db = TypedFakeDB()
+        db.register_select(DeliveryOrder, ScalarResult(scalar=row))
+        db.register_get(Order, order)
+
+        with patch("backend.app.delivery.order_service.reverse_consumption_on_cancel", new=AsyncMock()) as mock_reverse, \
+             patch("backend.app.delivery.order_service._publish_alert", new=AsyncMock()):
+            await _handle_cancellation(
+                db, provider="UBER_EATS", business_id=business_id, external_order_id="order-1"
+            )
+        assert row.status == "CANCELLED"
+        assert order.status == "COLLECTED", "a handed-over order is never flipped to CANCELLED"
+        mock_reverse.assert_not_awaited()
+        assert db.commits == 1
+
+    async def test_every_cancellation_transition_is_audited(self):
+        from shared.models.audit import AuditEvent
+
+        business_id = uuid.uuid4()
+        row = _delivery_order(business_id, uuid.uuid4(), status="NEEDS_MAPPING")
+        db = TypedFakeDB()
+        db.register_select(DeliveryOrder, ScalarResult(scalar=row))
+        with patch("backend.app.delivery.order_service._publish_alert", new=AsyncMock()):
+            await _handle_cancellation(
+                db, provider="UBER_EATS", business_id=business_id, external_order_id="order-1"
+            )
+        audits = [a for a in db.added if isinstance(a, AuditEvent)]
+        assert len(audits) == 1
+        assert audits[0].action == "delivery.order.status_changed"
+        assert audits[0].diff_json["from"] == "NEEDS_MAPPING"
+        assert audits[0].diff_json["to"] == "CANCELLED"
+        assert audits[0].business_id == business_id
 
     async def test_already_terminal_cancellation_is_a_no_op(self):
         business_id = uuid.uuid4()

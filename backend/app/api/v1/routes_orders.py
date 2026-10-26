@@ -6,7 +6,7 @@ Staff, Manager, and Owner can access. Status transitions are validated.
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import select, func, and_
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -550,6 +550,7 @@ async def update_order_status(
     body: StatusUpdateRequest,
     user: AuthUser = Depends(require_staff_or_above),
     db: AsyncSession = Depends(get_db),
+    request: Request = None,
 ):
     """
     Update order status with transition validation.
@@ -676,6 +677,27 @@ async def update_order_status(
     except Exception:
         import logging
         logging.getLogger("nextgen").warning("Failed to publish SSE event for order %s", order.id)
+
+    # ── Marketplace order: tell the provider (fire and forget) ────────────
+    # READY -> "ready for pickup", CANCELLED -> restaurant cancel, a
+    # hand-over status -> local FULFILLED. Queued, never awaited inline, so
+    # a slow/failing provider can never block or undo the kitchen's own
+    # status change; failures are recorded on the delivery order and raised
+    # to managers (backend/app/delivery/order_service.py::sync_delivery_order_status).
+    # business_id comes from the JWT, never the request body.
+    if order.source in EXTERNAL_ORDER_SOURCES:
+        try:
+            arq_pool = getattr(request.app.state, "arq_pool", None) if request is not None else None
+            if arq_pool is not None:
+                await arq_pool.enqueue_job(
+                    "sync_delivery_order_status",
+                    str(user.business_id), str(order.id), requested.value, body.reason,
+                )
+        except Exception:
+            import logging
+            logging.getLogger("nextgen").warning(
+                "Failed to enqueue marketplace status sync for order %s", order.id
+            )
 
     # ── Notify customer via WhatsApp (fire and forget) ────────────────────
     try:
