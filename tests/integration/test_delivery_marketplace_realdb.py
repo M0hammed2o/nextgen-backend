@@ -515,3 +515,31 @@ async def test_report_import_skips_an_order_the_live_api_already_booked(uber_ten
     assert await _count(Order, Order.business_id == business.id, Order.external_order_id == "RP777") == 0, (
         "the live order is booked under Uber's id; the report's short code must not add a second sale"
     )
+
+
+# ── Environment isolation (security review, 2026-10-26) ─────────────────────
+
+
+async def test_a_cancel_signed_with_the_sandbox_secret_cannot_touch_a_production_order(uber_tenant, uber_settings):
+    """
+    The cancellation job has no environment gate of its own, so before the
+    intake check a cancel signed with the (weaker-held) sandbox secret,
+    naming a production store and order, cancelled that order and reversed
+    its stock. Intake now refuses it before any row or job exists.
+    """
+    order_id, row, _ = await _live_accepted_order(uber_tenant)
+    sandbox_secret = "integration-test-sandbox-secret"
+    body = json.dumps({
+        "event_type": "orders.cancel", "event_id": str(uuid.uuid4()),
+        "meta": {"resource_id": order_id, "status": "pos", "user_id": uber_tenant["store_id"]},
+    }).encode()
+    headers = {"x-uber-signature": hmac.new(sandbox_secret.encode(), body, hashlib.sha256).hexdigest()}
+    pool = RecordingPool()
+    with patch.object(uber_settings, "UBER_EATS_SANDBOX_CLIENT_SECRET", sandbox_secret):
+        result = await _deliver(body, headers, pool)
+
+    assert result.error_category == "ENV_MISMATCH" and pool.jobs == []
+    async with get_session_factory()() as session:
+        assert (await session.get(Order, row.order_id)).status == "ACCEPTED"
+    assert (await _delivery_row(uber_tenant["business"].id, order_id)).status == "ACCEPTED"
+    assert all(m.movement_type == "SALE_CONSUMPTION" for m in await _stock_movements(row.order_id))
