@@ -325,6 +325,22 @@ SA_MENU: list[FakeMenuItem] = [
     # pre-existing fixture, so nothing above is affected.
     FakeMenuItem("Quarter Chicken", 5990, category_name="Flame-Grilled Chicken",
                  options_json=_MOCHACHOS_SPICE_LEVEL_OPTIONS),
+    # Added-only, for the BUG-1/BUG-2 reproduction suite (conv_336+,
+    # 2026-10-26) built from a real Mochachos test conversation. Prices
+    # match the real deployed demo seed (scripts/seed_mochachos_demo.py).
+    FakeMenuItem("Half Chicken", 11490, category_name="Flame-Grilled Chicken",
+                 options_json=_MOCHACHOS_SPICE_LEVEL_OPTIONS),
+    # NOTE: deliberately NOT adding "Single/Double Chicken Burger" here.
+    # Tried that for the BUG-0158 fixture (2026-10-26) and it broke 176
+    # pre-existing tests: _find_size_variants groups by base name with
+    # size-keywords stripped ("single"/"double" -> "chicken burger"), and
+    # its match is a >=80%-of-significant-words ratio, not an exact/bounded
+    # match -- so creating any "chicken burger" group at all made it also
+    # swap in for messages about the ALREADY-EXISTING, unrelated "Spicy
+    # Chicken Burger" / "Grilled Chicken Burger" (both contain "chicken"
+    # and "burger" too). BUG-0158's actual regression coverage lives in
+    # tests/integration/test_bug_0158_sibling_item_and_unmatched_alias.py
+    # instead, using its own isolated, non-shared catalog.
     FakeMenuItem("Buddy 440ml", 2890, category_name="Drinks"),
     FakeMenuItem(
         "Quarter Chicken, Beeg Chips and a Buddy", 10990, category_name="Combos",

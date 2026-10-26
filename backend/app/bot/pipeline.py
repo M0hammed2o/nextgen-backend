@@ -26,6 +26,7 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import select, update as _sa_update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -151,12 +152,37 @@ async def _process(
     )
 
     # ── 4. Idempotency ───────────────────────────────────────────────────
-    existing = await db.execute(
-        select(Message.id).where(Message.wa_message_id == wa_message_id)
+    # Race-safe: atomically RESERVES the wa_message_id via INSERT ... ON
+    # CONFLICT DO NOTHING RETURNING id (same pattern as
+    # _get_or_create_customer/get_or_create_session), instead of a plain
+    # SELECT-then-proceed. The old version was a genuine TOCTOU race: two
+    # concurrent ARQ jobs for the same wa_message_id (Meta's webhook
+    # delivery is documented "at least once", and the old enqueue_job call
+    # had no dedup key) could BOTH pass this SELECT before either committed
+    # -- cart mutations and the outbound WhatsApp send are not protected by
+    # Postgres's wa_message_id uniqueness at all, only the final Message
+    # insert was, and by then the damage (doubled cart, duplicate reply
+    # already sent) was done. Confirmed as the real, reproducible cause of
+    # BUG-0157's duplicate-cart-mutation report, 2026-10-26. The INSERT
+    # itself is the dedup check now: Postgres's unique index makes the
+    # check-and-reserve atomic, closing the race entirely regardless of
+    # how far apart the two deliveries' Python code runs.
+    _reserved = await db.execute(
+        pg_insert(Message)
+        .values(
+            business_id=business.id,
+            customer_id=customer.id,
+            wa_message_id=wa_message_id,
+            direction="INBOUND",
+        )
+        .on_conflict_do_nothing(constraint="uq_messages_wa_message_id")
+        .returning(Message.id)
     )
-    if existing.scalar_one_or_none():
+    _inbound_message_id = _reserved.scalar_one_or_none()
+    if _inbound_message_id is None:
         logger.info(
-            "PIPELINE_DUPLICATE: wa_message_id=%s already processed, skipping",
+            "PIPELINE_DUPLICATE: wa_message_id=%s already processed (or concurrently "
+            "being processed right now), skipping",
             wa_message_id,
         )
         return
@@ -186,11 +212,9 @@ async def _process(
     intent = intent_router.match_intent(norm_text)
     if intent == MessageIntent.OPT_OUT:
         customer.opted_out = True
-        _persist_inbound(
+        await _persist_inbound(
             db=db,
-            business_id=business.id,
-            customer_id=customer.id,
-            wa_message_id=wa_message_id,
+            message_id=_inbound_message_id,
             text=msg_text,
             raw_payload=raw_payload,
             intent="OPT_OUT",
@@ -213,11 +237,11 @@ async def _process(
         return
 
     # ── 7. Persist inbound message ───────────────────────────────────────
-    _persist_inbound(
+    # Fills in the row already atomically reserved in step 4 — never a
+    # second INSERT (see step 4's comment for why).
+    await _persist_inbound(
         db=db,
-        business_id=business.id,
-        customer_id=customer.id,
-        wa_message_id=wa_message_id,
+        message_id=_inbound_message_id,
         text=msg_text,
         raw_payload=raw_payload,
         intent=intent.value if intent else None,
@@ -2922,16 +2946,66 @@ async def _handle_with_llm(
     ):
         base_name, variants = _find_size_variants(norm_text, items)
         if base_name and variants:
+            # ── Sibling items in the same message, e.g. "a chicken burger
+            # and a Coke" ────────────────────────────────────────────────
+            # Before this fix, the function returned immediately below with
+            # only the ambiguous item remembered -- any other item named in
+            # the SAME message was silently discarded, never stored in any
+            # context, and unrecoverable even across the clarification
+            # sub-dialogue that follows (burger type -> spice level). This
+            # was a real, reported production bug, 2026-10-26 (BUG-0158):
+            # "Can I get a chicken burger and a Coke?" ended with only the
+            # burger ever added, the Coke request gone with no trace and no
+            # acknowledgement. Fix: extract the REST of the message for any
+            # item that resolves deterministically (same extraction used
+            # everywhere else in this file) and add it to the cart right
+            # now, before the ambiguity question is even asked -- it isn't
+            # ambiguous, so there's nothing to wait for.
+            _sibling_matches = _extract_items_from_message(norm_text, items)
+            _sibling_names_added: list[str] = []
+            for _sib_item, _sib_qty, _sib_mod in _sibling_matches:
+                if not _get_missing_required_groups(_sib_item, _sib_mod, norm_text):
+                    state_machine.add_to_cart(
+                        session,
+                        menu_item_id=str(_sib_item.id), name=_sib_item.name,
+                        price_cents=_sib_item.price_cents, quantity=_sib_qty,
+                        options=None,
+                        special_instructions=_sib_mod or _capture_options_from_message(_sib_item, norm_text),
+                    )
+                    _sibling_names_added.append(f"{_sib_qty}x {_sib_item.name}")
+
             pending = [{"name": base_name, "quantity": 1, "options": None, "special_instructions": None}]
             state_machine.set_context(session, "pending_options", pending)
             state_machine.transition_state(session, ConversationState.CHOOSING_OPTIONS.value)
             size_options = "\n".join(f"  • {v.name}" for v in variants)
             logger.warning(
-                "SIZE_AMBIGUITY: base=%r, variants=%d, session_id=%s",
-                base_name, len(variants), session.id,
+                "SIZE_AMBIGUITY: base=%r, variants=%d, sibling_items_added=%r, session_id=%s",
+                base_name, len(variants), _sibling_names_added, session.id,
             )
+            _prefix = (
+                f"Added {', '.join(_sibling_names_added)} ✅\n\n" if _sibling_names_added else ""
+            )
+            # ── Unmatched drink/alias mention, e.g. "a Coke" when the
+            # catalog has no Coke/Coca-Cola item ──────────────────────────
+            # _ITEM_ALIASES resolving to zero real candidates is handled
+            # silently by _extract_items_from_chunk (correctly -- that
+            # function has no business composing customer-facing text).
+            # Surface it HERE instead, once, rather than letting it vanish
+            # with no acknowledgement: tell the customer what we don't
+            # have, in the same message as the question we DO need
+            # answered, instead of a later dead-end "Sorry, I didn't catch
+            # the items properly."
+            _unmatched_alias_note = ""
+            for _alias, _target in _ITEM_ALIASES.items():
+                if _re.search(rf"(?<!-)\b{_re.escape(_alias)}s?\b", norm_text, _re.I):
+                    if not any(_target in i.name.lower() for i in items if i.is_active and not i.is_deleted):
+                        _unmatched_alias_note = (
+                            f"\n\n(We don't have '{_alias.title()}' by that name on our menu "
+                            f"— happy to help you pick a drink after this!)"
+                        )
+                        break
             return (
-                f"Which *{base_name.title()}* would you like?\n{size_options}",
+                f"{_prefix}Which *{base_name.title()}* would you like?\n{size_options}{_unmatched_alias_note}",
                 False, None, None, None,
             )
 
@@ -5104,53 +5178,64 @@ async def _get_or_create_customer(
     wa_id: str,
     display_name: str | None,
 ) -> Customer:
-    """Get or create a customer by wa_id for this business."""
+    """
+    Get or create a customer by wa_id for this business.
+
+    Race-safe: uses INSERT ... ON CONFLICT DO NOTHING (same pattern as
+    state_machine.get_or_create_session's own session-row upsert) so two
+    concurrent webhook deliveries for a brand-new customer's very first
+    message can never both race a plain SELECT-then-INSERT and crash on
+    uq_customers_business_wa_id -- confirmed as a real, reproducible crash
+    via a genuine concurrent-dispatch test, 2026-10-26 (BUG-0157). The old
+    plain-SELECT version let the second concurrent call's INSERT raise an
+    uncaught IntegrityError, aborting that entire message (no reply sent,
+    not merely a duplicate).
+    """
+    now = datetime.now(timezone.utc)
+    await db.execute(
+        pg_insert(Customer)
+        .values(
+            business_id=business_id,
+            wa_id=wa_id,
+            display_name=display_name,
+            last_message_at=now,
+        )
+        .on_conflict_do_nothing(constraint="uq_customers_business_wa_id")
+    )
     result = await db.execute(
         select(Customer).where(
             Customer.business_id == business_id,
             Customer.wa_id == wa_id,
         )
     )
-    customer = result.scalar_one_or_none()
-
-    if customer:
-        customer.last_message_at = datetime.now(timezone.utc)
-        if display_name and not customer.display_name:
-            customer.display_name = display_name
-        return customer
-
-    customer = Customer(
-        business_id=business_id,
-        wa_id=wa_id,
-        display_name=display_name,
-        last_message_at=datetime.now(timezone.utc),
-    )
-    db.add(customer)
-    await db.flush()
+    customer = result.scalar_one()
+    customer.last_message_at = now
+    if display_name and not customer.display_name:
+        customer.display_name = display_name
     return customer
 
 
-def _persist_inbound(
+async def _persist_inbound(
     db: AsyncSession,
-    business_id: uuid.UUID,
-    customer_id: uuid.UUID,
-    wa_message_id: str,
+    message_id: uuid.UUID,
     text: str,
     raw_payload: dict,
     intent: str | None,
-) -> Message:
-    """Persist an inbound message to the messages table."""
-    msg = Message(
-        business_id=business_id,
-        customer_id=customer_id,
-        wa_message_id=wa_message_id,
-        direction="INBOUND",
-        text=text,
-        payload_json=raw_payload,
-        intent=intent,
+) -> None:
+    """
+    Fill in the inbound Message row already atomically reserved by step 4's
+    INSERT ... ON CONFLICT DO NOTHING (see _process's step 4 comment) --
+    an UPDATE by primary key, never a second INSERT. Reusing the same row
+    (rather than inserting a fresh one here) is what makes the step-4
+    reservation meaningful: if this function inserted its own row, a
+    concurrent duplicate could still sneak a second Message in between
+    step 4's reservation and this call.
+    """
+    await db.execute(
+        _sa_update(Message)
+        .where(Message.id == message_id)
+        .values(text=text, payload_json=raw_payload, intent=intent)
     )
-    db.add(msg)
-    return msg
 
 
 async def _send_response(
