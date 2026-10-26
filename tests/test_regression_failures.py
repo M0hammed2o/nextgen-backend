@@ -281,9 +281,10 @@ class TestFailure2OnlyWantReplacement:
         ), f"Unexpected strong intent {intent} for 'i only want the coke'"
 
     def test_det_finds_coke_in_only_want_message(self):
-        """DET must find Coke when 'only want' message names it."""
-        matches = _extract_items_from_message(normalize("I only want the coke"), _MENU)
-        assert matches, "DET must find Coke from 'I only want the coke'"
+        """DET must find Coke when 'only want' message names it. BUG-0160:
+        a bare "coke" is now correctly ambiguous (330ml/500ml); disambiguated."""
+        matches = _extract_items_from_message(normalize("I only want the coke (330ml)"), _MENU)
+        assert matches, "DET must find Coke from 'I only want the coke (330ml)'"
         assert any("Coca-Cola" in m[0].name for m in matches), (
             f"Expected Coke in matches, got {[m[0].name for m in matches]}"
         )
@@ -322,8 +323,9 @@ class TestFailure2OnlyWantReplacement:
             state_machine.clear_cart(session)
             assert not _cart(session), "Cart should be empty after clear"
 
-            # DET finds Coke and adds it
-            matches = _extract_items_from_message(normalize("I only want the coke"), _MENU)
+            # DET finds Coke and adds it. BUG-0160: a bare "coke" is now
+            # correctly ambiguous (330ml/500ml, different prices); disambiguated.
+            matches = _extract_items_from_message(normalize("I only want the coke (330ml)"), _MENU)
             assert matches, "DET must find Coke"
             for mi, qty, mod in matches:
                 if "Coca-Cola" in mi.name:
@@ -694,9 +696,11 @@ class TestRegressionMatrix:
         assert csb and csb[0][1] == 3, f"Expected 3x CSB, got {csb}"
 
     def test_A3_two_burgers_three_cokes(self):
-        """A3: '2 classic smash burgers and 3 cokes' → 2 CSB + 3 Coke."""
+        """A3: '2 classic smash burgers and 3 cokes (330ml)' → 2 CSB + 3
+        Coke. BUG-0160: a bare "cokes" is now correctly ambiguous
+        (330ml/500ml, different prices); disambiguated."""
         m = _extract_items_from_message(
-            normalize("2 classic smash burgers and 3 cokes"), _MENU
+            normalize("2 classic smash burgers and 3 cokes (330ml)"), _MENU
         )
         qty_map = {i.name: q for i, q, _ in m}
         assert qty_map.get("Classic Smash Burger") == 2, f"CSB qty: {qty_map}"
@@ -821,9 +825,11 @@ class TestRegressionMatrix:
         assert intent == MessageIntent.ORDER_START, f"Got {intent}"
 
     def test_F25_coks_alias(self):
-        """F25: 'coks' → normalized, DET finds Coca-Cola via alias."""
+        """F25: 'coks' → normalized, DET finds Coca-Cola via alias.
+        BUG-0160: a bare "cokes" is now correctly ambiguous (330ml/500ml);
+        disambiguated."""
         # normalizer has no 'coks' rule, but DET alias handles 'coke'/'cokes'
-        matches = _extract_items_from_message(normalize("2 cokes"), _MENU)
+        matches = _extract_items_from_message(normalize("2 cokes (330ml)"), _MENU)
         assert any("Coca-Cola" in m[0].name for m in matches), (
             "'cokes' must match Coca-Cola via DET alias"
         )

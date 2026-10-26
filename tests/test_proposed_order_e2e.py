@@ -341,14 +341,16 @@ class TestScenario3ConfirmProposedOrder:
 
 class TestScenario4AddDuringConfirmation:
     def test_det_finds_coke_in_add_a_coke(self):
-        """DET must extract Coca-Cola from 'Add a coke'."""
-        matches = _extract_items_from_message(normalize("Add a coke"), _MENU)
-        assert matches, "DET must find Coke from 'Add a coke'"
+        """DET must extract Coca-Cola from 'Add a coke (330ml)'. BUG-0160:
+        a bare "coke" is now correctly ambiguous (330ml/500ml, different
+        prices); "(330ml)" specified explicitly."""
+        matches = _extract_items_from_message(normalize("Add a coke (330ml)"), _MENU)
+        assert matches, "DET must find Coke from 'Add a coke (330ml)'"
         assert any("Coca-Cola" in m[0].name for m in matches)
 
     def test_det_finds_coke_plural(self):
-        """'add 2 cokes' → 2x Coca-Cola."""
-        matches = _extract_items_from_message(normalize("add 2 cokes"), _MENU)
+        """'add 2 cokes (330ml)' → 2x Coca-Cola. BUG-0160: disambiguated."""
+        matches = _extract_items_from_message(normalize("add 2 cokes (330ml)"), _MENU)
         assert matches
         assert any("Coca-Cola" in m[0].name for m in matches)
         assert matches[0][1] == 2
@@ -606,8 +608,9 @@ class TestBug2AskOptionsDETFallback:
         cola = next(i for i in _MENU if i.name == "Coca-Cola (330ml)")
         with patch("backend.app.bot.state_machine.flag_modified"):
             _add_item(session, csb, 1)
-            # DET_ADD_CONFIRMING path: find coke and add
-            matches = _extract_items_from_message(normalize("Add a coke"), _MENU)
+            # DET_ADD_CONFIRMING path: find coke and add. BUG-0160: a bare
+            # "coke" is now correctly ambiguous (330ml/500ml); disambiguated.
+            matches = _extract_items_from_message(normalize("Add a coke (330ml)"), _MENU)
             assert matches, "Coke not found"
             for mi, qty, mod in matches:
                 state_machine.add_to_cart(session, str(mi.id), mi.name, mi.price_cents, qty)

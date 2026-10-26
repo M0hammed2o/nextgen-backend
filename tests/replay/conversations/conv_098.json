@@ -8,7 +8,7 @@
 
   "turns": [
     {
-      "message": "China gimme 2 cokes",
+      "message": "China gimme 2 cokes (330ml)",
       "expect": {
         "state": "CONFIRMING_ORDER",
         "cart": [{"name": "Coca-Cola (330ml)", "quantity": 2}]

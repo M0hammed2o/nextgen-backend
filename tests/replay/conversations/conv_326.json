@@ -8,7 +8,7 @@
 
   "turns": [
     {
-      "message": "I'll have a coke, a Smash Burger Combo with Still Water, and chips",
+      "message": "I'll have a coke (330ml), a Smash Burger Combo with Still Water, and chips",
       "expect": {
         "state": "CONFIRMING_ORDER",
         "cart": [

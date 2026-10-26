@@ -27,7 +27,7 @@
       }
     },
     {
-      "message": "pls add a coke bru",
+      "message": "pls add a 330ml coke bru",
       "expect": {
         "state": "CONFIRMING_ORDER",
         "cart": [

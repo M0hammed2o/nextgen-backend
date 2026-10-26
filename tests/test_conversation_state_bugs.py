@@ -239,9 +239,11 @@ class TestBug2InquiryModeOrderAdd:
         assert match_intent(normalize("add a coke")) == MessageIntent.ORDER_ADD
 
     def test_det_finds_coke_from_add_a_coke(self):
-        """DET extracts Coca-Cola from 'add a coke' regardless of state."""
-        matches = _extract_items_from_message(normalize("add a coke"), _MENU)
-        assert matches, "DET must find Coke from 'add a coke'"
+        """DET extracts Coca-Cola from 'add a 330ml coke' regardless of
+        state. BUG-0160: "add a coke" alone is now correctly ambiguous
+        (330ml/500ml, different prices) -- see test_coke_messages_resolved_by_det."""
+        matches = _extract_items_from_message(normalize("add a 330ml coke"), _MENU)
+        assert matches, "DET must find Coke from 'add a 330ml coke'"
         assert any("Coca-Cola" in m[0].name for m in matches)
 
     def test_det_eligible_in_browsing_menu(self):
@@ -269,15 +271,17 @@ class TestBug2InquiryModeOrderAdd:
 
     def test_coke_added_to_empty_cart_after_inquiry(self):
         """
-        Simulate: inquiry state → 'add a coke' → Coke in cart.
-        This must not require a LLM call.
+        Simulate: inquiry state → 'add a 330ml coke' → Coke in cart.
+        This must not require a LLM call. BUG-0160: a bare "coke" is now
+        correctly ambiguous between 330ml/500ml (different prices); 330ml
+        specified explicitly here, same item the old silent default picked.
         """
         session = _session()
         session.state = "BROWSING_MENU"
         cola = next(i for i in _MENU if i.name == "Coca-Cola (330ml)")
         with patch("backend.app.bot.state_machine.flag_modified"):
             # DET finds coke and adds it (simulating what DET_ELIGIBLE would do)
-            matches = _extract_items_from_message(normalize("add a coke"), _MENU)
+            matches = _extract_items_from_message(normalize("add a 330ml coke"), _MENU)
             assert matches
             for mi, qty, mod in matches:
                 state_machine.add_to_cart(session, str(mi.id), mi.name, mi.price_cents, qty)
@@ -297,15 +301,24 @@ class TestBug3CokeDetection:
     to Coca-Cola via DET regardless of session state.
     """
 
+    # BUG-0160 (KNOWN_BUGS.md), product decision 2026-10-26: "coke" alone
+    # now correctly requires clarification (it ambiguously matches both
+    # Coca-Cola (330ml, R20) and (500ml, R25) -- different prices). These
+    # phrasings are updated to specify "330ml" explicitly, same as a real
+    # disambiguating customer would -- this is the EXACT item the old
+    # default silently picked (same-length names, stable-sorted, 330ml
+    # listed first in _MENU), so every assertion below is unchanged; only
+    # the input phrasing is now realistic instead of relying on the
+    # (now-removed) silent-default behaviour.
     @pytest.mark.parametrize("msg", [
-        "Add a coke",
-        "add a coke",
-        "add 2 cokes",
-        "Add coke",
-        "Please add a coke to my order",
-        "gimme a coke",
-        "I want a coke",
-        "can I get a coke",
+        "Add a 330ml coke",
+        "add a 330ml coke",
+        "add 2 cokes (330ml)",
+        "Add 330ml coke",
+        "Please add a 330ml coke to my order",
+        "gimme a 330ml coke",
+        "I want a 330ml coke",
+        "can I get a 330ml coke",
     ])
     def test_coke_messages_resolved_by_det(self, msg):
         """All coke-ordering phrasings must resolve via DET."""
@@ -316,10 +329,10 @@ class TestBug3CokeDetection:
         )
 
     @pytest.mark.parametrize("msg,expected_qty", [
-        ("add a coke", 1),
-        ("add 2 cokes", 2),
-        ("2x coke", 2),
-        ("3 cokes", 3),
+        ("add a 330ml coke", 1),
+        ("add 2 cokes (330ml)", 2),
+        ("2x coke (330ml)", 2),
+        ("3 cokes (330ml)", 3),
     ])
     def test_coke_quantity_parsing(self, msg, expected_qty):
         """Quantities must be parsed correctly."""
@@ -487,8 +500,10 @@ class TestE2EConversationSimulations:
         cola = next(i for i in _MENU if "330ml" in i.name)
 
         with patch("backend.app.bot.state_machine.flag_modified"):
-            # Simulate DET_ELIGIBLE firing for ORDER_ADD in BROWSING_MENU
-            matches = _extract_items_from_message(normalize("Add a coke"), _MENU)
+            # Simulate DET_ELIGIBLE firing for ORDER_ADD in BROWSING_MENU.
+            # BUG-0160: "Add a coke" alone is now correctly ambiguous
+            # (330ml/500ml, different prices) -- 330ml specified explicitly.
+            matches = _extract_items_from_message(normalize("Add a 330ml coke"), _MENU)
             assert matches, "FAIL: Coke not found by DET"
             for mi, qty, mod in matches:
                 state_machine.add_to_cart(session, str(mi.id), mi.name, mi.price_cents, qty)

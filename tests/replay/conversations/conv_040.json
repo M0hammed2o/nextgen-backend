@@ -27,7 +27,7 @@
       }
     },
     {
-      "message": "Add a Coke",
+      "message": "Add a Coke (330ml)",
       "expect": {
         "state": "CONFIRMING_ORDER",
         "cart": [
@@ -75,7 +75,7 @@
       }
     },
     {
-      "message": "Take out the Coke",
+      "message": "Take out the Coke (330ml)",
       "expect": {
         "state": "CONFIRMING_ORDER",
         "cart": [
