@@ -43,9 +43,23 @@ async def get_or_create_session(
     Get the active conversation session for this customer+business,
     or create a new one. Auto-expires stale sessions.
 
-    Race-safe: uses INSERT … ON CONFLICT DO NOTHING so that concurrent
-    webhook deliveries cannot create duplicate session rows (relies on
-    the uq_conversation_sessions_business_customer DB constraint).
+    Race-safe on two levels:
+    - Row CREATION: INSERT … ON CONFLICT DO NOTHING so that concurrent
+      webhook deliveries cannot create duplicate session rows (relies on
+      the uq_conversation_sessions_business_customer DB constraint).
+    - Row MUTATION: the SELECT below uses .with_for_update(), so a second
+      concurrent caller for the same customer BLOCKS here until the first
+      caller's transaction commits or rolls back, then reads the
+      post-commit cart state rather than a stale pre-mutation snapshot.
+      Before this lock existed, two concurrent calls (e.g. a genuine
+      duplicate ARQ job dispatch for one Meta webhook delivery -- Meta's
+      delivery is documented "at least once", not exactly once) could both
+      load the SAME starting cart, both independently add the same items,
+      and both commit/send a reply -- a real, reported production
+      duplicate-cart-mutation bug, 2026-10-26 (BUG-0157). This lock is
+      what makes pipeline.py's wa_message_id idempotency check in step 4
+      actually effective under concurrency, not just in the common
+      sequential case.
     """
     now = datetime.now(timezone.utc)
 
@@ -66,10 +80,12 @@ async def get_or_create_session(
     )
 
     result = await db.execute(
-        select(ConversationSession).where(
+        select(ConversationSession)
+        .where(
             ConversationSession.business_id == business_id,
             ConversationSession.customer_id == customer_id,
         )
+        .with_for_update()
     )
     session = result.scalar_one()
 
