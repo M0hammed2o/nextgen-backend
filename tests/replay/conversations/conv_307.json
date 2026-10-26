@@ -2,9 +2,9 @@
   "id": "conv_307",
   "title": "Options — mixed order: item needing options + item without options in one message",
   "category": "options",
-  "tags": ["det", "llm", "options", "required_options", "multi_item", "cx"],
+  "tags": ["det", "options", "required_options", "multi_item", "cx"],
 
-  "notes": "DET finds both Flat White (required Milk Type, unsatisfied) and Classic Smash Burger (no options). CSB is added to cart immediately. Flat White is saved to pending_options. Bot asks for milk. LLM resolves with oat milk.",
+  "notes": "DET finds both Flat White (required Milk Type, unsatisfied) and Classic Smash Burger (no options). CSB is added to cart immediately. Flat White is saved to pending_options. Bot asks for milk. Updated 2026-10-26 (BUG-0159): 'Oat milk' now resolves the pending Flat White deterministically (no LLM call) -- see KNOWN_BUGS.md BUG-0159.",
 
   "turns": [
     {
@@ -18,11 +18,6 @@
     },
     {
       "message": "Oat milk",
-      "llm": {
-        "action": "add_items",
-        "message": "Added Flat White with oat milk! ✅",
-        "items": [{"name": "Flat White", "quantity": 1, "special_instructions": "oat milk"}]
-      },
       "expect": {
         "state": "CONFIRMING_ORDER",
         "cart": [

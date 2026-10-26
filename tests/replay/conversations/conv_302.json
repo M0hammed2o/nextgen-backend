@@ -1,8 +1,10 @@
 {
   "id": "conv_302",
-  "title": "Options — full flow: DET asks required option, LLM resolves, order placed",
+  "title": "Options — full flow: DET asks required option, DET resolves deterministically, order placed",
   "category": "options",
-  "tags": ["det", "llm", "options", "required_options", "pickup", "cx"],
+  "tags": ["det", "options", "required_options", "pickup", "cx"],
+
+  "notes": "Updated 2026-10-26 (BUG-0159): resolving a single pending item's required option is now deterministic (matched directly against the item's own options_json, no LLM call) -- 'Oat milk please' used to need a scripted LLM response; it no longer reaches the LLM at all, so the 'llm' key here is now dead and was removed. See KNOWN_BUGS.md BUG-0159.",
 
   "turns": [
     {
@@ -15,11 +17,6 @@
     },
     {
       "message": "Oat milk please",
-      "llm": {
-        "action": "add_items",
-        "message": "Added Cappuccino with oat milk! ✅",
-        "items": [{"name": "Cappuccino", "quantity": 1, "special_instructions": "oat milk"}]
-      },
       "expect": {
         "state": "CONFIRMING_ORDER",
         "cart": [{"name": "Cappuccino", "quantity": 1, "special_instructions": "oat milk"}]
