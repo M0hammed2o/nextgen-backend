@@ -2644,7 +2644,10 @@ def _detect_quantity_correction(
     if len(candidates) == 1:
         return candidates[0], new_qty
     if len(candidates) > 1 and menu_items:
-        named = _extract_items_from_message(msg_text, menu_items)
+        # ignore_price_ambiguity=True: this only identifies which EXISTING
+        # cart line the name refers to -- no new price is being chosen, so
+        # BUG-0160's "ask before picking a price" gate doesn't apply here.
+        named = _extract_items_from_message(msg_text, menu_items, ignore_price_ambiguity=True)
         named_ids = {str(mi.id) for mi, _q, _m in named}
         named_candidates = [ci for ci in candidates if ci["menu_item_id"] in named_ids]
         if len(named_candidates) == 1:
@@ -2699,7 +2702,9 @@ def _detect_named_quantity_set(
     if new_qty <= 0 or new_qty > 20:
         return None
 
-    named = _extract_items_from_message(msg_text, menu_items)
+    # ignore_price_ambiguity=True: same reasoning as _detect_quantity_correction
+    # above -- matching against an EXISTING cart line, not choosing a new price.
+    named = _extract_items_from_message(msg_text, menu_items, ignore_price_ambiguity=True)
     if len(named) != 1:
         return None
     target_item = named[0][0]
@@ -2741,6 +2746,7 @@ def _extract_items_from_chunk(
     chunk: str,
     active_sorted: list,
     global_consumed_names: set[str],
+    ignore_price_ambiguity: bool = False,
 ) -> list[tuple]:
     """
     Run alias + substring extraction against a single message chunk.
@@ -2787,16 +2793,48 @@ def _extract_items_from_chunk(
             ]
             if not candidates:
                 continue
-            # NOTE: when an alias has multiple candidates (e.g. "coke" ->
-            # both "Coca-Cola (330ml)" and "(500ml)"), this picks
-            # candidates[0] unconditionally -- a real, known limitation
-            # (no size is ever confirmed), but changing it was tried and
-            # reverted 2026-10-26: 40+ existing tests across this suite
-            # explicitly validate the current behaviour (deterministic
-            # resolution without asking), so this is an intentional,
-            # already-tested trade-off, not something to change
-            # unilaterally mid-task. See KNOWN_BUGS.md BUG-0160 for the
-            # full investigation and why it was reverted rather than kept.
+            if (
+                not ignore_price_ambiguity
+                and len(candidates) > 1
+                and len({c.price_cents for c in candidates}) > 1
+            ):
+                # BUG-0160 (KNOWN_BUGS.md), product decision 2026-10-26:
+                # "when a customer's request ambiguously matches multiple
+                # distinct purchasable variants with different sizes or
+                # prices, the chatbot MUST ask for clarification. Never
+                # silently choose the wrong product." Narrowly scoped to
+                # genuine price ambiguity specifically -- candidates sharing
+                # the exact same price (a true non-financial naming
+                # variation) are NOT required to ask, same as before, so
+                # this doesn't regress any case where silently picking
+                # candidates[0] carries no financial/correctness risk.
+                # Only resolves automatically when the message itself names
+                # exactly one candidate specifically (e.g. a size appearing
+                # in the text); otherwise the match is skipped so the
+                # message falls through to the LLM, which asks the
+                # clarifying question instead of guessing a price the
+                # customer never confirmed. An earlier, unscoped version of
+                # this same idea (ANY multi-candidate alias, regardless of
+                # price) was tried and reverted the same day -- it broke
+                # 40+ pre-existing tests that used same-price or
+                # intentionally-disambiguated catalogs; the price check
+                # here is what keeps those unaffected. See KNOWN_BUGS.md
+                # BUG-0160 for the full investigation.
+                # A real customer disambiguating rarely repeats the item's
+                # FULL catalog name ("add a coca-cola (330ml)") -- they say
+                # "a 330ml coke". Match on the distinguishing detail (any
+                # parenthetical in the name, e.g. "330ml") as well as the
+                # full name, so "330ml coke" correctly resolves without
+                # requiring the customer to recite the exact listing.
+                _named = []
+                for c in candidates:
+                    _distinguishing = _re.findall(r"\(([^)]+)\)", c.name.lower())
+                    if c.name.lower() in chunk_lower or any(d in chunk_lower for d in _distinguishing):
+                        _named.append(c)
+                if len(_named) == 1:
+                    candidates = _named
+                else:
+                    continue
             best = candidates[0]
             qty = _parse_quantity_before(chunk_lower, a_start)
             suffix = chunk_lower[a_end:]
@@ -2912,6 +2950,7 @@ def _parse_stated_total_cents(text: str) -> int | None:
 def _extract_items_from_message(
     msg_text: str,
     menu_items: list,
+    ignore_price_ambiguity: bool = False,
 ) -> list[tuple]:
     """
     Deterministic pre-LLM item extraction.
@@ -2919,6 +2958,13 @@ def _extract_items_from_message(
     Splits the message on "and", "also", and "," then runs alias + substring
     extraction per chunk. Longest menu names tested first so "Cheesy Chips"
     wins over "Chips". Returns [] if nothing matched — caller falls back to LLM.
+
+    ignore_price_ambiguity: bypasses the BUG-0160 price-ambiguity clarification
+    gate (see _extract_items_from_chunk). Only for callers using the return
+    value as a boolean "does this message reference a real menu item" signal
+    (e.g. the CHITCHAT_WITH_ACTIVE_CART mutation guards) — never for callers
+    that actually commit the matched item/price to the cart, since those must
+    keep asking for clarification on genuine price ambiguity.
 
     Each element is (MenuItem, quantity, special_instructions | None).
 
@@ -2982,7 +3028,9 @@ def _extract_items_from_message(
     chunks = _re.split(r"\band\b|\balso\b|,", _working_text, flags=_re.I)
 
     for chunk in chunks:
-        chunk_matches = _extract_items_from_chunk(chunk, active_sorted, consumed_names)
+        chunk_matches = _extract_items_from_chunk(
+            chunk, active_sorted, consumed_names, ignore_price_ambiguity=ignore_price_ambiguity
+        )
         if chunk_matches:
             all_matched.extend(chunk_matches)
         elif all_matched:
@@ -4039,9 +4087,69 @@ async def _handle_with_llm(
     if not history or not (history[-1]["role"] == "user" and history[-1]["content"] == msg_text):
         history.append({"role": "user", "content": msg_text})
 
-    llm_response = await provider.complete_with_history(system_prompt, history)
+    # Layer 3 resilience (WhatsApp ordering reliability directive,
+    # 2026-10-26): before this, a raw, unguarded await here meant ANY LLM
+    # failure (timeout, rate limit, auth error, network error -- all
+    # realistic in real production, not hypothetical) propagated all the
+    # way up to process_inbound_message's outer try/except, which only
+    # logs and rolls back the DB transaction -- the customer got NO REPLY
+    # AT ALL, with no indication anything went wrong. The cart/session
+    # itself was never at risk (nothing here has mutated anything yet,
+    # and the DB rollback is correct), but silence looks exactly like a
+    # dead bot. Now caught explicitly: no cart mutation happens (none was
+    # about to), and the customer gets an honest, actionable message
+    # instead of nothing.
+    try:
+        llm_response = await provider.complete_with_history(system_prompt, history)
+    except Exception:
+        logger.exception(
+            "LLM_CALL_FAILED: business_id=%s, session_id=%s — LLM provider raised, "
+            "returning a graceful fallback instead of silence",
+            business.id, session.id,
+        )
+        return (
+            "Sorry, I'm having trouble processing that right now. "
+            "Please try again in a moment, or rephrase your message. 🙏",
+            False, None, None, None,
+        )
 
     parsed = llm_parser.parse_llm_response(llm_response.text)
+
+    # ── Contradictory-action guard (Layer 3, WhatsApp ordering reliability
+    #    directive, 2026-10-26) ───────────────────────────────────────────
+    # A self-contradictory LLM response: it picked a mutation action
+    # (add_items/remove_item/replace_item) but supplied NO items to mutate
+    # with. There is no legitimate reason for this combination -- a
+    # genuinely empty-handed reply should be action="chitchat" or
+    # "ask_options" instead. Found via adversarial pipeline testing: before
+    # this guard, such a response fell through every existing check (the
+    # action-specific blocks below all require `and parsed.items`, the
+    # ORDER_MUTATION_GUARD only fires when `parsed.action not in
+    # _ORDER_MUTATION_ACTIONS` -- which this action IS in -- and the
+    # CHITCHAT_WITH_ACTIVE_CART catch-all only fires when a cart already
+    # exists) and the LLM's raw, fabricated prose (e.g. "Added to your
+    # order! Total is now R250.00" while nothing was actually added) was
+    # sent straight to the customer. Caught here, uniformly, before any
+    # action-specific or intent-specific branch, so it can never depend on
+    # intent routing or an existing cart to catch it.
+    if parsed.action in ("add_items", "remove_item", "replace_item") and not parsed.items:
+        logger.warning(
+            "CONTRADICTORY_ACTION_GUARD: action=%r with an empty items list -- "
+            "blocking the LLM's unmutated reply instead of relaying it. session_id=%s, "
+            "msg_preview=%r",
+            parsed.action, session.id, parsed.message[:80],
+        )
+        if parsed.action == "remove_item":
+            retry_msg = "Sorry, I didn't catch which item to remove. Could you tell me the name of the item you'd like taken off? 😊"
+        else:
+            retry_msg = "Sorry, I didn't catch the items properly. Please tell me exactly what you'd like to add 😊"
+        return (
+            retry_msg,
+            True,
+            llm_response.total_tokens,
+            llm_response.cost_cents,
+            llm_response.provider,
+        )
 
     if parsed.action == "add_items" and parsed.items:
         items_map = {i.name.lower(): i for i in items if i.is_active and not i.is_deleted}
@@ -4404,7 +4512,7 @@ async def _handle_with_llm(
         # (e.g. "Can I place an order for delivery?"), not a failed item extraction.
         # In that case let the LLM's chitchat response through — it's correct.
         _cart_is_empty = not state_machine.get_cart(session)
-        _has_menu_items = bool(_extract_items_from_message(msg_text, items))
+        _has_menu_items = bool(_extract_items_from_message(msg_text, items, ignore_price_ambiguity=True))
         if _cart_is_empty and not _has_menu_items:
             logger.warning(
                 "ORDER_MUTATION_GUARD_SKIPPED: empty cart + no items in msg, letting LLM response through. "
@@ -4461,7 +4569,7 @@ async def _handle_with_llm(
         # message plausibly references a real menu item (so genuine
         # clarifying chitchat, e.g. "what spice levels do you have?", still
         # passes through unchanged).
-        if _extract_items_from_message(msg_text, items):
+        if _extract_items_from_message(msg_text, items, ignore_price_ambiguity=True):
             logger.warning(
                 "CHITCHAT_CART_MUTATION_GUARD: blocking unmutated chitchat that "
                 "references a menu item while a cart is active. session_id=%s",
