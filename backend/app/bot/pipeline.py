@@ -1189,9 +1189,16 @@ async def _handle_message(
                             _mi = sorted(_cands, reverse=True)[0][1]
                 if _mi:
                     _qty = max(1, min(int(_p.get("quantity") or 1), 20))
+                    # BUG-0159: this previously never passed selected_options
+                    # through to add_to_cart (only the display-only `options`
+                    # field), so a priced option resolved via this path (e.g.
+                    # a Size group with a Large=+R5 delta) silently charged
+                    # the base price only -- found while adding deterministic
+                    # option resolution and its regression tests, 2026-10-26.
                     state_machine.add_to_cart(
                         session, str(_mi.id), _mi.name, _mi.price_cents,
-                        _qty, options=_p.get("options"),
+                        _qty, selected_options=_p.get("selected_options"),
+                        options=_p.get("options"),
                         special_instructions=_p.get("special_instructions"),
                     )
                     _lbl = f"{_qty}x {_mi.name}"
@@ -1213,6 +1220,100 @@ async def _handle_message(
             _lbl_str = ", ".join(_labels_co) if _labels_co else "items"
             return (f"Added to your order: {_lbl_str} ✅\n\n{_cfm}", False, None, None, None)
 
+        # ── Sub-case: deterministic resolution of a single pending item's
+        # required option(s) (e.g. "Hot" answering a Spice Level question) ──
+        # BUG-0159 (KNOWN_BUGS.md): before this, ANY answer here (including a
+        # plain, unambiguous option name like "Hot") fell through to the LLM
+        # below. The LLM could narrate a complete, correct-looking summary in
+        # its reply TEXT while never actually writing the chosen option back
+        # into `pending_options`' `special_instructions` -- so a later "Yes"
+        # committed the ORIGINAL, still-unresolved pending item (no spice
+        # level recorded), on top of whatever deterministic "ready" items
+        # (e.g. Chips) had already been silently added to cart during the
+        # original message. Real, reported production symptom, 2026-10-26:
+        # "Hot" showed a correct 3-item R179.70 summary; "Yes" then
+        # committed a 2-item, wrong-total cart with no spice level at all.
+        # Fix: resolve a single pending item's required option groups
+        # directly against its OWN options_json (already stored in the
+        # pending dict -- no extra query, no AI call) whenever the message
+        # text satisfies them, exactly reusing the same substring-match
+        # rule _get_missing_required_groups already uses. No LLM involved,
+        # so there is nothing for this class of bug to attach to. Falls
+        # through to the LLM unchanged for anything this can't resolve
+        # (multiple pending items, freeform phrasing that names no
+        # recognised option) -- the existing behaviour for those cases.
+        if _pending_opts and len(_pending_opts) == 1 and not _proposed_items:
+            _solo_pending = _pending_opts[0]
+            _solo_options_json = _solo_pending.get("options_json") or {}
+            _solo_shim = type("_PendingItemShim", (), {"options_json": _solo_options_json})()
+            _existing_instr = _solo_pending.get("special_instructions")
+            _still_missing = _get_missing_required_groups(_solo_shim, _existing_instr, norm_text)
+            _all_groups = [
+                g for g in _solo_options_json.get("option_groups", [])
+                if g.get("required") and g.get("is_enabled", True)
+            ]
+            if _all_groups and len(_still_missing) < len(_all_groups):
+                # At least one previously-missing group is now satisfied by
+                # this message -- merge the newly-chosen option(s) in, name
+                # AND price_delta_cents (a priced group, e.g. Size with a
+                # Large=+R5 delta, must actually charge that delta -- found
+                # missing while adding this deterministic path, 2026-10-26:
+                # _commit_to_cart_and_confirm never forwarded selected_options
+                # to add_to_cart at all, a pre-existing gap for every caller
+                # of that function, not just this new one. Fixed at both
+                # the point selected_options is built (here) and the point
+                # it's consumed (_commit_to_cart_and_confirm, above).
+                _newly_satisfied_names: list[str] = []
+                _newly_satisfied_options: list[dict] = []
+                for _grp in _all_groups:
+                    if _grp in _still_missing:
+                        continue
+                    _enabled_opts = [o for o in _grp.get("options", []) if o.get("is_enabled", True)]
+                    for _opt in _enabled_opts:
+                        if _opt["name"].lower() in norm_text.lower():
+                            _newly_satisfied_names.append(_opt["name"])
+                            _newly_satisfied_options.append({
+                                "group_id": _grp.get("id"),
+                                "group_name": _grp.get("name"),
+                                "option_id": _opt.get("id"),
+                                "name": _opt["name"],
+                                "price_delta_cents": _opt.get("price_delta_cents", 0),
+                            })
+                            break
+                _merged_instr_parts = [p for p in [_existing_instr] if p] + _newly_satisfied_names
+                _merged_instr = ", ".join(dict.fromkeys(_merged_instr_parts)) or None  # dedupe, keep order
+                _merged_selected_options = list(_solo_pending.get("selected_options") or []) + _newly_satisfied_options
+                if not _still_missing:
+                    # Fully resolved -- commit via the SAME backend-calculated
+                    # summary/total path every other commit in this function
+                    # uses (requirement: summaries come from backend cart
+                    # math, never free-form AI text).
+                    logger.warning(
+                        "DET_OPTIONS_RESOLVED: item=%r, options=%r, session_id=%s",
+                        _solo_pending.get("name"), _newly_satisfied_names, session.id,
+                    )
+                    _resolved_item = dict(_solo_pending)
+                    _resolved_item["special_instructions"] = _merged_instr
+                    _resolved_item["selected_options"] = _merged_selected_options
+                    return await _commit_to_cart_and_confirm([_resolved_item])
+                else:
+                    # Partially resolved (e.g. a second required group still
+                    # unanswered) -- update the stored pending item and ask
+                    # about what's left, still with no LLM call.
+                    logger.warning(
+                        "DET_OPTIONS_PARTIAL: item=%r, resolved=%r, still_missing=%r, session_id=%s",
+                        _solo_pending.get("name"), _newly_satisfied_names,
+                        [g["name"] for g in _still_missing], session.id,
+                    )
+                    _updated_pending = dict(_solo_pending)
+                    _updated_pending["special_instructions"] = _merged_instr
+                    _updated_pending["selected_options"] = _merged_selected_options
+                    state_machine.set_context(session, "pending_options", [_updated_pending])
+                    return (
+                        _build_option_question(_solo_pending.get("name", "item"), _still_missing),
+                        False, None, None, None,
+                    )
+
         # ── Sub-case: customer confirms the LLM's proposal ("yes") ───────
         # Fires when the LLM already proposed items in natural language AND
         # customer says yes — commit proposed_items (preferred) or pending_options.
@@ -1221,7 +1322,27 @@ async def _handle_message(
                 "CHOOSING_OPTIONS_CONFIRM: confirmation — proposed=%d, pending=%d, session_id=%s",
                 len(_proposed_items or []), len(_pending_opts or []), session.id,
             )
+            # BUG-0159 reconciliation guard (requirement 6): when committing
+            # via the LLM's own `_proposed_items` narrative, never silently
+            # lose an item that was validated and tracked in `_pending_opts`
+            # before the LLM ran. If the LLM's structured proposal doesn't
+            # mention a pending item by name at all, recover it from the
+            # validated pending state rather than trusting the (possibly
+            # incomplete) AI output alone.
             _to_commit = _proposed_items or _pending_opts
+            if _proposed_items and _pending_opts:
+                _proposed_names = {(p.get("name") or "").strip().lower() for p in _proposed_items}
+                _recovered = [
+                    p for p in _pending_opts
+                    if (p.get("name") or "").strip().lower() not in _proposed_names
+                ]
+                if _recovered:
+                    logger.warning(
+                        "BUG0159_RECONCILE: LLM proposal missing %d previously-pending item(s), "
+                        "recovering from validated pending state: %r, session_id=%s",
+                        len(_recovered), [p.get("name") for p in _recovered], session.id,
+                    )
+                    _to_commit = list(_proposed_items) + _recovered
             return await _commit_to_cart_and_confirm(_to_commit)
 
         # ── Sub-case: customer declines modifications ("No") ─────────────
@@ -1742,13 +1863,15 @@ _ITEM_ALIASES: dict[str, str] = {
     "sprite": "sprite",      # matches "Sprite (330ml)", "Sprite (500ml)", etc.
     "fanta":  "fanta",       # future-proof
     "wings":  "wings",       # matches "Wings (6 pcs)", "Wings (12 pcs)", etc.
-    # Real Mochachos branded soft drink had no alias, unlike coke/sprite/
-    # fanta -- "a buddy" alone fell through to the LLM instead of matching
-    # deterministically. Target is "buddy 440ml", NOT bare "buddy" -- real
-    # combo names end in "...and a Buddy" (e.g. "Quarter Chicken, Beeg
-    # Chips and a Buddy"), and active_sorted tries longest names first, so
-    # a bare "buddy" target matches the combo's full name instead of the
-    # standalone drink (confirmed directly before this fix was committed).
+    # BUG-0155 (KNOWN_BUGS.md): Mochachos's own branded soft drink ("Buddy
+    # 440ml") had no alias, unlike coke/sprite/fanta -- "a buddy" alone fell
+    # through to the LLM instead of matching deterministically. Target is
+    # "buddy 440ml", NOT bare "buddy" -- real Mochachos combo names end in
+    # "...and a Buddy" (e.g. "Quarter Chicken, Beeg Chips and a Buddy"), and
+    # active_sorted tries longest names first, so a bare "buddy" target
+    # matches the combo's full name instead of the standalone drink
+    # (confirmed directly, 2026-10-26, while fixing both BUG-0159 and the
+    # scenario D quantity-handling defects).
     "buddy":  "buddy 440ml",
 }
 
