@@ -78,14 +78,14 @@ class _Harness:
         self.business = business
         self.wa_id = f"27{uuid.uuid4().int % 10**9:09d}"
 
-    async def send(self, text_body: str) -> str:
+    async def send(self, text_body: str, wa_message_id: str | None = None) -> str:
         captured = {}
 
         async def _capture_send(*args, **kwargs):
             captured["text"] = kwargs.get("text")
             return "wamid.SENT"
 
-        wmid = f"wamid.{uuid.uuid4().hex[:12]}"
+        wmid = wa_message_id or f"wamid.{uuid.uuid4().hex[:12]}"
         async with get_session_factory()() as db:
             with patch("backend.app.bot.pipeline.whatsapp_sender.send_text_message", new=_capture_send), \
                  patch("backend.app.bot.pipeline.whatsapp_sender.send_image_message", new=AsyncMock(return_value=None)):
@@ -108,6 +108,43 @@ class _Harness:
     async def pending_allocation(self) -> dict | None:
         sess = await self.session_row()
         return state_machine.get_context(sess, "pending_variant_allocation")
+
+    async def force_state(self, state: str) -> None:
+        """Test-only: directly overwrites the persisted conversation state,
+        without touching the cart or context otherwise. Used to simulate
+        "checkout advanced to this state through some other, broken path"
+        independent of whatever cart contents actually exist."""
+        async with get_session_factory()() as db:
+            cust = (await db.execute(
+                select(Customer).where(Customer.business_id == self.business.id, Customer.wa_id == self.wa_id)
+            )).scalar_one()
+            sess = (await db.execute(
+                select(ConversationSession).where(ConversationSession.customer_id == cust.id)
+            )).scalar_one()
+            sess.state = state
+            await db.commit()
+
+    async def force_stale_pending_allocation(self, pending: dict) -> None:
+        """Test-only: directly writes a `pending_variant_allocation` into the
+        CURRENT persisted session context, regardless of what else is there.
+        Used to simulate "some code path other than `_resolve_variant_allocation_reply`
+        resolved the order and left this key stale" without needing to
+        reproduce whatever actually caused that in production (e.g. a worker
+        mid-deploy-rollover running pre-fix code)."""
+        async with get_session_factory()() as db:
+            cust = (await db.execute(
+                select(Customer).where(Customer.business_id == self.business.id, Customer.wa_id == self.wa_id)
+            )).scalar_one()
+            sess = (await db.execute(
+                select(ConversationSession).where(ConversationSession.customer_id == cust.id)
+            )).scalar_one()
+            import copy as _copy_force
+            ctx = _copy_force.deepcopy(sess.context_json or {})
+            ctx["pending_variant_allocation"] = pending
+            sess.context_json = ctx
+            from sqlalchemy.orm.attributes import flag_modified as _flag_force
+            _flag_force(sess, "context_json")
+            await db.commit()
 
     async def session_row(self) -> ConversationSession:
         async with get_session_factory()() as db:
@@ -517,5 +554,236 @@ async def test_removal_attempt_while_allocation_outstanding_never_double_adds_th
 
         pending = await h.pending_allocation()
         assert pending is not None and pending["quantity_needed"] == 15
+    finally:
+        await _cleanup(business.id)
+
+
+async def test_single_message_allocation_then_full_checkout_clean_path(
+    test_business: Business, db,
+):
+    """2026-10-27 live regression investigation: the exact reported
+    conversation -- a SINGLE message naming both variants ("5 Jose and 10
+    Pedro"), immediately followed by "yes" and name collection -- run
+    through the current code with NO injected staleness. This is the
+    control case: confirmed clean end-to-end (inspected after every turn
+    during investigation; no stale-allocation resurgence when every message
+    is handled by the same, current code version). This does NOT reproduce
+    the live incident -- see `test_stale_pending_allocation_after_confirmation_is_dropped_not_reasked`
+    below for the actual root-caused scenario and its fix."""
+    business = await _setup_business(test_business, db)
+    h = _Harness(business)
+    try:
+        await h.send("Hello")
+        await h.send("Can I get 15 Bambino Meals and 3 Chicken Schwarmas?")
+
+        reply = await h.send("5 Jose and 10 Pedro")
+        assert "yes" in reply.lower() and "total" in reply.lower()
+        assert (await h.pending_allocation()) is None
+
+        reply = await h.send("yes")
+        assert "name" in reply.lower() or "phone" in reply.lower()
+        assert (await h.pending_allocation()) is None
+
+        reply = await h.send("Mohammed")
+        assert "15" not in reply and "bambino" not in reply.lower()
+        assert (await h.pending_allocation()) is None
+    finally:
+        await _cleanup(business.id)
+
+
+async def test_stale_pending_allocation_after_confirmation_is_dropped_not_reasked(
+    test_business: Business, db,
+):
+    """Root-caused regression, 2026-10-27 live report: customer asked for 15
+    Bambino Meals, resolved to 5 Jose + 10 Pedro in one message, said "yes",
+    and was asked for their name -- then, on sending their name ("Mohammed"),
+    the bot incorrectly replied "Still need to know which Bambino Meals for
+    the remaining 15" instead of accepting the name.
+
+    Root cause (confirmed not to be a logic defect in this function itself --
+    `test_single_message_allocation_then_full_checkout_clean_path` above
+    proves the normal path is correct end-to-end): `pending_variant_allocation`
+    is ONLY ever read and cleared by `_resolve_variant_allocation_reply`,
+    which runs unconditionally at the top of every message. The most likely
+    trigger (not independently confirmable without Render deploy-timeline
+    access -- labelled Likely, not Verified): a ROLLING worker redeploy mid-
+    conversation. "5 Jose and 10 Pedro" and "yes" were most likely handled
+    by an ARQ worker process still running pre-BUG-0172 code (no concept of
+    `pending_variant_allocation` at all), which resolved the order correctly
+    through its own ordinary, BUG-0172-unaware LLM/confirm flow and -- having
+    no knowledge of this context key -- never touched or cleared it, leaving
+    it stale at its original value (quantity_needed=15). The NEXT message
+    ("Mohammed") was then handled by a worker already running the fixed
+    code, which found the stale key still set and wrongly re-asked about it
+    instead of treating "Mohammed" as the name answer the state machine was
+    actually waiting for.
+
+    This test does not depend on reproducing the rolling-deploy trigger
+    itself (not reproducible in this environment) -- it directly simulates
+    the resulting STATE (an order already resolved and confirmed through a
+    path other than this function, leaving `pending_variant_allocation`
+    stale) and proves the fix: a stale allocation found once the
+    conversation has already moved past order confirmation is dropped,
+    never re-asked, regardless of what left it stale."""
+    business = await _setup_business(test_business, db)
+    h = _Harness(business)
+    try:
+        await h.send("Hello")
+        await h.send("Can I get 15 Bambino Meals and 3 Chicken Schwarmas?")
+        reply = await h.send("5 Jose and 10 Pedro")
+        assert (await h.pending_allocation()) is None  # resolved cleanly here
+
+        reply = await h.send("yes")
+        assert (await h.pending_allocation()) is None
+        sess = await h.session_row()
+        assert sess.state == "COLLECTING_DETAILS"
+
+        # Simulate the live incident: something else left this key stale
+        # AFTER the order was already confirmed and checkout progressed --
+        # exactly the state a pre-fix worker would leave behind. Uses the
+        # REAL menu_item_ids already sitting in the cart (added above by
+        # the normal resolution), since the safety-check guard added after
+        # this test was first written now verifies the pending quantity is
+        # actually backed by the cart before treating it as stale -- this
+        # case IS genuinely backed (5 Jose + 10 Pedro are really there),
+        # unlike `test_stale_allocation_is_not_dropped_when_items_are_genuinely_missing_from_cart`.
+        cart_now = await h.cart()
+        jose_id = next(c["menu_item_id"] for c in cart_now if c["name"] == "Bambino Meal: Jose")
+        pedro_id = next(c["menu_item_id"] for c in cart_now if c["name"] == "Bambino Meal: Pedro")
+        await h.force_stale_pending_allocation({
+            "family_label": "Bambino Meal",
+            "quantity_needed": 15,
+            "variants": [
+                {"name": "Bambino Meal: Jose", "short_name": "Jose", "price_cents": 8490, "menu_item_id": jose_id},
+                {"name": "Bambino Meal: Pedro", "short_name": "Pedro", "price_cents": 8490, "menu_item_id": pedro_id},
+            ],
+        })
+        assert (await h.pending_allocation()) is not None  # confirm the injection took
+
+        reply = await h.send("Mohammed")
+        assert "15" not in reply and "bambino" not in reply.lower(), (
+            f"reproduces the live regression if this fails -- the stale allocation must "
+            f"never be re-asked once checkout has already progressed. Got: {reply!r}"
+        )
+        assert (await h.pending_allocation()) is None, "the stale key must be dropped, not left lingering"
+
+        # And the name must have actually been accepted as the name, not
+        # silently swallowed -- the conversation must keep progressing.
+        sess = await h.session_row()
+        assert sess.state in ("COLLECTING_DETAILS", "CHOOSING_ORDER_MODE", "CONFIRMING_ORDER"), (
+            f"expected checkout to keep progressing after the name, got state={sess.state!r}"
+        )
+    finally:
+        await _cleanup(business.id)
+
+
+async def test_stale_allocation_guard_does_not_interfere_before_confirmation(
+    test_business: Business, db,
+):
+    """Guard against the obvious regression risk of the fix above: a
+    genuinely outstanding allocation BEFORE the order has ever been
+    confirmed (state still BUILDING_CART/GREETING/etc.) must still block
+    checkout and be re-asked exactly as before -- the new guard only drops
+    a stale allocation found AFTER checkout has already progressed past
+    CONFIRMING_ORDER, never before."""
+    business = await _setup_business(test_business, db)
+    h = _Harness(business)
+    try:
+        await h.send("Hello")
+        await h.send(_INCIDENT_MESSAGE)  # 3x Chicken Schwarma added, 15 Bambino outstanding
+        sess = await h.session_row()
+        assert sess.state != "COLLECTING_DETAILS"
+
+        reply = await h.send("yes")  # attempting to confirm while still outstanding
+        assert "15" in reply, "a genuinely outstanding allocation before confirmation must still be enforced"
+        pending = await h.pending_allocation()
+        assert pending is not None and pending["quantity_needed"] == 15
+    finally:
+        await _cleanup(business.id)
+
+
+async def test_stale_allocation_is_not_dropped_when_items_are_genuinely_missing_from_cart(
+    test_business: Business, db,
+):
+    """Safety check requested before release, 2026-10-27: the stale-
+    allocation guard must NEVER silently discard a pending allocation just
+    because conversation STATE advanced -- state advancing proves nothing
+    about what is actually in the cart. This simulates a DIFFERENT, worse
+    failure than the live incident: checkout state somehow reached
+    COLLECTING_DETAILS (e.g. a different bug, or a different old-worker
+    code path) WITHOUT the 15 Bambino Meals ever actually being added to
+    the cart -- only the 3 Chicken Schwarma are really there. If the guard
+    dropped the pending allocation here just because the state looks
+    "post-confirmation", the 15 Bambino Meals would be lost with zero
+    trace, with the customer none the wiser -- the exact BUG-0172 failure
+    mode, just relocated to a later state. The fix must refuse to drop it
+    and must keep telling the customer (and the logs) about the real
+    missing quantity instead."""
+    business = await _setup_business(test_business, db)
+    h = _Harness(business)
+    try:
+        await h.send("Hello")
+        await h.send(_INCIDENT_MESSAGE)  # 3x Chicken Schwarma really added, 15 Bambino pending
+
+        cart_before = await h.cart()
+        assert all("Bambino" not in c["name"] for c in cart_before), (
+            "sanity check: no Bambino items should be in the cart yet"
+        )
+
+        # Simulate checkout state advancing WITHOUT the Bambino items ever
+        # actually landing in the cart (a different failure than the live
+        # incident, which DID have correct cart contents).
+        await h.force_state("COLLECTING_DETAILS")
+
+        reply = await h.send("Mohammed")
+
+        # Must NOT be silently accepted as if nothing were wrong -- the
+        # customer must still be told about the missing Bambino Meals.
+        assert "15" in reply and "bambino" in reply.lower(), (
+            f"must not silently lose the missing 15 Bambino Meals just because "
+            f"state advanced -- got: {reply!r}"
+        )
+
+        pending = await h.pending_allocation()
+        assert pending is not None and pending["quantity_needed"] == 15, (
+            "the allocation must still be outstanding -- it must never be dropped "
+            "while the items are genuinely missing from the cart"
+        )
+
+        cart_after = await h.cart()
+        assert all("Bambino" not in c["name"] for c in cart_after), (
+            "must not have fabricated Bambino cart lines either -- still genuinely missing"
+        )
+    finally:
+        await _cleanup(business.id)
+
+
+async def test_retried_allocation_resolving_message_is_idempotent(
+    test_business: Business, db,
+):
+    """A duplicate ARQ job delivery (Meta's webhook is documented "at least
+    once", and `WorkerSettings.max_tries=3` retries infrastructure
+    failures) for the SAME wa_message_id must never double-allocate -- the
+    wa_message_id dedup check (BUG-0157) must make reprocessing the exact
+    resolving message a safe no-op, same final cart/state either way."""
+    business = await _setup_business(test_business, db)
+    h = _Harness(business)
+    try:
+        await h.send("Hello")
+        await h.send(_INCIDENT_MESSAGE)
+
+        wmid = f"wamid.{uuid.uuid4().hex[:12]}"
+        reply1 = await h.send("5 Jose and 10 Pedro", wa_message_id=wmid)
+        assert "yes" in reply1.lower() and "total" in reply1.lower()
+
+        # Simulate a retried/duplicate ARQ job delivery for the exact same message.
+        reply2 = await h.send("5 Jose and 10 Pedro", wa_message_id=wmid)
+        assert reply2 == "", "a true wa_message_id duplicate must be a no-op (dedup'd before reaching the pipeline)"
+
+        cart = await h.cart()
+        by_name = {c["name"]: c["quantity"] for c in cart}
+        assert by_name.get("Bambino Meal: Jose") == 5, f"must not double-allocate on retry, got: {cart!r}"
+        assert by_name.get("Bambino Meal: Pedro") == 10, f"must not double-allocate on retry, got: {cart!r}"
+        assert (await h.pending_allocation()) is None
     finally:
         await _cleanup(business.id)

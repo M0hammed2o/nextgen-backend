@@ -2082,6 +2082,92 @@ async def _resolve_variant_allocation_reply(
     if not pending:
         return None
 
+    # Found 2026-10-27 (live regression report, same day as the fix above):
+    # once the conversation has already moved PAST order confirmation --
+    # COLLECTING_DETAILS, CHOOSING_ORDER_MODE, WAITING_DELIVERY_FEE_APPROVAL,
+    # COLLECTING_PAYMENT, ORDER_PLACED, or HANDOFF -- a `pending_variant_allocation`
+    # that is still set is necessarily STALE: the cart was already confirmed
+    # (CONFIRMING_ORDER already happened) through some other path, by
+    # construction, since this function is the ONLY code that is allowed to
+    # move a resolved allocation into CONFIRMING_ORDER, and it always clears
+    # this key when it does. A stale value surviving to this point can only
+    # mean the allocation was effectively resolved by something OTHER than
+    # this function (confirmed root cause of the live incident: a worker
+    # process running pre-BUG-0172 code handled "5 Jose and 10 Pedro" and
+    # "yes" mid-deploy-rollover, resolved the order via its own normal,
+    # BUG-0172-unaware LLM/confirm flow, and -- having no concept of this
+    # context key -- never touched or cleared it; a worker already on the
+    # fixed code then hit this still-15 value on the very next, unrelated
+    # message, "Mohammed", sent to answer the name question, and wrongly
+    # re-asked about the 15 Bambino Meals instead of accepting it as the
+    # name). Without this guard, an unconditional early hook has no way to
+    # tell "still legitimately outstanding" apart from "stale leftover from
+    # a code path that bypassed this function entirely" once the cart is
+    # already locked -- re-asking at that point is always wrong regardless
+    # of how the key became stale, so it is dropped unconditionally here
+    # rather than acted on, and this turn falls through to be handled
+    # normally (e.g. "Mohammed" is then correctly read as the customer's
+    # name). Deliberately keyed on conversation STATE, not on `confirmed_cart`
+    # being set, since several existing cart-sync call sites set
+    # `confirmed_cart` well before formal confirmation -- state is the
+    # narrow, unambiguous "has the customer already said yes" signal.
+    _POST_CONFIRMATION_STATES = {
+        ConversationState.COLLECTING_DETAILS.value,
+        ConversationState.CHOOSING_ORDER_MODE.value,
+        ConversationState.WAITING_DELIVERY_FEE_APPROVAL.value,
+        ConversationState.COLLECTING_PAYMENT.value,
+        ConversationState.ORDER_PLACED.value,
+        ConversationState.HANDOFF.value,
+    }
+    if session.state in _POST_CONFIRMATION_STATES:
+        # Safety check (2026-10-27, requested before release): the guard
+        # above assumes that if checkout has already advanced, the
+        # allocation must have been genuinely resolved elsewhere. That is
+        # true for the actual live incident (cart had all 3 line items,
+        # correct total, correct persisted order) but is NOT a safe
+        # assumption in general -- advancing conversation STATE proves
+        # nothing about what is actually IN the cart. If some other,
+        # different failure let checkout advance (state moved past
+        # CONFIRMING_ORDER) WITHOUT the requested variant quantity ever
+        # actually being added to the cart, silently dropping this key
+        # would permanently discard a real, paid-for request with no
+        # trace -- exactly the original BUG-0172 failure mode, just
+        # relocated to a later state. So: verify the quantity is actually
+        # present in the live cart before treating the allocation as
+        # resolved-elsewhere. Only drop it when the cart backs that up.
+        _live_cart_check = state_machine.get_cart(session)
+        _pending_variant_ids = {v["menu_item_id"] for v in pending["variants"]}
+        _already_in_cart = sum(
+            c.get("quantity", 0) for c in _live_cart_check
+            if c.get("menu_item_id") in _pending_variant_ids
+        )
+        if _already_in_cart >= pending["quantity_needed"]:
+            logger.warning(
+                "VARIANT_ALLOCATION_STALE_DROPPED: family=%r, quantity_needed=%r, "
+                "already_in_cart=%d, state=%s, session_id=%s -- conversation already "
+                "past confirmation AND the cart already holds the full quantity, "
+                "dropping stale allocation instead of re-asking.",
+                pending.get("family_label"), pending.get("quantity_needed"),
+                _already_in_cart, session.state, session.id,
+            )
+            state_machine.set_context(session, "pending_variant_allocation", None)
+            return None
+        # Checkout advanced but the items are genuinely NOT in the cart --
+        # do NOT silently drop. Fall through to the normal resolution
+        # logic below exactly as if this were still a legitimately
+        # outstanding allocation: it will try to match named variants in
+        # THIS message, and if none are named, the customer (and the logs)
+        # are told about the real missing quantity instead of losing it
+        # with no trace.
+        logger.error(
+            "VARIANT_ALLOCATION_STATE_MISMATCH: pending allocation found with checkout "
+            "already past confirmation, but only %d/%d %s actually in the cart -- "
+            "NOT dropping silently, this would lose a real requested quantity. "
+            "state=%s, session_id=%s",
+            _already_in_cart, pending["quantity_needed"], pending.get("family_label"),
+            session.state, session.id,
+        )
+
     # Found during independent review (2026-10-27): `get_or_create_session`
     # (state_machine.py) always does an intermediate `db.flush()` right
     # after loading the session, before any handler runs. SQLAlchemy keeps
