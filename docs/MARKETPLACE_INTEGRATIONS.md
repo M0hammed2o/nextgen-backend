@@ -11,7 +11,7 @@ from Uber's developer docs (developer.uber.com/docs/eats) as read on 2026-10-26.
 
 | Channel | What works | Live connectivity |
 |---|---|---|
-| **Uber Eats, live API** | Built and covered by automated tests: webhook intake, order fetch, menu mapping, accept/deny, kitchen hand-off, ready-for-pickup, restaurant cancel, store pause/resume, menu import for mapping | **Not verified against Uber.** No sandbox credentials or test store exist yet. Every Uber call has only been tested against Uber's documented payloads, with the network mocked. |
+| **Uber Eats, live API** | Built and covered by automated tests: webhook intake, order fetch, menu mapping, accept/deny, kitchen hand-off, ready-for-pickup, restaurant cancel, store pause/resume, menu import for mapping | **Sandbox authentication verified 2026-10-27.** The sandbox app's `client_credentials` token was minted from `https://sandbox-login.uber.com/oauth/v2/token` through the adapter's own code: HTTP 200, Bearer, `expires_in` 2,592,000 s, all four requested scopes granted (`eats.order`, `eats.store`, `eats.store.orders.read`, `eats.store.status.write`). **Everything past authentication is still unverified**, because the test store is pending (Uber support ticket #69BF76); those calls have only been tested against Uber's documented payloads with the network mocked. |
 | **Uber Eats, CSV report** | Working (`/delivery-orders` import). A report order already booked through the live API is skipped as a duplicate. | n/a |
 | **Mr D, live API** | Disabled adapter only. Mr D publishes no partner API, and NextGen has no credentials. | **Pending Partner Approval** |
 | **Mr D, CSV report** | Working (same importer) | n/a |
@@ -80,7 +80,7 @@ Environment isolation: an event signed with one app's secret is ignored (`ENV_MI
    - ask Integration Tech Support for a **test store** and note its store id.
 2. Create a dedicated test business in NextGen, e.g. "NextGen Uber Sandbox". Never use a real restaurant's tenant.
 3. In the Admin Suite (SUPER_ADMIN), enable `delivery_platforms_enabled` and `uber_eats_enabled` on that business.
-4. Set `UBER_EATS_SANDBOX_CLIENT_ID`, `UBER_EATS_SANDBOX_CLIENT_SECRET`, `UBER_EATS_SANDBOX_ORDER_BUSINESS_IDS=<test business id>`, `UBER_EATS_WEBHOOK_ENABLED=true` and, while no production app exists, `UBER_EATS_SANDBOX_ONLY_DEPLOYMENT=true`. Then redeploy the backend **and** the worker.
+4. Local testing: keep the sandbox pair in a git-ignored `.env.*` file such as `.env.uber-sandbox` in the backend root (every `.env.*` except the `*.example` templates is ignored). The app itself auto-loads only `.env.backend`, so a local server needs these as real environment variables. On a deployment, set `UBER_EATS_SANDBOX_CLIENT_ID`, `UBER_EATS_SANDBOX_CLIENT_SECRET`, `UBER_EATS_SANDBOX_ORDER_BUSINESS_IDS=<test business id>`, `UBER_EATS_WEBHOOK_ENABLED=true` and, while no production app exists, `UBER_EATS_SANDBOX_ONLY_DEPLOYMENT=true`. Then redeploy the backend **and** the worker.
 5. Register the connection (SUPER_ADMIN, admin API):
    `PUT /v1/admin/admin/businesses/{id}/delivery-connections/UBER_EATS`
    with `{"status": "SANDBOX", "environment": "sandbox", "external_store_id": "<test store id>"}`
