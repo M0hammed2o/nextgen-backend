@@ -124,6 +124,23 @@ class _Harness:
                 "SELECT count(*) FROM orders WHERE business_id = :bid"
             ), {"bid": self.business.id})).scalar_one()
 
+    async def latest_order(self):
+        async with get_session_factory()() as db:
+            return (await db.execute(text(
+                "SELECT order_number, subtotal_cents, total_cents, order_mode, status "
+                "FROM orders WHERE business_id = :bid ORDER BY created_at DESC LIMIT 1"
+            ), {"bid": self.business.id})).mappings().one()
+
+    async def latest_order_items(self) -> list[dict]:
+        async with get_session_factory()() as db:
+            rows = (await db.execute(text(
+                "SELECT name_snapshot, quantity, special_instructions, line_total_cents "
+                "FROM order_items WHERE order_id = ("
+                "  SELECT id FROM orders WHERE business_id = :bid ORDER BY created_at DESC LIMIT 1"
+                ")"
+            ), {"bid": self.business.id})).mappings().all()
+            return [dict(r) for r in rows]
+
 
 async def _cleanup(business_id):
     async with get_session_factory()() as db:
@@ -227,10 +244,22 @@ async def test_variant_allocation_across_multiple_messages_tracks_outstanding_qu
         assert pending1["quantity_needed"] == 10
 
         reply2 = await h.send("10 Pedro")
-        assert "sorted" in reply2.lower(), f"expected resolution message, got: {reply2!r}"
+        # Once fully resolved, the cart must be locked and a real checkout
+        # confirmation prompt shown (the same pattern the main deterministic
+        # add-items path already uses) -- not a dead-end acknowledgement
+        # with no way to proceed to checkout.
+        assert "yes" in reply2.lower() and "total" in reply2.lower(), (
+            f"expected a real confirmation prompt once resolved, got: {reply2!r}"
+        )
 
         pending2 = await h.pending_allocation()
         assert pending2 is None, "allocation must be cleared once fully resolved"
+
+        session = await h.session_row()
+        assert session.state == "CONFIRMING_ORDER", (
+            f"expected the session to advance to CONFIRMING_ORDER once fully "
+            f"resolved, got: {session.state!r}"
+        )
 
         cart = await h.cart()
         by_name = {c["name"]: c["quantity"] for c in cart}
@@ -324,5 +353,169 @@ async def test_explicit_half_chicken_order_still_resolves_directly_no_regression
         assert len(cart) == 1 and cart[0]["name"] == "Half Chicken", (
             f"expected a direct, unambiguous match, got cart={cart!r}, reply={reply!r}"
         )
+    finally:
+        await _cleanup(business.id)
+
+
+async def test_single_message_naming_two_variants_with_quantities_allocates_both(
+    test_business: Business, db,
+):
+    """'5 Jose and 10 Pedro' in a SINGLE message (not spread across two
+    messages) must allocate both correctly in one turn."""
+    business = await _setup_business(test_business, db)
+    h = _Harness(business)
+    try:
+        await h.send("Hello")
+        await h.send("15 Bambino Meals please")
+
+        reply = await h.send("5 Jose and 10 Pedro")
+        assert "yes" in reply.lower() and "total" in reply.lower(), (
+            f"expected a real confirmation prompt (fully resolved in one message), got: {reply!r}"
+        )
+
+        pending = await h.pending_allocation()
+        assert pending is None
+
+        cart = await h.cart()
+        by_name = {c["name"]: c["quantity"] for c in cart}
+        assert by_name.get("Bambino Meal: Jose") == 5
+        assert by_name.get("Bambino Meal: Pedro") == 10
+    finally:
+        await _cleanup(business.id)
+
+
+async def test_full_checkout_after_partial_allocation_persists_correct_order_items(
+    test_business: Business, db,
+):
+    """End-to-end: the exact incident conversation, allocated across two
+    messages, carried all the way through to a real placed order -- the
+    persisted OrderItem rows, quantities and totals must be exactly correct,
+    including the sibling Chicken Schwarma added on the very first message."""
+    business = await _setup_business(test_business, db)
+    h = _Harness(business)
+    try:
+        await h.send("Hello")
+        await h.send(_INCIDENT_MESSAGE)  # 3x Chicken Schwarma added, 15 Bambino outstanding
+        await h.send("5 Jose")  # 10 outstanding
+        reply = await h.send("10 Pedro")  # fully resolved -> CONFIRMING_ORDER
+        assert "yes" in reply.lower()
+
+        await h.send("Yes")
+        await h.send("0821234567")
+        await h.send("Pickup")
+        await h.send("Thabo")
+        await h.send("skip")
+
+        expected_total = 3 * 9490 + 5 * 8490 + 10 * 8490  # Schwarma + Jose + Pedro
+        order = await h.latest_order()
+        assert order["total_cents"] == expected_total, (
+            f"expected total {expected_total}, got {order['total_cents']}"
+        )
+        assert order["subtotal_cents"] == expected_total
+        assert order["order_mode"] == "PICKUP"
+
+        items = await h.latest_order_items()
+        by_name = {i["name_snapshot"]: i for i in items}
+        assert set(by_name) == {"Chicken Schwarma", "Bambino Meal: Jose", "Bambino Meal: Pedro"}, (
+            f"expected exactly these 3 line items, got: {set(by_name)}"
+        )
+        assert by_name["Chicken Schwarma"]["quantity"] == 3
+        assert by_name["Chicken Schwarma"]["line_total_cents"] == 3 * 9490
+        assert by_name["Bambino Meal: Jose"]["quantity"] == 5
+        assert by_name["Bambino Meal: Jose"]["line_total_cents"] == 5 * 8490
+        assert by_name["Bambino Meal: Pedro"]["quantity"] == 10
+        assert by_name["Bambino Meal: Pedro"]["line_total_cents"] == 10 * 8490
+    finally:
+        await _cleanup(business.id)
+
+
+async def test_ordering_other_products_while_allocation_outstanding_is_not_silently_dropped(
+    test_business: Business, db,
+):
+    """A customer asking for something else while the Bambino allocation is
+    still outstanding must have that OTHER item acknowledged and added --
+    not silently ignored the way the original BUG-0172 omission worked --
+    while the outstanding allocation itself still blocks checkout."""
+    business = await _setup_business(test_business, db)
+    h = _Harness(business)
+    try:
+        await h.send("Hello")
+        await h.send("15 Bambino Meals please")
+
+        reply = await h.send("Also give me a Chicken Burger")
+        assert "chicken burger" in reply.lower(), (
+            f"expected the unrelated item to be acknowledged, not silently dropped, got: {reply!r}"
+        )
+        assert "15" in reply, "the outstanding Bambino quantity must still be mentioned"
+
+        cart = await h.cart()
+        names = {c["name"] for c in cart}
+        assert "Chicken Burger" in names, f"expected Chicken Burger added, got cart: {cart!r}"
+
+        pending = await h.pending_allocation()
+        assert pending is not None and pending["quantity_needed"] == 15, (
+            "the Bambino allocation must remain outstanding and unchanged"
+        )
+        assert await h.order_count() == 0, "checkout must still be blocked"
+    finally:
+        await _cleanup(business.id)
+
+
+async def test_customer_can_cancel_the_outstanding_bambino_allocation(
+    test_business: Business, db,
+):
+    """A customer changing their mind about the whole outstanding request
+    ('never mind') must be able to drop it, rather than being stuck in the
+    same clarification loop forever."""
+    business = await _setup_business(test_business, db)
+    h = _Harness(business)
+    try:
+        await h.send("Hello")
+        await h.send("15 Bambino Meals please")
+
+        reply = await h.send("Never mind")
+        assert "dropped" in reply.lower() or "no problem" in reply.lower(), (
+            f"expected the allocation to be cancelled, got: {reply!r}"
+        )
+
+        pending = await h.pending_allocation()
+        assert pending is None, "allocation must be cleared after cancellation"
+
+        cart = await h.cart()
+        assert cart == [], "nothing should have been committed for the cancelled family"
+    finally:
+        await _cleanup(business.id)
+
+
+async def test_removal_attempt_while_allocation_outstanding_never_double_adds_the_item(
+    test_business: Business, db,
+):
+    """Independent review finding (2026-10-27): the "other products while
+    allocation outstanding" fallback must NEVER fire for an ORDER_REMOVE/
+    ORDER_CANCEL message, since _extract_items_from_message matches an
+    item's name regardless of intent -- "Remove the Schwarma" naming
+    "Schwarma" would otherwise be misread as a request to ADD another one.
+    This is a disclosed, deliberate limitation, not a crash: the actual
+    removal is NOT performed while the allocation is outstanding (cart
+    edits are deferred until the Bambino question is resolved or
+    cancelled) -- the one thing this guards is that the Schwarma quantity
+    is never silently doubled."""
+    business = await _setup_business(test_business, db)
+    h = _Harness(business)
+    try:
+        await h.send("Hello")
+        await h.send(_INCIDENT_MESSAGE)  # 3x Chicken Schwarma added, 15 Bambino outstanding
+
+        reply = await h.send("Remove the Chicken Schwarma")
+        assert "15" in reply, "the outstanding Bambino quantity must still be mentioned"
+
+        cart = await h.cart()
+        schwarma_lines = [c for c in cart if c["name"] == "Chicken Schwarma"]
+        assert len(schwarma_lines) == 1 and schwarma_lines[0]["quantity"] == 3, (
+            f"the Schwarma quantity must never be silently doubled, got: {cart!r}"
+        )
+
+        pending = await h.pending_allocation()
+        assert pending is not None and pending["quantity_needed"] == 15
     finally:
         await _cleanup(business.id)

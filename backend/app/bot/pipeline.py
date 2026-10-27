@@ -608,7 +608,7 @@ async def _handle_message(
     # _resolve_variant_allocation_reply's docstring. Also what prevents
     # checkout being confirmed while a Bambino-style quantity is still
     # outstanding, since it owns the whole turn until resolved.
-    _variant_alloc_result = _resolve_variant_allocation_reply(session, norm_text)
+    _variant_alloc_result = await _resolve_variant_allocation_reply(db, business, session, norm_text, intent=intent)
     if _variant_alloc_result is not None:
         return _variant_alloc_result
 
@@ -2040,8 +2040,8 @@ def _find_named_variant_family(msg_text: str, menu_items: list) -> tuple[str | N
     return None, []
 
 
-def _resolve_variant_allocation_reply(
-    session, norm_text: str,
+async def _resolve_variant_allocation_reply(
+    db, business, session, norm_text: str, intent: MessageIntent | None = None,
 ) -> tuple[str, bool, int | None, int | None, str | None] | None:
     """
     Resolve a reply to an outstanding named-variant-family clarification
@@ -2063,10 +2063,47 @@ def _resolve_variant_allocation_reply(
     quantities remain outstanding: a "yes"/"checkout" message names no
     variant, so it is treated as unresolved and the customer is reminded
     instead of being allowed through to the CONFIRMING_ORDER flow.
+
+    Two deliberate, additive refinements found during independent review
+    (2026-10-27), both reusing an already-established pattern rather than
+    introducing a new one:
+      - A clear negation/cancellation of the WHOLE message (`is_negation` --
+        the same detector the existing CONFIRMING_ORDER cancellation flow
+        already uses) drops the outstanding allocation instead of looping
+        the same clarification forever on a customer who changed their mind.
+      - If nothing named a variant AND the message isn't a bare negation,
+        it is still checked for any OTHER, unambiguous menu item (same
+        sibling-preservation pattern as BUG-0158/the family check itself)
+        so a customer asking for something else while allocation is
+        outstanding is acknowledged, not silently dropped -- the outstanding
+        allocation itself still blocks checkout exactly as before.
     """
     pending = state_machine.get_context(session, "pending_variant_allocation")
     if not pending:
         return None
+
+    # Found during independent review (2026-10-27): `get_or_create_session`
+    # (state_machine.py) always does an intermediate `db.flush()` right
+    # after loading the session, before any handler runs. SQLAlchemy keeps
+    # that flushed value as its comparison baseline for this JSONB column.
+    # `state_machine.set_cart`/`set_context` only shallow-copy the TOP-level
+    # context_json dict before reassigning -- nested objects (the cart list,
+    # this function's own `pending` dict) are still the SAME objects as in
+    # that baseline. Mutating one of those nested objects in place (as this
+    # function used to do for `pending["quantity_needed"]`, and as
+    # `add_to_cart`'s `cart.append(...)` always does) retroactively changes
+    # the baseline's content too, so the final dict-equality check SQLAlchemy
+    # runs at flush time sees "no change" and silently skips the UPDATE --
+    # reproduced directly: the in-memory object was correct, the commit
+    # logged success, but a fresh read-back showed the pre-mutation values.
+    # A deep copy here, taken before ANY mutation, severs that aliasing
+    # once and for all so every mutation below lands only on this function's
+    # own independent tree, never retroactively rewriting the baseline.
+    import copy as _copy_dealias
+    from sqlalchemy.orm.attributes import flag_modified as _flag_dealias
+    session.context_json = _copy_dealias.deepcopy(session.context_json)
+    _flag_dealias(session, "context_json")
+    pending = session.context_json.get("pending_variant_allocation")
 
     import re as _re_resolve
     norm_lower = norm_text.lower()
@@ -2074,6 +2111,19 @@ def _resolve_variant_allocation_reply(
     family_label = pending["family_label"]
     quantity_needed = pending["quantity_needed"]
     variant_names = [v["short_name"] for v in variants]
+
+    # ── Customer changed their mind about the whole outstanding request ──
+    if intent_router.is_negation(norm_text):
+        state_machine.set_context(session, "pending_variant_allocation", None)
+        logger.warning(
+            "VARIANT_ALLOCATION_CANCELLED: family=%r, quantity_needed=%d, session_id=%s",
+            family_label, quantity_needed, session.id,
+        )
+        return (
+            f"No problem — I've dropped the request for {quantity_needed} more "
+            f"{family_label}{'s' if quantity_needed != 1 else ''}.",
+            False, None, None, None,
+        )
 
     newly_added: list[str] = []
     total_allocated_now = 0
@@ -2092,16 +2142,43 @@ def _resolve_variant_allocation_reply(
         total_allocated_now += qty
 
     if total_allocated_now == 0:
-        # Nothing recognised this turn (a repeat of the generic family
+        # Nothing named a variant this turn (a repeat of the generic family
         # phrase, an unrelated message, or a premature "yes"/"checkout") --
-        # remind without touching the cart or the outstanding quantity, so
-        # repeating the original request never duplicates anything.
-        logger.warning(
-            "VARIANT_ALLOCATION_REMINDER: family=%r, quantity_needed=%d, session_id=%s",
-            family_label, quantity_needed, session.id,
+        # the outstanding quantity is never touched, so repeating the
+        # original request never duplicates anything. Any OTHER real,
+        # unambiguous item in the same message is still added, so a
+        # customer ordering something else isn't silently ignored -- it
+        # just doesn't resolve the Bambino allocation itself.
+        #
+        # Excluded for ORDER_REMOVE/ORDER_CANCEL: found during independent
+        # review (2026-10-27) -- _extract_items_from_message matches an
+        # item's name regardless of intent, so "Remove the Schwarma" would
+        # otherwise match "Chicken Schwarma" and ADD it again instead of
+        # removing it. Safer to fall through to the plain reminder below
+        # (cart edits/cancellation are not this function's job) than to
+        # risk silently doubling an item the customer asked to remove.
+        _other_matches = (
+            _extract_items_from_message(norm_text, (await _load_menu(db, business.id))[1])
+            if intent not in (MessageIntent.ORDER_REMOVE, MessageIntent.ORDER_CANCEL)
+            else []
         )
+        _other_added: list[str] = []
+        for _oi, _oq, _om in _other_matches:
+            if not _get_missing_required_groups(_oi, _om, norm_text):
+                state_machine.add_to_cart(
+                    session,
+                    menu_item_id=str(_oi.id), name=_oi.name,
+                    price_cents=_oi.price_cents, quantity=_oq,
+                    options=None, special_instructions=_om,
+                )
+                _other_added.append(f"{_oq}x {_oi.name}")
+        logger.warning(
+            "VARIANT_ALLOCATION_REMINDER: family=%r, quantity_needed=%d, other_added=%r, session_id=%s",
+            family_label, quantity_needed, _other_added, session.id,
+        )
+        _other_prefix = f"Added {', '.join(_other_added)} ✅\n\n" if _other_added else ""
         return (
-            f"Still need to know which {family_label}s for the remaining "
+            f"{_other_prefix}Still need to know which {family_label}s for the remaining "
             f"{quantity_needed} -- we have {', '.join(variant_names)}. You can mix them.",
             False, None, None, None,
         )
@@ -2113,8 +2190,23 @@ def _resolve_variant_allocation_reply(
             "VARIANT_ALLOCATION_RESOLVED: family=%r, added=%r, session_id=%s",
             family_label, newly_added, session.id,
         )
+        # Same "lock the cart and prompt for confirmation" pattern already
+        # used by the main deterministic add-items path (pipeline.py,
+        # DET_MATCH) -- without this, the session would stay in whatever
+        # state it was in before the allocation, and a subsequent "Yes"
+        # would have nothing to confirm.
+        import copy as _copy_resolve
+        updated_cart = state_machine.get_cart(session)
+        state_machine.set_context(session, "confirmed_cart", _copy_resolve.deepcopy(updated_cart))
+        state_machine.transition_state(session, ConversationState.CONFIRMING_ORDER.value)
+        order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
+        total = state_machine.cart_total_cents(session)
+        summary = state_machine.cart_summary_text(session, business.currency)
+        confirm_msg = responses.ask_confirmation_response(summary, total, 0, order_mode, business.currency)
+        if order_mode == "DELIVERY":
+            confirm_msg += "\n_Delivery fee will be confirmed by our team._"
         return (
-            f"Added {', '.join(newly_added)} ✅\n\nAll your {family_label}s are sorted!",
+            f"Added {', '.join(newly_added)} ✅\n\n{confirm_msg}",
             False, None, None, None,
         )
 
