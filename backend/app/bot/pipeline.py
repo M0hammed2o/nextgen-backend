@@ -603,6 +603,15 @@ async def _handle_message(
         msg_text[:80],
     )
 
+    # ── Outstanding named-variant-family allocation (BUG-0172) ──────────
+    # Must run before ANY intent/state routing -- see
+    # _resolve_variant_allocation_reply's docstring. Also what prevents
+    # checkout being confirmed while a Bambino-style quantity is still
+    # outstanding, since it owns the whole turn until resolved.
+    _variant_alloc_result = _resolve_variant_allocation_reply(session, norm_text)
+    if _variant_alloc_result is not None:
+        return _variant_alloc_result
+
     # ── Specific image requests: a named product, a named menu-image page
     #    (e.g. "Secret Creations"), or paging through several — "show me
     #    the Jawbreaker" / "show secret creations" / "next page". Runs
@@ -1947,10 +1956,180 @@ def _find_size_variants(msg_text: str, menu_items: list) -> tuple[str | None, li
             continue
         # Require ≥80% of the significant base words to appear in the message
         match_ratio = sum(1 for w in significant if w in msg_words) / len(significant)
-        if match_ratio >= 0.8:
-            return base, variants
+        if match_ratio < 0.8:
+            continue
+        # BUG-0172: a size family's base can be a single generic head word
+        # (e.g. "chicken", from "Half Chicken"/"Full Chicken"), which is ALSO
+        # a substring of a completely different, longer, unrelated active
+        # item's own name ("Chicken Schwarma", "Chicken Burrito", "2 Chicken
+        # Fillets and a Side"). Reported production incident, 2026-10-27: a
+        # message that only named "chicken Schwarma" triggered an unsolicited
+        # "Half Chicken or Full Chicken?" clarification nobody asked for,
+        # because the bare word "chicken" alone satisfied this match. If the
+        # message actually names one of those OTHER, more specific items in
+        # full, the word belongs to that item, not to this base/size family
+        # -- skip this family so that other item's own name can match
+        # normally instead.
+        variant_ids = {v.id for v in variants}
+        _claimed_by_other_item = any(
+            base in other.name.lower()
+            and other.id not in variant_ids
+            and other.name.lower() in msg_lower
+            for other in active
+        )
+        if _claimed_by_other_item:
+            continue
+        return base, variants
 
     return None, []
+
+
+def _find_named_variant_family(msg_text: str, menu_items: list) -> tuple[str | None, list]:
+    """
+    Pre-LLM check: detect if the message refers to a FAMILY of menu items
+    that share a common "<Family Label>: <Variant>" catalog name (e.g. the
+    real "Bambino Meal: Jose" / "...: Pedro" / "...: Speedy" / "...: Juanita"
+    products), using only the family's generic head phrase with no specific
+    variant named.
+
+    BUG-0172 (production incident, 2026-10-27): "Ok can you give me 15
+    Bambino Meals and also give me 3 chicken Schwarma" silently dropped the
+    15 Bambino Meals with zero trace -- _extract_items_from_message/
+    _extract_items_from_chunk only match an item by its FULL catalog name
+    (including the specific variant after the colon), so a generic plural
+    mention never matches any of the 4 real products. This check runs at the
+    same call site as the existing, already-shipped `_find_size_variants`
+    check (BUG-0158) so the family is recognised and clarified -- instead of
+    silently vanishing -- while any other, unambiguous item named in the
+    SAME message is still added immediately (same sibling-preservation
+    pattern as that fix).
+
+    Groups active items by the text before the FIRST ": " in their name.
+    Returns (family_label, [MenuItem, ...]) when:
+      - At least 2 active items share the same label, AND
+      - The label (optionally plural, e.g. "Bambino Meal(s)") appears in the
+        message, AND
+      - The message does NOT already name one of the specific variants (so
+        "Bambino Meal: Jose", or just "Jose", is left alone -- nothing
+        ambiguous remains to ask about).
+    Otherwise returns (None, []).
+    """
+    import re as _re_fam
+    active = [i for i in menu_items if i.is_active and not i.is_deleted]
+    msg_lower = msg_text.lower()
+
+    groups: dict[str, list] = {}
+    for item in active:
+        if ": " not in item.name:
+            continue
+        label = item.name.split(": ", 1)[0].strip()
+        groups.setdefault(label.lower(), []).append(item)
+
+    for label_lower, variants in groups.items():
+        if len(variants) < 2:
+            continue
+        variant_suffixes = [v.name.split(": ", 1)[1].strip().lower() for v in variants]
+        # A specific variant is already named -- nothing ambiguous left.
+        if any(_re_fam.search(rf"\b{_re_fam.escape(suf)}\b", msg_lower) for suf in variant_suffixes):
+            continue
+        if not _re_fam.search(rf"\b{_re_fam.escape(label_lower)}s?\b", msg_lower):
+            continue
+        display_label = variants[0].name.split(": ", 1)[0].strip()
+        return display_label, variants
+
+    return None, []
+
+
+def _resolve_variant_allocation_reply(
+    session, norm_text: str,
+) -> tuple[str, bool, int | None, int | None, str | None] | None:
+    """
+    Resolve a reply to an outstanding named-variant-family clarification
+    (BUG-0172 -- see `_find_named_variant_family`). Returns a full
+    `_handle_message`-shaped response when a `pending_variant_allocation`
+    context exists and this turn was spent resolving it; returns None when
+    there is nothing pending, so the caller falls through to normal routing.
+
+    Runs BEFORE intent/state routing (same reasoning as the pre-existing
+    `recommended_items` early-acceptance check in `_handle_message`):
+    "Jose" or "5 Jose and 10 Pedro" names no menu item by its full catalog
+    name, so intent_router has no dedicated pattern for it and deterministic
+    extraction elsewhere would never resolve it on its own.
+
+    Owns the WHOLE turn whenever a variant allocation is outstanding -- it
+    never falls through to the normal LLM/deterministic flow while
+    unresolved. This is deliberate and is also what prevents checkout from
+    being confirmed while Bambino (or any future named-variant-family)
+    quantities remain outstanding: a "yes"/"checkout" message names no
+    variant, so it is treated as unresolved and the customer is reminded
+    instead of being allowed through to the CONFIRMING_ORDER flow.
+    """
+    pending = state_machine.get_context(session, "pending_variant_allocation")
+    if not pending:
+        return None
+
+    import re as _re_resolve
+    norm_lower = norm_text.lower()
+    variants = pending["variants"]
+    family_label = pending["family_label"]
+    quantity_needed = pending["quantity_needed"]
+    variant_names = [v["short_name"] for v in variants]
+
+    newly_added: list[str] = []
+    total_allocated_now = 0
+    for v in variants:
+        m = _re_resolve.search(rf"\b{_re_resolve.escape(v['short_name'].lower())}\b", norm_lower)
+        if not m:
+            continue
+        qty = _parse_quantity_before(norm_lower, m.start())
+        state_machine.add_to_cart(
+            session,
+            menu_item_id=v["menu_item_id"], name=v["name"],
+            price_cents=v["price_cents"], quantity=qty,
+            options=None, special_instructions=None,
+        )
+        newly_added.append(f"{qty}x {v['name']}")
+        total_allocated_now += qty
+
+    if total_allocated_now == 0:
+        # Nothing recognised this turn (a repeat of the generic family
+        # phrase, an unrelated message, or a premature "yes"/"checkout") --
+        # remind without touching the cart or the outstanding quantity, so
+        # repeating the original request never duplicates anything.
+        logger.warning(
+            "VARIANT_ALLOCATION_REMINDER: family=%r, quantity_needed=%d, session_id=%s",
+            family_label, quantity_needed, session.id,
+        )
+        return (
+            f"Still need to know which {family_label}s for the remaining "
+            f"{quantity_needed} -- we have {', '.join(variant_names)}. You can mix them.",
+            False, None, None, None,
+        )
+
+    remaining = max(0, quantity_needed - total_allocated_now)
+    if remaining <= 0:
+        state_machine.set_context(session, "pending_variant_allocation", None)
+        logger.warning(
+            "VARIANT_ALLOCATION_RESOLVED: family=%r, added=%r, session_id=%s",
+            family_label, newly_added, session.id,
+        )
+        return (
+            f"Added {', '.join(newly_added)} ✅\n\nAll your {family_label}s are sorted!",
+            False, None, None, None,
+        )
+
+    pending["quantity_needed"] = remaining
+    state_machine.set_context(session, "pending_variant_allocation", pending)
+    logger.warning(
+        "VARIANT_ALLOCATION_PARTIAL: family=%r, added=%r, remaining=%d, session_id=%s",
+        family_label, newly_added, remaining, session.id,
+    )
+    return (
+        f"Added {', '.join(newly_added)} ✅\n\nYou still have {remaining} more "
+        f"{family_label}{'s' if remaining != 1 else ''} to choose -- which would you like? "
+        f"We have {', '.join(variant_names)}.",
+        False, None, None, None,
+    )
 
 
 def _extract_modifier_from_suffix(suffix: str) -> str | None:
@@ -3311,6 +3490,75 @@ async def _handle_with_llm(
                         break
             return (
                 f"{_prefix}Which *{base_name.title()}* would you like?\n{size_options}{_unmatched_alias_note}",
+                False, None, None, None,
+            )
+
+    # ── Deterministic named-variant-family ambiguity check (BUG-0172) ───────
+    # Mirrors the size-ambiguity check immediately above, but for catalog
+    # items named "<Family Label>: <Variant>" (e.g. the real "Bambino Meal:
+    # Jose/Pedro/Speedy/Juanita"). A generic, un-qualified plural mention
+    # ("15 Bambino Meals") never matches any one of those full catalog
+    # names in _extract_items_from_message, so without this check it was
+    # silently dropped with zero trace while any other unambiguous item in
+    # the same message got added fine (the exact reported production
+    # incident, 2026-10-27). Skipped while already resolving a previous
+    # family ambiguity (pending_variant_allocation) or mid-CHOOSING_OPTIONS.
+    if (
+        session.state != ConversationState.CHOOSING_OPTIONS.value
+        and not state_machine.get_context(session, "pending_variant_allocation")
+    ):
+        family_label, family_variants = _find_named_variant_family(norm_text, items)
+        if family_label and family_variants:
+            _fam_lower = family_label.lower()
+            _fam_match = _re.search(rf"\b{_re.escape(_fam_lower)}s?\b", norm_text.lower())
+            requested_qty = (
+                _parse_quantity_before(norm_text.lower(), _fam_match.start())
+                if _fam_match else 1
+            )
+
+            # ── Sibling items in the same message (same pattern as the
+            # BUG-0158 fix above) -- add anything else unambiguous right
+            # now rather than blocking it behind this family's question.
+            _fam_sibling_matches = _extract_items_from_message(norm_text, items)
+            _fam_siblings_added: list[str] = []
+            for _sib_item, _sib_qty, _sib_mod in _fam_sibling_matches:
+                if not _get_missing_required_groups(_sib_item, _sib_mod, norm_text):
+                    state_machine.add_to_cart(
+                        session,
+                        menu_item_id=str(_sib_item.id), name=_sib_item.name,
+                        price_cents=_sib_item.price_cents, quantity=_sib_qty,
+                        options=None,
+                        special_instructions=_sib_mod or _capture_options_from_message(_sib_item, norm_text),
+                    )
+                    _fam_siblings_added.append(f"{_sib_qty}x {_sib_item.name}")
+
+            _fam_variant_names = [v.name.split(": ", 1)[1].strip() for v in family_variants]
+            pending_alloc = {
+                "family_label": family_label,
+                "variants": [
+                    {
+                        "menu_item_id": str(v.id),
+                        "name": v.name,
+                        "short_name": _sn,
+                        "price_cents": v.price_cents,
+                    }
+                    for v, _sn in zip(family_variants, _fam_variant_names)
+                ],
+                "quantity_needed": requested_qty,
+            }
+            state_machine.set_context(session, "pending_variant_allocation", pending_alloc)
+            logger.warning(
+                "VARIANT_FAMILY_AMBIGUITY: family=%r, requested_qty=%d, variants=%d, "
+                "siblings_added=%r, session_id=%s",
+                family_label, requested_qty, len(family_variants), _fam_siblings_added, session.id,
+            )
+            _fam_prefix = (
+                f"Added {', '.join(_fam_siblings_added)} ✅\n\n" if _fam_siblings_added else ""
+            )
+            return (
+                f"{_fam_prefix}Which *{family_label}s* would you like? We have "
+                f"{', '.join(_fam_variant_names)}. You can mix them to make up your "
+                f"{requested_qty}.",
                 False, None, None, None,
             )
 
