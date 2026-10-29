@@ -386,6 +386,13 @@ class POSSettingsResponse(BaseModel):
     # of discovering it only by having every other POS call come back 409.
     pos_enabled: bool = True
 
+    # Delivery marketplace module (Business.delivery_platforms_enabled) —
+    # read-only, same pattern as loyalty_enabled above: tells the Staff PWA
+    # whether to show the pending delivery-order queue on Live Orders
+    # (GET /business/delivery/queue), rather than discovering it by probing
+    # that route and interpreting a DELIVERY_NOT_ENABLED 409.
+    delivery_platforms_enabled: bool = False
+
 
 class POSPaymentIntentCreateRequest(BaseModel):
     amount_cents: int = Field(gt=0)
@@ -749,6 +756,7 @@ async def get_pos_settings(
         print_kitchen_receipt=business.print_kitchen_receipt,
         inventory_enabled=business.inventory_enabled,
         loyalty_enabled=business.loyalty_enabled,
+        delivery_platforms_enabled=bool(getattr(business, "delivery_platforms_enabled", False)),
         staff_live_orders_tab_enabled=business.staff_live_orders_tab_enabled,
         staff_wastage_tab_enabled=business.staff_wastage_tab_enabled,
         # A stocktake tab is only useful if there is stock to count. Gating the

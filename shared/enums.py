@@ -98,7 +98,11 @@ class OrderSource(str, enum.Enum):
 
 
 #: Sources whose money the restaurant never handles, so they must never
-#: reach till cash-up. Used by backend/app/pos/till.py.
+#: reach till cash-up, be relabelled via PATCH .../payment, or be refunded
+#: through the restaurant's own payment provider. Used by
+#: backend/app/api/v1/routes_orders.py and routes_external_orders.py
+#: (NOT backend/app/pos/till.py, which is source-agnostic by construction —
+#: it sums by till_session_id, which these sources never have).
 EXTERNAL_ORDER_SOURCES: frozenset[str] = frozenset({
     OrderSource.UBER_EATS.value,
     OrderSource.MR_D.value,

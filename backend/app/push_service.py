@@ -39,6 +39,24 @@ async def send_order_alert(
     Background task: send push notifications to all staff subscriptions for a business.
     Opens its own DB session so this is fully independent of the order creation transaction.
     """
+    mode_label = "Pickup" if order_mode == "PICKUP" else "Delivery"
+    await send_business_notification(
+        business_id, title="New Order!", body=f"Order {order_number} — {mode_label}",
+    )
+
+
+async def send_business_notification(
+    business_id: uuid.UUID,
+    *,
+    title: str,
+    body: str,
+    url: str = "/",
+) -> None:
+    """
+    Push an arbitrary staff notification (e.g. "Uber Eats order cancelled")
+    to every subscription for a business. Same delivery path and VAPID
+    handling as `send_order_alert`, which is a thin wrapper over this.
+    """
     from backend.app.core.config import get_settings
     settings = get_settings()
     if not settings.VAPID_PRIVATE_KEY or not settings.VAPID_PUBLIC_KEY:
@@ -54,12 +72,7 @@ async def send_order_alert(
     # triggering create_async_engine in test environments where the DB is not available.
     from backend.app.db.session import async_session_factory
 
-    mode_label = "Pickup" if order_mode == "PICKUP" else "Delivery"
-    payload = json.dumps({
-        "title": "New Order!",
-        "body": f"Order {order_number} — {mode_label}",
-        "url": "/",
-    })
+    payload = json.dumps({"title": title, "body": body, "url": url})
     vapid_claims = {"sub": settings.VAPID_CONTACT_EMAIL}
 
     async with async_session_factory() as db:

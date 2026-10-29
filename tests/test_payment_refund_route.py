@@ -118,6 +118,38 @@ async def test_refund_rejects_order_that_is_not_paid():
     assert exc.value.code == "ORDER_NOT_PAID"
 
 
+# ── Rejected: a marketplace order's payment was collected externally ───────
+# Mirrors the same guard added to PATCH .../payment — see
+# test_payment_status_transitions.py and KNOWN_BUGS.md, found during the
+# delivery-integration Phase 1 audit, 2026-10-26. Only one FakeResult is
+# queued because the guard must raise before the route's second query
+# (fetching the business's payment provider) ever runs.
+
+async def test_refund_rejects_a_uber_eats_order():
+    user = make_user()
+    order = make_order(user.business_id, payment_status="PAID", source="UBER_EATS")
+    db = FakeDB([FakeResult(scalar=order)])
+
+    with pytest.raises(AppError) as exc:
+        await refund_order_payment(order_id=order.id, body=RefundRequest(), user=user, db=db)
+    assert exc.value.code == "EXTERNAL_ORDER_PAYMENT_LOCKED"
+    assert db.commits == 0
+
+
+async def test_refund_rejects_a_mr_d_order_even_with_confirm_manual():
+    user = make_user()
+    order = make_order(user.business_id, payment_status="PAID", source="MR_D")
+    db = FakeDB([FakeResult(scalar=order)])
+
+    with pytest.raises(AppError) as exc:
+        await refund_order_payment(
+            order_id=order.id,
+            body=RefundRequest(confirm_manual=True, reference="test"),
+            user=user, db=db,
+        )
+    assert exc.value.code == "EXTERNAL_ORDER_PAYMENT_LOCKED"
+
+
 async def test_refund_rejects_amount_exceeding_total():
     user = make_user()
     order = make_order(user.business_id, payment_status="PAID", total_cents=5000)

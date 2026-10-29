@@ -14,6 +14,10 @@ venv/
 .env.production
 .env.backend
 .env.admin
+# Any other local env file holding secrets (e.g. .env.uber-sandbox for the
+# Uber Eats sandbox app); the committed *.example templates stay tracked.
+.env.*
+!.env*.example
 .admin_session.local.json
 .owner_session.local.json
 .*.local.json

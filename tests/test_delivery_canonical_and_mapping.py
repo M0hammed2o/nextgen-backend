@@ -8,6 +8,7 @@ import hashlib
 import hmac
 
 import pytest
+from unittest.mock import patch
 
 from backend.app.delivery.base import (
     DeliveryCapabilities,
@@ -218,56 +219,126 @@ class TestMapCurrentState:
 # ── Get Order Details parsing ────────────────────────────────────────────────
 
 class TestParseOrderDetails:
-    def test_maps_confirmed_fields(self):
-        raw = {
-            "id": "order-1",
-            "display_id": "A1B2",
+    """
+    Fixture shapes follow Uber's own v2 Get Order Details example
+    (developer.uber.com/docs/eats/references/api/v2/get-eats-order-orderid,
+    read 2026-10-26) — not guesses. The previous fixture used a flat
+    `price.amount` and a "+1" `phone_code`, neither of which exists in that
+    reference, so the old test passed while real payloads would have priced
+    every line at R0.
+    """
+
+    @staticmethod
+    def _money(amount, currency="ZAR"):
+        return {"amount": amount, "currency_code": currency, "formatted_amount": f"R{amount / 100:.2f}"}
+
+    def _documented_order(self):
+        m = self._money
+        return {
+            "id": "f9f363d1-e1c2-4595-b477-c649845bc953",
+            "display_id": "BC953",
             "current_state": "CREATED",
             "type": "DELIVERY_BY_UBER",
-            "brand": "Ciao Pizza",
-            "placed_at": "2026-09-22T10:00:00Z",
-            "eater": {"first_name": "Sam", "phone": "5551234", "phone_code": "+1"},
+            "brand": "UBER_EATS",
+            "placed_at": "2026-10-26T18:30:00+02:00",
+            "estimated_ready_for_pickup_at": "2026-10-26T18:50:00+02:00",
+            "store": {"id": "store-from-payload-NEVER-trusted"},
+            "eater": {"first_name": "Larry", "phone": "+27 21 555 0100", "phone_code": "555 55 555"},
             "cart": {
+                "special_instructions": "Ring the bell",
                 "items": [
                     {
-                        "id": "item-1",
-                        "external_data": "menu-item-large-margherita",
-                        "title": "Large Margherita",
+                        "id": "Muffin",
+                        "instance_id": "Muffin-Instance",
+                        "title": "Fresh-baked muffin",
+                        "external_data": "free text set by some other integrator",
                         "quantity": 2,
-                        "price": {"amount": 15000},
+                        "price": {
+                            "unit_price": m(350), "total_price": m(700),
+                            "base_unit_price": m(300), "base_total_price": m(600),
+                        },
                         "selected_modifier_groups": [
-                            {"selected_items": [{"id": "mod-1", "title": "Extra Cheese", "quantity": 1, "price": {"amount": 1000}}]}
+                            {
+                                "id": "Choose-flavor", "title": "Choose flavor",
+                                "selected_items": [{
+                                    "id": "Chocolate-deluxe", "title": "Chocolate deluxe", "quantity": 1,
+                                    "price": {"unit_price": m(50), "total_price": m(50)},
+                                }],
+                                "removed_items": None,
+                            },
+                            {
+                                "id": "Add-sugar", "title": "Add sugar", "selected_items": None,
+                                "removed_items": [{
+                                    "id": "Sugar", "title": "Sugar", "quantity": 0,
+                                    "price": {"unit_price": m(0)}, "default_quantity": 2,
+                                }],
+                            },
                         ],
                     }
                 ],
-                "fulfillment_issues": [],
+                "fulfillment_issues": [{
+                    "fulfillment_issue_type": "OUT_OF_ITEM",
+                    "fulfillment_action_type": "REMOVE_ITEM",
+                    "root_item": {"id": "Donut", "title": "Chocolate donut"},
+                }],
             },
             "payment": {
                 "charges": {
-                    "sub_total": 30000, "tax": 4500, "total_fee": 3000, "total": 34500, "cash_amount_due": 0,
+                    "total": m(1399), "sub_total": m(700), "tax": m(0),
+                    "total_fee": m(699), "cash_amount_due": m(0),
                 }
             },
         }
-        canonical = uber_mapping.parse_order_details(raw, external_store_id="store-abc")
-        assert canonical.external_order_id == "order-1"
+
+    def test_maps_documented_fields(self):
+        canonical = uber_mapping.parse_order_details(self._documented_order(), external_store_id="store-abc")
+        assert canonical.external_order_id == "f9f363d1-e1c2-4595-b477-c649845bc953"
+        assert canonical.display_id == "BC953"
         assert canonical.external_store_id == "store-abc"  # from the caller, never from `raw`
         assert canonical.provider_status_raw == "CREATED"
-        assert canonical.subtotal_cents == 30000
-        assert canonical.tax_cents == 4500
-        assert canonical.fee_cents == 3000
-        assert canonical.total_cents == 34500
+        assert canonical.order_type == "DELIVERY_BY_UBER"
+        assert canonical.currency == "ZAR"
+        assert canonical.subtotal_cents == 700
+        assert canonical.tax_cents == 0
+        assert canonical.fee_cents == 699
+        assert canonical.total_cents == 1399
         assert canonical.restaurant_net_cents is None  # never inferred
         assert canonical.delivery_address is None
-        assert len(canonical.lines) == 1
-        line = canonical.lines[0]
-        assert line.external_item_id == "menu-item-large-margherita"
+        assert canonical.special_instructions == "Ring the bell"
+        assert canonical.ready_for_pickup_at is not None
+        assert canonical.fulfillment_issues == ("OUT_OF_ITEM Chocolate donut (REMOVE_ITEM)",)
+
+    def test_line_prices_come_from_the_nested_money_objects(self):
+        line = uber_mapping.parse_order_details(self._documented_order(), external_store_id="s").lines[0]
         assert line.quantity == 2
-        assert line.unit_price_cents == 15000
-        assert len(line.modifiers) == 1
-        assert line.modifiers[0].title == "Extra Cheese"
-        assert line.modifiers[0].price_cents == 1000
-        assert canonical.customer_first_name == "Sam"
-        assert canonical.customer_phone == "+15551234"
+        assert line.unit_price_cents == 350, "price.unit_price.amount — includes the selected modifier"
+        assert line.total_price_cents == 700
+        assert line.base_unit_price_cents == 300
+
+    def test_mapping_key_is_the_entity_id_not_free_text_external_data(self):
+        line = uber_mapping.parse_order_details(self._documented_order(), external_store_id="s").lines[0]
+        assert line.external_item_id == "Muffin"
+
+    def test_selected_and_removed_modifiers_are_both_captured(self):
+        line = uber_mapping.parse_order_details(self._documented_order(), external_store_id="s").lines[0]
+        added = [m for m in line.modifiers if not m.removed]
+        removed = [m for m in line.modifiers if m.removed]
+        assert [(m.external_id, m.title, m.price_cents, m.group_title) for m in added] == [
+            ("Chocolate-deluxe", "Chocolate deluxe", 50, "Choose flavor"),
+        ]
+        assert [(m.external_id, m.title) for m in removed] == [("Sugar", "Sugar")]
+        assert removed[0].price_cents is None, "taking an ingredient out never adds a charge"
+
+    def test_phone_code_is_an_access_code_not_a_dialling_prefix(self):
+        canonical = uber_mapping.parse_order_details(self._documented_order(), external_store_id="s")
+        assert canonical.customer_first_name == "Larry"
+        assert canonical.customer_phone == "+27 21 555 0100"
+        assert canonical.customer_phone_code == "555 55 555"
+
+    def test_flat_amount_price_is_still_accepted_as_a_fallback(self):
+        raw = {"id": "o1", "cart": {"items": [{"id": "i", "title": "X", "quantity": 1, "price": {"amount": 1500}}]}}
+        line = uber_mapping.parse_order_details(raw, external_store_id="s1").lines[0]
+        assert line.unit_price_cents == 1500
 
     def test_missing_price_object_does_not_crash(self):
         raw = {"id": "o1", "cart": {"items": [{"title": "Mystery Item", "quantity": 1}]}}
@@ -288,3 +359,113 @@ class TestParseOrderDetails:
         assert set(canonical.provider_metadata.keys()) <= {"brand", "type", "current_state"}
         assert "eater" not in canonical.provider_metadata
         assert "Secret Name" not in str(canonical.provider_metadata)
+
+
+class TestNonOrderEventsNeverBecomeOrders:
+    def test_store_event_with_top_level_store_id_parses_without_an_order_id(self):
+        envelope = uber_mapping.parse_webhook_envelope({
+            "event_id": "evt-store-1", "event_type": "store.provisioned", "store_id": "store-9",
+        })
+        assert envelope.external_store_id == "store-9"
+        assert envelope.external_order_id is None
+
+    def test_unknown_event_type_carrying_a_resource_id_is_not_treated_as_an_order(self):
+        """Uber: "new event types may be added in the future without notice"."""
+        envelope = uber_mapping.parse_webhook_envelope({
+            "event_id": "evt-x", "event_type": "delivery.state_changed",
+            "meta": {"user_id": "store-1", "resource_id": "something-else"},
+        })
+        assert envelope.external_order_id is None
+
+    @pytest.mark.parametrize("event_type", [
+        "orders.notification", "orders.scheduled.notification",
+        "orders.cancel", "orders.failure", "orders.customer_order_edit",
+    ])
+    def test_order_lifecycle_events_keep_their_order_id(self, event_type):
+        envelope = uber_mapping.parse_webhook_envelope({
+            "event_id": "e", "event_type": event_type,
+            "meta": {"user_id": "store-1", "resource_id": "order-1"},
+        })
+        assert envelope.external_order_id == "order-1"
+
+
+class TestMenuCatalogueParsing:
+    def test_items_and_modifiers_are_classified_and_priced(self):
+        raw = {
+            "items": [
+                {"id": "Coffee", "title": {"translations": {"en_us": "Coffee"}}, "price_info": {"price": 3000}},
+                {"id": "Milk", "title": {"translations": {"en_us": "Milk"}}, "price_info": {"price": 500}},
+                {"id": "Orphan", "title": {"translations": {"en_us": "Not on any menu"}}},
+            ],
+            "categories": [{"id": "Drinks", "entities": [{"type": "ITEM", "id": "Coffee"}]}],
+            "modifier_groups": [
+                {"id": "Add-milk", "title": {"translations": {"en_us": "Add milk"}},
+                 "modifier_options": [{"type": "ITEM", "id": "Milk"}]},
+                {"id": "Extras", "title": {"translations": {"en_us": "Extras"}},
+                 "modifier_options": [{"type": "ITEM", "id": "Milk"}]},
+            ],
+        }
+        entries = uber_mapping.parse_menu_catalogue(raw)
+        by_key = {(e.kind, e.external_id): e for e in entries}
+        assert set(by_key) == {("ITEM", "Coffee"), ("MODIFIER", "Milk")}, "one entry per entity per kind"
+        assert by_key[("ITEM", "Coffee")].price_cents == 3000
+        assert by_key[("MODIFIER", "Milk")].group_title == "Add milk"
+        assert by_key[("MODIFIER", "Milk")].title == "Milk"
+
+    def test_malformed_menu_degrades_to_nothing_not_a_crash(self):
+        assert uber_mapping.parse_menu_catalogue({"items": "nope", "categories": [None]}) == []
+
+
+class TestWebhookEnvironmentIsProvenBySignature:
+    def _settings(self, **overrides):
+        from backend.app.core.config import get_settings
+        settings = get_settings()
+        values = {
+            "UBER_EATS_CLIENT_SECRET": "prod-secret", "UBER_EATS_SANDBOX_CLIENT_SECRET": "sandbox-secret",
+        }
+        values.update(overrides)
+        return patch.multiple(settings, **values)
+
+    def test_each_app_secret_proves_its_own_environment(self):
+        from backend.app.delivery.uber.environments import match_webhook_environment
+
+        body = b'{"event_id": "e"}'
+        with self._settings():
+            prod_sig = hmac.new(b"prod-secret", body, hashlib.sha256).hexdigest()
+            sandbox_sig = hmac.new(b"sandbox-secret", body, hashlib.sha256).hexdigest()
+            assert match_webhook_environment(body, prod_sig) == "production"
+            assert match_webhook_environment(body, sandbox_sig) == "sandbox"
+            assert match_webhook_environment(body, "0" * 64) is None
+            assert match_webhook_environment(body, None) is None
+
+    def test_an_unconfigured_environment_can_never_match(self):
+        from backend.app.delivery.uber.environments import match_webhook_environment
+
+        body = b"{}"
+        empty_sig = hmac.new(b"", body, hashlib.sha256).hexdigest()
+        with self._settings(UBER_EATS_SANDBOX_CLIENT_SECRET=""):
+            assert match_webhook_environment(body, empty_sig) is None
+
+    def test_adapter_reports_the_verified_environment(self):
+        body = b'{"event_id": "e"}'
+        with self._settings():
+            sig = hmac.new(b"sandbox-secret", body, hashlib.sha256).hexdigest()
+            adapter = UberEatsAdapter()
+            assert adapter.verified_webhook_environment(body, {"x-uber-signature": sig}) == "sandbox"
+            assert adapter.verify_webhook_signature(body, {"x-uber-signature": sig}) is True
+
+
+class TestUberEpochTimestamps:
+    """Uber (2026-10-29): epoch timestamps are UTC and may be seconds OR milliseconds."""
+
+    def test_seconds_and_milliseconds_parse_to_the_same_instant(self):
+        seconds = uber_mapping._parse_timestamp(1761771000)
+        assert seconds is not None and seconds.tzinfo is not None
+        assert uber_mapping._parse_timestamp(1761771000000) == seconds
+        assert uber_mapping._parse_timestamp(1761771000.5) == uber_mapping._parse_timestamp(1761771000500)
+
+    def test_iso_strings_and_junk(self):
+        assert uber_mapping._parse_timestamp("2026-10-29T20:50:00Z").isoformat() == "2026-10-29T20:50:00+00:00"
+        assert uber_mapping._parse_timestamp(True) is None
+        assert uber_mapping._parse_timestamp("not a time") is None
+        assert uber_mapping._parse_timestamp(None) is None

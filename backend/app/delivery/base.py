@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from typing import Mapping
 
 from backend.app.delivery.canonical import (
+    CanonicalCatalogueEntry,
     CanonicalDeliveryOrder,
     DeliveryOrderStatus,
     WebhookEnvelope,
@@ -58,6 +59,12 @@ class DeliveryCapabilities:
     store_discovery: bool = False
     # Phase 2, not built in v1 — needs the separate eats.report OAuth scope.
     settlement_report: bool = False
+    # Tell the provider an accepted order is ready for courier pickup.
+    ready_signal: bool = False
+    # Restaurant-initiated cancel of an order already accepted.
+    restaurant_cancel: bool = False
+    # Read (never write) the provider's menu, for bulk mapping import.
+    catalogue_read: bool = False
 
 
 @dataclass(frozen=True)
@@ -103,6 +110,25 @@ class DeliveryProviderAdapter(ABC):
 
     @abstractmethod
     def _verify_webhook_signature(self, raw_body: bytes, headers: Mapping[str, str]) -> bool: ...
+
+    def verified_webhook_environment(
+        self, raw_body: bytes, headers: Mapping[str, str]
+    ) -> str | None:
+        """
+        The environment ("production"/"sandbox") whose credentials verify
+        this webhook's signature, or None when the signature is invalid.
+        Unlike a provider's own environment header, this cannot be claimed
+        by a sender who does not hold that environment's secret. Adapters
+        with only one signing secret inherit the default: "production" when
+        the signature verifies.
+        """
+        self._require("webhooks")
+        return self._verified_webhook_environment(raw_body, headers)
+
+    def _verified_webhook_environment(
+        self, raw_body: bytes, headers: Mapping[str, str]
+    ) -> str | None:
+        return "production" if self._verify_webhook_signature(raw_body, headers) else None
 
     def parse_webhook_event(
         self, raw_body: bytes, headers: Mapping[str, str]
@@ -167,14 +193,22 @@ class DeliveryProviderAdapter(ABC):
         context: DeliveryOrderContext,
         reason_code: str,
         explanation: str | None = None,
+        out_of_stock_items: list[str] | None = None,
     ) -> None:
+        """
+        `out_of_stock_items` (provider item ids) is only forwarded when
+        non-empty, so an adapter whose `_deny_order` predates it still works.
+        """
         self._require("accept_deny")
-        return await self._deny_order(
+        kwargs = dict(
             external_order_id=external_order_id,
             context=context,
             reason_code=reason_code,
             explanation=explanation,
         )
+        if out_of_stock_items:
+            kwargs["out_of_stock_items"] = list(out_of_stock_items)
+        return await self._deny_order(**kwargs)
 
     @abstractmethod
     async def _deny_order(
@@ -185,6 +219,47 @@ class DeliveryProviderAdapter(ABC):
         reason_code: str,
         explanation: str | None,
     ) -> None: ...
+
+    # ── Kitchen-to-provider status — optional, capability-gated ──────────
+    #
+    # Not abstract: a provider that cannot do these simply leaves the flag
+    # False, and the public method refuses before the default body is ever
+    # reached.
+
+    async def mark_order_ready(
+        self, *, external_order_id: str, context: DeliveryOrderContext,
+    ) -> None:
+        self._require("ready_signal")
+        return await self._mark_order_ready(external_order_id=external_order_id, context=context)
+
+    async def _mark_order_ready(
+        self, *, external_order_id: str, context: DeliveryOrderContext,
+    ) -> None:
+        raise DeliveryCapabilityUnsupported(self.provider, "ready_signal")
+
+    async def cancel_order(
+        self,
+        *,
+        external_order_id: str,
+        context: DeliveryOrderContext,
+        reason_code: str,
+        explanation: str | None = None,
+    ) -> None:
+        self._require("restaurant_cancel")
+        return await self._cancel_order(
+            external_order_id=external_order_id, context=context,
+            reason_code=reason_code, explanation=explanation,
+        )
+
+    async def _cancel_order(
+        self,
+        *,
+        external_order_id: str,
+        context: DeliveryOrderContext,
+        reason_code: str,
+        explanation: str | None,
+    ) -> None:
+        raise DeliveryCapabilityUnsupported(self.provider, "restaurant_cancel")
 
     # ── Store plane — network ─────────────────────────────────────────────
 
@@ -226,6 +301,18 @@ class DeliveryProviderAdapter(ABC):
 
     @abstractmethod
     async def _upsert_menu(self, *, context: DeliveryOrderContext, menu_payload: dict) -> None: ...
+
+    async def fetch_menu_catalogue(
+        self, *, context: DeliveryOrderContext,
+    ) -> list[CanonicalCatalogueEntry]:
+        """Read the provider's menu as catalogue entries. Never writes anything."""
+        self._require("catalogue_read")
+        return await self._fetch_menu_catalogue(context=context)
+
+    async def _fetch_menu_catalogue(
+        self, *, context: DeliveryOrderContext,
+    ) -> list[CanonicalCatalogueEntry]:
+        raise DeliveryCapabilityUnsupported(self.provider, "catalogue_read")
 
     # ── Pure mapping — no capability gate; every adapter must always be ──
     #    able to say what a provider status means, even a disabled stub.

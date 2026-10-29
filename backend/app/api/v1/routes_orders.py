@@ -6,7 +6,7 @@ Staff, Manager, and Owner can access. Status transitions are validated.
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import select, func, and_
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -24,7 +24,13 @@ from backend.app.receipts.whatsapp_receipt import (
     send_digital_receipt,
 )
 from backend.app.utils.phone import normalize_sa_mobile
-from shared.enums import ORDER_STATUS_TRANSITIONS, AuditScope, OrderSource, OrderStatus
+from shared.enums import (
+    EXTERNAL_ORDER_SOURCES,
+    ORDER_STATUS_TRANSITIONS,
+    AuditScope,
+    OrderSource,
+    OrderStatus,
+)
 from backend.app.payments.registry import get_provider
 from shared.models.audit import AuditEvent
 from shared.models.business import Business
@@ -544,6 +550,7 @@ async def update_order_status(
     body: StatusUpdateRequest,
     user: AuthUser = Depends(require_staff_or_above),
     db: AsyncSession = Depends(get_db),
+    request: Request = None,
 ):
     """
     Update order status with transition validation.
@@ -670,6 +677,27 @@ async def update_order_status(
     except Exception:
         import logging
         logging.getLogger("nextgen").warning("Failed to publish SSE event for order %s", order.id)
+
+    # ── Marketplace order: tell the provider (fire and forget) ────────────
+    # READY -> "ready for pickup", CANCELLED -> restaurant cancel, a
+    # hand-over status -> local FULFILLED. Queued, never awaited inline, so
+    # a slow/failing provider can never block or undo the kitchen's own
+    # status change; failures are recorded on the delivery order and raised
+    # to managers (backend/app/delivery/order_service.py::sync_delivery_order_status).
+    # business_id comes from the JWT, never the request body.
+    if order.source in EXTERNAL_ORDER_SOURCES:
+        try:
+            arq_pool = getattr(request.app.state, "arq_pool", None) if request is not None else None
+            if arq_pool is not None:
+                await arq_pool.enqueue_job(
+                    "sync_delivery_order_status",
+                    str(user.business_id), str(order.id), requested.value, body.reason,
+                )
+        except Exception:
+            import logging
+            logging.getLogger("nextgen").warning(
+                "Failed to enqueue marketplace status sync for order %s", order.id
+            )
 
     # ── Notify customer via WhatsApp (fire and forget) ────────────────────
     try:
@@ -1017,6 +1045,15 @@ async def update_payment_status(
     if not order:
         raise NotFoundError("Order", str(order_id))
 
+    if order.source in EXTERNAL_ORDER_SOURCES:
+        raise AppError(
+            "EXTERNAL_ORDER_PAYMENT_LOCKED",
+            "This order's payment was collected by the delivery platform, not this "
+            "restaurant — its payment status/method can't be edited here. Contact "
+            "the platform (Uber Eats/Mr D) for payment disputes on marketplace orders.",
+            422,
+        )
+
     new_status = body.payment_status
     old_payment_status = order.payment_status
 
@@ -1209,6 +1246,15 @@ async def refund_order_payment(
     order = result.scalar_one_or_none()
     if not order:
         raise NotFoundError("Order", str(order_id))
+
+    if order.source in EXTERNAL_ORDER_SOURCES:
+        raise AppError(
+            "EXTERNAL_ORDER_PAYMENT_LOCKED",
+            "This order's payment was collected by the delivery platform, not this "
+            "restaurant's own payment provider — it can't be refunded here. Refunds "
+            "on marketplace orders go through the platform (Uber Eats/Mr D) directly.",
+            422,
+        )
 
     if body.confirm_manual:
         if order.payment_status in ("REFUNDED", "PARTIALLY_REFUNDED"):

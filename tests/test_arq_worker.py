@@ -385,12 +385,16 @@ class TestWorkerSettings:
         package) the WhatsApp order-usage threshold-alert sweep,
         check_whatsapp_usage_alerts (monitoring/reporting only — reads
         orders/businesses, writes only its own new usage_alerts table,
-        never touches the bot pipeline) — cron jobs must be registered.
-        Count was 6, then 7, then 8, now 9; bumped deliberately each time,
-        not a weakened assertion (this test still enumerates every job by
-        name below).
+        never touches the bot pipeline) — and (added 2026-10-26, marketplace
+        completion pass) the delivery webhook-event retention sweep,
+        delivery_webhook_retention_sweep (redacts raw payloads at 30 days,
+        deletes at 400 — backend/app/delivery/retention.py) — cron jobs
+        must be registered.
+        Count was 6, then 7, then 8, then 9, now 10; bumped deliberately each
+        time, not a weakened assertion (this test still enumerates every job
+        by name below).
         """
-        assert len(WorkerSettings.cron_jobs) == 9
+        assert len(WorkerSettings.cron_jobs) == 10
         names = {c.name for c in WorkerSettings.cron_jobs}
         assert "cron:run_outbox_batch" in names
         assert "cron:cancel_stale_delivery_fee_orders" in names
@@ -401,6 +405,7 @@ class TestWorkerSettings:
         assert "cron:log_stale_whatsapp_connections" in names
         assert "cron:delivery_accept_deadline_watchdog" in names
         assert "cron:check_whatsapp_usage_alerts" in names
+        assert "cron:delivery_webhook_retention_sweep" in names
 
     def test_max_tries_is_positive(self):
         """max_tries must be > 0 so infrastructure failures can be retried."""

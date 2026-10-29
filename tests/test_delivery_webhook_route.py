@@ -41,11 +41,6 @@ class FakeRequest:
         return self._body
 
 
-class FakeResponse:
-    def __init__(self):
-        self.status_code = 200
-
-
 class TestRateLimitScope:
     def test_route_uses_a_fixed_shared_limit_scope_not_the_path_default(self):
         """
@@ -64,6 +59,14 @@ class TestRateLimitScope:
 
 
 class TestWebhookRouteHandler:
+    """
+    Uber's webhook reference: "Your service should return an HTTP 200
+    response code with an empty response body". Every outcome is therefore
+    a bare status code — the gate result lives in the log line and in
+    delivery_webhook_events.error_category, never in the response (which
+    also used to tell a forger whether their signature was rejected).
+    """
+
     async def test_reads_raw_body_before_any_parsing(self, monkeypatch):
         """
         `request.body()` must be awaited and its exact bytes passed through
@@ -72,7 +75,6 @@ class TestWebhookRouteHandler:
         raw = b'{"event_id": "e1"}'
         pool = AsyncMock()
         request = FakeRequest(raw, headers={}, arq_pool=pool)
-        response = FakeResponse()
 
         captured = {}
 
@@ -82,51 +84,50 @@ class TestWebhookRouteHandler:
             return WebhookGateResult(accepted=True, error_category="OK")
 
         with patch.object(routes_delivery_webhook, "ingest_delivery_webhook", fake_ingest):
-            await routes_delivery_webhook.delivery_webhook.__wrapped__(
-                "UBER_EATS", request, response, db=MagicMock(),
+            result = await routes_delivery_webhook.delivery_webhook.__wrapped__(
+                "UBER_EATS", request, db=MagicMock(),
             )
         assert captured["raw_body"] == raw
         assert captured["provider"] == "UBER_EATS"
+        assert result.status_code == 200
+        assert result.body == b""
 
     async def test_no_arq_pool_returns_503_never_a_false_200(self):
         request = FakeRequest(b"{}", headers={}, arq_pool=None)
-        response = FakeResponse()
 
         result = await routes_delivery_webhook.delivery_webhook.__wrapped__(
-            "UBER_EATS", request, response, db=MagicMock(),
+            "UBER_EATS", request, db=MagicMock(),
         )
-        assert response.status_code == 503
-        assert result["status"] == "service_unavailable"
+        assert result.status_code == 503
+        assert result.body == b""
 
     async def test_gate_result_status_code_is_propagated_onto_the_response(self):
         pool = AsyncMock()
         request = FakeRequest(b"{}", headers={}, arq_pool=pool)
-        response = FakeResponse()
 
         async def fake_ingest(db, *, provider, raw_body, headers, arq_pool):
             return WebhookGateResult(accepted=False, http_status=503, error_category="ENQUEUE_FAILED")
 
         with patch.object(routes_delivery_webhook, "ingest_delivery_webhook", fake_ingest):
             result = await routes_delivery_webhook.delivery_webhook.__wrapped__(
-                "UBER_EATS", request, response, db=MagicMock(),
+                "UBER_EATS", request, db=MagicMock(),
             )
-        assert response.status_code == 503
-        assert result["error_category"] == "ENQUEUE_FAILED"
+        assert result.status_code == 503
+        assert result.body == b""
 
-    async def test_gate_rejection_still_returns_200_by_default(self):
+    async def test_gate_rejection_still_returns_200_with_an_empty_body(self):
         pool = AsyncMock()
         request = FakeRequest(b"{}", headers={}, arq_pool=pool)
-        response = FakeResponse()
 
         async def fake_ingest(db, *, provider, raw_body, headers, arq_pool):
             return WebhookGateResult(accepted=False, http_status=200, error_category="BAD_SIGNATURE")
 
         with patch.object(routes_delivery_webhook, "ingest_delivery_webhook", fake_ingest):
             result = await routes_delivery_webhook.delivery_webhook.__wrapped__(
-                "MR_D", request, response, db=MagicMock(),
+                "MR_D", request, db=MagicMock(),
             )
-        assert response.status_code == 200
-        assert result["status"] == "rejected"
+        assert result.status_code == 200
+        assert result.body == b"", "the response must not reveal that the signature was rejected"
 
 
 class TestRouteRegistration:
