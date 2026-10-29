@@ -30,6 +30,17 @@ def redeem_reversal_idempotency_key(order_id: uuid.UUID) -> str:
     return f"REDEEM_REVERSAL:{order_id}"
 
 
+def manual_redeem_idempotency_key(raw_key: str) -> str:
+    """
+    Namespaced so a staff member's manual-redemption idempotency key (BUG-0186)
+    can never collide with a checkout REDEEM/REDEEM_REVERSAL key or a manager's
+    ADJUST key in the same partial unique index
+    (`uq_loyalty_transactions_business_id_idempotency_key`), even if a client
+    happened to reuse a raw string shape. Mirrors `manual_adjustment_idempotency_key`.
+    """
+    return f"REDEEM_MANUAL:{raw_key}"
+
+
 def compute_tier(points_balance: int, program: LoyaltyProgram) -> str:
     if points_balance >= program.gold_tier_points:
         return "GOLD"
@@ -177,7 +188,7 @@ async def award_loyalty_points_if_enabled(db: AsyncSession, business_id: uuid.UU
 
 async def redeem_reward(
     db: AsyncSession, business_id: uuid.UUID, customer: Customer, reward: LoyaltyReward, program: LoyaltyProgram,
-    *, order_id: uuid.UUID | None = None,
+    *, order_id: uuid.UUID | None = None, idempotency_key: str | None = None,
 ) -> LoyaltyTransaction:
     """
     Redeem a reward for a customer. Raises AppError on any validation failure.
@@ -194,7 +205,11 @@ async def redeem_reward(
     nullability. When given (POS checkout, via `redeem_reward_for_checkout`),
     it stamps a deterministic `idempotency_key` on the written transaction —
     belt-and-braces defense on top of the order's own idempotency guard,
-    mirroring `post_sale_consumption`'s ledger keys.
+    mirroring `post_sale_consumption`'s ledger keys. The explicit
+    `idempotency_key` parameter is for the manual endpoint's own namespaced
+    key (`manual_redeem_idempotency_key`, BUG-0186) and is only ever used when
+    `order_id` is not given — the checkout path's own deterministic key always
+    wins when both are present, so this never changes checkout behaviour.
     """
     # Cheap in-memory checks first — no need to take the row lock at all if
     # the redemption is going to be rejected regardless of balance.
@@ -225,7 +240,7 @@ async def redeem_reward(
         points_delta=-reward.points_cost,
         balance_after=customer.loyalty_points_balance,
         reason=f"Redeemed: {reward.name}",
-        idempotency_key=redeem_idempotency_key(order_id) if order_id else None,
+        idempotency_key=redeem_idempotency_key(order_id) if order_id else idempotency_key,
     )
     db.add(txn)
     return txn

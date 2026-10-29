@@ -257,21 +257,219 @@ async def test_redeem_via_route_success():
     FakeDB([])._finalize(reward)
 
     # Query order: business entitlement lookup, program lookup, unlocked
-    # customer lookup (404 check), reward lookup, then redeem_reward()'s OWN
-    # row-lock reselect of the SAME customer (BUG-0097 fix) — five executes.
+    # customer lookup (404 check), reward lookup, BUG-0186 idempotency
+    # pre-check (none found), then redeem_reward()'s OWN row-lock reselect of
+    # the SAME customer (BUG-0097 fix) — six executes.
     db = FakeDB([
         FakeResult(scalar=business),
         FakeResult(scalar=program), FakeResult(scalar=customer),
-        FakeResult(scalar=reward), FakeResult(scalar=customer),
+        FakeResult(scalar=reward), FakeResult(scalar=None),
+        FakeResult(scalar=customer),
     ])
 
     result = await redeem_loyalty_reward(
-        body=RedeemRequest(customer_id=customer.id, reward_id=reward.id), user=user, db=db,
+        body=RedeemRequest(customer_id=customer.id, reward_id=reward.id, idempotency_key="till-redeem-1"),
+        user=user, db=db,
     )
 
     assert result.success is True
     assert result.balance_after == 300
     assert customer.loyalty_points_balance == 300
+
+
+# ── BUG-0186: manual redeem idempotency, insufficient balance, tenant isolation ─
+
+async def test_redeem_idempotent_replay_on_repeated_key():
+    """A retried/double-clicked request carrying the SAME idempotency_key as
+    an already-applied redemption must replay the original outcome, not
+    deduct points a second time — the common-case pre-check path."""
+    user = make_user(role="STAFF")
+    business = make_business(user.business_id)
+    program = make_program(user.business_id, is_enabled=True)
+    customer = make_customer(user.business_id, loyalty_points_balance=159)
+    reward = LoyaltyReward(business_id=user.business_id, name="Free Fries", points_cost=150)
+    FakeDB([])._finalize(reward)
+    existing_txn = LoyaltyTransaction(
+        business_id=user.business_id, customer_id=customer.id, order_id=None,
+        transaction_type="REDEEM", points_delta=-150, balance_after=9,
+        reason="Redeemed: Free Fries", idempotency_key="REDEEM_MANUAL:fries-1",
+    )
+    FakeDB([])._finalize(existing_txn)
+
+    db = FakeDB([
+        FakeResult(scalar=business), FakeResult(scalar=program),
+        FakeResult(scalar=customer), FakeResult(scalar=reward),
+        FakeResult(scalar=existing_txn),  # idempotency pre-check finds the original
+    ])
+
+    result = await redeem_loyalty_reward(
+        body=RedeemRequest(customer_id=customer.id, reward_id=reward.id, idempotency_key="fries-1"),
+        user=user, db=db,
+    )
+
+    assert result.success is True
+    assert result.points_delta == -150
+    assert result.balance_after == 9
+    # No new work done — this is a replay, not a second redemption.
+    assert customer.loyalty_points_balance == 159
+    assert db.added == []
+    assert db.commits == 0
+
+
+async def test_redeem_intentional_second_redemption_uses_new_key():
+    """A DIFFERENT idempotency_key for a genuinely new redemption must NOT
+    be short-circuited by an unrelated prior transaction — only an exact key
+    match replays."""
+    user = make_user(role="STAFF")
+    business = make_business(user.business_id)
+    program = make_program(user.business_id, is_enabled=True)
+    customer = make_customer(user.business_id, loyalty_points_balance=400)
+    reward = LoyaltyReward(business_id=user.business_id, name="Free Fries", points_cost=150)
+    FakeDB([])._finalize(reward)
+
+    db = FakeDB([
+        FakeResult(scalar=business), FakeResult(scalar=program),
+        FakeResult(scalar=customer), FakeResult(scalar=reward),
+        FakeResult(scalar=None),  # no prior transaction under this NEW key
+        FakeResult(scalar=customer),  # redeem_reward()'s row-lock reselect
+    ])
+
+    result = await redeem_loyalty_reward(
+        body=RedeemRequest(customer_id=customer.id, reward_id=reward.id, idempotency_key="fries-2-genuinely-new"),
+        user=user, db=db,
+    )
+
+    assert result.success is True
+    assert result.balance_after == 250
+    assert customer.loyalty_points_balance == 250
+    assert db.commits == 1
+
+
+async def test_redeem_race_caught_by_unique_index_returns_committed_state():
+    """Two concurrent requests carrying the SAME idempotency_key both pass
+    the pre-check before either has committed — the partial unique index
+    decides the winner; the loser's commit hits it and must replay the
+    winner's committed result instead of 500ing or double-deducting."""
+    user = make_user(role="STAFF")
+    business = make_business(user.business_id)
+    program = make_program(user.business_id, is_enabled=True)
+    customer = make_customer(user.business_id, loyalty_points_balance=309)
+    reward = LoyaltyReward(business_id=user.business_id, name="Free Fries", points_cost=150)
+    FakeDB([])._finalize(reward)
+    winner_txn = LoyaltyTransaction(
+        business_id=user.business_id, customer_id=customer.id, order_id=None,
+        transaction_type="REDEEM", points_delta=-150, balance_after=159,
+        reason="Redeemed: Free Fries", idempotency_key="REDEEM_MANUAL:race-key",
+    )
+    FakeDB([])._finalize(winner_txn)
+
+    db = FakeDB(
+        [
+            FakeResult(scalar=business), FakeResult(scalar=program),
+            FakeResult(scalar=customer), FakeResult(scalar=reward),
+            FakeResult(scalar=None),          # pre-check passes (race window)
+            FakeResult(scalar=customer),       # redeem_reward()'s row-lock reselect
+            FakeResult(scalar=winner_txn),     # post-IntegrityError lookup finds the winner
+        ],
+        commit_exc=make_integrity_error(),
+    )
+
+    result = await redeem_loyalty_reward(
+        body=RedeemRequest(customer_id=customer.id, reward_id=reward.id, idempotency_key="race-key"),
+        user=user, db=db,
+    )
+
+    assert result.success is True
+    assert result.points_delta == -150
+    assert result.balance_after == 159
+    assert db.rollbacks == 1
+    assert db.commits == 0
+
+
+async def test_redeem_insufficient_points_rejected_and_untouched():
+    """Route-layer coverage for the insufficient-balance path (engine-level
+    behaviour already covered in test_loyalty_engine.py) — the balance must
+    be left completely untouched and nothing written."""
+    user = make_user(role="STAFF")
+    business = make_business(user.business_id)
+    program = make_program(user.business_id, is_enabled=True)
+    customer = make_customer(user.business_id, loyalty_points_balance=50)
+    reward = LoyaltyReward(business_id=user.business_id, name="Free Fries", points_cost=150)
+    FakeDB([])._finalize(reward)
+
+    db = FakeDB([
+        FakeResult(scalar=business), FakeResult(scalar=program),
+        FakeResult(scalar=customer), FakeResult(scalar=reward),
+        FakeResult(scalar=None),      # idempotency pre-check — no prior attempt
+        FakeResult(scalar=customer),  # redeem_reward()'s row-lock reselect
+    ])
+
+    with pytest.raises(AppError) as exc:
+        await redeem_loyalty_reward(
+            body=RedeemRequest(customer_id=customer.id, reward_id=reward.id, idempotency_key="not-enough-points"),
+            user=user, db=db,
+        )
+    assert exc.value.code == "INSUFFICIENT_POINTS"
+    assert customer.loyalty_points_balance == 50  # untouched
+    assert db.added == []
+    assert db.commits == 0
+
+
+async def test_redeem_customer_in_another_business_is_not_found():
+    """A customer_id belonging to a different business must be
+    indistinguishable from one that does not exist — the lookup is scoped by
+    user.business_id (the JWT claim), never by client input, so a
+    cross-tenant id resolves to the exact same NotFoundError a nonexistent
+    id would."""
+    user = make_user(role="STAFF")
+    business = make_business(user.business_id)
+    program = make_program(user.business_id, is_enabled=True)
+    other_business_customer_id = uuid.uuid4()
+
+    db = FakeDB([
+        FakeResult(scalar=business), FakeResult(scalar=program),
+        FakeResult(scalar=None),  # business_id filter excludes the other tenant's row
+    ])
+
+    with pytest.raises(NotFoundError) as exc:
+        await redeem_loyalty_reward(
+            body=RedeemRequest(
+                customer_id=other_business_customer_id, reward_id=uuid.uuid4(), idempotency_key="cross-tenant-probe",
+            ),
+            user=user, db=db,
+        )
+    assert exc.value.code == "CUSTOMER_NOT_FOUND"
+    assert db.added == []
+    assert db.commits == 0
+
+
+async def test_redeem_reward_in_another_business_is_not_found():
+    """Same tenant-isolation guarantee for the reward side of the lookup —
+    a reward_id belonging to a different business must 404, not redeem
+    someone else's reward catalogue entry against this business's customer."""
+    user = make_user(role="STAFF")
+    business = make_business(user.business_id)
+    program = make_program(user.business_id, is_enabled=True)
+    customer = make_customer(user.business_id, loyalty_points_balance=500)
+    other_business_reward_id = uuid.uuid4()
+
+    db = FakeDB([
+        FakeResult(scalar=business), FakeResult(scalar=program),
+        FakeResult(scalar=customer),
+        FakeResult(scalar=None),  # business_id filter excludes the other tenant's reward
+    ])
+
+    with pytest.raises(NotFoundError) as exc:
+        await redeem_loyalty_reward(
+            body=RedeemRequest(
+                customer_id=customer.id, reward_id=other_business_reward_id, idempotency_key="cross-tenant-reward",
+            ),
+            user=user, db=db,
+        )
+    assert exc.value.code == "LOYALTYREWARD_NOT_FOUND"
+    assert customer.loyalty_points_balance == 500  # untouched
+    assert db.added == []
+    assert db.commits == 0
 
 
 # ── Manual points adjustment (adjust_customer_points) ───────────────────────
@@ -667,7 +865,10 @@ class TestLoyaltyEntitlementGate:
 
         with pytest.raises(AppError) as exc:
             await redeem_loyalty_reward(
-                body=RedeemRequest(customer_id=uuid.uuid4(), reward_id=uuid.uuid4()), user=user, db=db,
+                body=RedeemRequest(
+                    customer_id=uuid.uuid4(), reward_id=uuid.uuid4(), idempotency_key="gate-check",
+                ),
+                user=user, db=db,
             )
         assert exc.value.code == "LOYALTY_NOT_ENABLED"
         assert db.commits == 0

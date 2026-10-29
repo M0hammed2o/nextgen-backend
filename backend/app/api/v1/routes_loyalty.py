@@ -80,6 +80,7 @@ from backend.app.loyalty.engine import (
     adjust_points,
     get_or_create_customer_by_phone,
     manual_adjustment_idempotency_key,
+    manual_redeem_idempotency_key,
     redeem_reward,
 )
 from shared.enums import AuditScope
@@ -212,6 +213,12 @@ class CustomerLoyaltyResponse(BaseModel):
 class RedeemRequest(BaseModel):
     customer_id: uuid.UUID
     reward_id: uuid.UUID
+    # Required (BUG-0186) — a retried/double-clicked request with the SAME key
+    # replays the original outcome instead of deducting points twice; an
+    # intentional second redemption must use a new key. Mirrors the POS
+    # checkout path's own mandatory idempotency_key for a loyalty redemption
+    # (routes_pos.py::POSOrderCreateRequest.validate_loyalty_redemption).
+    idempotency_key: str = Field(min_length=1, max_length=160)
 
 
 class RedeemResponse(BaseModel):
@@ -392,6 +399,17 @@ async def redeem_loyalty_reward(
     user: AuthUser = Depends(require_staff_or_above),
     db: AsyncSession = Depends(get_db),
 ):
+    """
+    BUG-0186 fix: a retried/double-clicked request with the same
+    `idempotency_key` replays the original outcome instead of deducting
+    points a second time. Checked up front (the common case, a sequential
+    retry) and again by catching the unique-index violation on a genuine
+    concurrent double-submit (the race case) — the exact two-layer pattern
+    `adjust_customer_points` already uses below. The POS checkout redemption
+    path (`routes_pos.py` -> `redeem_reward_for_checkout`) is untouched by
+    this change: it always passes its own `order_id`-derived key, which
+    `redeem_reward()` still prefers over any explicit key.
+    """
     await _require_loyalty_enabled(db, user.business_id)
     program = await _get_or_create_program(db, user.business_id)
 
@@ -409,8 +427,24 @@ async def redeem_loyalty_reward(
     if not reward:
         raise NotFoundError("LoyaltyReward", str(body.reward_id))
 
-    txn = await redeem_reward(db, user.business_id, customer, reward, program)
-    await db.commit()
+    namespaced_key = manual_redeem_idempotency_key(body.idempotency_key)
+
+    existing = await _find_by_idempotency_key(db, user.business_id, namespaced_key)
+    if existing is not None:
+        return RedeemResponse(success=True, points_delta=existing.points_delta, balance_after=existing.balance_after)
+
+    try:
+        txn = await redeem_reward(db, user.business_id, customer, reward, program, idempotency_key=namespaced_key)
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        if _is_adjustment_idempotency_violation(exc):
+            existing = await _find_by_idempotency_key(db, user.business_id, namespaced_key)
+            if existing is not None:
+                return RedeemResponse(
+                    success=True, points_delta=existing.points_delta, balance_after=existing.balance_after,
+                )
+        raise
 
     return RedeemResponse(success=True, points_delta=txn.points_delta, balance_after=txn.balance_after)
 
