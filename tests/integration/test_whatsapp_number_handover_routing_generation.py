@@ -262,3 +262,177 @@ async def test_legacy_caller_with_no_snapshot_falls_back_to_original_behaviour(d
         assert len(customers) == 1, "legacy callers (no snapshot) must still work exactly as before"
 
     await _cleanup_business(alpha.id)
+
+
+async def test_delayed_meta_webhook_retry_after_handover_does_not_reprocess_under_new_owner(db):
+    """
+    A DIFFERENT scenario from the delayed-ARQ-job test above: not a job
+    stuck in the queue, but Meta itself re-delivering the SAME webhook (same
+    wa_message_id) some time after a handover -- e.g. our server 200'd the
+    first delivery late enough that Meta's own retry window still fired, or
+    a network blip caused Meta to resend. A webhook retry re-enters
+    routes_webhook.py fresh and gets a snapshot for WHOEVER CURRENTLY owns
+    the number at that instant (Beta) -- migration 0059's generation check
+    alone does not catch this, because the snapshot IS fresh and IS
+    accurate for right now. What actually protects this case is the
+    pre-existing, unrelated protection: Message.wa_message_id is GLOBALLY
+    unique (shared/models/message.py's own docstring: "wa_message_id is
+    globally unique for idempotency"), not scoped per business. So a retry
+    of a wa_message_id that was already successfully processed once (under
+    Alpha) hits that global uniqueness in the dedup INSERT and is refused,
+    regardless of which business the retry's fresh lookup resolves to.
+
+    This test proves that existing protection actually holds for this exact
+    cross-tenant shape, which nothing in migration 0059 was previously
+    verified against.
+    """
+    shared_number = f"handover-{uuid.uuid4().hex[:10]}"
+    alpha = await _make_business(db, "Alpha")
+    beta = await _make_business(db, "Beta")
+
+    alpha.whatsapp_phone_number_id = shared_number
+    db.add(alpha)
+    await db.commit()
+    await db.refresh(alpha)
+
+    wa_id = f"27{uuid.uuid4().int % 10**9:09d}"
+    wa_message_id = f"wamid.retry-{uuid.uuid4().hex[:12]}"
+    # Deliberately a plain greeting, not an order-confirmation phrase -- the
+    # intent router sends anything it can't classify deterministically to
+    # the LLM, which has no API key in this test environment. The scenario
+    # under test (retry/dedup across a handover) doesn't depend on message
+    # content, only on it being the SAME wa_message_id both times.
+    text = "Hi"
+
+    # ── First delivery: webhook resolves Alpha fresh, processes normally ──
+    async with get_session_factory()() as job_db:
+        p1, p2 = _patches()
+        with p1 as mock_send, p2:
+            await process_inbound_message(
+                db=job_db, phone_number_id=shared_number, wa_message_id=wa_message_id, wa_id=wa_id,
+                msg_text=text, msg_type="text",
+                raw_payload={"id": wa_message_id, "type": "text", "text": {"body": text}},
+                contact_name="Retry Scenario Customer",
+                expected_business_id=alpha.id, expected_routing_generation=alpha.whatsapp_routing_generation,
+            )
+            mock_send.assert_called()  # Alpha got a real reply
+
+    # ── Handover happens (two sequential commits, matching the real procedure) ──
+    alpha.whatsapp_phone_number_id = None
+    alpha.whatsapp_routing_generation += 1
+    db.add(alpha)
+    await db.commit()
+
+    beta.whatsapp_phone_number_id = shared_number
+    beta.whatsapp_routing_generation += 1
+    db.add(beta)
+    await db.commit()
+    await db.refresh(beta)
+
+    # ── Meta retries the SAME webhook delivery. A fresh webhook-level lookup
+    #    at this instant would resolve Beta (the current owner) -- simulate
+    #    exactly that fresh-but-wrong-for-this-message resolution. ──
+    async with get_session_factory()() as retry_db:
+        p1, p2 = _patches()
+        with p1 as mock_send, p2:
+            await process_inbound_message(
+                db=retry_db, phone_number_id=shared_number, wa_message_id=wa_message_id, wa_id=wa_id,
+                msg_text=text, msg_type="text",
+                raw_payload={"id": wa_message_id, "type": "text", "text": {"body": text}},
+                contact_name="Retry Scenario Customer",
+                expected_business_id=beta.id, expected_routing_generation=beta.whatsapp_routing_generation,
+            )
+            mock_send.assert_not_called()  # the retry must be silently deduplicated, not re-processed
+
+    async with get_session_factory()() as verify_db:
+        beta_customers = (
+            await verify_db.execute(select(Customer).where(Customer.business_id == beta.id, Customer.wa_id == wa_id))
+        ).scalars().all()
+        assert beta_customers == [], "the retried historical message must NOT create a customer under the new owner"
+
+        all_messages_for_this_wamid = (
+            await verify_db.execute(select(Message).where(Message.wa_message_id == wa_message_id))
+        ).scalars().all()
+        assert len(all_messages_for_this_wamid) == 1, (
+            "exactly one Message row must exist for this wa_message_id across the whole table"
+        )
+        assert all_messages_for_this_wamid[0].business_id == alpha.id, (
+            "the one recorded message must belong to Alpha (who actually received it), not Beta"
+        )
+
+    await _cleanup_business(alpha.id)
+    await _cleanup_business(beta.id)
+
+
+async def test_round_trip_handover_back_to_original_owner_still_refuses_stale_snapshot(db):
+    """
+    The number moves Alpha -> Beta -> back to Alpha. A job snapshotted
+    during the FIRST window (Alpha, generation=1) arrives late, after the
+    full round trip -- Alpha is once again the current owner, but at
+    generation=3, not 1. This is exactly the gap a simpler "does this
+    business still own the number" check (without a generation counter)
+    would miss: Alpha DOES still own it by the time this stale job runs.
+    The generation must still catch it and refuse, proving
+    DECISION-0054's choice of a monotonic generation over a simpler
+    ownership check was actually necessary, not just theoretically nicer.
+    """
+    shared_number = f"handover-{uuid.uuid4().hex[:10]}"
+    alpha = await _make_business(db, "Alpha")
+    beta = await _make_business(db, "Beta")
+
+    alpha.whatsapp_phone_number_id = shared_number
+    db.add(alpha)
+    await db.commit()
+    await db.refresh(alpha)
+
+    # Snapshot taken while Alpha owns it, generation 1.
+    snapshot_business_id = alpha.id
+    snapshot_generation = alpha.whatsapp_routing_generation
+    assert snapshot_generation == 1
+
+    # Alpha -> Beta.
+    alpha.whatsapp_phone_number_id = None
+    alpha.whatsapp_routing_generation += 1  # -> 2
+    db.add(alpha)
+    await db.commit()
+    beta.whatsapp_phone_number_id = shared_number
+    beta.whatsapp_routing_generation += 1  # -> 2
+    db.add(beta)
+    await db.commit()
+
+    # Beta -> back to Alpha (the round trip).
+    beta.whatsapp_phone_number_id = None
+    beta.whatsapp_routing_generation += 1  # -> 3
+    db.add(beta)
+    await db.commit()
+    alpha.whatsapp_phone_number_id = shared_number
+    alpha.whatsapp_routing_generation += 1  # -> 3
+    db.add(alpha)
+    await db.commit()
+    await db.refresh(alpha)
+    assert alpha.whatsapp_phone_number_id == shared_number
+    assert alpha.whatsapp_routing_generation == 3  # moved on twice since the stale snapshot was taken
+
+    wa_id = f"27{uuid.uuid4().int % 10**9:09d}"
+    wa_message_id = f"wamid.roundtrip-{uuid.uuid4().hex[:12]}"
+
+    async with get_session_factory()() as job_db:
+        p1, p2 = _patches()
+        with p1 as mock_send, p2:
+            await process_inbound_message(
+                db=job_db, phone_number_id=shared_number, wa_message_id=wa_message_id, wa_id=wa_id,
+                msg_text="Hi again", msg_type="text",
+                raw_payload={"id": wa_message_id, "type": "text", "text": {"body": "Hi again"}},
+                contact_name="Round Trip Customer",
+                expected_business_id=snapshot_business_id, expected_routing_generation=snapshot_generation,
+            )
+            mock_send.assert_not_called()  # stale snapshot, even though Alpha is (again) the real current owner
+
+    async with get_session_factory()() as verify_db:
+        customers = (
+            await verify_db.execute(select(Customer).where(Customer.business_id == alpha.id, Customer.wa_id == wa_id))
+        ).scalars().all()
+        assert customers == [], "a stale pre-round-trip snapshot must be refused even though Alpha owns the number again"
+
+    await _cleanup_business(alpha.id)
+    await _cleanup_business(beta.id)

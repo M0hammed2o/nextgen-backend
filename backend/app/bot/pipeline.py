@@ -184,6 +184,36 @@ async def _process(
         logger.info("PIPELINE_BUSINESS_INACTIVE: business_id=%s, skipping", business.id)
         return
 
+    # ── 2.5. Fast-path duplicate check ───────────────────────────────────
+    # wa_message_id is GLOBALLY unique (shared/models/message.py), so a
+    # message already recorded by an earlier delivery (any business, any
+    # time) can never be legitimately reprocessed. Checking this BEFORE
+    # _get_or_create_customer matters specifically for the WhatsApp-number-
+    # handover case (migration 0059): without this check, a sequential
+    # retry of an already-processed wa_message_id that now resolves to a
+    # DIFFERENT business (because the number moved on) would still call
+    # _get_or_create_customer under the new owner first — creating a real,
+    # if otherwise-inert, Customer row under a tenant this person never
+    # actually messaged, even though the authoritative step-4 dedup INSERT
+    # below correctly stops any reply or cart/order mutation either way.
+    # Found and reproduced empirically, 2026-10-29 (see
+    # test_whatsapp_number_handover_routing_generation.py), not assumed.
+    # This is a plain SELECT, not the race-safe guard — step 4's
+    # INSERT ... ON CONFLICT remains the one that actually closes the
+    # concurrent-delivery race (BUG-0157); this is a cheap, early exit for
+    # the much more common sequential-retry case, which no longer needs a
+    # customer lookup/creation at all once this check fires.
+    already_processed = (
+        await db.execute(select(Message.id).where(Message.wa_message_id == wa_message_id))
+    ).scalar_one_or_none()
+    if already_processed is not None:
+        logger.info(
+            "PIPELINE_DUPLICATE_FAST_PATH: wa_message_id=%s already processed — skipping before any "
+            "customer lookup under business_id=%s",
+            wa_message_id, business.id,
+        )
+        return
+
     # ── 3. Get/create customer ───────────────────────────────────────────
     customer = await _get_or_create_customer(db, business.id, wa_id, contact_name)
     logger.info(
