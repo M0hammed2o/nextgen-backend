@@ -17,7 +17,7 @@
       }
     },
     {
-      "message": "Can I get 2 Classic Smash Burgers and a Coke",
+      "message": "Can I get 2 Classic Smash Burgers and a Coke (330ml)",
       "expect": {
         "state": "CONFIRMING_ORDER",
         "cart": [
@@ -103,7 +103,7 @@
       }
     },
     {
-      "message": "Add 2 Cokes",
+      "message": "Add 2 Cokes (330ml)",
       "expect": {
         "state": "CONFIRMING_ORDER",
         "cart": [

@@ -8,7 +8,7 @@
 
   "turns": [
     {
-      "message": "I'll have a Classic Smash Burger, Chips and a Coke",
+      "message": "I'll have a Classic Smash Burger, Chips and a Coke (330ml)",
       "expect": {
         "state": "CONFIRMING_ORDER",
         "cart": [

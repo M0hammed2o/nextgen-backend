@@ -10,7 +10,7 @@
   "notes": "CSB + Coke. 'Remove the Coke' \u2014 DET Sub-case A2. CSB must remain. Exactly 1 item after removal.",
   "turns": [
     {
-      "message": "Can I get a Classic Smash Burger and a Coke",
+      "message": "Can I get a Classic Smash Burger and a Coke (330ml)",
       "expect": {
         "state": "CONFIRMING_ORDER",
         "cart": [

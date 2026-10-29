@@ -30,16 +30,6 @@
     },
     {
       "message": "Classic Smash Burger",
-      "llm": {
-        "action": "add_items",
-        "message": "Added Classic Smash Burger to your order! Any changes?",
-        "items": [
-          {
-            "name": "Classic Smash Burger",
-            "quantity": 1
-          }
-        ]
-      },
       "expect": {
         "state": "CONFIRMING_ORDER",
         "cart": [

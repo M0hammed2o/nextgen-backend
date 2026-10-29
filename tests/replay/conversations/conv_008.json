@@ -10,7 +10,7 @@
       "expect": {"state": "GREETING", "cart": []}
     },
     {
-      "message": "Can I get a Classic Smash Burger and a Coke",
+      "message": "Can I get a Classic Smash Burger and a Coke (330ml)",
       "expect": {
         "state": "CONFIRMING_ORDER",
         "cart": [
@@ -24,7 +24,7 @@
       }
     },
     {
-      "message": "I only want the Coke",
+      "message": "I only want the Coke (330ml)",
       "expect": {
         "state": "CONFIRMING_ORDER",
         "cart": [{"name": "Coca-Cola (330ml)", "quantity": 1}],

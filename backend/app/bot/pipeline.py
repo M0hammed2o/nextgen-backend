@@ -603,6 +603,15 @@ async def _handle_message(
         msg_text[:80],
     )
 
+    # ── Outstanding named-variant-family allocation (BUG-0172) ──────────
+    # Must run before ANY intent/state routing -- see
+    # _resolve_variant_allocation_reply's docstring. Also what prevents
+    # checkout being confirmed while a Bambino-style quantity is still
+    # outstanding, since it owns the whole turn until resolved.
+    _variant_alloc_result = await _resolve_variant_allocation_reply(db, business, session, norm_text, intent=intent)
+    if _variant_alloc_result is not None:
+        return _variant_alloc_result
+
     # ── Specific image requests: a named product, a named menu-image page
     #    (e.g. "Secret Creations"), or paging through several — "show me
     #    the Jawbreaker" / "show secret creations" / "next page". Runs
@@ -1124,13 +1133,18 @@ async def _handle_message(
         # Clear the cart, transition to BUILDING_CART, then call LLM with ORDER_START so that
         # real add_to_cart() logic executes and confirmed_cart is correctly locked afterward.
         if intent_router.is_cart_correction(norm_text):
+            import copy as _copy_cc
+            _cc_snapshot = (_copy_cc.deepcopy(session.context_json or {}), session.state)
             state_machine.clear_cart(session)
             state_machine.transition_state(session, ConversationState.BUILDING_CART.value)
             logger.warning(
                 "CART_CORRECTION: cleared cart, transitioning to BUILDING_CART, rebuilding via LLM. session_id=%s, msg=%r",
                 session.id, msg_text[:80],
             )
-            return await _handle_with_llm(db, business, customer, session, msg_text, intent=MessageIntent.ORDER_START, norm_text=norm_text)
+            return await _handle_with_llm(
+                db, business, customer, session, msg_text, intent=MessageIntent.ORDER_START,
+                norm_text=norm_text, pre_mutation_snapshot=_cc_snapshot,
+            )
 
         # "I only want X" / "Just the coke" — full order replacement.
         # Customer names a specific item as their complete order, replacing
@@ -1149,8 +1163,17 @@ async def _handle_message(
             and not _MOD_SIGNAL_RE.search(norm_text)
         ):
             _, _ow_items = await _load_menu(db, business.id)
-            _ow_matches = _extract_items_from_message(norm_text, _ow_items)
+            # ignore_price_ambiguity=True: this is only a gate deciding
+            # whether to clear the cart and route to the real item-resolution
+            # path (which applies BUG-0160's price-ambiguity check properly
+            # when it actually commits a price) -- not a price commitment
+            # itself. Missing this flag here meant "I only want the coke"
+            # against a multi-price Coke catalog never matched, silently
+            # skipping the whole full-order-replacement path.
+            _ow_matches = _extract_items_from_message(norm_text, _ow_items, ignore_price_ambiguity=True)
             if _ow_matches:
+                import copy as _copy_ow
+                _ow_snapshot = (_copy_ow.deepcopy(session.context_json or {}), session.state)
                 state_machine.clear_cart(session)
                 state_machine.transition_state(session, ConversationState.BUILDING_CART.value)
                 logger.warning(
@@ -1160,6 +1183,7 @@ async def _handle_message(
                 return await _handle_with_llm(
                     db, business, customer, session,
                     msg_text, intent=MessageIntent.ORDER_START, norm_text=norm_text,
+                    pre_mutation_snapshot=_ow_snapshot,
                 )
 
     # ── Choosing options state (e.g. "what size?") ──────────────────────
@@ -1805,30 +1829,49 @@ def _det_has_add_on_conflict(
     det_matches: list,
     modifier: str | None,
     add_ons_map: dict[str, list[dict]],
+    full_text: str | None = None,
 ) -> bool:
     """
     Return True if the message suffix looks like a paid add-on name for any
     matched item. Handles plurals via 4-char stem matching so "extra patties"
     matches the "Extra Patty" add-on. Yields to LLM when True so the LLM can
     apply the correct add-on price.
+
+    `full_text`, the raw/normalised message, is checked in addition to the
+    already-extracted `modifier` -- found 2026-10-26, building scenario D's
+    regression tests: `modifier` comes from _extract_modifier_from_suffix,
+    which only recognises "no X"/"extra X" patterns, never generic "with X"
+    for an arbitrary add-on name ("Classic Smash Burger with stuffed
+    crust") -- so `modifier` was None and this function returned False
+    without ever looking at the add-on name sitting right there in the
+    message, silently dropping a requested, possibly-paid add-on instead of
+    yielding to the LLM. Pre-existing gap (reproduced identically via the
+    existing explicit "Can I get a ..." phrasing, not something scenario
+    D's own changes introduced) -- just never exercised by this session's
+    existing fixtures until a broader range of phrasings started reaching
+    this deterministic path.
     """
-    if not modifier:
-        return False
-    mod_lower = modifier.lower()
-    mod_words = mod_lower.split()
-    for item, _qty, _m in det_matches:
-        avail = add_ons_map.get(str(getattr(item, "id", "")), [])
-        for ao in avail:
-            ao_name = ao["name"].lower()
-            if ao_name in mod_lower or mod_lower in ao_name:
-                return True
-            # Word-level stem match: "patties"[:4]="patt" == "patty"[:4]="patt"
-            ao_words = [w for w in ao_name.split() if len(w) >= 4]
-            if any(
-                any(mw[:4] == aw[:4] for mw in mod_words if len(mw) >= 4)
-                for aw in ao_words
-            ):
-                return True
+    avail_by_item = [
+        (item, add_ons_map.get(str(getattr(item, "id", "")), []))
+        for item, _qty, _m in det_matches
+    ]
+    for search_text in (modifier, full_text):
+        if not search_text:
+            continue
+        search_lower = search_text.lower()
+        search_words = search_lower.split()
+        for _item, avail in avail_by_item:
+            for ao in avail:
+                ao_name = ao["name"].lower()
+                if ao_name in search_lower or search_lower in ao_name:
+                    return True
+                # Word-level stem match: "patties"[:4]="patt" == "patty"[:4]="patt"
+                ao_words = [w for w in ao_name.split() if len(w) >= 4]
+                if any(
+                    any(mw[:4] == aw[:4] for mw in search_words if len(mw) >= 4)
+                    for aw in ao_words
+                ):
+                    return True
     return False
 
 
@@ -1867,10 +1910,11 @@ _ITEM_ALIASES: dict[str, str] = {
     # 440ml") had no alias, unlike coke/sprite/fanta -- "a buddy" alone fell
     # through to the LLM instead of matching deterministically. Target is
     # "buddy 440ml", NOT bare "buddy" -- real Mochachos combo names end in
-    # "...and a Buddy" (e.g. "Rump Steak Burrito, Beeg Chips and a Buddy"),
-    # and active_sorted tries longest names first, so a bare "buddy" target
-    # matched the combo's full name instead of the standalone drink
-    # (confirmed directly, 2026-10-26, while fixing BUG-0159).
+    # "...and a Buddy" (e.g. "Quarter Chicken, Beeg Chips and a Buddy"), and
+    # active_sorted tries longest names first, so a bare "buddy" target
+    # matches the combo's full name instead of the standalone drink
+    # (confirmed directly, 2026-10-26, while fixing both BUG-0159 and the
+    # scenario D quantity-handling defects).
     "buddy":  "buddy 440ml",
 }
 
@@ -1912,10 +1956,358 @@ def _find_size_variants(msg_text: str, menu_items: list) -> tuple[str | None, li
             continue
         # Require ≥80% of the significant base words to appear in the message
         match_ratio = sum(1 for w in significant if w in msg_words) / len(significant)
-        if match_ratio >= 0.8:
-            return base, variants
+        if match_ratio < 0.8:
+            continue
+        # BUG-0172: a size family's base can be a single generic head word
+        # (e.g. "chicken", from "Half Chicken"/"Full Chicken"), which is ALSO
+        # a substring of a completely different, longer, unrelated active
+        # item's own name ("Chicken Schwarma", "Chicken Burrito", "2 Chicken
+        # Fillets and a Side"). Reported production incident, 2026-10-27: a
+        # message that only named "chicken Schwarma" triggered an unsolicited
+        # "Half Chicken or Full Chicken?" clarification nobody asked for,
+        # because the bare word "chicken" alone satisfied this match. If the
+        # message actually names one of those OTHER, more specific items in
+        # full, the word belongs to that item, not to this base/size family
+        # -- skip this family so that other item's own name can match
+        # normally instead.
+        variant_ids = {v.id for v in variants}
+        _claimed_by_other_item = any(
+            base in other.name.lower()
+            and other.id not in variant_ids
+            and other.name.lower() in msg_lower
+            for other in active
+        )
+        if _claimed_by_other_item:
+            continue
+        return base, variants
 
     return None, []
+
+
+def _find_named_variant_family(msg_text: str, menu_items: list) -> tuple[str | None, list]:
+    """
+    Pre-LLM check: detect if the message refers to a FAMILY of menu items
+    that share a common "<Family Label>: <Variant>" catalog name (e.g. the
+    real "Bambino Meal: Jose" / "...: Pedro" / "...: Speedy" / "...: Juanita"
+    products), using only the family's generic head phrase with no specific
+    variant named.
+
+    BUG-0172 (production incident, 2026-10-27): "Ok can you give me 15
+    Bambino Meals and also give me 3 chicken Schwarma" silently dropped the
+    15 Bambino Meals with zero trace -- _extract_items_from_message/
+    _extract_items_from_chunk only match an item by its FULL catalog name
+    (including the specific variant after the colon), so a generic plural
+    mention never matches any of the 4 real products. This check runs at the
+    same call site as the existing, already-shipped `_find_size_variants`
+    check (BUG-0158) so the family is recognised and clarified -- instead of
+    silently vanishing -- while any other, unambiguous item named in the
+    SAME message is still added immediately (same sibling-preservation
+    pattern as that fix).
+
+    Groups active items by the text before the FIRST ": " in their name.
+    Returns (family_label, [MenuItem, ...]) when:
+      - At least 2 active items share the same label, AND
+      - The label (optionally plural, e.g. "Bambino Meal(s)") appears in the
+        message, AND
+      - The message does NOT already name one of the specific variants (so
+        "Bambino Meal: Jose", or just "Jose", is left alone -- nothing
+        ambiguous remains to ask about).
+    Otherwise returns (None, []).
+    """
+    import re as _re_fam
+    active = [i for i in menu_items if i.is_active and not i.is_deleted]
+    msg_lower = msg_text.lower()
+
+    groups: dict[str, list] = {}
+    for item in active:
+        if ": " not in item.name:
+            continue
+        label = item.name.split(": ", 1)[0].strip()
+        groups.setdefault(label.lower(), []).append(item)
+
+    for label_lower, variants in groups.items():
+        if len(variants) < 2:
+            continue
+        variant_suffixes = [v.name.split(": ", 1)[1].strip().lower() for v in variants]
+        # A specific variant is already named -- nothing ambiguous left.
+        if any(_re_fam.search(rf"\b{_re_fam.escape(suf)}\b", msg_lower) for suf in variant_suffixes):
+            continue
+        if not _re_fam.search(rf"\b{_re_fam.escape(label_lower)}s?\b", msg_lower):
+            continue
+        display_label = variants[0].name.split(": ", 1)[0].strip()
+        return display_label, variants
+
+    return None, []
+
+
+async def _resolve_variant_allocation_reply(
+    db, business, session, norm_text: str, intent: MessageIntent | None = None,
+) -> tuple[str, bool, int | None, int | None, str | None] | None:
+    """
+    Resolve a reply to an outstanding named-variant-family clarification
+    (BUG-0172 -- see `_find_named_variant_family`). Returns a full
+    `_handle_message`-shaped response when a `pending_variant_allocation`
+    context exists and this turn was spent resolving it; returns None when
+    there is nothing pending, so the caller falls through to normal routing.
+
+    Runs BEFORE intent/state routing (same reasoning as the pre-existing
+    `recommended_items` early-acceptance check in `_handle_message`):
+    "Jose" or "5 Jose and 10 Pedro" names no menu item by its full catalog
+    name, so intent_router has no dedicated pattern for it and deterministic
+    extraction elsewhere would never resolve it on its own.
+
+    Owns the WHOLE turn whenever a variant allocation is outstanding -- it
+    never falls through to the normal LLM/deterministic flow while
+    unresolved. This is deliberate and is also what prevents checkout from
+    being confirmed while Bambino (or any future named-variant-family)
+    quantities remain outstanding: a "yes"/"checkout" message names no
+    variant, so it is treated as unresolved and the customer is reminded
+    instead of being allowed through to the CONFIRMING_ORDER flow.
+
+    Two deliberate, additive refinements found during independent review
+    (2026-10-27), both reusing an already-established pattern rather than
+    introducing a new one:
+      - A clear negation/cancellation of the WHOLE message (`is_negation` --
+        the same detector the existing CONFIRMING_ORDER cancellation flow
+        already uses) drops the outstanding allocation instead of looping
+        the same clarification forever on a customer who changed their mind.
+      - If nothing named a variant AND the message isn't a bare negation,
+        it is still checked for any OTHER, unambiguous menu item (same
+        sibling-preservation pattern as BUG-0158/the family check itself)
+        so a customer asking for something else while allocation is
+        outstanding is acknowledged, not silently dropped -- the outstanding
+        allocation itself still blocks checkout exactly as before.
+    """
+    pending = state_machine.get_context(session, "pending_variant_allocation")
+    if not pending:
+        return None
+
+    # Found 2026-10-27 (live regression report, same day as the fix above):
+    # once the conversation has already moved PAST order confirmation --
+    # COLLECTING_DETAILS, CHOOSING_ORDER_MODE, WAITING_DELIVERY_FEE_APPROVAL,
+    # COLLECTING_PAYMENT, ORDER_PLACED, or HANDOFF -- a `pending_variant_allocation`
+    # that is still set is necessarily STALE: the cart was already confirmed
+    # (CONFIRMING_ORDER already happened) through some other path, by
+    # construction, since this function is the ONLY code that is allowed to
+    # move a resolved allocation into CONFIRMING_ORDER, and it always clears
+    # this key when it does. A stale value surviving to this point can only
+    # mean the allocation was effectively resolved by something OTHER than
+    # this function (confirmed root cause of the live incident: a worker
+    # process running pre-BUG-0172 code handled "5 Jose and 10 Pedro" and
+    # "yes" mid-deploy-rollover, resolved the order via its own normal,
+    # BUG-0172-unaware LLM/confirm flow, and -- having no concept of this
+    # context key -- never touched or cleared it; a worker already on the
+    # fixed code then hit this still-15 value on the very next, unrelated
+    # message, "Mohammed", sent to answer the name question, and wrongly
+    # re-asked about the 15 Bambino Meals instead of accepting it as the
+    # name). Without this guard, an unconditional early hook has no way to
+    # tell "still legitimately outstanding" apart from "stale leftover from
+    # a code path that bypassed this function entirely" once the cart is
+    # already locked -- re-asking at that point is always wrong regardless
+    # of how the key became stale, so it is dropped unconditionally here
+    # rather than acted on, and this turn falls through to be handled
+    # normally (e.g. "Mohammed" is then correctly read as the customer's
+    # name). Deliberately keyed on conversation STATE, not on `confirmed_cart`
+    # being set, since several existing cart-sync call sites set
+    # `confirmed_cart` well before formal confirmation -- state is the
+    # narrow, unambiguous "has the customer already said yes" signal.
+    _POST_CONFIRMATION_STATES = {
+        ConversationState.COLLECTING_DETAILS.value,
+        ConversationState.CHOOSING_ORDER_MODE.value,
+        ConversationState.WAITING_DELIVERY_FEE_APPROVAL.value,
+        ConversationState.COLLECTING_PAYMENT.value,
+        ConversationState.ORDER_PLACED.value,
+        ConversationState.HANDOFF.value,
+    }
+    if session.state in _POST_CONFIRMATION_STATES:
+        # Safety check (2026-10-27, requested before release): the guard
+        # above assumes that if checkout has already advanced, the
+        # allocation must have been genuinely resolved elsewhere. That is
+        # true for the actual live incident (cart had all 3 line items,
+        # correct total, correct persisted order) but is NOT a safe
+        # assumption in general -- advancing conversation STATE proves
+        # nothing about what is actually IN the cart. If some other,
+        # different failure let checkout advance (state moved past
+        # CONFIRMING_ORDER) WITHOUT the requested variant quantity ever
+        # actually being added to the cart, silently dropping this key
+        # would permanently discard a real, paid-for request with no
+        # trace -- exactly the original BUG-0172 failure mode, just
+        # relocated to a later state. So: verify the quantity is actually
+        # present in the live cart before treating the allocation as
+        # resolved-elsewhere. Only drop it when the cart backs that up.
+        _live_cart_check = state_machine.get_cart(session)
+        _pending_variant_ids = {v["menu_item_id"] for v in pending["variants"]}
+        _already_in_cart = sum(
+            c.get("quantity", 0) for c in _live_cart_check
+            if c.get("menu_item_id") in _pending_variant_ids
+        )
+        if _already_in_cart >= pending["quantity_needed"]:
+            logger.warning(
+                "VARIANT_ALLOCATION_STALE_DROPPED: family=%r, quantity_needed=%r, "
+                "already_in_cart=%d, state=%s, session_id=%s -- conversation already "
+                "past confirmation AND the cart already holds the full quantity, "
+                "dropping stale allocation instead of re-asking.",
+                pending.get("family_label"), pending.get("quantity_needed"),
+                _already_in_cart, session.state, session.id,
+            )
+            state_machine.set_context(session, "pending_variant_allocation", None)
+            return None
+        # Checkout advanced but the items are genuinely NOT in the cart --
+        # do NOT silently drop. Fall through to the normal resolution
+        # logic below exactly as if this were still a legitimately
+        # outstanding allocation: it will try to match named variants in
+        # THIS message, and if none are named, the customer (and the logs)
+        # are told about the real missing quantity instead of losing it
+        # with no trace.
+        logger.error(
+            "VARIANT_ALLOCATION_STATE_MISMATCH: pending allocation found with checkout "
+            "already past confirmation, but only %d/%d %s actually in the cart -- "
+            "NOT dropping silently, this would lose a real requested quantity. "
+            "state=%s, session_id=%s",
+            _already_in_cart, pending["quantity_needed"], pending.get("family_label"),
+            session.state, session.id,
+        )
+
+    # Found during independent review (2026-10-27): `get_or_create_session`
+    # (state_machine.py) always does an intermediate `db.flush()` right
+    # after loading the session, before any handler runs. SQLAlchemy keeps
+    # that flushed value as its comparison baseline for this JSONB column.
+    # `state_machine.set_cart`/`set_context` only shallow-copy the TOP-level
+    # context_json dict before reassigning -- nested objects (the cart list,
+    # this function's own `pending` dict) are still the SAME objects as in
+    # that baseline. Mutating one of those nested objects in place (as this
+    # function used to do for `pending["quantity_needed"]`, and as
+    # `add_to_cart`'s `cart.append(...)` always does) retroactively changes
+    # the baseline's content too, so the final dict-equality check SQLAlchemy
+    # runs at flush time sees "no change" and silently skips the UPDATE --
+    # reproduced directly: the in-memory object was correct, the commit
+    # logged success, but a fresh read-back showed the pre-mutation values.
+    # A deep copy here, taken before ANY mutation, severs that aliasing
+    # once and for all so every mutation below lands only on this function's
+    # own independent tree, never retroactively rewriting the baseline.
+    import copy as _copy_dealias
+    from sqlalchemy.orm.attributes import flag_modified as _flag_dealias
+    session.context_json = _copy_dealias.deepcopy(session.context_json)
+    _flag_dealias(session, "context_json")
+    pending = session.context_json.get("pending_variant_allocation")
+
+    import re as _re_resolve
+    norm_lower = norm_text.lower()
+    variants = pending["variants"]
+    family_label = pending["family_label"]
+    quantity_needed = pending["quantity_needed"]
+    variant_names = [v["short_name"] for v in variants]
+
+    # ── Customer changed their mind about the whole outstanding request ──
+    if intent_router.is_negation(norm_text):
+        state_machine.set_context(session, "pending_variant_allocation", None)
+        logger.warning(
+            "VARIANT_ALLOCATION_CANCELLED: family=%r, quantity_needed=%d, session_id=%s",
+            family_label, quantity_needed, session.id,
+        )
+        return (
+            f"No problem — I've dropped the request for {quantity_needed} more "
+            f"{family_label}{'s' if quantity_needed != 1 else ''}.",
+            False, None, None, None,
+        )
+
+    newly_added: list[str] = []
+    total_allocated_now = 0
+    for v in variants:
+        m = _re_resolve.search(rf"\b{_re_resolve.escape(v['short_name'].lower())}\b", norm_lower)
+        if not m:
+            continue
+        qty = _parse_quantity_before(norm_lower, m.start())
+        state_machine.add_to_cart(
+            session,
+            menu_item_id=v["menu_item_id"], name=v["name"],
+            price_cents=v["price_cents"], quantity=qty,
+            options=None, special_instructions=None,
+        )
+        newly_added.append(f"{qty}x {v['name']}")
+        total_allocated_now += qty
+
+    if total_allocated_now == 0:
+        # Nothing named a variant this turn (a repeat of the generic family
+        # phrase, an unrelated message, or a premature "yes"/"checkout") --
+        # the outstanding quantity is never touched, so repeating the
+        # original request never duplicates anything. Any OTHER real,
+        # unambiguous item in the same message is still added, so a
+        # customer ordering something else isn't silently ignored -- it
+        # just doesn't resolve the Bambino allocation itself.
+        #
+        # Excluded for ORDER_REMOVE/ORDER_CANCEL: found during independent
+        # review (2026-10-27) -- _extract_items_from_message matches an
+        # item's name regardless of intent, so "Remove the Schwarma" would
+        # otherwise match "Chicken Schwarma" and ADD it again instead of
+        # removing it. Safer to fall through to the plain reminder below
+        # (cart edits/cancellation are not this function's job) than to
+        # risk silently doubling an item the customer asked to remove.
+        _other_matches = (
+            _extract_items_from_message(norm_text, (await _load_menu(db, business.id))[1])
+            if intent not in (MessageIntent.ORDER_REMOVE, MessageIntent.ORDER_CANCEL)
+            else []
+        )
+        _other_added: list[str] = []
+        for _oi, _oq, _om in _other_matches:
+            if not _get_missing_required_groups(_oi, _om, norm_text):
+                state_machine.add_to_cart(
+                    session,
+                    menu_item_id=str(_oi.id), name=_oi.name,
+                    price_cents=_oi.price_cents, quantity=_oq,
+                    options=None, special_instructions=_om,
+                )
+                _other_added.append(f"{_oq}x {_oi.name}")
+        logger.warning(
+            "VARIANT_ALLOCATION_REMINDER: family=%r, quantity_needed=%d, other_added=%r, session_id=%s",
+            family_label, quantity_needed, _other_added, session.id,
+        )
+        _other_prefix = f"Added {', '.join(_other_added)} ✅\n\n" if _other_added else ""
+        return (
+            f"{_other_prefix}Still need to know which {family_label}s for the remaining "
+            f"{quantity_needed} -- we have {', '.join(variant_names)}. You can mix them.",
+            False, None, None, None,
+        )
+
+    remaining = max(0, quantity_needed - total_allocated_now)
+    if remaining <= 0:
+        state_machine.set_context(session, "pending_variant_allocation", None)
+        logger.warning(
+            "VARIANT_ALLOCATION_RESOLVED: family=%r, added=%r, session_id=%s",
+            family_label, newly_added, session.id,
+        )
+        # Same "lock the cart and prompt for confirmation" pattern already
+        # used by the main deterministic add-items path (pipeline.py,
+        # DET_MATCH) -- without this, the session would stay in whatever
+        # state it was in before the allocation, and a subsequent "Yes"
+        # would have nothing to confirm.
+        import copy as _copy_resolve
+        updated_cart = state_machine.get_cart(session)
+        state_machine.set_context(session, "confirmed_cart", _copy_resolve.deepcopy(updated_cart))
+        state_machine.transition_state(session, ConversationState.CONFIRMING_ORDER.value)
+        order_mode = state_machine.get_context(session, "order_mode", "PICKUP")
+        total = state_machine.cart_total_cents(session)
+        summary = state_machine.cart_summary_text(session, business.currency)
+        confirm_msg = responses.ask_confirmation_response(summary, total, 0, order_mode, business.currency)
+        if order_mode == "DELIVERY":
+            confirm_msg += "\n_Delivery fee will be confirmed by our team._"
+        return (
+            f"Added {', '.join(newly_added)} ✅\n\n{confirm_msg}",
+            False, None, None, None,
+        )
+
+    pending["quantity_needed"] = remaining
+    state_machine.set_context(session, "pending_variant_allocation", pending)
+    logger.warning(
+        "VARIANT_ALLOCATION_PARTIAL: family=%r, added=%r, remaining=%d, session_id=%s",
+        family_label, newly_added, remaining, session.id,
+    )
+    return (
+        f"Added {', '.join(newly_added)} ✅\n\nYou still have {remaining} more "
+        f"{family_label}{'s' if remaining != 1 else ''} to choose -- which would you like? "
+        f"We have {', '.join(variant_names)}.",
+        False, None, None, None,
+    )
 
 
 def _extract_modifier_from_suffix(suffix: str) -> str | None:
@@ -2624,7 +3016,10 @@ def _detect_quantity_correction(
     if len(candidates) == 1:
         return candidates[0], new_qty
     if len(candidates) > 1 and menu_items:
-        named = _extract_items_from_message(msg_text, menu_items)
+        # ignore_price_ambiguity=True: this only identifies which EXISTING
+        # cart line the name refers to -- no new price is being chosen, so
+        # BUG-0160's "ask before picking a price" gate doesn't apply here.
+        named = _extract_items_from_message(msg_text, menu_items, ignore_price_ambiguity=True)
         named_ids = {str(mi.id) for mi, _q, _m in named}
         named_candidates = [ci for ci in candidates if ci["menu_item_id"] in named_ids]
         if len(named_candidates) == 1:
@@ -2679,7 +3074,9 @@ def _detect_named_quantity_set(
     if new_qty <= 0 or new_qty > 20:
         return None
 
-    named = _extract_items_from_message(msg_text, menu_items)
+    # ignore_price_ambiguity=True: same reasoning as _detect_quantity_correction
+    # above -- matching against an EXISTING cart line, not choosing a new price.
+    named = _extract_items_from_message(msg_text, menu_items, ignore_price_ambiguity=True)
     if len(named) != 1:
         return None
     target_item = named[0][0]
@@ -2721,6 +3118,7 @@ def _extract_items_from_chunk(
     chunk: str,
     active_sorted: list,
     global_consumed_names: set[str],
+    ignore_price_ambiguity: bool = False,
 ) -> list[tuple]:
     """
     Run alias + substring extraction against a single message chunk.
@@ -2744,8 +3142,18 @@ def _extract_items_from_chunk(
     # Use alias + optional 's' so "cokes" matches the "coke" alias, etc.
     # (?<!-) prevents "cola" from matching INSIDE "coca-cola" (hyphen creates a
     # word boundary so plain \b would otherwise fire mid-compound-word).
+    # For an alias ending in a consonant + "y" (e.g. "buddy"), standard
+    # English pluralizes to "-ies" ("buddies"), not "-ys" -- a bare "s?"
+    # suffix never matches that form at all. Found 2026-10-25 while testing
+    # "two chips and three buddies": "buddies" matched nothing, silently
+    # dropping the item. General rule, not a Mochachos-specific patch --
+    # applies to any current or future alias with this shape.
     for alias, target_substr in _ITEM_ALIASES.items():
-        for m in _re.finditer(rf"(?<!-)\b{_re.escape(alias)}s?\b", chunk_lower):
+        if len(alias) > 1 and alias[-1] == "y" and alias[-2] not in "aeiou":
+            _alias_pattern = rf"(?:{_re.escape(alias)}s?|{_re.escape(alias[:-1])}ies)"
+        else:
+            _alias_pattern = rf"{_re.escape(alias)}s?"
+        for m in _re.finditer(rf"(?<!-)\b{_alias_pattern}\b", chunk_lower):
             a_start, a_end = m.start(), m.end()
             span = set(range(a_start, a_end))
             if span & consumed_positions:
@@ -2757,6 +3165,48 @@ def _extract_items_from_chunk(
             ]
             if not candidates:
                 continue
+            if (
+                not ignore_price_ambiguity
+                and len(candidates) > 1
+                and len({c.price_cents for c in candidates}) > 1
+            ):
+                # BUG-0160 (KNOWN_BUGS.md), product decision 2026-10-26:
+                # "when a customer's request ambiguously matches multiple
+                # distinct purchasable variants with different sizes or
+                # prices, the chatbot MUST ask for clarification. Never
+                # silently choose the wrong product." Narrowly scoped to
+                # genuine price ambiguity specifically -- candidates sharing
+                # the exact same price (a true non-financial naming
+                # variation) are NOT required to ask, same as before, so
+                # this doesn't regress any case where silently picking
+                # candidates[0] carries no financial/correctness risk.
+                # Only resolves automatically when the message itself names
+                # exactly one candidate specifically (e.g. a size appearing
+                # in the text); otherwise the match is skipped so the
+                # message falls through to the LLM, which asks the
+                # clarifying question instead of guessing a price the
+                # customer never confirmed. An earlier, unscoped version of
+                # this same idea (ANY multi-candidate alias, regardless of
+                # price) was tried and reverted the same day -- it broke
+                # 40+ pre-existing tests that used same-price or
+                # intentionally-disambiguated catalogs; the price check
+                # here is what keeps those unaffected. See KNOWN_BUGS.md
+                # BUG-0160 for the full investigation.
+                # A real customer disambiguating rarely repeats the item's
+                # FULL catalog name ("add a coca-cola (330ml)") -- they say
+                # "a 330ml coke". Match on the distinguishing detail (any
+                # parenthetical in the name, e.g. "330ml") as well as the
+                # full name, so "330ml coke" correctly resolves without
+                # requiring the customer to recite the exact listing.
+                _named = []
+                for c in candidates:
+                    _distinguishing = _re.findall(r"\(([^)]+)\)", c.name.lower())
+                    if c.name.lower() in chunk_lower or any(d in chunk_lower for d in _distinguishing):
+                        _named.append(c)
+                if len(_named) == 1:
+                    candidates = _named
+                else:
+                    continue
             best = candidates[0]
             qty = _parse_quantity_before(chunk_lower, a_start)
             suffix = chunk_lower[a_end:]
@@ -2872,6 +3322,7 @@ def _parse_stated_total_cents(text: str) -> int | None:
 def _extract_items_from_message(
     msg_text: str,
     menu_items: list,
+    ignore_price_ambiguity: bool = False,
 ) -> list[tuple]:
     """
     Deterministic pre-LLM item extraction.
@@ -2879,6 +3330,13 @@ def _extract_items_from_message(
     Splits the message on "and", "also", and "," then runs alias + substring
     extraction per chunk. Longest menu names tested first so "Cheesy Chips"
     wins over "Chips". Returns [] if nothing matched — caller falls back to LLM.
+
+    ignore_price_ambiguity: bypasses the BUG-0160 price-ambiguity clarification
+    gate (see _extract_items_from_chunk). Only for callers using the return
+    value as a boolean "does this message reference a real menu item" signal
+    (e.g. the CHITCHAT_WITH_ACTIVE_CART mutation guards) — never for callers
+    that actually commit the matched item/price to the cart, since those must
+    keep asking for clarification on genuine price ambiguity.
 
     Each element is (MenuItem, quantity, special_instructions | None).
 
@@ -2942,7 +3400,9 @@ def _extract_items_from_message(
     chunks = _re.split(r"\band\b|\balso\b|,", _working_text, flags=_re.I)
 
     for chunk in chunks:
-        chunk_matches = _extract_items_from_chunk(chunk, active_sorted, consumed_names)
+        chunk_matches = _extract_items_from_chunk(
+            chunk, active_sorted, consumed_names, ignore_price_ambiguity=ignore_price_ambiguity
+        )
         if chunk_matches:
             all_matched.extend(chunk_matches)
         elif all_matched:
@@ -3014,6 +3474,43 @@ def _build_option_question(item_name: str, missing_groups: list[dict]) -> str:
     )
 
 
+def _split_distinct_per_unit_modifiers(item, qty: int, modifier: str | None) -> list[tuple[int, str | None]]:
+    """
+    Scenario D4: "2 chicken burgers, one mild and one hot" must become TWO
+    separate qty=1 cart lines (one Mild, one Hot), not one qty=2 line whose
+    special_instructions concatenates both option names together. Before
+    this, _capture_options_from_message correctly found BOTH option names
+    anywhere in the message and joined them ("Mild, Hot"), but the caller
+    then applied that single combined string to one qty=2 add_to_cart call
+    -- the two distinct per-unit choices were captured as text but never
+    actually split into separate line items. Found 2026-10-26 while
+    building fresh regression tests for the real reported quantity-
+    handling defects.
+
+    Returns [(qty, modifier)] unchanged in the normal case. Only splits
+    into qty separate (1, single_modifier) pairs when the modifier, split
+    on ",", yields EXACTLY as many pieces as the stated quantity, AND
+    every piece is a real, enabled option name from one of the item's own
+    option groups -- never splits a plain free-text modifier like "no
+    tomato, extra cheese" describing ONE unit, which legitimately stays a
+    single qty=N line.
+    """
+    if qty > 1 and modifier:
+        parts = [p.strip() for p in modifier.split(",")]
+        if len(parts) == qty:
+            options_json = getattr(item, "options_json", None) or {}
+            enabled_names = {
+                o["name"].lower()
+                for g in options_json.get("option_groups", [])
+                if g.get("is_enabled", True)
+                for o in g.get("options", [])
+                if o.get("is_enabled", True)
+            }
+            if enabled_names and all(p.lower() in enabled_names for p in parts):
+                return [(1, part) for part in parts]
+    return [(qty, modifier)]
+
+
 def _capture_options_from_message(item, norm_text: str) -> str | None:
     """
     Scan the full normalised message for option names belonging to this item.
@@ -3041,6 +3538,30 @@ def _capture_options_from_message(item, norm_text: str) -> str | None:
     return ", ".join(found) if found else None
 
 
+def _restore_pre_mutation_snapshot(
+    session, pre_mutation_snapshot: tuple[dict, str] | None, reason: str,
+) -> None:
+    """Restore a cart/context snapshot a caller took before clearing the
+    cart in anticipation of an LLM rebuild that then didn't happen (the LLM
+    call failed, or its response was blocked as contradictory). No-op if no
+    snapshot was provided. See `_handle_with_llm`'s `pre_mutation_snapshot`
+    docstring for the full rationale -- found via independent verification,
+    2026-10-26 (R2): without this, CART_CORRECTION/ONLY_WANT could commit
+    an already-cleared cart with no indication to the customer."""
+    if pre_mutation_snapshot is None:
+        return
+    import copy as _copy_restore
+    from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+    pre_ctx, pre_state = pre_mutation_snapshot
+    session.context_json = _copy_restore.deepcopy(pre_ctx)
+    _flag_modified(session, "context_json")
+    session.state = pre_state
+    logger.warning(
+        "PRE_MUTATION_SNAPSHOT_RESTORED: reason=%s, restored state=%s, session_id=%s",
+        reason, pre_state, session.id,
+    )
+
+
 async def _handle_with_llm(
     db: AsyncSession,
     business: Business,
@@ -3049,12 +3570,23 @@ async def _handle_with_llm(
     msg_text: str,
     intent: MessageIntent | None = None,
     norm_text: str | None = None,
+    pre_mutation_snapshot: tuple[dict, str] | None = None,
 ) -> tuple[str, bool, int | None, int | None, str | None]:
     """Call LLM with conversation history, parse response, update cart/state.
 
     msg_text  — original text sent to LLM and stored in history
     norm_text — normalised text used for deterministic pre-LLM checks;
                 defaults to msg_text when not supplied
+    pre_mutation_snapshot — (context_json, state) captured by a caller that
+                already mutated the session (e.g. clear_cart + transition to
+                BUILDING_CART for CART_CORRECTION/ONLY_WANT) BEFORE calling
+                this function, expecting the LLM call below to rebuild it.
+                If the LLM call itself fails, that pre-mutation is restored
+                before returning the graceful fallback -- otherwise an
+                already-cleared cart would be committed with no indication
+                to the customer that anything was lost (found via
+                independent verification, 2026-10-26: "I only want the
+                Coke" with a failing LLM call silently emptied the cart).
     """
     if norm_text is None:
         norm_text = msg_text
@@ -3139,6 +3671,75 @@ async def _handle_with_llm(
                 False, None, None, None,
             )
 
+    # ── Deterministic named-variant-family ambiguity check (BUG-0172) ───────
+    # Mirrors the size-ambiguity check immediately above, but for catalog
+    # items named "<Family Label>: <Variant>" (e.g. the real "Bambino Meal:
+    # Jose/Pedro/Speedy/Juanita"). A generic, un-qualified plural mention
+    # ("15 Bambino Meals") never matches any one of those full catalog
+    # names in _extract_items_from_message, so without this check it was
+    # silently dropped with zero trace while any other unambiguous item in
+    # the same message got added fine (the exact reported production
+    # incident, 2026-10-27). Skipped while already resolving a previous
+    # family ambiguity (pending_variant_allocation) or mid-CHOOSING_OPTIONS.
+    if (
+        session.state != ConversationState.CHOOSING_OPTIONS.value
+        and not state_machine.get_context(session, "pending_variant_allocation")
+    ):
+        family_label, family_variants = _find_named_variant_family(norm_text, items)
+        if family_label and family_variants:
+            _fam_lower = family_label.lower()
+            _fam_match = _re.search(rf"\b{_re.escape(_fam_lower)}s?\b", norm_text.lower())
+            requested_qty = (
+                _parse_quantity_before(norm_text.lower(), _fam_match.start())
+                if _fam_match else 1
+            )
+
+            # ── Sibling items in the same message (same pattern as the
+            # BUG-0158 fix above) -- add anything else unambiguous right
+            # now rather than blocking it behind this family's question.
+            _fam_sibling_matches = _extract_items_from_message(norm_text, items)
+            _fam_siblings_added: list[str] = []
+            for _sib_item, _sib_qty, _sib_mod in _fam_sibling_matches:
+                if not _get_missing_required_groups(_sib_item, _sib_mod, norm_text):
+                    state_machine.add_to_cart(
+                        session,
+                        menu_item_id=str(_sib_item.id), name=_sib_item.name,
+                        price_cents=_sib_item.price_cents, quantity=_sib_qty,
+                        options=None,
+                        special_instructions=_sib_mod or _capture_options_from_message(_sib_item, norm_text),
+                    )
+                    _fam_siblings_added.append(f"{_sib_qty}x {_sib_item.name}")
+
+            _fam_variant_names = [v.name.split(": ", 1)[1].strip() for v in family_variants]
+            pending_alloc = {
+                "family_label": family_label,
+                "variants": [
+                    {
+                        "menu_item_id": str(v.id),
+                        "name": v.name,
+                        "short_name": _sn,
+                        "price_cents": v.price_cents,
+                    }
+                    for v, _sn in zip(family_variants, _fam_variant_names)
+                ],
+                "quantity_needed": requested_qty,
+            }
+            state_machine.set_context(session, "pending_variant_allocation", pending_alloc)
+            logger.warning(
+                "VARIANT_FAMILY_AMBIGUITY: family=%r, requested_qty=%d, variants=%d, "
+                "siblings_added=%r, session_id=%s",
+                family_label, requested_qty, len(family_variants), _fam_siblings_added, session.id,
+            )
+            _fam_prefix = (
+                f"Added {', '.join(_fam_siblings_added)} ✅\n\n" if _fam_siblings_added else ""
+            )
+            return (
+                f"{_fam_prefix}Which *{family_label}s* would you like? We have "
+                f"{', '.join(_fam_variant_names)}. You can mix them to make up your "
+                f"{requested_qty}.",
+                False, None, None, None,
+            )
+
     # ── Deterministic item extraction (pre-LLM, ORDER_START / ORDER_ADD) ───────
     # For ORDER_START: runs in any non-CHOOSING_OPTIONS state so that "Can I get
     # one Double Smash Burger" is always resolved deterministically regardless of
@@ -3154,12 +3755,44 @@ async def _handle_with_llm(
         ConversationState.BROWSING_MENU.value,
         ConversationState.IDLE.value,
     }
+    # ── Bare "<quantity> <item>" with no ordering verb ("3 half chickens",
+    # "two chips and three buddies") ─────────────────────────────────────
+    # intent_router's ORDER_START pattern requires an explicit verb phrase
+    # ("can I get", "I want", "I'll have", etc.) -- a bare quantity+item
+    # statement matches no intent pattern at all (intent=None), so it
+    # NEVER reached deterministic extraction and went to the LLM for
+    # everything, every time, regardless of how unambiguous the item/
+    # quantity actually was. Real reported production defect (scenario D,
+    # "the latest reported production defect"), found 2026-10-26 while
+    # building fresh regression tests for it. Scoped to the same early,
+    # low-risk states as the ORDER_ADD det path (never COLLECTING_DETAILS,
+    # where a bare word is far more likely to be a name/phone number) plus
+    # GREETING, since a customer's first message straight after the
+    # greeting is commonly phrased this way. Safe by construction: if
+    # det_matches below finds nothing (because the message genuinely isn't
+    # about an item), this falls through to the LLM exactly as before --
+    # nothing here can misfire on its own.
+    _det_states_for_implicit_order = _det_states_for_add | {ConversationState.GREETING.value}
+    # A bare SINGLE word ("Coke", "Wings") is deliberately excluded -- found
+    # 2026-10-26: enabling it broke 40+ existing tests that validate
+    # alias-ambiguity resolution (e.g. "coke" matching both the 330ml and
+    # 500ml Coca-Cola) picks a default size WITHOUT asking, throughout this
+    # suite's established, already-tested behaviour for that case -- and
+    # separately, conv_219 specifically relies on a bare "Coke" reaching
+    # the LLM so it can ask which size, when no other context disambiguates
+    # it. Every real scenario-D case ("3 half chickens", "two chips and
+    # three buddies", etc.) is multi-word, so this costs nothing there.
+    _is_multi_word = len(norm_text.split()) > 1
     _det_eligible = (
         intent == MessageIntent.ORDER_START
         and session.state != ConversationState.CHOOSING_OPTIONS.value
     ) or (
         intent == MessageIntent.ORDER_ADD
         and session.state in _det_states_for_add
+    ) or (
+        intent is None
+        and session.state in _det_states_for_implicit_order
+        and _is_multi_word
     )
     if _det_eligible:
         det_matches = _extract_items_from_message(norm_text, items)
@@ -3219,6 +3852,7 @@ async def _handle_with_llm(
                 [(it, qty, mod) for it, qty, mod in det_matches],
                 _modifier_combined,
                 add_ons_map,
+                full_text=norm_text,
             )
             _has_priced_option = any(
                 _det_has_priced_option(it, norm_text)
@@ -3301,19 +3935,20 @@ async def _handle_with_llm(
                     # If suffix extraction found no modifier, also check the full
                     # message for option names (catches "with oat milk" style phrasing).
                     _eff_mod = det_modifier or _capture_options_from_message(det_item, norm_text)
-                    state_machine.add_to_cart(
-                        session,
-                        menu_item_id=str(det_item.id),
-                        name=det_item.name,
-                        price_cents=det_item.price_cents,
-                        quantity=det_qty,
-                        options=None,
-                        special_instructions=_eff_mod,
-                    )
-                    label = f"{det_qty}x {det_item.name}"
-                    if _eff_mod:
-                        label += f" ({_eff_mod})"
-                    det_added.append(label)
+                    for _unit_qty, _unit_mod in _split_distinct_per_unit_modifiers(det_item, det_qty, _eff_mod):
+                        state_machine.add_to_cart(
+                            session,
+                            menu_item_id=str(det_item.id),
+                            name=det_item.name,
+                            price_cents=det_item.price_cents,
+                            quantity=_unit_qty,
+                            options=None,
+                            special_instructions=_unit_mod,
+                        )
+                        label = f"{_unit_qty}x {det_item.name}"
+                        if _unit_mod:
+                            label += f" ({_unit_mod})"
+                        det_added.append(label)
                 logger.warning(
                     "DET_MATCH: added %d item(s) deterministically: %r, session_id=%s",
                     len(det_added), det_added, session.id,
@@ -3356,7 +3991,18 @@ async def _handle_with_llm(
 
         # ── Sub-case A: message also names a menu item + extraction found modifier ──
         # e.g. "Classic Smash Burger take out tomato"
-        _det_remove_matches = _extract_items_from_message(norm_text, items)
+        # ignore_price_ambiguity=True: both sub-cases below (A and A2) only
+        # identify an item ALREADY in the cart (A2) or a real menu-item name
+        # that disambiguates a removal-vs-order-with-modifier phrase (A) --
+        # neither commits a NEW price, so BUG-0160's ask-before-pricing gate
+        # must not apply here. Missing this was a real regression (found by
+        # independent verification, 2026-10-26): "Remove the Coke" against a
+        # catalog with both a 330ml and 500ml Coke no longer matched "coke"
+        # at all once BUG-0160 shipped, so the message fell through to the
+        # ingredient-modifier fallback below and incorrectly added "no coke"
+        # to an unrelated cart item while the real Coke stayed in the cart,
+        # still charged.
+        _det_remove_matches = _extract_items_from_message(norm_text, items, ignore_price_ambiguity=True)
         _with_modifier = [(it, qty, mod) for it, qty, mod in _det_remove_matches if mod]
         if _with_modifier:
             import copy as _copy
@@ -3413,9 +4059,27 @@ async def _handle_with_llm(
                 and not _is_reference_not_target(it.name, norm_text.lower())
             ]
             if _confirmed_removals:
+                # BUG (scenario D7): "Remove one half chicken" against a cart
+                # holding 2x Half Chicken removed the WHOLE line (cart_remaining
+                # dropped to 0) instead of decrementing to 1x -- _qty was
+                # already being parsed correctly above but never passed to
+                # remove_from_cart at all (which already supports a partial
+                # decrement via its own `quantity` param). Found 2026-10-26
+                # while building fresh regression tests for the real reported
+                # quantity-handling defects. Only pass a quantity through when
+                # the message contains an EXPLICIT count word/digit -- "remove
+                # the burger" (no count stated) must stay a full removal, only
+                # "remove one/two/2 burger(s)" should partially decrement.
+                import re as _re_rm
+                _explicit_qty_present = bool(_re_rm.search(
+                    r"\b(\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten)\b",
+                    norm_text.lower(),
+                ))
                 for _it, _qty in _confirmed_removals:
                     state_machine.remove_from_cart(
-                        session, _it.name, qualifier_hint=msg_text
+                        session, _it.name,
+                        quantity=_qty if _explicit_qty_present else None,
+                        qualifier_hint=msg_text,
                     )
                 # Also clear any stale pending/proposed context
                 state_machine.set_context(session, "pending_options", None)
@@ -3910,9 +4574,71 @@ async def _handle_with_llm(
     if not history or not (history[-1]["role"] == "user" and history[-1]["content"] == msg_text):
         history.append({"role": "user", "content": msg_text})
 
-    llm_response = await provider.complete_with_history(system_prompt, history)
+    # Layer 3 resilience (WhatsApp ordering reliability directive,
+    # 2026-10-26): before this, a raw, unguarded await here meant ANY LLM
+    # failure (timeout, rate limit, auth error, network error -- all
+    # realistic in real production, not hypothetical) propagated all the
+    # way up to process_inbound_message's outer try/except, which only
+    # logs and rolls back the DB transaction -- the customer got NO REPLY
+    # AT ALL, with no indication anything went wrong. The cart/session
+    # itself was never at risk (nothing here has mutated anything yet,
+    # and the DB rollback is correct), but silence looks exactly like a
+    # dead bot. Now caught explicitly: no cart mutation happens (none was
+    # about to), and the customer gets an honest, actionable message
+    # instead of nothing.
+    try:
+        llm_response = await provider.complete_with_history(system_prompt, history)
+    except Exception:
+        logger.exception(
+            "LLM_CALL_FAILED: business_id=%s, session_id=%s — LLM provider raised, "
+            "returning a graceful fallback instead of silence",
+            business.id, session.id,
+        )
+        _restore_pre_mutation_snapshot(session, pre_mutation_snapshot, reason="LLM_CALL_FAILED")
+        return (
+            "Sorry, I'm having trouble processing that right now. "
+            "Please try again in a moment, or rephrase your message. 🙏",
+            False, None, None, None,
+        )
 
     parsed = llm_parser.parse_llm_response(llm_response.text)
+
+    # ── Contradictory-action guard (Layer 3, WhatsApp ordering reliability
+    #    directive, 2026-10-26) ───────────────────────────────────────────
+    # A self-contradictory LLM response: it picked a mutation action
+    # (add_items/remove_item/replace_item) but supplied NO items to mutate
+    # with. There is no legitimate reason for this combination -- a
+    # genuinely empty-handed reply should be action="chitchat" or
+    # "ask_options" instead. Found via adversarial pipeline testing: before
+    # this guard, such a response fell through every existing check (the
+    # action-specific blocks below all require `and parsed.items`, the
+    # ORDER_MUTATION_GUARD only fires when `parsed.action not in
+    # _ORDER_MUTATION_ACTIONS` -- which this action IS in -- and the
+    # CHITCHAT_WITH_ACTIVE_CART catch-all only fires when a cart already
+    # exists) and the LLM's raw, fabricated prose (e.g. "Added to your
+    # order! Total is now R250.00" while nothing was actually added) was
+    # sent straight to the customer. Caught here, uniformly, before any
+    # action-specific or intent-specific branch, so it can never depend on
+    # intent routing or an existing cart to catch it.
+    if parsed.action in ("add_items", "remove_item", "replace_item") and not parsed.items:
+        logger.warning(
+            "CONTRADICTORY_ACTION_GUARD: action=%r with an empty items list -- "
+            "blocking the LLM's unmutated reply instead of relaying it. session_id=%s, "
+            "msg_preview=%r",
+            parsed.action, session.id, parsed.message[:80],
+        )
+        _restore_pre_mutation_snapshot(session, pre_mutation_snapshot, reason="CONTRADICTORY_ACTION_GUARD")
+        if parsed.action == "remove_item":
+            retry_msg = "Sorry, I didn't catch which item to remove. Could you tell me the name of the item you'd like taken off? 😊"
+        else:
+            retry_msg = "Sorry, I didn't catch the items properly. Please tell me exactly what you'd like to add 😊"
+        return (
+            retry_msg,
+            True,
+            llm_response.total_tokens,
+            llm_response.cost_cents,
+            llm_response.provider,
+        )
 
     if parsed.action == "add_items" and parsed.items:
         items_map = {i.name.lower(): i for i in items if i.is_active and not i.is_deleted}
@@ -4275,7 +5001,7 @@ async def _handle_with_llm(
         # (e.g. "Can I place an order for delivery?"), not a failed item extraction.
         # In that case let the LLM's chitchat response through — it's correct.
         _cart_is_empty = not state_machine.get_cart(session)
-        _has_menu_items = bool(_extract_items_from_message(msg_text, items))
+        _has_menu_items = bool(_extract_items_from_message(msg_text, items, ignore_price_ambiguity=True))
         if _cart_is_empty and not _has_menu_items:
             logger.warning(
                 "ORDER_MUTATION_GUARD_SKIPPED: empty cart + no items in msg, letting LLM response through. "
@@ -4332,7 +5058,7 @@ async def _handle_with_llm(
         # message plausibly references a real menu item (so genuine
         # clarifying chitchat, e.g. "what spice levels do you have?", still
         # passes through unchanged).
-        if _extract_items_from_message(msg_text, items):
+        if _extract_items_from_message(msg_text, items, ignore_price_ambiguity=True):
             logger.warning(
                 "CHITCHAT_CART_MUTATION_GUARD: blocking unmutated chitchat that "
                 "references a menu item while a cart is active. session_id=%s",

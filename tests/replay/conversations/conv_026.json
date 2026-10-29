@@ -6,7 +6,7 @@
 
   "turns": [
     {
-      "message": "Can I get 5 Cokes",
+      "message": "Can I get 5 Cokes (330ml)",
       "expect": {
         "state": "CONFIRMING_ORDER",
         "cart": [{"name": "Coca-Cola (330ml)", "quantity": 5}],

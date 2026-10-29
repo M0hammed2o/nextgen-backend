@@ -6,7 +6,7 @@
 
   "turns": [
     {
-      "message": "Can I get a Classic Smash Burger and a Coke",
+      "message": "Can I get a Classic Smash Burger and a Coke (330ml)",
       "expect": {
         "state": "CONFIRMING_ORDER",
         "cart": [

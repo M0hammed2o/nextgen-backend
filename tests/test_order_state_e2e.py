@@ -166,11 +166,14 @@ class TestScenario2MultipleQuantity:
 class TestScenario3MultipleItems:
     def test_burger_and_coke(self):
         """
-        BUG 1: '2 Classic Smash Burgers and 3 Cokes' — both 'burgers' (plural)
-        and 'cokes' (plural alias) must resolve deterministically.
+        BUG 1: '2 Classic Smash Burgers and 3 Cokes (330ml)' — both
+        'burgers' (plural) and 'cokes' (plural alias) must resolve
+        deterministically. BUG-0160: a bare "cokes" is now correctly
+        ambiguous (330ml/500ml, different prices) -- "(330ml)" specified
+        explicitly, the exact item the old silent default picked.
         """
         matches = _extract_items_from_message(
-            normalize("2 Classic Smash Burgers and 3 Cokes"), _MENU
+            normalize("2 Classic Smash Burgers and 3 Cokes (330ml)"), _MENU
         )
         assert len(matches) == 2, f"Expected 2 items, got {len(matches)}: {[m[0].name for m in matches]}"
         names = {m[0].name for m in matches}
@@ -196,8 +199,10 @@ class TestScenario3MultipleItems:
         assert len(matches) == 2
 
     def test_plural_coke_alias(self):
-        """'cokes' → Coca-Cola via alias with plural 's' allowed."""
-        matches = _extract_items_from_message(normalize("3 cokes"), _MENU)
+        """'cokes' → Coca-Cola via alias with plural 's' allowed.
+        BUG-0160: "3 cokes" alone is now correctly ambiguous (330ml/500ml);
+        "(330ml)" specified explicitly."""
+        matches = _extract_items_from_message(normalize("3 cokes (330ml)"), _MENU)
         assert matches, "Plural 'cokes' must match via alias"
         assert "Coca-Cola" in matches[0][0].name
         assert matches[0][1] == 3

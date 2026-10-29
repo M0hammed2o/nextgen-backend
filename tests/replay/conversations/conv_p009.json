@@ -9,11 +9,6 @@
   "turns": [
     {
       "message": "Classic Smash Burger with stuffed crust",
-      "llm": {
-        "action": "add_items",
-        "message": "Classic Smash Burger added ✅",
-        "items": [{"name": "Classic Smash Burger", "quantity": 1, "options": {}, "add_ons": [{"name": "Stuffed Crust", "quantity": 1}], "special_instructions": ""}]
-      },
       "expect": {
         "state": "CONFIRMING_ORDER",
         "cart": [{"name": "Classic Smash Burger", "quantity": 1}]
