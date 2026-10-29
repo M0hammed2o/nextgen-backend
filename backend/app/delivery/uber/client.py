@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import re
+from urllib.parse import urlencode
 
 import httpx
 
@@ -206,3 +207,34 @@ async def upsert_menu(
         raise DeliveryProviderError(
             "UBER_EATS", "menu upsert failed", status_code=response.status_code
         )
+
+
+# ── Integration Configuration API (store activation) ────────────────────────
+# Both calls need a MERCHANT token (`authorization_code`, scope
+# `eats.pos_provisioning`) — see `provisioning.py`. Read 2026-10-29:
+# developer.uber.com/docs/eats/guides/integration-activation-flows and
+# .../references/api/v1/post-eats-stores-storeid-posdata
+
+
+async def list_stores(
+    http_client: httpx.AsyncClient, token: str, *, api_base_url: str, start_key: str | None = None,
+) -> dict:
+    """List All Stores (`GET /v1/eats/stores`) — READ ONLY. Pages via `next_key` → `start_key`."""
+    url = f"{api_base_url}/v1/eats/stores?limit=50"
+    if start_key:
+        url += "&" + urlencode({"start_key": start_key})
+    return await _get(http_client, url, token)
+
+
+async def activate_integration(
+    http_client: httpx.AsyncClient, token: str, store_id: str, *, body: dict, api_base_url: str,
+) -> None:
+    """
+    Activate Integration (`POST /v1/eats/stores/{store_id}/pos_data`). Uber's
+    reference lists no response codes, so any 2xx is success.
+    """
+    store_id = _validated_order_id(store_id)
+    await _post(
+        http_client, f"{api_base_url}/v1/eats/stores/{store_id}/pos_data", token, body,
+        expect_status=(200, 201, 202, 204),
+    )

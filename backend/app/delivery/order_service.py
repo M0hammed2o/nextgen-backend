@@ -120,6 +120,9 @@ _SCHEDULED_EVENT_TYPE = "orders.scheduled.notification"
 _ORDER_EDIT_EVENT_TYPE = "orders.customer_order_edit"
 
 #: Statuses the accept-deadline watchdog scans (and auto-denies past deadline).
+#: Uber auto-cancels an order not accepted or denied within 11.5 minutes.
+_UBER_ACCEPT_WINDOW = timedelta(seconds=690)
+
 OPEN_STATUSES = ("RECEIVED", "FETCHING", "NEEDS_MAPPING", "READY_TO_ACCEPT")
 #: A real Order exists and the kitchen has it.
 ACCEPTED_STATUSES = ("ACCEPTED", "ACCEPT_UNCONFIRMED")
@@ -464,6 +467,9 @@ async def _handle_order(
         return
 
     _apply_fetched(row, canonical)
+    first_event_type = webhook_event.event_type if webhook_event else event_type
+    if first_event_type != _SCHEDULED_EVENT_TYPE:
+        _tighten_accept_deadline(row, canonical.placed_at)
 
     # BUG-0092 fix, re-based on the food sale: refuse to book a sale the
     # platform could not price. A wrong number in the books is worse than a
@@ -672,6 +678,20 @@ async def _first_event_type(db: AsyncSession, row: DeliveryOrder) -> str | None:
 
 
 async def _reaccept_scheduled(db: AsyncSession, *, row: DeliveryOrder) -> None:
+    # Uber may retry the orders.notification under a NEW event_id, which slips
+    # past intake's event_id dedupe. The second handshake is owed once per
+    # order, so the audit trail decides — never a repeat accept call.
+    already = (await db.execute(
+        select(AuditEvent.id).where(
+            AuditEvent.business_id == row.business_id,
+            AuditEvent.target_type == "delivery_order",
+            AuditEvent.target_id == row.id,
+            AuditEvent.action == "delivery.order.scheduled_reaccepted",
+        ).limit(1)
+    )).scalar_one_or_none()
+    if already is not None:
+        logger.info("DELIVERY_SCHEDULED_REACCEPT_ALREADY_DONE: id=%s — idempotent no-op.", row.id)
+        return
     connection = await db.get(DeliveryConnection, row.delivery_connection_id) if row.delivery_connection_id else None
     adapter = registry.get_provider(row.provider)
     outcome, error, status_code = await _accept_with_retries(
@@ -875,6 +895,31 @@ def _food_sale_cents(canonical: CanonicalDeliveryOrder) -> int | None:
     if totals and all(t is not None for t in totals):
         return sum(totals)
     return None
+
+
+def _tighten_accept_deadline(row: DeliveryOrder, placed_at: datetime | None) -> None:
+    """
+    BUG-0185. Uber's accept/deny window runs from when the customer placed the
+    order, but intake can only start the clock when the webhook reaches us — and
+    a delivery Uber had to retry (10s, then 30/60/120s...) arrives late. The
+    webhook's own `event_time` can't anchor it: Uber confirmed (2026-10-29) it is
+    the time of that notification attempt and may differ between retries.
+    `placed_at` from the order details can. Only ever shortens the deadline; a
+    `placed_at` in the future (clock skew) is ignored. Not for scheduled orders,
+    whose window starts at the scheduled notification, not at placement — and
+    not for anything placed longer ago than Uber's whole window: an on-demand
+    order that old is already cancelled by Uber, so such an order is far more
+    likely a scheduled one whose first notification never reached us, and
+    tightening would deny it at once (security review, 2026-10-29).
+    """
+    if placed_at is None or row.accept_deadline_at is None:
+        return
+    age = datetime.now(timezone.utc) - placed_at
+    if age < timedelta(0) or age > _UBER_ACCEPT_WINDOW:
+        return
+    from_placement = placed_at + timedelta(seconds=get_settings().DELIVERY_ACCEPT_DEADLINE_SECONDS)
+    if from_placement < row.accept_deadline_at:
+        row.accept_deadline_at = from_placement
 
 
 def _apply_fetched(row: DeliveryOrder, canonical: CanonicalDeliveryOrder) -> None:

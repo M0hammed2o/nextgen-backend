@@ -15,6 +15,7 @@ approach") — never against a shared database.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 import hmac
 import json
@@ -116,11 +117,11 @@ def _signed(payload: dict) -> tuple[bytes, dict]:
     }
 
 
-def _webhook(store_id: str, order_id: str, *, event_type="orders.notification", event_id=None):
+def _webhook(store_id: str, order_id: str, *, event_type="orders.notification", event_id=None, event_time=1729651095):
     return _signed({
         "event_type": event_type,
         "event_id": event_id or str(uuid.uuid4()),
-        "event_time": 1729651095,
+        "event_time": event_time,
         "meta": {"resource_id": order_id, "status": "pos", "user_id": store_id},
         "resource_href": f"https://api.uber.com/v2/eats/order/{order_id}",
     })
@@ -543,3 +544,127 @@ async def test_a_cancel_signed_with_the_sandbox_secret_cannot_touch_a_production
         assert (await session.get(Order, row.order_id)).status == "ACCEPTED"
     assert (await _delivery_row(uber_tenant["business"].id, order_id)).status == "ACCEPTED"
     assert all(m.movement_type == "SALE_CONSUMPTION" for m in await _stock_movements(row.order_id))
+
+
+# ── Retries, out-of-order delivery and the accept deadline (Uber, 2026-10-29) ─
+#
+# Uber Integration Tech Support: `event_time` is the time of that notification
+# attempt (epoch seconds OR milliseconds), and a retry may carry a different
+# `event_time` AND a different `event_id`. Neither may be the only guard against
+# a second sale, a second accept call or a second stock movement.
+
+
+def _fail_if_called(name: str) -> AsyncMock:
+    return AsyncMock(side_effect=AssertionError(f"{name} must not be called"))
+
+
+async def test_same_event_id_with_a_different_event_time_is_still_a_duplicate(uber_tenant):
+    order_id, event_id, pool = str(uuid.uuid4()), str(uuid.uuid4()), RecordingPool()
+    first = await _deliver(*_webhook(uber_tenant["store_id"], order_id, event_id=event_id), pool)
+    retry = await _deliver(
+        *_webhook(uber_tenant["store_id"], order_id, event_id=event_id, event_time=1729651095123), pool,
+    )
+
+    assert first.error_category == "OK" and retry.detail == "duplicate_event"
+    assert retry.http_status == 200 and len(pool.jobs) == 1
+    assert await _count(DeliveryWebhookEvent, DeliveryWebhookEvent.business_id == uber_tenant["business"].id) == 1
+
+
+async def test_a_retry_under_a_new_event_id_after_acceptance_books_and_calls_nothing(uber_tenant):
+    order_id, row, accept = await _live_accepted_order(uber_tenant)
+    assert accept.await_count == 1
+    before = sorted(m.quantity_milli for m in await _stock_movements(row.order_id))
+
+    pool = RecordingPool()
+    result = await _deliver(*_webhook(uber_tenant["store_id"], order_id, event_time=1729651999), pool)
+    assert result.error_category == "OK"
+    with patch.object(UberEatsAdapter, "_fetch_order", _fail_if_called("fetch")), \
+         patch.object(UberEatsAdapter, "_accept_order", _fail_if_called("accept")):
+        await _run_jobs(pool)
+
+    business = uber_tenant["business"]
+    assert await _count(Order, Order.business_id == business.id, Order.external_order_id == order_id) == 1
+    assert (await _delivery_row(business.id, order_id)).status == "ACCEPTED"
+    assert sorted(m.quantity_milli for m in await _stock_movements(row.order_id)) == before
+
+
+async def test_a_cancel_that_overtakes_the_order_notification_books_nothing(uber_tenant):
+    order_id, pool = str(uuid.uuid4()), RecordingPool()
+    await _deliver(*_webhook(uber_tenant["store_id"], order_id, event_type="orders.cancel"), pool)
+    await _run_jobs(pool)
+    business = uber_tenant["business"]
+    assert (await _delivery_row(business.id, order_id)).status == "CANCELLED"
+
+    await _deliver(*_webhook(uber_tenant["store_id"], order_id), pool)
+    with patch.object(UberEatsAdapter, "_fetch_order", _fail_if_called("fetch")), \
+         patch.object(UberEatsAdapter, "_accept_order", _fail_if_called("accept")):
+        await _run_jobs(pool)
+
+    row = await _delivery_row(business.id, order_id)
+    assert row.status == "CANCELLED" and row.order_id is None
+    assert await _count(Order, Order.business_id == business.id, Order.external_order_id == order_id) == 0
+
+
+async def test_scheduled_reaccept_is_sent_once_when_uber_retries_under_a_new_event_id(uber_tenant):
+    order_id, pool = str(uuid.uuid4()), RecordingPool()
+    canonical = _uber_order(order_id, uber_tenant["store_id"])
+    with patch.object(UberEatsAdapter, "_fetch_order", AsyncMock(return_value=canonical)), \
+         patch.object(UberEatsAdapter, "_accept_order", AsyncMock()) as accept:
+        await _deliver(*_webhook(uber_tenant["store_id"], order_id, event_type="orders.scheduled.notification"), pool)
+        await _run_jobs(pool)
+        assert accept.await_count == 1
+        for _ in range(2):  # the owed second handshake, then Uber retrying it under a new event_id
+            await _deliver(*_webhook(uber_tenant["store_id"], order_id), pool)
+        await _run_jobs(pool)
+
+    assert accept.await_count == 2, "first accept + exactly one scheduled re-accept"
+    business = uber_tenant["business"]
+    assert await _count(Order, Order.business_id == business.id, Order.external_order_id == order_id) == 1
+    row = await _delivery_row(business.id, order_id)
+    assert row.status == "ACCEPTED" and row.last_provider_sync_error is None
+
+
+async def _deadline_after(tenant: dict, *, placed_at: datetime, event_type="orders.notification"):
+    order_id, pool = str(uuid.uuid4()), RecordingPool()
+    canonical = dataclasses.replace(_uber_order(order_id, tenant["store_id"]), placed_at=placed_at)
+    received = datetime.now(timezone.utc)
+    with patch.object(UberEatsAdapter, "_fetch_order", AsyncMock(return_value=canonical)), \
+         patch.object(UberEatsAdapter, "_accept_order", AsyncMock()):
+        await _deliver(*_webhook(tenant["store_id"], order_id, event_type=event_type), pool)
+        await _run_jobs(pool)
+    return received, (await _delivery_row(tenant["business"].id, order_id)).accept_deadline_at
+
+
+async def test_accept_deadline_runs_from_placement_when_the_webhook_arrives_late(uber_tenant):
+    window = timedelta(seconds=get_settings().DELIVERY_ACCEPT_DEADLINE_SECONDS)
+    placed = datetime.now(timezone.utc) - timedelta(minutes=4)  # Uber had to retry the delivery
+    _, deadline = await _deadline_after(uber_tenant, placed_at=placed)
+    assert abs((deadline - (placed + window)).total_seconds()) < 1
+
+
+async def test_accept_deadline_ignores_a_future_placed_at_and_scheduled_orders(uber_tenant):
+    window = timedelta(seconds=get_settings().DELIVERY_ACCEPT_DEADLINE_SECONDS)
+    received, deadline = await _deadline_after(
+        uber_tenant, placed_at=datetime.now(timezone.utc) + timedelta(minutes=5),  # clock skew
+    )
+    assert abs((deadline - (received + window)).total_seconds()) < 5
+
+    received, deadline = await _deadline_after(
+        uber_tenant, placed_at=datetime.now(timezone.utc) - timedelta(hours=2),
+        event_type="orders.scheduled.notification",
+    )
+    assert deadline > received, "a scheduled order's window starts at its notification, not at placement"
+
+
+async def test_accept_deadline_is_not_tightened_for_an_order_older_than_ubers_window(uber_tenant):
+    """
+    Security review: a scheduled order whose orders.scheduled.notification never
+    reached us arrives as a plain orders.notification with an hours-old
+    placed_at. Tightening would put its deadline in the past and the watchdog
+    would deny a paid order at once.
+    """
+    window = timedelta(seconds=get_settings().DELIVERY_ACCEPT_DEADLINE_SECONDS)
+    received, deadline = await _deadline_after(
+        uber_tenant, placed_at=datetime.now(timezone.utc) - timedelta(hours=2),
+    )
+    assert abs((deadline - (received + window)).total_seconds()) < 5

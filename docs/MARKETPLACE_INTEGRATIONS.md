@@ -113,6 +113,16 @@ A zero-cost alternative for one attended session is a local stack behind a Cloud
 
 Cross-tenant order rows: 0. Afterwards the tunnel was closed, the jobs were drained and the synthetic tenants deleted.
 
+**Local sandbox stack, 2026-10-29 (late).** Until a hosted sandbox exists, the sandbox runs on the operator's machine:
+- **Isolation:** its own Postgres and Redis containers, migrated to `0059`, and its own random secrets; no production value is present.
+- **Tenants:** one NextGen test business per Uber test store, with real store ids, SANDBOX/sandbox connections and the sandbox-business allow-list.
+- **Processes:** backend and worker.
+- **Public edge:** a Cloudflare quick tunnel reaching a **gateway** that forwards only `POST /v1/webhook/delivery/UBER_EATS`, `GET /health` and the activation callback; everything else is 404.
+
+`ENVIRONMENT=staging` is not usable locally: the boot guard rightly refuses loopback database and Redis URLs. The stack therefore runs as `development`, whose relaxations (for example the Meta webhook signature check) are unreachable from outside because of the gateway. A quick-tunnel URL changes whenever the tunnel restarts, so the Primary Webhook URL must then be updated.
+
+The same 9-case pre-flight passed through that public URL against the **real** store mappings.
+
 ### 4.1 Test stores and activation
 
 Uber Integration Tech Support provisioned two sandbox test stores on ticket #69BF76. The delivery type is "Delivery by Uber", so the ready signal (`/v1/delivery/order/{id}/ready`) is the one that matters. Keep their Store IDs in the git-ignored `.env.uber-sandbox-stores` (`UBER_SANDBOX_STORE_1_ID`, `UBER_SANDBOX_STORE_2_ID`). Never write the test-merchant logins or passwords anywhere in the repo.
@@ -122,9 +132,29 @@ Verified 2026-10-29: `GET /v1/eats/stores` (List All Stores) with the sandbox cl
 2. `POST /v1/eats/stores/{store_id}/pos_data` with that merchant token and `{"is_order_manager": true, "integrator_store_id": "<NextGen business id>"}`.
 3. Uber sends `store.provisioned`.
 
-Two things are still open:
-- The sandbox authorize host is **Unknown**. The guide shows only `auth.uber.com`; ask on #69BF76, or ask Uber whether they can activate the test stores for the app directly.
-- NextGen has **no** activation flow built yet. It also needs a redirect URI registered on the Uber app.
+Also verified 2026-10-29:
+- With the app's own token, both test stores' status and menu endpoints return **HTTP 401**, which is what an un-activated store returns.
+- The sandbox **authorize** step lives on the same host as the token endpoint: `https://sandbox-login.uber.com/oauth/v2/authorize` redirects to Uber's login page. `sandbox-auth.uber.com` does not resolve, and production `auth.uber.com` rejects the sandbox client as `invalid_client`.
+
+**Activation tool** (`scripts/uber_activate_store.py`, sandbox only), built on `backend/app/delivery/uber/provisioning.py`. Run it once per store, with the sandbox deployment's environment loaded:
+
+```
+python scripts/uber_activate_store.py --business-id <test business id> --operator "<your name>" \
+    --redirect-uri <a redirect URI registered on the Uber TEST app> [--listen-port 8766]
+```
+
+What it does, in order:
+1. Refuses anything but that business's SANDBOX/sandbox connection.
+2. Binds a one-shot listener on 127.0.0.1, then opens Uber's consent page. Sign in **in a private window** with that store's **merchant** login; the tool never sees the password.
+3. Accepts only a redirect whose `state` matches this run.
+4. Exchanges the code for a merchant token, held in memory only.
+5. Refuses unless that merchant can see the mapped store.
+6. Calls `pos_data` with `is_order_manager: true` and `integrator_store_id: <business id>`.
+7. Re-reads the store with the app's own cached token, and audits success or failure, including who ran it.
+
+Register the redirect URI on the Uber app under Auth → Redirect URIs first, exactly as passed. If the redirect URI is an https tunnel, point it at `--listen-port`.
+
+**Production stores** must not use this tool: it would put production secrets on a workstation. They need a server-side SUPER_ADMIN activation flow, which is not built yet.
 
 1. In the Uber developer dashboard, on the TEST app, set the Primary Webhook URL to the sandbox host's URL from §4.0, only after its HTTPS pre-flight passes.
 2. Create two dedicated test businesses in the **sandbox** deployment, one per test store, e.g. "NextGen Uber Sandbox A" and "NextGen Uber Sandbox B". Never use a real restaurant's tenant, and never the Smokin Joes demo tenant.
@@ -154,7 +184,20 @@ Open questions for Uber's integration team:
 - **API version.** Which order API version does certification expect? This build uses the documented v1/v2 Eats endpoints, now labelled "Previous Version", plus the newer `/v1/delivery/order/{id}/ready`, which has no older equivalent.
 - **Store prep time.** Uber lists "Update Store Prep Time" as required for certification. It is **not built**.
 - **Activation.** The two test stores are not associated with the app yet (List All Stores returns 0). Can Uber activate them for the app, and what is the sandbox host for the `authorization_code` authorize step (see §4.1)?
-- **`event_time`.** What are the units and meaning of the webhook's `event_time`, and do retries reuse it? The accept deadline is anchored on our *receipt* time. When Uber has to retry a delivery, our watchdog's deny can therefore land after Uber's own 11.5-minute auto-cancel, which is harmless but means the staff countdown overstates the time left. Anchoring on `event_time` would fix that, but only once its semantics are confirmed, for example from the first real sandbox webhooks, whose raw payloads the event log keeps for 30 days.
+- **`event_time`: answered by Uber, 2026-10-29.** It is a UTC epoch timestamp in seconds **or** milliseconds, it is the time of that notification attempt, and a retry may carry a different `event_time` **and a different `event_id`**. NextGen never deduplicates on `event_time`. Its protection against a second sale, accept call or stock movement is:
+  - the order-level unique key `(business, provider, order id)`;
+  - the row lock;
+  - a status machine where anything already past `RECEIVED` is a no-op;
+  - a once-only scheduled re-accept.
+
+  Real-DB tests cover:
+  - a retry under a new `event_id`;
+  - the same `event_id` with a new `event_time`;
+  - a cancel that overtakes its notification;
+  - a retried scheduled re-accept.
+
+  The accept deadline is now tightened to `placed_at + 600 s` from the order details (BUG-0185), never for scheduled orders and never for anything placed more than 690 s ago. The text below is the original question, kept for history.
+- *(Original)* **`event_time`.** What are the units and meaning of the webhook's `event_time`, and do retries reuse it? The accept deadline is anchored on our *receipt* time. When Uber has to retry a delivery, our watchdog's deny can therefore land after Uber's own 11.5-minute auto-cancel, which is harmless but means the staff countdown overstates the time left. Anchoring on `event_time` would fix that, but only once its semantics are confirmed, for example from the first real sandbox webhooks, whose raw payloads the event log keeps for 30 days.
 
 ## 6. Pilot verification (sandbox, then the pilot store)
 

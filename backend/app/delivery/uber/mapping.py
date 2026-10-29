@@ -175,10 +175,17 @@ def _currency(charges: dict) -> str | None:
     return None
 
 
+#: Uber's epoch timestamps "may be seconds or milliseconds" (Integration Tech
+#: Support, 2026-10-29). Seconds stay below this until the year 5138.
+_EPOCH_MILLIS_THRESHOLD = 100_000_000_000
+
+
 def _parse_timestamp(value) -> datetime | None:
     if not value:
         return None
     if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if abs(value) >= _EPOCH_MILLIS_THRESHOLD:
+            value = value / 1000
         try:
             return datetime.fromtimestamp(value, tz=timezone.utc)
         except (ValueError, OSError, OverflowError):

@@ -14,12 +14,10 @@ one token (design doc §1):
 2. PROVISIONING token — separate `authorization_code` grant, scope
    `eats.pos_provisioning` ONLY (cannot be combined with the scopes above
    on one token), one per merchant during store activation. That token is
-   handled entirely in `provisioning`-flow code (not built in this change —
-   menu sync / store discovery pipeline is out of scope, see
-   `docs/DELIVERY_PLATFORM_ARCHITECTURE.md` §6/§8) and, once a live
-   connection exists, is Fernet-encrypted on `DeliveryConnection.
-   provisioning_token_encrypted` and wiped after activation — never routed
-   through this module.
+   handled entirely in `provisioning.py` (2026-10-29): it lives in memory
+   for the activation calls only and is never cached, stored or logged —
+   `DeliveryConnection.provisioning_token_encrypted` stays unused. Never
+   routed through this module.
 
 Endpoint (confirmed): `POST https://auth.uber.com/oauth/v2/token`
 (`https://sandbox-login.uber.com/...` for the separate sandbox app — see

@@ -453,3 +453,19 @@ class TestWebhookEnvironmentIsProvenBySignature:
             adapter = UberEatsAdapter()
             assert adapter.verified_webhook_environment(body, {"x-uber-signature": sig}) == "sandbox"
             assert adapter.verify_webhook_signature(body, {"x-uber-signature": sig}) is True
+
+
+class TestUberEpochTimestamps:
+    """Uber (2026-10-29): epoch timestamps are UTC and may be seconds OR milliseconds."""
+
+    def test_seconds_and_milliseconds_parse_to_the_same_instant(self):
+        seconds = uber_mapping._parse_timestamp(1761771000)
+        assert seconds is not None and seconds.tzinfo is not None
+        assert uber_mapping._parse_timestamp(1761771000000) == seconds
+        assert uber_mapping._parse_timestamp(1761771000.5) == uber_mapping._parse_timestamp(1761771000500)
+
+    def test_iso_strings_and_junk(self):
+        assert uber_mapping._parse_timestamp("2026-10-29T20:50:00Z").isoformat() == "2026-10-29T20:50:00+00:00"
+        assert uber_mapping._parse_timestamp(True) is None
+        assert uber_mapping._parse_timestamp("not a time") is None
+        assert uber_mapping._parse_timestamp(None) is None

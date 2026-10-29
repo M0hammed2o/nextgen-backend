@@ -440,6 +440,7 @@ class TestScheduledAndEdits:
         row = _delivery_order(business_id, uuid.uuid4(), status="ACCEPTED", raw_event_id=event.id, order_id=uuid.uuid4())
         db = TypedFakeDB()
         db.register_select(DeliveryOrder, ScalarResult(scalar=row))
+        db.register_select(AuditEvent, ScalarResult(scalar=None))  # no earlier re-accept
         db.register_get(DeliveryWebhookEvent, event)
         db.register_get(DeliveryConnection, _connection(business_id))
         adapter = MagicMock(accept_order=AsyncMock())
@@ -451,6 +452,24 @@ class TestScheduledAndEdits:
         adapter.accept_order.assert_awaited_once()
         assert not any(isinstance(o, Order) for o in db.added)
         assert any(isinstance(a, AuditEvent) and a.action == "delivery.order.scheduled_reaccepted" for a in db.added)
+
+    async def test_scheduled_reaccept_already_done_is_not_sent_again(self):
+        # Uber retried the orders.notification under a new event_id (2026-10-29 clarification).
+        business_id = uuid.uuid4()
+        event = DeliveryWebhookEvent(id=uuid.uuid4(), event_type="orders.scheduled.notification")
+        row = _delivery_order(business_id, uuid.uuid4(), status="ACCEPTED", raw_event_id=event.id, order_id=uuid.uuid4())
+        db = TypedFakeDB()
+        db.register_select(DeliveryOrder, ScalarResult(scalar=row))
+        db.register_select(AuditEvent, ScalarResult(scalar=uuid.uuid4()))  # the re-accept already happened
+        db.register_get(DeliveryWebhookEvent, event)
+        adapter = MagicMock(accept_order=AsyncMock())
+        with patch.object(order_service.registry, "get_provider", return_value=adapter):
+            await order_service._handle_order(
+                db, provider="UBER_EATS", business_id=business_id, external_order_id="order-1",
+                event_type="orders.notification",
+            )
+        adapter.accept_order.assert_not_awaited()
+        assert db.added == []
 
     async def test_ordinary_duplicate_notification_for_an_accepted_order_stays_a_no_op(self):
         business_id = uuid.uuid4()
