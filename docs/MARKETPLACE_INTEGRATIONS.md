@@ -11,7 +11,7 @@ from Uber's developer docs (developer.uber.com/docs/eats) as read on 2026-10-26.
 
 | Channel | What works | Live connectivity |
 |---|---|---|
-| **Uber Eats, live API** | Built and covered by automated tests: webhook intake, order fetch, menu mapping, accept/deny, kitchen hand-off, ready-for-pickup, restaurant cancel, store pause/resume, menu import for mapping | **Sandbox authentication verified 2026-10-27.** The sandbox app's `client_credentials` token was minted from `https://sandbox-login.uber.com/oauth/v2/token` through the adapter's own code: HTTP 200, Bearer, `expires_in` 2,592,000 s, all four requested scopes granted (`eats.order`, `eats.store`, `eats.store.orders.read`, `eats.store.status.write`). **Everything past authentication is still unverified**, because the test store is pending (Uber support ticket #69BF76); those calls have only been tested against Uber's documented payloads with the network mocked. |
+| **Uber Eats, live API** | Built and covered by automated tests: webhook intake, order fetch, menu mapping, accept/deny, kitchen hand-off, ready-for-pickup, restaurant cancel, store pause/resume, menu import for mapping | **Sandbox authentication verified 2026-10-27.** The sandbox app's `client_credentials` token was minted from `https://sandbox-login.uber.com/oauth/v2/token` through the adapter's own code: HTTP 200, Bearer, `expires_in` 2,592,000 s, all four requested scopes granted (`eats.order`, `eats.store`, `eats.store.orders.read`, `eats.store.status.write`). Re-verified 2026-10-29: same result. **2026-10-29:** Uber provisioned two sandbox test stores (ticket #69BF76), but neither is activated for the app yet; List All Stores returns 0 (see §4.1). The webhook endpoint passed an HTTPS pre-flight with synthetic signed events (§4.0). **No real Uber webhook, order, menu or store call has succeeded yet**; order processing past intake has only been tested against Uber's documented payloads with the network mocked. |
 | **Uber Eats, CSV report** | Working (`/delivery-orders` import). A report order already booked through the live API is skipped as a duplicate. | n/a |
 | **Mr D, live API** | Disabled adapter only. Mr D publishes no partner API, and NextGen has no credentials. | **Pending Partner Approval** |
 | **Mr D, CSV report** | Working (same importer) | n/a |
@@ -75,22 +75,72 @@ Environment isolation: an event signed with one app's secret is ignored (`ENV_MI
 
 ## 4. Sandbox onboarding checklist
 
-1. In the Uber developer dashboard, on the TEST app:
-   - set the webhook URL to `https://<backend-host>/v1/webhook/delivery/UBER_EATS`;
-   - ask Integration Tech Support for a **test store** and note its store id.
-2. Create a dedicated test business in NextGen, e.g. "NextGen Uber Sandbox". Never use a real restaurant's tenant.
-3. In the Admin Suite (SUPER_ADMIN), enable `delivery_platforms_enabled` and `uber_eats_enabled` on that business.
-4. Local testing: keep the sandbox pair in a git-ignored `.env.*` file such as `.env.uber-sandbox` in the backend root (every `.env.*` except the `*.example` templates is ignored). The app itself auto-loads only `.env.backend`, so a local server needs these as real environment variables. On a deployment, set `UBER_EATS_SANDBOX_CLIENT_ID`, `UBER_EATS_SANDBOX_CLIENT_SECRET`, `UBER_EATS_SANDBOX_ORDER_BUSINESS_IDS=<test business id>`, `UBER_EATS_WEBHOOK_ENABLED=true` and, while no production app exists, `UBER_EATS_SANDBOX_ONLY_DEPLOYMENT=true`. Then redeploy the backend **and** the worker.
-5. Register the connection (SUPER_ADMIN, admin API):
-   `PUT /v1/admin/admin/businesses/{id}/delivery-connections/UBER_EATS`
-   with `{"status": "SANDBOX", "environment": "sandbox", "external_store_id": "<test store id>"}`
-6. As the test business's manager, open Delivery → Menu Mapping → **Import Uber Eats menu**, then map anything left unmapped.
-7. Place sandbox orders and run the pilot checks in §6.
+### 4.0 Where the sandbox runs: never the production backend
 
-Activation note: Uber's `POST /v1/eats/stores/{id}/pos_data` (`is_order_manager`) needs a merchant-authorised `eats.pos_provisioning` token. That OAuth flow is **not built**. Ask Uber's integration team whether the test store comes pre-activated for the app; if not, the provisioning flow is the next build item.
+Do **not** point the Uber test app's webhook at `api.nextgenintelligence.co.za`. Production runs the WhatsApp release line (`e65ec31`, branch `hotfix/bambino-allocation-checkout-state-20261027`). That line contains none of this branch's code or migration 0059, and test orders must never land in the production database. Run the sandbox as its own deployment, built from `feat/marketplace-integrations`:
+
+| Piece | Sandbox deployment |
+|---|---|
+| Web | Its own service, start command `./start.sh` (migrations, then uvicorn with `--proxy-headers`) |
+| Worker | Its own `backend.app.worker.WorkerSettings` process. Without it, orders are acknowledged but never processed. |
+| Postgres | Its own fresh database. **Never** the production `DATABASE_URL`. |
+| Redis | Its own instance. **Never** the production `REDIS_URL`. |
+| Secrets | Its own `JWT_SECRET_KEY` / `JWT_ADMIN_SECRET_KEY`, and anything else the boot guard demands: the sandbox's own values, never copies of production's. Billing off. No real WhatsApp token. |
+| Uber | `UBER_EATS_WEBHOOK_ENABLED=true`, `UBER_EATS_SANDBOX_ONLY_DEPLOYMENT=true`, the sandbox pair, `UBER_EATS_SANDBOX_ORDER_BUSINESS_IDS=<test business A>,<test business B>`. **No** `UBER_EATS_CLIENT_ID`/`_SECRET`. |
+| `ENVIRONMENT` | `staging`, so the boot guard checks it exactly like production |
+
+The webhook URL to register is the **single** Primary Webhook URL for both test stores (Uber allows one per application): `https://<sandbox-host>/v1/webhook/delivery/UBER_EATS`. Each event's store id (`meta.user_id`) picks the tenant, so one URL serves both stores.
+
+Before saving that URL in the dashboard, check the host over HTTPS:
+- `GET /health` returns 200;
+- `GET` on the webhook path returns 405;
+- a correctly signed `POST` returns 200 with an empty body.
+
+A zero-cost alternative for one attended session is a local stack behind a Cloudflare quick tunnel. Its URL changes on every restart, so it is not a URL to leave in the dashboard.
+
+**Pre-flight, 2026-10-29.** This branch ran locally against the disposable DB/Redis, behind a temporary Cloudflare quick tunnel (TLS 1.3, valid certificate), with two synthetic test tenants and the worker off. Every case returned HTTP 200 with a 0-byte body:
+
+| Case | DB outcome | Queue |
+|---|---|---|
+| Valid signed order, store A | Event `OK/sandbox`, order under tenant A | +1 job |
+| Exact duplicate of that delivery | No new rows | +0 |
+| Valid signed order, store B | Order under tenant B only | +1 job |
+| Body edited after signing (store A → B) | `BAD_SIGNATURE` row, no tenant, no order | +0 |
+| Missing signature | `BAD_SIGNATURE` | +0 |
+| Wrong key | `BAD_SIGNATURE` | +0 |
+| Unmapped store | `UNKNOWN_STORE` | +0 |
+| `store.provisioned` | `OK`, no order | — |
+
+Cross-tenant order rows: 0. Afterwards the tunnel was closed, the jobs were drained and the synthetic tenants deleted.
+
+### 4.1 Test stores and activation
+
+Uber Integration Tech Support provisioned two sandbox test stores on ticket #69BF76. The delivery type is "Delivery by Uber", so the ready signal (`/v1/delivery/order/{id}/ready`) is the one that matters. Keep their Store IDs in the git-ignored `.env.uber-sandbox-stores` (`UBER_SANDBOX_STORE_1_ID`, `UBER_SANDBOX_STORE_2_ID`). Never write the test-merchant logins or passwords anywhere in the repo.
+
+Verified 2026-10-29: `GET /v1/eats/stores` (List All Stores) with the sandbox client-credentials token returns HTTP 200 and **0 stores**. Per Uber's Integration Activation Flows guide, a store becomes usable by the app's client-credentials token only after **activation**:
+1. A merchant user consents through Uber's OAuth login (`authorization_code`, scope `eats.pos_provisioning`). The test merchant types their own password on Uber's page, so NextGen never sees it.
+2. `POST /v1/eats/stores/{store_id}/pos_data` with that merchant token and `{"is_order_manager": true, "integrator_store_id": "<NextGen business id>"}`.
+3. Uber sends `store.provisioned`.
+
+Two things are still open:
+- The sandbox authorize host is **Unknown**. The guide shows only `auth.uber.com`; ask on #69BF76, or ask Uber whether they can activate the test stores for the app directly.
+- NextGen has **no** activation flow built yet. It also needs a redirect URI registered on the Uber app.
+
+1. In the Uber developer dashboard, on the TEST app, set the Primary Webhook URL to the sandbox host's URL from §4.0, only after its HTTPS pre-flight passes.
+2. Create two dedicated test businesses in the **sandbox** deployment, one per test store, e.g. "NextGen Uber Sandbox A" and "NextGen Uber Sandbox B". Never use a real restaurant's tenant, and never the Smokin Joes demo tenant.
+3. In the Admin Suite (SUPER_ADMIN), enable `delivery_platforms_enabled` and `uber_eats_enabled` on each test business.
+4. Local testing: keep the sandbox pair in a git-ignored `.env.*` file such as `.env.uber-sandbox` in the backend root (every `.env.*` except the `*.example` templates is ignored). The app itself auto-loads only `.env.backend`, so a local server needs these as real environment variables. On the sandbox deployment, set the variables in §4.0, with **both** test business ids in `UBER_EATS_SANDBOX_ORDER_BUSINESS_IDS`. Then redeploy the backend **and** the worker.
+5. Register one connection per test business (SUPER_ADMIN, admin API):
+   `PUT /v1/admin/admin/businesses/{id}/delivery-connections/UBER_EATS`
+   with `{"status": "SANDBOX", "environment": "sandbox", "external_store_id": "<that business's test store id>"}`
+   A store id can belong to only one business; a second claim returns 409.
+6. Activate both stores for the app (§4.1).
+7. As each test business's manager, open Delivery → Menu Mapping → **Import Uber Eats menu**, then map anything left unmapped.
+8. Place sandbox orders and run the pilot checks in §6.
 
 ## 5. Production approval checklist (Uber)
 
+0. **Deploy gate.** Render deploys each repo's `main` on push, and `main` does **not** contain the live WhatsApp release `e65ec31`. That release's branch conflicts with `main` in `backend/app/bot/pipeline.py`; this branch does not touch that file. Do not merge this PR, or deploy anything built from `main`, until `e65ec31` has been reconciled into `main` by the chatbot workstream, and until you have confirmed which branch or commit Render production actually tracks.
 1. Finish sandbox verification (§6) and request **integration verification** through Uber Tech Support.
 2. Create a separate **production** app; Uber whitelists its scopes. Request only `eats.order`, `eats.store`, `eats.store.orders.read`, `eats.store.status.write` and `eats.pos_provisioning`. Do not request `eats.report` until settlement reconciliation is built.
 3. Set the production webhook URL, and set `UBER_EATS_CLIENT_ID` / `UBER_EATS_CLIENT_SECRET`.
@@ -103,7 +153,8 @@ Open questions for Uber's integration team:
 
 - **API version.** Which order API version does certification expect? This build uses the documented v1/v2 Eats endpoints, now labelled "Previous Version", plus the newer `/v1/delivery/order/{id}/ready`, which has no older equivalent.
 - **Store prep time.** Uber lists "Update Store Prep Time" as required for certification. It is **not built**.
-- **Activation.** Is the test store pre-activated, or does it need `pos_data` (see §4)?
+- **Activation.** The two test stores are not associated with the app yet (List All Stores returns 0). Can Uber activate them for the app, and what is the sandbox host for the `authorization_code` authorize step (see §4.1)?
+- **`event_time`.** What are the units and meaning of the webhook's `event_time`, and do retries reuse it? The accept deadline is anchored on our *receipt* time. When Uber has to retry a delivery, our watchdog's deny can therefore land after Uber's own 11.5-minute auto-cancel, which is harmless but means the staff countdown overstates the time left. Anchoring on `event_time` would fix that, but only once its semantics are confirmed, for example from the first real sandbox webhooks, whose raw payloads the event log keeps for 30 days.
 
 ## 6. Pilot verification (sandbox, then the pilot store)
 
