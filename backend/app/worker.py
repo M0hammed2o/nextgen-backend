@@ -111,6 +111,8 @@ async def process_whatsapp_message(
     msg_type: str,
     raw_payload: dict,
     contact_name: str | None = None,
+    expected_business_id: uuid.UUID | None = None,
+    expected_routing_generation: int | None = None,
 ) -> None:
     """
     Process one inbound WhatsApp message through the full bot pipeline.
@@ -123,11 +125,24 @@ async def process_whatsapp_message(
     Infrastructure failures (DB temporarily unavailable) will cause the job to
     fail; ARQ will retry up to max_tries times. The pipeline's wa_message_id
     deduplication check ensures retries are safe and never double-process.
+
+    `expected_business_id`/`expected_routing_generation` (migration 0059):
+    the webhook handler's snapshot of who owned `phone_number_id` at the
+    moment this job was enqueued. The pipeline re-verifies this snapshot
+    against the business's CURRENT generation before doing anything else —
+    see `pipeline.py::_process` — so a message queued before a WhatsApp
+    number handover can never be processed under the new owner just because
+    ARQ happened to run (or retry) the job after the handover completed.
+    Both default to `None` for any caller that hasn't been updated to pass
+    them, which falls back to the pre-0059 lookup-by-phone-number-only
+    behaviour unchanged.
     """
     logger.info(
-        "ARQ job start: wa_message_id=%s, phone_number_id=%s",
+        "ARQ job start: wa_message_id=%s, phone_number_id=%s, expected_business_id=%s, expected_routing_generation=%s",
         wa_message_id,
         phone_number_id,
+        expected_business_id,
+        expected_routing_generation,
     )
     async with ctx["session_factory"]() as db:
         await process_inbound_message(
@@ -139,6 +154,8 @@ async def process_whatsapp_message(
             msg_type=msg_type,
             raw_payload=raw_payload,
             contact_name=contact_name,
+            expected_business_id=expected_business_id,
+            expected_routing_generation=expected_routing_generation,
         )
     logger.info("ARQ job done: wa_message_id=%s", wa_message_id)
 

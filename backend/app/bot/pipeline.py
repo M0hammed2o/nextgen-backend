@@ -72,6 +72,8 @@ async def process_inbound_message(
     msg_type: str,
     raw_payload: dict,
     contact_name: str | None = None,
+    expected_business_id: uuid.UUID | None = None,
+    expected_routing_generation: int | None = None,
 ) -> None:
     """
     Full message processing pipeline.
@@ -87,6 +89,8 @@ async def process_inbound_message(
             msg_type=msg_type,
             raw_payload=raw_payload,
             contact_name=contact_name,
+            expected_business_id=expected_business_id,
+            expected_routing_generation=expected_routing_generation,
         )
         await db.commit()
         logger.info("PIPELINE_COMMITTED: wa_message_id=%s", wa_message_id)
@@ -108,6 +112,8 @@ async def _process(
     msg_type: str,
     raw_payload: dict,
     contact_name: str | None,
+    expected_business_id: uuid.UUID | None = None,
+    expected_routing_generation: int | None = None,
 ) -> None:
     logger.warning(
         "PIPELINE_START: wa_message_id=%s, phone_number_id=%s, wa_id=%s, type=%s",
@@ -118,16 +124,52 @@ async def _process(
     )
 
     # ── 1. Resolve business ──────────────────────────────────────────────
-    result = await db.execute(
-        select(Business).where(Business.whatsapp_phone_number_id == phone_number_id)
-    )
-    business = result.scalar_one_or_none()
-    if not business:
-        logger.warning(
-            "PIPELINE_NO_BUSINESS: phone_number_id=%s — no business registered",
-            phone_number_id,
+    # Migration 0059 (fail-closed WhatsApp number handover): when the caller
+    # snapshotted an expected business + routing generation at webhook-accept
+    # time, re-fetch by THAT id and verify the snapshot still matches the
+    # business's CURRENT state before doing anything else. This closes the
+    # race where a message queued before a whatsapp_phone_number_id
+    # reassignment gets executed (first try, or an ARQ retry) after the
+    # reassignment completes — a fresh lookup by phone_number_id alone would
+    # silently resolve to the NEW owner for a message that was never sent to
+    # them. Any caller that hasn't been updated to pass a snapshot (both
+    # None) falls back to the original lookup-by-phone-number-only
+    # behaviour, unchanged.
+    if expected_business_id is not None:
+        result = await db.execute(select(Business).where(Business.id == expected_business_id))
+        business = result.scalar_one_or_none()
+        if not business:
+            logger.error(
+                "PIPELINE_QUARANTINE_BUSINESS_GONE: wa_message_id=%s, expected_business_id=%s — "
+                "business no longer exists, refusing to process",
+                wa_message_id, expected_business_id,
+            )
+            return
+        generation_matches = (
+            expected_routing_generation is None
+            or business.whatsapp_routing_generation == expected_routing_generation
         )
-        return
+        if business.whatsapp_phone_number_id != phone_number_id or not generation_matches:
+            logger.error(
+                "PIPELINE_QUARANTINE_ROUTING_CHANGED: wa_message_id=%s, phone_number_id=%s — "
+                "ownership changed since this message was accepted (expected business_id=%s "
+                "generation=%s; business %s now holds phone_number_id=%s generation=%s) — "
+                "refusing to process under a possibly-wrong tenant",
+                wa_message_id, phone_number_id, expected_business_id, expected_routing_generation,
+                business.id, business.whatsapp_phone_number_id, business.whatsapp_routing_generation,
+            )
+            return
+    else:
+        result = await db.execute(
+            select(Business).where(Business.whatsapp_phone_number_id == phone_number_id)
+        )
+        business = result.scalar_one_or_none()
+        if not business:
+            logger.warning(
+                "PIPELINE_NO_BUSINESS: phone_number_id=%s — no business registered",
+                phone_number_id,
+            )
+            return
 
     logger.info(
         "PIPELINE_BUSINESS_FOUND: business_id=%s, name=%s, active=%s, whatsapp_enabled=%s",

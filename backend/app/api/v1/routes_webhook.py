@@ -362,6 +362,59 @@ async def receive_webhook(
             # message handling below (see _stamp_last_webhook docstring).
             await _stamp_last_webhook(db, phone_number_id)
 
+            # Fail-closed WhatsApp routing binding (migration 0059): resolve
+            # the business and its current routing generation ONCE, at
+            # webhook-accept time, and snapshot both into every job enqueued
+            # for this change. The worker (pipeline.py::_process) re-checks
+            # this snapshot against the business's CURRENT generation before
+            # processing — if a number reassignment happened in between, the
+            # snapshot is stale and the job is refused rather than silently
+            # processed under the new owner. A change with no matching
+            # business at all is not enqueued, not even a quarantine: there
+            # is nothing to quarantine it as, so the message is simply
+            # dropped here, logged loudly, same as the previous "no business
+            # found" behaviour used to produce deeper inside the pipeline —
+            # just detected one step earlier now.
+            #
+            # If the lookup itself fails (DB hiccup, not "no business"), this
+            # must behave like _stamp_last_webhook just above it: never let an
+            # infra blip drop real messages. Fall back to enqueueing with no
+            # snapshot — pipeline.py's own fallback path then behaves exactly
+            # as it did before migration 0059. Only a SUCCESSFUL lookup that
+            # genuinely finds nothing skips enqueueing.
+            expected_business_id = None
+            expected_routing_generation = None
+            routing_lookup_succeeded = True
+            try:
+                routing_result = await db.execute(
+                    select(Business.id, Business.whatsapp_routing_generation).where(
+                        Business.whatsapp_phone_number_id == phone_number_id
+                    )
+                )
+                routing_row = routing_result.first()
+            except Exception:
+                logger.exception(
+                    "WEBHOOK_ROUTING_LOOKUP_FAILED (non-fatal): phone_number_id=%s — "
+                    "falling back to legacy enqueue without a routing snapshot",
+                    phone_number_id,
+                )
+                try:
+                    await db.rollback()
+                except Exception:
+                    pass
+                routing_lookup_succeeded = False
+                routing_row = None
+
+            if routing_lookup_succeeded and routing_row is None:
+                logger.warning(
+                    "WEBHOOK_POST_NO_BUSINESS_FOR_NUMBER: phone_number_id=%s — "
+                    "no business currently owns this number, dropping change without enqueueing",
+                    phone_number_id,
+                )
+                continue
+            if routing_lookup_succeeded:
+                expected_business_id, expected_routing_generation = routing_row
+
             contacts = value.get("contacts", [])
             contact_name = None
             if contacts:
@@ -432,6 +485,8 @@ async def receive_webhook(
                         msg_type,
                         message,
                         contact_name,
+                        expected_business_id,
+                        expected_routing_generation,
                     )
                     logger.warning(
                         "WEBHOOK_POST_ENQUEUED: wa_message_id=%s, wa_id=%s",

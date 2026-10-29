@@ -88,6 +88,10 @@ class TestProcessWhatsappMessage:
             msg_type="text",
             raw_payload={"id": "wamid.test_abc", "type": "text"},
             contact_name="Test Customer",
+            # migration 0059 — always forwarded; None here since this call
+            # didn't pass either, matching the pre-0059 fallback behaviour.
+            expected_business_id=None,
+            expected_routing_generation=None,
         )
 
     async def test_session_comes_from_factory_not_fastapi(self):
