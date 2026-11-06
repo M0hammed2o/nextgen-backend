@@ -416,6 +416,13 @@ class Settings(BaseSettings):
     UBER_EATS_SANDBOX_CLIENT_SECRET: str = ""
     UBER_EATS_SANDBOX_API_BASE_URL: str = "https://test-api.uber.com"
     UBER_EATS_SANDBOX_AUTH_BASE_URL: str = "https://sandbox-login.uber.com"
+    # Dashboard "Basic HMAC" webhook signing keys for the sandbox app. Uber
+    # signs X-Uber-Signature with the primary key and, during a rotation,
+    # X-Uber-Signature-New with the secondary one. Optional: when empty, the
+    # sandbox client secret (the key the Eats guide documents) is still tried.
+    # See backend/app/delivery/uber/environments.py.
+    UBER_EATS_SANDBOX_WEBHOOK_SIGNING_KEY: str = ""
+    UBER_EATS_SANDBOX_WEBHOOK_SECONDARY_SIGNING_KEY: str = ""
     # Comma-separated business UUIDs allowed to turn SANDBOX orders into real
     # NextGen Orders (stock, reports). A sandbox order is a test, so it may
     # only ever land in a dedicated test tenant — never a live restaurant's

@@ -140,8 +140,11 @@ class UberEatsAdapter(DeliveryProviderAdapter):
     def _verified_webhook_environment(
         self, raw_body: bytes, headers: Mapping[str, str]
     ) -> str | None:
-        header_value = headers.get("x-uber-signature") or headers.get("X-Uber-Signature")
-        return match_webhook_environment(raw_body, header_value)
+        return match_webhook_environment(
+            raw_body,
+            headers.get("x-uber-signature") or headers.get("X-Uber-Signature"),
+            headers.get("x-uber-signature-new") or headers.get("X-Uber-Signature-New"),
+        )
 
     def _parse_webhook_event(
         self, raw_body: bytes, headers: Mapping[str, str]

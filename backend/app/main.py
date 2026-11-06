@@ -223,10 +223,39 @@ def _validate_production_secrets() -> None:
             "the sandbox operational token cannot be minted — every sandbox "
             "test order's fetch/accept/deny call would fail",
         ),
+        # Optional keys: checked only once set, since a placeholder signing
+        # key is one an attacker could guess and sign forged webhooks with.
+        (
+            bool(settings.UBER_EATS_SANDBOX_WEBHOOK_SIGNING_KEY),
+            settings.UBER_EATS_SANDBOX_WEBHOOK_SIGNING_KEY,
+            "UBER_EATS_SANDBOX_WEBHOOK_SIGNING_KEY",
+            "a placeholder signing key would let anyone sign forged sandbox webhooks",
+        ),
+        (
+            bool(settings.UBER_EATS_SANDBOX_WEBHOOK_SECONDARY_SIGNING_KEY),
+            settings.UBER_EATS_SANDBOX_WEBHOOK_SECONDARY_SIGNING_KEY,
+            "UBER_EATS_SANDBOX_WEBHOOK_SECONDARY_SIGNING_KEY",
+            "a placeholder signing key would let anyone sign forged sandbox webhooks",
+        ),
     )
     for enabled, secret_value, secret_name, consequence in _webhook_secret_requirements:
         if enabled and _looks_like_placeholder(secret_value):
             errors.append(f"{secret_name} is not configured but its webhook is enabled — {consequence}")
+
+    # Production is tried first when proving a webhook's environment, so a
+    # sandbox key equal to the production secret would make every sandbox-
+    # signed event prove "production" and reach live restaurants' books.
+    _uber_sandbox_keys = (
+        ("UBER_EATS_SANDBOX_CLIENT_SECRET", settings.UBER_EATS_SANDBOX_CLIENT_SECRET),
+        ("UBER_EATS_SANDBOX_WEBHOOK_SIGNING_KEY", settings.UBER_EATS_SANDBOX_WEBHOOK_SIGNING_KEY),
+        ("UBER_EATS_SANDBOX_WEBHOOK_SECONDARY_SIGNING_KEY", settings.UBER_EATS_SANDBOX_WEBHOOK_SECONDARY_SIGNING_KEY),
+    )
+    for name, value in _uber_sandbox_keys:
+        if value and value == settings.UBER_EATS_CLIENT_SECRET:
+            errors.append(f"{name} equals UBER_EATS_CLIENT_SECRET — sandbox-signed webhooks would prove production")
+        # A pasted trailing newline or space would make every genuine event BAD_SIGNATURE.
+        if value and value != value.strip():
+            errors.append(f"{name} has leading or trailing whitespace — every genuine webhook would fail verification")
 
     if errors:
         msg = (

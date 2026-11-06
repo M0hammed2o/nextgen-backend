@@ -729,6 +729,7 @@ def _boot(**overrides):
         UBER_EATS_WEBHOOK_ENABLED=True, UBER_EATS_CLIENT_ID="", UBER_EATS_CLIENT_SECRET="",
         UBER_EATS_SANDBOX_CLIENT_ID="", UBER_EATS_SANDBOX_CLIENT_SECRET="",
         UBER_EATS_SANDBOX_ONLY_DEPLOYMENT=False,
+        UBER_EATS_SANDBOX_WEBHOOK_SIGNING_KEY="", UBER_EATS_SANDBOX_WEBHOOK_SECONDARY_SIGNING_KEY="",
     )
     values.update(overrides)
     with patch.multiple(settings, **values):
@@ -770,6 +771,41 @@ def test_half_configured_production_pair_refuses_even_with_a_sandbox_pair():
             UBER_EATS_CLIENT_ID="prod-id-" + "c" * 40,
             UBER_EATS_SANDBOX_CLIENT_ID="sb-id-" + "a" * 40, UBER_EATS_SANDBOX_CLIENT_SECRET="sb-secret-" + "b" * 40,
         )
+
+
+def test_sandbox_webhook_signing_keys_boot_when_real():
+    _boot(
+        UBER_EATS_SANDBOX_ONLY_DEPLOYMENT=True, **SANDBOX_PAIR,
+        UBER_EATS_SANDBOX_WEBHOOK_SIGNING_KEY="d" * 64,
+        UBER_EATS_SANDBOX_WEBHOOK_SECONDARY_SIGNING_KEY="e" * 64,
+    )
+
+
+@pytest.mark.parametrize("name", [
+    "UBER_EATS_SANDBOX_WEBHOOK_SIGNING_KEY", "UBER_EATS_SANDBOX_WEBHOOK_SECONDARY_SIGNING_KEY",
+])
+def test_placeholder_sandbox_webhook_signing_key_refuses_to_boot(name):
+    """A guessable signing key would let anyone sign a forged webhook."""
+    with pytest.raises(RuntimeError, match=name):
+        _boot(UBER_EATS_SANDBOX_ONLY_DEPLOYMENT=True, **SANDBOX_PAIR, **{name: "changeme"})
+
+
+@pytest.mark.parametrize("name", [
+    "UBER_EATS_SANDBOX_CLIENT_SECRET",
+    "UBER_EATS_SANDBOX_WEBHOOK_SIGNING_KEY",
+    "UBER_EATS_SANDBOX_WEBHOOK_SECONDARY_SIGNING_KEY",
+])
+def test_a_sandbox_key_equal_to_the_production_secret_refuses_to_boot(name):
+    """Security review 2026-11-06: production is tried first, so a shared value would prove production."""
+    prod = "prod-secret-" + "f" * 40
+    with pytest.raises(RuntimeError, match=f"{name} equals UBER_EATS_CLIENT_SECRET"):
+        _boot(UBER_EATS_CLIENT_ID="prod-id-" + "c" * 40, UBER_EATS_CLIENT_SECRET=prod, **{**SANDBOX_PAIR, name: prod})
+
+
+def test_a_signing_key_with_a_pasted_newline_refuses_to_boot():
+    with pytest.raises(RuntimeError, match="UBER_EATS_SANDBOX_WEBHOOK_SIGNING_KEY has leading or trailing whitespace"):
+        _boot(UBER_EATS_SANDBOX_ONLY_DEPLOYMENT=True, **SANDBOX_PAIR,
+              UBER_EATS_SANDBOX_WEBHOOK_SIGNING_KEY="d" * 64 + chr(10))
 
 
 # ── Security-review follow-ups (2026-10-26) ──────────────────────────────────

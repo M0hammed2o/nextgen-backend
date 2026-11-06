@@ -546,6 +546,74 @@ async def test_a_cancel_signed_with_the_sandbox_secret_cannot_touch_a_production
     assert all(m.movement_type == "SALE_CONSUMPTION" for m in await _stock_movements(row.order_id))
 
 
+# ── Dashboard "Basic HMAC" signing keys (2026-11-06) ────────────────────────
+
+SANDBOX_SIGNING_KEY, SANDBOX_SECONDARY_KEY = "it-sandbox-signing-key-" + "a" * 40, "it-sandbox-secondary-" + "b" * 40
+
+
+@pytest.fixture
+def sandbox_signing_keys(uber_settings):
+    with patch.multiple(
+        uber_settings,
+        UBER_EATS_SANDBOX_CLIENT_ID="it-sandbox-client-id",
+        UBER_EATS_SANDBOX_CLIENT_SECRET="it-sandbox-client-secret",
+        UBER_EATS_SANDBOX_WEBHOOK_SIGNING_KEY=SANDBOX_SIGNING_KEY,
+        UBER_EATS_SANDBOX_WEBHOOK_SECONDARY_SIGNING_KEY=SANDBOX_SECONDARY_KEY,
+    ):
+        yield
+
+
+async def _make_sandbox(tenant: dict) -> None:
+    async with get_session_factory()() as session:
+        conn = (await session.execute(select(DeliveryConnection).where(
+            DeliveryConnection.external_store_id == tenant["store_id"]))).scalar_one()
+        conn.environment = "sandbox"
+        await session.commit()
+
+
+def _key_signed(store_id: str, key: str, header: str = "x-uber-signature") -> tuple[bytes, dict]:
+    body = json.dumps({
+        "event_type": "orders.notification", "event_id": str(uuid.uuid4()), "event_time": 1729651095,
+        "meta": {"resource_id": str(uuid.uuid4()), "status": "pos", "user_id": store_id},
+    }).encode()
+    return body, {header: hmac.new(key.encode(), body, hashlib.sha256).hexdigest()}
+
+
+@pytest.mark.parametrize("key,header", [
+    (SANDBOX_SIGNING_KEY, "x-uber-signature"),
+    (SANDBOX_SECONDARY_KEY, "x-uber-signature-new"),
+])
+async def test_a_signing_key_signed_event_reaches_its_own_sandbox_tenant(
+    uber_tenant, sandbox_signing_keys, key, header,
+):
+    await _make_sandbox(uber_tenant)
+    pool = RecordingPool()
+    result = await _deliver(*_key_signed(uber_tenant["store_id"], key, header), pool)
+
+    assert result.error_category == "OK" and result.http_status == 200
+    assert [name for name, _ in pool.jobs] == ["process_delivery_order"]
+    assert await _count(DeliveryWebhookEvent, DeliveryWebhookEvent.business_id == uber_tenant["business"].id) == 1
+
+
+async def test_a_wrong_key_creates_nothing_and_queues_nothing(uber_tenant, sandbox_signing_keys):
+    await _make_sandbox(uber_tenant)
+    pool = RecordingPool()
+    result = await _deliver(*_key_signed(uber_tenant["store_id"], "not-our-key-" + "c" * 40), pool)
+
+    assert result.error_category == "BAD_SIGNATURE" and result.http_status == 200 and pool.jobs == []
+    assert await _count(DeliveryWebhookEvent, DeliveryWebhookEvent.business_id == uber_tenant["business"].id) == 0
+    assert await _count(DeliveryOrder, DeliveryOrder.business_id == uber_tenant["business"].id) == 0
+
+
+async def test_a_sandbox_signing_key_cannot_reach_a_production_tenant(uber_tenant, sandbox_signing_keys):
+    """uber_tenant stays a production connection: a sandbox key proves only the sandbox."""
+    pool = RecordingPool()
+    result = await _deliver(*_key_signed(uber_tenant["store_id"], SANDBOX_SIGNING_KEY), pool)
+
+    assert result.error_category == "ENV_MISMATCH" and pool.jobs == []
+    assert await _count(DeliveryOrder, DeliveryOrder.business_id == uber_tenant["business"].id) == 0
+
+
 # ── Retries, out-of-order delivery and the accept deadline (Uber, 2026-10-29) ─
 #
 # Uber Integration Tech Support: `event_time` is the time of that notification

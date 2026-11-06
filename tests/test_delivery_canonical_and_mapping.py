@@ -455,6 +455,116 @@ class TestWebhookEnvironmentIsProvenBySignature:
             assert adapter.verify_webhook_signature(body, {"x-uber-signature": sig}) is True
 
 
+class TestUberWebhookSigningKeys:
+    """
+    Dashboard "Basic HMAC" keys (Uber webhook-setup guide, read 2026-11-06):
+    X-Uber-Signature is keyed by the signing key, X-Uber-Signature-New by the
+    secondary key during a rotation, after which the new key moves into
+    X-Uber-Signature. The Eats guide's client secret is still accepted.
+    """
+
+    PRIMARY, SECONDARY = "p" * 64, "s" * 64
+    BODY = b'{"event_id":"e","event_type":"orders.notification"}'
+
+    def _settings(self, **overrides):
+        from backend.app.core.config import get_settings
+        values = {
+            "UBER_EATS_CLIENT_SECRET": "prod-secret",
+            "UBER_EATS_SANDBOX_CLIENT_SECRET": "sandbox-secret",
+            "UBER_EATS_SANDBOX_WEBHOOK_SIGNING_KEY": self.PRIMARY,
+            "UBER_EATS_SANDBOX_WEBHOOK_SECONDARY_SIGNING_KEY": self.SECONDARY,
+        }
+        values.update(overrides)
+        return patch.multiple(get_settings(), **values)
+
+    @staticmethod
+    def _sig(key, body):
+        return hmac.new(key.encode(), body, hashlib.sha256).hexdigest()
+
+    def _env(self, headers, body=None):
+        return UberEatsAdapter().verified_webhook_environment(self.BODY if body is None else body, headers)
+
+    def test_primary_key_in_the_primary_header(self):
+        with self._settings():
+            assert self._env({"x-uber-signature": self._sig(self.PRIMARY, self.BODY)}) == "sandbox"
+
+    def test_secondary_key_in_the_rotation_header(self):
+        with self._settings():
+            assert self._env({
+                "x-uber-signature": "0" * 64,
+                "x-uber-signature-new": self._sig(self.SECONDARY, self.BODY),
+            }) == "sandbox"
+
+    def test_secondary_key_after_rotation_moves_into_the_primary_header(self):
+        with self._settings():
+            assert self._env({"x-uber-signature": self._sig(self.SECONDARY, self.BODY)}) == "sandbox"
+
+    def test_client_secret_is_still_accepted(self):
+        with self._settings():
+            assert self._env({"x-uber-signature": self._sig("sandbox-secret", self.BODY)}) == "sandbox"
+
+    def test_header_names_are_matched_case_insensitively(self):
+        from starlette.datastructures import Headers
+        with self._settings():
+            headers = Headers({"X-Uber-Signature-New": self._sig(self.SECONDARY, self.BODY)})
+            assert self._env(headers) == "sandbox"
+
+    def test_uppercase_hex_digest_is_accepted(self):
+        with self._settings():
+            assert self._env({"x-uber-signature": self._sig(self.PRIMARY, self.BODY).upper()}) == "sandbox"
+
+    def test_wrong_key_is_refused(self):
+        with self._settings():
+            assert self._env({"x-uber-signature": self._sig("q" * 64, self.BODY)}) is None
+            assert self._env({"x-uber-signature-new": self._sig("q" * 64, self.BODY)}) is None
+
+    def test_tampered_body_is_refused(self):
+        with self._settings():
+            sig = self._sig(self.PRIMARY, self.BODY)
+            assert self._env({"x-uber-signature": sig}, body=self.BODY.replace(b'"e"', b'"f"')) is None
+            # A re-serialised (re-spaced) body is a different byte string.
+            assert self._env({"x-uber-signature": sig}, body=self.BODY.replace(b":", b": ")) is None
+
+    def test_missing_signature_is_refused(self):
+        with self._settings():
+            assert self._env({}) is None
+            assert self._env({"x-uber-signature": ""}) is None
+
+    @pytest.mark.parametrize("value", [
+        "sha256=" + "a" * 64,                 # prefixed, Meta-style
+        "a" * 63, "a" * 65,                   # wrong length
+        "g" * 64,                              # not hex
+        "é" * 64,                        # non-ASCII would make compare_digest raise
+        "abc, def",
+    ])
+    def test_malformed_header_is_refused_without_raising(self, value):
+        with self._settings():
+            assert self._env({"x-uber-signature": value, "x-uber-signature-new": value}) is None
+
+    def test_prefixed_header_is_refused_even_with_the_right_digest(self):
+        with self._settings():
+            assert self._env({"x-uber-signature": "sha256=" + self._sig(self.PRIMARY, self.BODY)}) is None
+
+    def test_unset_signing_keys_never_match_an_empty_key(self):
+        with self._settings(UBER_EATS_SANDBOX_WEBHOOK_SIGNING_KEY="",
+                            UBER_EATS_SANDBOX_WEBHOOK_SECONDARY_SIGNING_KEY="",
+                            UBER_EATS_SANDBOX_CLIENT_SECRET="", UBER_EATS_CLIENT_SECRET=""):
+            assert self._env({"x-uber-signature": self._sig("", self.BODY)}) is None
+
+    def test_sandbox_keys_never_prove_production(self):
+        with self._settings():
+            assert self._env({"x-uber-signature": self._sig(self.PRIMARY, self.BODY)}) == "sandbox"
+            assert self._env({"x-uber-signature": self._sig("prod-secret", self.BODY)}) == "production"
+
+    def test_log_names_the_key_label_never_its_value(self, caplog):
+        import logging
+        with self._settings(), caplog.at_level(logging.INFO, logger="backend.app.delivery.uber.environments"):
+            self._env({"x-uber-signature-new": self._sig(self.SECONDARY, self.BODY)})
+        text = caplog.text
+        assert "key=secondary_signing_key" in text and "header=x-uber-signature-new" in text
+        assert self.SECONDARY not in text and self.PRIMARY not in text
+
+
 class TestUberEpochTimestamps:
     """Uber (2026-10-29): epoch timestamps are UTC and may be seconds OR milliseconds."""
 
