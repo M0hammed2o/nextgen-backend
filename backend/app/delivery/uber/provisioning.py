@@ -114,8 +114,11 @@ async def activate_store(
     own id for the store — the business id). `pos_integration_enabled` is
     documented as deprecated and ignored, so it is never sent.
     """
+    # Uber's reference lists these fields under "Query Params" while its
+    # example sends a JSON body, so both carry the same two values.
     await client.activate_integration(
         http_client, token, store_id,
         body={"is_order_manager": True, "integrator_store_id": integrator_store_id},
+        params={"is_order_manager": "true", "integrator_store_id": integrator_store_id},
         api_base_url=get_environment_config(environment).api_base_url,
     )

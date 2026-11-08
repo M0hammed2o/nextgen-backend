@@ -192,6 +192,36 @@ class TestUberWebhookEnvelope:
     def test_non_dict_payload_returns_none(self):
         assert uber_mapping.parse_webhook_envelope(["not", "a", "dict"]) is None
 
+    def test_store_provisioned_uses_webhook_msg_uuid_as_its_id(self):
+        """Shape of the real sandbox `store.provisioned` received 2026-11-07 (ids replaced): no event_id, no meta."""
+        payload = {
+            "store_id": "0b6f2a3e-1d2c-4e5f-8a9b-7c6d5e4f3a21",
+            "event_type": "store.provisioned",
+            "webhook_meta": {
+                "client_id": "test-client",
+                "webhook_msg_uuid": "0372bae4-c3ca-4dae-b3ec-cc3282853828",
+                "webhook_config_id": "eats-pos-provision-platform.provisioning-update",
+                "webhook_msg_timestamp": 1794010099,
+            },
+            "resource_href": "https://api.uber.com/v1/eats/stores/0b6f2a3e-1d2c-4e5f-8a9b-7c6d5e4f3a21/pos_data",
+            "partner_store_id": "biz-1",
+            "perform_refresh_menu": False,
+        }
+        envelope = uber_mapping.parse_webhook_envelope(payload)
+        assert envelope.event_id == "0372bae4-c3ca-4dae-b3ec-cc3282853828"
+        assert envelope.event_type == "store.provisioned"
+        assert envelope.external_store_id == "0b6f2a3e-1d2c-4e5f-8a9b-7c6d5e4f3a21"
+        assert envelope.external_order_id is None, "a store event never becomes an order job"
+
+    def test_event_id_wins_over_webhook_msg_uuid(self):
+        envelope = uber_mapping.parse_webhook_envelope(
+            {"event_id": "evt-1", "webhook_meta": {"webhook_msg_uuid": "msg-1"}, "meta": {"user_id": "s"}})
+        assert envelope.event_id == "evt-1"
+
+    @pytest.mark.parametrize("webhook_meta", [{}, {"webhook_msg_uuid": ""}, "not-a-dict", None])
+    def test_no_usable_id_anywhere_returns_none(self, webhook_meta):
+        assert uber_mapping.parse_webhook_envelope({"store_id": "s", "webhook_meta": webhook_meta}) is None
+
     def test_resource_href_is_never_read_into_the_envelope(self):
         """SSRF hardening — nothing in WebhookEnvelope carries resource_href at all."""
         payload = {"event_id": "e", "meta": {}, "resource_href": "http://evil.internal/steal"}
@@ -422,6 +452,8 @@ class TestWebhookEnvironmentIsProvenBySignature:
         settings = get_settings()
         values = {
             "UBER_EATS_CLIENT_SECRET": "prod-secret", "UBER_EATS_SANDBOX_CLIENT_SECRET": "sandbox-secret",
+            # No dashboard keys: the client secret is then each environment's key.
+            "UBER_EATS_SANDBOX_WEBHOOK_SIGNING_KEY": "", "UBER_EATS_SANDBOX_WEBHOOK_SECONDARY_SIGNING_KEY": "",
         }
         values.update(overrides)
         return patch.multiple(settings, **values)
@@ -460,7 +492,9 @@ class TestUberWebhookSigningKeys:
     Dashboard "Basic HMAC" keys (Uber webhook-setup guide, read 2026-11-06):
     X-Uber-Signature is keyed by the signing key, X-Uber-Signature-New by the
     secondary key during a rotation, after which the new key moves into
-    X-Uber-Signature. The Eats guide's client secret is still accepted.
+    X-Uber-Signature. The first real Uber sandbox event (2026-11-07) was
+    signed with the signing key, so once dashboard keys are configured the
+    Eats guide's client secret is no longer accepted.
     """
 
     PRIMARY, SECONDARY = "p" * 64, "s" * 64
@@ -499,9 +533,33 @@ class TestUberWebhookSigningKeys:
         with self._settings():
             assert self._env({"x-uber-signature": self._sig(self.SECONDARY, self.BODY)}) == "sandbox"
 
-    def test_client_secret_is_still_accepted(self):
+    def test_client_secret_is_refused_once_signing_keys_are_configured(self):
         with self._settings():
+            assert self._env({"x-uber-signature": self._sig("sandbox-secret", self.BODY)}) is None
+            assert self._env({"x-uber-signature-new": self._sig("sandbox-secret", self.BODY)}) is None
+
+    def test_a_refused_client_secret_signature_is_logged_loudly(self, caplog):
+        import logging
+        with self._settings(), caplog.at_level(logging.INFO, logger="backend.app.delivery.uber.environments"):
+            assert self._env({"x-uber-signature": self._sig("sandbox-secret", self.BODY)}) is None
+            assert self._env({"x-uber-signature": self._sig("q" * 64, self.BODY)}) is None
+        warnings = [r for r in caplog.records if "SIGNED_WITH_CLIENT_SECRET_REFUSED" in r.getMessage()]
+        assert len(warnings) == 1 and "environment=sandbox" in warnings[0].getMessage()
+        assert "sandbox-secret" not in caplog.text
+
+    def test_client_secret_is_refused_with_only_a_secondary_key_configured(self):
+        with self._settings(UBER_EATS_SANDBOX_WEBHOOK_SIGNING_KEY=""):
+            assert self._env({"x-uber-signature": self._sig("sandbox-secret", self.BODY)}) is None
+            assert self._env({"x-uber-signature": self._sig(self.SECONDARY, self.BODY)}) == "sandbox"
+
+    def test_client_secret_is_the_fallback_without_signing_keys(self):
+        with self._settings(UBER_EATS_SANDBOX_WEBHOOK_SIGNING_KEY="",
+                            UBER_EATS_SANDBOX_WEBHOOK_SECONDARY_SIGNING_KEY=""):
             assert self._env({"x-uber-signature": self._sig("sandbox-secret", self.BODY)}) == "sandbox"
+
+    def test_production_without_signing_keys_still_uses_its_client_secret(self):
+        with self._settings():
+            assert self._env({"x-uber-signature": self._sig("prod-secret", self.BODY)}) == "production"
 
     def test_header_names_are_matched_case_insensitively(self):
         from starlette.datastructures import Headers
@@ -563,6 +621,18 @@ class TestUberWebhookSigningKeys:
         text = caplog.text
         assert "key=secondary_signing_key" in text and "header=x-uber-signature-new" in text
         assert self.SECONDARY not in text and self.PRIMARY not in text
+
+    def test_log_reports_each_presented_header_separately(self, caplog):
+        import logging
+        with self._settings(), caplog.at_level(logging.INFO, logger="backend.app.delivery.uber.environments"):
+            self._env({"x-uber-signature": self._sig(self.PRIMARY, self.BODY),
+                       "x-uber-signature-new": self._sig(self.SECONDARY, self.BODY)})
+            self._env({"x-uber-signature": self._sig(self.PRIMARY, self.BODY), "x-uber-signature-new": "0" * 64})
+        first, second = [r.getMessage() for r in caplog.records if "SIGNATURE_VERIFIED" in r.getMessage()]
+        assert "key=signing_key header=x-uber-signature " in first
+        assert "x-uber-signature=signing_key, x-uber-signature-new=secondary_signing_key" in first
+        assert "x-uber-signature-new=none" in second
+        assert self.SECONDARY not in caplog.text and self.PRIMARY not in caplog.text
 
 
 class TestUberEpochTimestamps:

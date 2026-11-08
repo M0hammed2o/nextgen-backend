@@ -93,12 +93,15 @@ def parse_webhook_envelope(payload: dict) -> WebhookEnvelope | None:
     read here (or anywhere else) — see module and `base.py` docstrings on
     the SSRF-closing rule.
 
-    Returns None if the payload doesn't even have an `event_id` — nothing
-    usable to log or act on.
+    Provisioning events (`store.provisioned`, observed from Uber's sandbox
+    2026-11-07) carry no `event_id`: their id is `webhook_meta.webhook_msg_uuid`.
+
+    Returns None if the payload has neither — nothing usable to log or act on.
     """
     if not isinstance(payload, dict):
         return None
-    event_id = payload.get("event_id")
+    webhook_meta = payload.get("webhook_meta") if isinstance(payload.get("webhook_meta"), dict) else {}
+    event_id = payload.get("event_id") or webhook_meta.get("webhook_msg_uuid")
     if not event_id:
         return None
     meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}

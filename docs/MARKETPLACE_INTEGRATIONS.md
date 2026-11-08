@@ -20,7 +20,7 @@ from Uber's developer docs (developer.uber.com/docs/eats) as read on 2026-10-26.
 
 ## 2. How an Uber Eats order flows
 
-1. Uber sends a webhook to `POST /v1/webhook/delivery/UBER_EATS`. The signature (`X-Uber-Signature`, and `X-Uber-Signature-New` during a key rotation; each a lowercase hex HMAC-SHA256 of the exact raw body) is checked against every configured key of the production app, then of the sandbox app: the dashboard's "Basic HMAC" signing keys first, then the client secret, which the Eats guide still documents. Malformed headers are refused before comparison. Whichever key matches **proves the environment**, and the backend logs that key's label (`UBER_WEBHOOK_SIGNATURE_VERIFIED ... key=signing_key`), never its value. The `X-Environment` header is only logged. Uber's docs disagree on which key signs Eats webhooks, so the first real Uber event's log line settles it.
+1. Uber sends a webhook to `POST /v1/webhook/delivery/UBER_EATS`. The signature (`X-Uber-Signature`, and `X-Uber-Signature-New` during a key rotation; each a lowercase hex HMAC-SHA256 of the exact raw body) is checked against the keys of the production app, then of the sandbox app. An environment with dashboard "Basic HMAC" signing keys accepts **only** those keys, in either header. The client secret, which the Eats guide still documents, is used only by an environment that has no signing keys; today that is production, until its signing-key settings exist. This was settled by the first real Uber event (2026-11-07, `store.provisioned`): it was signed with the dashboard signing key in `X-Uber-Signature`. If a refused event would have matched the client secret, the backend logs `UBER_WEBHOOK_SIGNED_WITH_CLIENT_SECRET_REFUSED` (still refused), so a wrong call shows up instead of orders being lost silently. Malformed headers are refused before comparison. The matching key **proves the environment**. The backend logs the key's label and, for every header present, which key verified it (`UBER_WEBHOOK_SIGNATURE_VERIFIED ... key=signing_key header=x-uber-signature headers={x-uber-signature=signing_key, x-uber-signature-new=none}`), never a value. The `X-Environment` header is only logged.
 2. The tenant is resolved only from `(provider, store id) → delivery_connections`. Nothing else in the webhook can choose a business.
 3. The worker fetches the order and checks four gates in turn: environment matches, tenant active, entitlement on, connection may take orders. A known store that fails any gate gets an **active deny**, never silence.
 4. Items and modifiers are resolved against `external_product_mappings`, keyed by Uber's entity id. That includes add-ons, sizes/options and removed ingredients. Exact-name matches are automatic; nothing fuzzier is.
@@ -135,6 +135,24 @@ Verified 2026-10-29: `GET /v1/eats/stores` (List All Stores) with the sandbox cl
 
 Re-verified 2026-11-06, after the Testing app's webhook was configured with Basic HMAC keys: List All Stores still returns HTTP 200 and **0 stores**, and both stores still return **401**. Configuring the webhook does not activate a store; the merchant consent below does.
 
+**Investigated 2026-11-07, after Uber Integration Tech Support replied** that the test stores "are not integrated with your application", that the Single Webhook URL was missing from the test client id, and that the store must be integrated "from your end using Integration Configuration API":
+- The test client id in Uber's email is exactly `UBER_EATS_SANDBOX_CLIENT_ID` (compared, not printed).
+- "Integration Configuration API" is the `/v1/eats/stores/{store_id}/pos_data` family. **POST** (Activate Integration) needs a **merchant user** token with `eats.pos_provisioning`. **GET** (integration details) and **PATCH** need `eats.store`. **DELETE** removes the integration. The app's `client_credentials` grant is refused `invalid_scope` for `eats.pos_provisioning`, so the merchant consent cannot be skipped.
+- Both store ids **exist** in the sandbox. With the app token they answer 401, and `GET .../pos_data` answers **403 `user_not_allowed`**. Random UUIDs answer 404 (store) and 500 (`pos_data`).
+- The first consent run on 2026-11-07 exchanged a merchant code successfully, but that login could see **0 stores**, so nothing was activated. Most likely an already-signed-in developer account approved instead of the test merchant.
+- Uber's POST reference lists the fields under "Query Params" while its example sends a JSON body, so the tool now sends `is_order_manager` and `integrator_store_id` in both. After activating, it reads `GET .../pos_data` back with the app token: `integration_enabled`, `is_order_manager_pending`, and whether `order_manager_client_id` is this app.
+
+**Test Restaurant 1 ACTIVATED 2026-11-07 02:08 SAST** (real Uber, sandbox), via `scripts/uber_activate_store.py` with the store's own test-merchant login:
+- the merchant login saw 1 store, and `POST pos_data` was accepted;
+- `GET pos_data` returned `integration_enabled=true` with this app as order manager, and `integrator_store_id` = the business id;
+- List All Stores now returns that 1 store; store, status and menu return 200 (menu: Uber's default 1 item); store status ONLINE.
+- Earlier failed runs were consents given by a browser already signed in to a different Uber account. Sign out of Uber (sandbox-login/auth) before each store.
+
+**First real Uber webhook, `store.provisioned`, 2026-11-07 00:08 UTC:**
+- Uber signed it with the dashboard **primary signing key** in `X-Uber-Signature`. `X-Uber-Signature-New` was present too; there was no `Authorization` header. So the dashboard's "Basic" type is HMAC over the body with the signing key.
+- Its envelope has no `event_id`: the id is `webhook_meta.webhook_msg_uuid`, with a top-level `store_id` and `partner_store_id`. It was acked 200 but logged `UNPARSEABLE_PAYLOAD`.
+- The parser now falls back to `webhook_msg_uuid`. A replay of the exact stored body was then accepted, filed under Test Restaurant 1, queued nothing, and its redelivery was recognised as a duplicate.
+
 Also verified 2026-10-29:
 - With the app's own token, both test stores' status and menu endpoints return **HTTP 401**, which is what an un-activated store returns.
 - The sandbox **authorize** step lives on the same host as the token endpoint: `https://sandbox-login.uber.com/oauth/v2/authorize` redirects to Uber's login page. `sandbox-auth.uber.com` does not resolve, and production `auth.uber.com` rejects the sandbox client as `invalid_client`.
@@ -152,12 +170,21 @@ What it does, in order:
 3. Accepts only a redirect whose `state` matches this run.
 4. Exchanges the code for a merchant token, held in memory only.
 5. Refuses unless that merchant can see the mapped store.
-6. Calls `pos_data` with `is_order_manager: true` and `integrator_store_id: <business id>`.
-7. Re-reads the store with the app's own cached token, and audits success or failure, including who ran it.
+6. Calls `POST .../pos_data` with `is_order_manager: true` and `integrator_store_id: <business id>`, in both the query string and the JSON body.
+7. Reads Uber's integration record (`GET .../pos_data`) and the store's status back with the app's own cached token, and audits success or failure, including who ran it.
 
 Register the redirect URI on the Uber app under Auth → Redirect URIs first, exactly as passed. If the redirect URI is an https tunnel, point it at `--listen-port`.
 
 **Production stores** must not use this tool: it would put production secrets on a workstation. They need a server-side SUPER_ADMIN activation flow, which is not built yet.
+
+**2026-11-08: status, and what Uber's docs say (read 2026-11-08; quoted URLs in the worklog).**
+- **Both test stores activated.** TR1 on 2026-11-07 at 02:08 SAST; TR2 on 2026-11-07 at about 15:03 SAST, after Uber support reset its merchant password. `GET pos_data` for both: `integration_enabled=true`, order manager = this app, `integrator_store_id` = the NextGen business. Status ONLINE.
+- **Menus mapped.** Each store's menu is Uber's default single item, `external_item_1` "Best Burger", R1.00. Each is MAPPED to its own tenant's NextGen item and its own connection.
+- **Webhook URL: Developer Dashboard only.** Uber documents no API to set or change the Primary Webhook URL. The Eats webhooks guide says it is set in the dashboard, one per application. `GET pos_data` has a `webhooks_config` block, but it holds only on/off flags (`schedule_order_webhooks`, `order_release_webhooks`, `delivery_status_webhooks`), not a URL.
+- **Test orders: no API.** Uber documents no Eats Marketplace API for creating test orders. The method is to sign in to Uber Eats with a test/developer eater account, set the delivery address to the test store's address, and order from the store's WebEats link. Whether a payment method is needed is unclear: the sentence is garbled ("you do need to enter any payment information"). Treat any checkout that asks for a real card as needing the owner's approval.
+- **Retries:** Uber retries on 500/502/503/504, timeouts and network errors, after 10 s, 30 s, 60 s, 120 s and so on, up to 7 sends. A gate failure is acknowledged with 200, so it is not retried, by design.
+- **Accept window:** an order must be accepted or denied within 11.5 minutes. The watchdog denies overdue ones.
+- **Public edge (local sandbox):** a Cloudflare *quick* tunnel. On this workstation only `--protocol http2 --edge-ip-version 4` is reliable; QUIC and IPv6 dropped. Quick tunnels expire and change URL, and the 2026-11-07 tunnel was gone by the next morning ("Tunnel not found"). A named tunnel would give a stable URL, but it needs a Cloudflare account login and a DNS zone. None is configured here, and the production domain must not be used. A watchdog restarts the quick tunnel when its health check fails and records the current URL, but the dashboard must still be updated after every restart.
 
 1. In the Uber developer dashboard, on the TEST app, set the Primary Webhook URL to the sandbox host's URL from §4.0, only after its HTTPS pre-flight passes.
 2. Create two dedicated test businesses in the **sandbox** deployment, one per test store, e.g. "NextGen Uber Sandbox A" and "NextGen Uber Sandbox B". Never use a real restaurant's tenant, and never the Smokin Joes demo tenant.

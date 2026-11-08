@@ -70,11 +70,12 @@ async def _get(http_client: httpx.AsyncClient, url: str, token: str) -> dict:
 
 async def _post(
     http_client: httpx.AsyncClient, url: str, token: str, json_body: dict,
-    *, expect_status: tuple[int, ...] = (204,),
+    *, expect_status: tuple[int, ...] = (204,), params: dict | None = None,
 ) -> None:
+    extra = {"params": params} if params else {}
     try:
         response = await http_client.post(
-            url, headers=_headers(token), json=json_body, timeout=_DEFAULT_TIMEOUT_SECONDS
+            url, headers=_headers(token), json=json_body, timeout=_DEFAULT_TIMEOUT_SECONDS, **extra
         )
     except httpx.TimeoutException as exc:
         raise DeliveryProviderTimeout(f"UBER_EATS POST {url} timed out") from exc
@@ -228,6 +229,7 @@ async def list_stores(
 
 async def activate_integration(
     http_client: httpx.AsyncClient, token: str, store_id: str, *, body: dict, api_base_url: str,
+    params: dict | None = None,
 ) -> None:
     """
     Activate Integration (`POST /v1/eats/stores/{store_id}/pos_data`). Uber's
@@ -236,5 +238,18 @@ async def activate_integration(
     store_id = _validated_order_id(store_id)
     await _post(
         http_client, f"{api_base_url}/v1/eats/stores/{store_id}/pos_data", token, body,
-        expect_status=(200, 201, 202, 204),
+        expect_status=(200, 201, 202, 204), params=params,
     )
+
+
+async def get_integration_details(
+    http_client: httpx.AsyncClient, token: str, store_id: str, *, api_base_url: str,
+) -> dict:
+    """
+    Get Integration Details (`GET /v1/eats/stores/{store_id}/pos_data`, scope
+    `eats.store`) — READ ONLY. Uber's own record of whether this app is
+    integrated with the store (`integration_enabled`) and who its order
+    manager is (`order_manager_client_id`). 403 until the store is activated.
+    """
+    store_id = _validated_order_id(store_id)
+    return await _get(http_client, f"{api_base_url}/v1/eats/stores/{store_id}/pos_data", token)

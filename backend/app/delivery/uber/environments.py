@@ -20,10 +20,13 @@ setting issues dedicated signing keys, and Uber's webhook-setup guide
 (developer.uber.com/docs/third-party-rides-demand-v1/guides/webhook-setup,
 read 2026-11-06) says `X-Uber-Signature` is keyed by the signing key and
 `X-Uber-Signature-New` by the optional secondary key during a rotation, after
-which the new key moves into `X-Uber-Signature`. So every configured key of
-an environment is tried against both headers, and the label of the key that
-matched (never its value) is logged: the first real Uber event shows which
-one Uber actually uses.
+which the new key moves into `X-Uber-Signature`. The first real Uber sandbox
+event (2026-11-07) settled it: signed with the dashboard signing key in
+`X-Uber-Signature`. So an environment's dashboard keys, when configured, are
+the only keys accepted (both headers are tried); the client secret is only a
+fallback for an environment without them (production, until its signing-key
+settings exist). The label of the key that matched (never its value) is
+logged.
 """
 
 from __future__ import annotations
@@ -111,10 +114,20 @@ def match_webhook_environment(
     Return the environment one of whose keys verifies a presented signature
     (lowercase hex HMAC-SHA256 of the exact raw body), or None if none does.
 
-    Candidates per environment: its dashboard signing keys, then its client
-    secret (the key the Eats guide documents). Each is tried against
-    `X-Uber-Signature` and `X-Uber-Signature-New`. Production is tried
-    first. Malformed or missing headers never match. Constant-time comparison.
+    Candidates per environment: its dashboard signing keys when any are
+    configured, otherwise its client secret (the key the Eats guide
+    documents). The first authentic Uber sandbox event (2026-11-07,
+    `store.provisioned`) was signed with the dashboard signing key, so once an
+    environment has signing keys its client secret is no longer accepted —
+    one fewer key that can forge a webhook. Production has no signing-key
+    settings yet and keeps the client secret until it does.
+
+    Each candidate is tried against `X-Uber-Signature` and
+    `X-Uber-Signature-New`. Production is tried first. Malformed or missing
+    headers never match. Constant-time comparison. On success the log names,
+    for every presented header, the label of the key that verified it (or
+    `none`) — never a value — so a real event also shows how Uber uses the
+    rotation header.
     """
     presented = [
         (name, value)
@@ -126,15 +139,34 @@ def match_webhook_environment(
     for env in ENVIRONMENTS:
         config = get_environment_config(env)
         candidates = list(config.webhook_signing_keys)
-        if config.client_secret:
+        if not candidates and config.client_secret:
             candidates.append(("client_secret", config.client_secret))
-        for label, key in candidates:
-            expected = hmac.new(key.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
-            for header, value in presented:
-                if hmac.compare_digest(expected, value):
-                    logger.info(
-                        "UBER_WEBHOOK_SIGNATURE_VERIFIED: environment=%s key=%s header=%s",
-                        env, label, header,
-                    )
-                    return env
+        expected = [
+            (label, hmac.new(key.encode("utf-8"), raw_body, hashlib.sha256).hexdigest())
+            for label, key in candidates
+        ]
+        matched = {
+            header: next((label for label, digest in expected if hmac.compare_digest(digest, value)), None)
+            for header, value in presented
+        }
+        if any(matched.values()):
+            header, label = next((h, k) for h, k in matched.items() if k)
+            logger.info(
+                "UBER_WEBHOOK_SIGNATURE_VERIFIED: environment=%s key=%s header=%s headers={%s}",
+                env, label, header, ", ".join(f"{h}={k or 'none'}" for h, k in matched.items()),
+            )
+            return env
+    # Refused. If Uber turns out to sign some events with the client secret
+    # after all (the Eats guide says it does), say so loudly instead of
+    # dropping them silently — still refused, never accepted.
+    for env in ENVIRONMENTS:
+        config = get_environment_config(env)
+        if config.webhook_signing_keys and config.client_secret:
+            digest = hmac.new(config.client_secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+            if any(hmac.compare_digest(digest, value) for _, value in presented):
+                logger.warning(
+                    "UBER_WEBHOOK_SIGNED_WITH_CLIENT_SECRET_REFUSED: environment=%s — this event is signed "
+                    "with the client secret, which is not accepted while dashboard signing keys are configured",
+                    env,
+                )
     return None

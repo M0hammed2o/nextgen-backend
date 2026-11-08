@@ -18,7 +18,9 @@ Runs with the sandbox deployment's environment variables loaded. It:
   4. refuses unless that merchant can see the mapped store;
   5. POST /v1/eats/stores/{store_id}/pos_data — is_order_manager=true,
      integrator_store_id=<business id>;
-  6. re-reads the store's status with the app's own (cached) client_credentials
+  6. reads Uber's own integration record back (GET .../pos_data: integration_enabled,
+     whether this app is the order manager), then re-reads the store's status with
+     the app's own (cached) client_credentials
      token — 401 before activation — and audits the outcome, success or failure.
 
 The redirect URI must be registered on the Uber app (Developer Dashboard →
@@ -154,12 +156,21 @@ async def _activate(connection: DeliveryConnection, code: str, redirect_uri: str
         del token
         print(f"Activate Integration: accepted by Uber for store {_mask(store_id)} (is_order_manager=true).")
 
+        env = get_environment_config(SANDBOX)
         redis = await get_redis()
         app_token = await auth.get_operational_token(redis, http, SANDBOX)
         try:
-            status = await client.get_store_status(
-                http, app_token, store_id, api_base_url=get_environment_config(SANDBOX).api_base_url,
-            )
+            details = await client.get_integration_details(http, app_token, store_id, api_base_url=env.api_base_url)
+            manager = details.get("order_manager_client_id")
+            print("Uber's integration record (GET pos_data): "
+                  f"integration_enabled={details.get('integration_enabled')!r}, "
+                  f"is_order_manager_pending={details.get('is_order_manager_pending')!r}, "
+                  f"order manager is this app={bool(manager) and hmac.compare_digest(str(manager), env.client_id)}, "
+                  f"integrator_store_id matches={details.get('integrator_store_id') == str(connection.business_id)}")
+        except (DeliveryProviderError, DeliveryProviderTimeout) as exc:
+            print(f"Uber's integration record (GET pos_data) not readable yet: HTTP {getattr(exc, 'status_code', None)}")
+        try:
+            status = await client.get_store_status(http, app_token, store_id, api_base_url=env.api_base_url)
             print(f"Store status with the app's own token: HTTP 200, status={status.get('status')!r}")
         except (DeliveryProviderError, DeliveryProviderTimeout) as exc:
             print(f"Store status with the app's own token still fails: HTTP {getattr(exc, 'status_code', None)} "

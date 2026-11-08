@@ -605,6 +605,31 @@ async def test_a_wrong_key_creates_nothing_and_queues_nothing(uber_tenant, sandb
     assert await _count(DeliveryOrder, DeliveryOrder.business_id == uber_tenant["business"].id) == 0
 
 
+async def test_store_provisioned_is_logged_for_its_tenant_and_queues_nothing(uber_tenant, sandbox_signing_keys):
+    """The real sandbox `store.provisioned` shape (2026-11-07): id in webhook_meta, top-level store_id."""
+    await _make_sandbox(uber_tenant)
+    msg_uuid = str(uuid.uuid4())
+    body = json.dumps({
+        "store_id": uber_tenant["store_id"], "event_type": "store.provisioned",
+        "webhook_meta": {"client_id": "it-sandbox-client-id", "webhook_msg_uuid": msg_uuid,
+                         "webhook_config_id": "eats-pos-provision-platform.provisioning-update",
+                         "webhook_msg_timestamp": 1794010099},
+        "resource_href": f"https://api.uber.com/v1/eats/stores/{uber_tenant['store_id']}/pos_data",
+        "partner_store_id": str(uber_tenant["business"].id), "perform_refresh_menu": False,
+    }).encode()
+    headers = {"x-uber-signature": hmac.new(SANDBOX_SIGNING_KEY.encode(), body, hashlib.sha256).hexdigest()}
+    pool = RecordingPool()
+
+    first = await _deliver(body, headers, pool)
+    again = await _deliver(body, headers, pool)
+
+    assert first.error_category == "OK" and first.http_status == 200 and first.business_id == uber_tenant["business"].id
+    assert again.detail == "duplicate_event", "a redelivery of the same webhook_msg_uuid is recognised"
+    assert pool.jobs == [], "a store event never queues an order job"
+    assert await _count(DeliveryWebhookEvent, DeliveryWebhookEvent.business_id == uber_tenant["business"].id) == 1
+    assert await _count(DeliveryOrder, DeliveryOrder.business_id == uber_tenant["business"].id) == 0
+
+
 async def test_a_sandbox_signing_key_cannot_reach_a_production_tenant(uber_tenant, sandbox_signing_keys):
     """uber_tenant stays a production connection: a sandbox key proves only the sandbox."""
     pool = RecordingPool()

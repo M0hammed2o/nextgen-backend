@@ -132,8 +132,40 @@ async def test_activation_sends_only_documented_fields_to_pos_data():
     assert len(seen) == 1, "an unsafe store id never reaches the network"
     request = seen[0]
     assert request.method == "POST"
-    assert str(request.url) == "https://test-api.uber.com/v1/eats/stores/0b6f2a3e-1d2c-4e5f-8a9b-7c6d5e4f3a21/pos_data"
+    assert (request.url.host, request.url.path) == (
+        "test-api.uber.com", "/v1/eats/stores/0b6f2a3e-1d2c-4e5f-8a9b-7c6d5e4f3a21/pos_data")
     assert json.loads(request.content) == {"is_order_manager": True, "integrator_store_id": "biz-1"}
+    # Uber's reference lists the fields as query params; its example sends a body. Both carry them.
+    assert dict(request.url.params) == {"is_order_manager": "true", "integrator_store_id": "biz-1"}
+
+
+async def test_integration_details_is_a_read_only_get_of_pos_data():
+    from backend.app.delivery.uber import client
+    seen = []
+    record = {"store_id": "s", "integration_enabled": True, "order_manager_client_id": "abc"}
+
+    def handler(request: httpx.Request):
+        seen.append(request)
+        return httpx.Response(200, json=record)
+
+    async with _client(handler) as http:
+        details = await client.get_integration_details(
+            http, "app-token", "0b6f2a3e-1d2c-4e5f-8a9b-7c6d5e4f3a21", api_base_url="https://test-api.uber.com")
+        with pytest.raises(DeliveryProviderError):
+            await client.get_integration_details(http, "app-token", "../evil", api_base_url="https://test-api.uber.com")
+    assert details == record
+    assert len(seen) == 1, "an unsafe store id never reaches the network"
+    assert seen[0].method == "GET"
+    assert str(seen[0].url) == "https://test-api.uber.com/v1/eats/stores/0b6f2a3e-1d2c-4e5f-8a9b-7c6d5e4f3a21/pos_data"
+    assert seen[0].headers["authorization"] == "Bearer app-token"
+
+
+async def test_integration_details_before_activation_raises_with_ubers_403():
+    from backend.app.delivery.uber import client
+    async with _client(lambda r: httpx.Response(403, json={"code": "user_not_allowed"})) as http:
+        with pytest.raises(DeliveryProviderError) as raised:
+            await client.get_integration_details(http, "t", "store-1", api_base_url="https://test-api.uber.com")
+    assert raised.value.status_code == 403
 
 
 async def test_activation_rejected_by_uber_raises_with_the_status():
@@ -194,3 +226,52 @@ def test_listener_gives_up_on_a_real_clock_deadline_even_with_an_idle_connection
     finally:
         idle.close()
     assert result == {}
+
+
+async def test_activation_tool_reads_ubers_integration_record_back(capsys):
+    """After POST pos_data the tool reads GET pos_data with the app token and reports it without printing ids."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    tool = _load_tool()
+    business_id = "c7c244dd-d4f0-49e5-85fc-52b8dd16575c"
+    connection = SimpleNamespace(external_store_id="0b6f2a3e-1d2c-4e5f-8a9b-7c6d5e4f3a21", business_id=business_id)
+    env = SimpleNamespace(api_base_url="https://test-api.uber.com", client_id="sandbox-client-id-value")
+    record = {"integration_enabled": True, "is_order_manager_pending": False,
+              "order_manager_client_id": "sandbox-client-id-value", "integrator_store_id": business_id}
+    with patch.object(tool.provisioning, "exchange_authorization_code", AsyncMock(return_value="merchant-token")), \
+            patch.object(tool.provisioning, "list_merchant_store_ids", AsyncMock(return_value=[connection.external_store_id])), \
+            patch.object(tool.provisioning, "activate_store", AsyncMock()) as activate, \
+            patch.object(tool, "get_redis", AsyncMock()), \
+            patch.object(tool.auth, "get_operational_token", AsyncMock(return_value="app-token")), \
+            patch.object(tool, "get_environment_config", return_value=env), \
+            patch.object(tool.client, "get_integration_details", AsyncMock(return_value=record)) as details, \
+            patch.object(tool.client, "get_store_status", AsyncMock(return_value={"status": "ONLINE"})):
+        await tool._activate(connection, "code", "https://example.test/cb")
+    out = capsys.readouterr().out
+    activate.assert_awaited_once()
+    assert details.await_args.args[1:3] == ("app-token", connection.external_store_id)
+    assert "integration_enabled=True" in out
+    assert "order manager is this app=True" in out
+    assert "integrator_store_id matches=True" in out
+    assert "sandbox-client-id-value" not in out and "merchant-token" not in out and "app-token" not in out
+
+
+async def test_activation_tool_reports_a_403_integration_record_without_failing(capsys):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    tool = _load_tool()
+    connection = SimpleNamespace(external_store_id="0b6f2a3e-1d2c-4e5f-8a9b-7c6d5e4f3a21", business_id="biz")
+    env = SimpleNamespace(api_base_url="https://test-api.uber.com", client_id="cid")
+    with patch.object(tool.provisioning, "exchange_authorization_code", AsyncMock(return_value="m")), \
+            patch.object(tool.provisioning, "list_merchant_store_ids", AsyncMock(return_value=[connection.external_store_id])), \
+            patch.object(tool.provisioning, "activate_store", AsyncMock()), \
+            patch.object(tool, "get_redis", AsyncMock()), \
+            patch.object(tool.auth, "get_operational_token", AsyncMock(return_value="a")), \
+            patch.object(tool, "get_environment_config", return_value=env), \
+            patch.object(tool.client, "get_integration_details",
+                         AsyncMock(side_effect=DeliveryProviderError("UBER_EATS", "x", status_code=403))), \
+            patch.object(tool.client, "get_store_status",
+                         AsyncMock(side_effect=DeliveryProviderError("UBER_EATS", "x", status_code=401))):
+        await tool._activate(connection, "code", "https://example.test/cb")
+    out = capsys.readouterr().out
+    assert "not readable yet: HTTP 403" in out and "still fails: HTTP 401" in out
