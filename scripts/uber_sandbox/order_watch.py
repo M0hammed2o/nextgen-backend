@@ -5,8 +5,8 @@ Uber sandbox order monitor (local sandbox only). Run from the backend worktree r
   python order_watch.py trace <uber order id | delivery order id>     PASS/FAIL report of the whole chain
 
 --drive acts as each test restaurant's staff through the normal /auth/login and the same endpoints the staff
-app uses: accept (READY_TO_ACCEPT), then the kitchen ticket IN_PROGRESS -> READY (pushes "ready" to Uber) ->
-COLLECTED. Never prints a credential, token, signature or key.
+app uses: accept (READY_TO_ACCEPT), then the kitchen ticket IN_PROGRESS -> READY (pushes "ready" to Uber). It
+stops there: Uber has no restaurant-side "collected" call, its courier picks the order up. Never prints a credential, token, signature or key.
 """
 import asyncio
 import glob
@@ -111,7 +111,9 @@ async def watch(drive: bool) -> None:
                 tenant = TENANTS[str(r["business_id"])]
                 say(f"KDS    {tenant} {'NEW ticket' if new else 'ticket'} #{r['order_number']} uber={r['external_order_id']} -> {r['status']}")
                 if drive and r["external_order_id"]:
-                    nxt = {"ACCEPTED": "IN_PROGRESS", "IN_PROGRESS": "READY", "READY": "COLLECTED"}.get(r["status"])
+                    # Stops at READY: Uber has no restaurant-side "collected" call (its courier
+                    # picks up), so COLLECTED is never set on Uber's behalf.
+                    nxt = {"ACCEPTED": "IN_PROGRESS", "IN_PROGRESS": "READY"}.get(r["status"])
                     if nxt:
                         await asyncio.sleep(3)
                         resp = await staff.call(str(r["business_id"]), "POST", f"/business/orders/{r['id']}/status", json={"status": nxt})

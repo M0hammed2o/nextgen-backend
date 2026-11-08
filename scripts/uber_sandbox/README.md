@@ -15,7 +15,8 @@ Run each command from the backend worktree root. `SB` is this folder, or a copy 
 | `lt_watchdog.sh` | **Stable public URL**: `https://nextgen-uber-sbx-q7k3.loca.lt` via localtunnel. It always re-requests the same subdomain, restarts on exit or after 3 failed health checks, and logs an ALERT if the subdomain isn't granted. |
 | `tunnel_watchdog.sh` | Fallback: a Cloudflare quick tunnel (`--protocol http2 --edge-ip-version 4`). Its URL changes on every restart and is written to `current_tunnel_url.txt`. |
 | `public_webhook_proof.py <public url>` | Sends HMAC-signed store events (real sandbox keys, computed in-process) through the public URL, and reads every verdict from the database: tenant routing, the rotation header, replay, a bad signature, a tampered body, a client-secret signature. Store events queue no job and never call Uber. |
-| `order_watch.py watch [--drive]` | Live monitor: one line per step (edge → intake → delivery order → kitchen ticket → stock → logs). `--drive` acts as restaurant staff through the normal login: accept, then IN_PROGRESS → READY (pushes "ready" to Uber) → COLLECTED. |
+| `order_watch.py watch [--drive]` | Live monitor: one line per step (edge → intake → delivery order → kitchen ticket → stock → logs). `--drive` acts as restaurant staff through the normal login: accept, then IN_PROGRESS → READY (pushes "ready" to Uber). It stops at READY: Uber has no restaurant-side "collected" call. |
+| `preflight.py` | Read-only checks before a test order: Uber store ONLINE, NextGen app is order manager, Best Burger on Uber's menu and mapped to the tenant's own item, connection row, recipe and starting patty stock, kitchen/delivery endpoints through the owner login. |
 | `order_watch.py trace <uber order id>` | PASS/FAIL report for one order: capture, signature, tenant, created once, kitchen ticket, accepted, Uber's own state (read-only `GET /v2/eats/order`), stock deducted exactly once. |
 | `owner_api.py import\|get\|post` | Calls the manager API as a test tenant's owner through the normal login. `BID=<business id>` selects the tenant. |
 | `setup_inventory.py` | Gives each tenant's "Best Burger" a recipe (1 × Burger patty) and 20 in opening stock, idempotently. |
@@ -25,6 +26,7 @@ Run each command from the backend worktree root. `SB` is this folder, or a copy 
 ## When a test order is placed
 
 ```
+python "$SB/preflight.py"
 python "$SB/order_watch.py" watch --drive      # start BEFORE the order; Uber allows 11.5 min to accept
 python "$SB/order_watch.py" trace <uber order id>
 ```
