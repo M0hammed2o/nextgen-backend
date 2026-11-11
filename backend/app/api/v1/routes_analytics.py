@@ -41,6 +41,8 @@ from backend.app.analytics.revenue import (
     voided_cents_expr,
     voided_count_expr,
 )
+from backend.app.analytics import sales_wallets
+from backend.app.core.errors import AppError
 from backend.app.core.rbac import AuthUser, require_owner_or_manager
 from backend.app.db.session import get_db
 from shared.models.analytics import DailyUsage
@@ -593,3 +595,53 @@ async def get_payment_method_breakdown(
         total_refunds_cents=sum(m.refunds_cents for m in methods),
         total_net_cents=sum(m.net_cents for m in methods),
     )
+
+
+# ── Sales Wallets ────────────────────────────────────────────────────────────
+# Sales per channel group (Mr D, Uber Eats, General) and their total. These are
+# reporting views, not stored money; see backend/app/analytics/sales_wallets.py.
+# Same Advanced Analytics gate as the /channels report they extend.
+
+_RANGE_PATTERN = r"^(today|yesterday|7d|month|custom)$"
+
+
+@router.get("/sales-wallets")
+async def get_sales_wallets(
+    range_: str = Query(default="today", alias="range", pattern=_RANGE_PATTERN),
+    start: date | None = Query(default=None),
+    end: date | None = Query(default=None),
+    user: AuthUser = Depends(require_owner_or_manager),
+    db: AsyncSession = Depends(get_db),
+):
+    business = await require_advanced_analytics_enabled(db, user.business_id)
+    rng = sales_wallets.resolve_range(range_, start, end, business.timezone or "Africa/Johannesburg")
+    wallets, total = await sales_wallets.wallet_totals(db, user.business_id, rng)
+    return {
+        "range": rng.range, "start_date": rng.start_date.isoformat(), "end_date": rng.end_date.isoformat(),
+        "timezone": rng.timezone, "currency": business.currency, "wallets": wallets, "total": total,
+    }
+
+
+@router.get("/sales-wallets/{wallet}/orders")
+async def get_sales_wallet_orders(
+    wallet: str,
+    range_: str = Query(default="today", alias="range", pattern=_RANGE_PATTERN),
+    start: date | None = Query(default=None),
+    end: date | None = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=25, ge=1, le=100),
+    user: AuthUser = Depends(require_owner_or_manager),
+    db: AsyncSession = Depends(get_db),
+):
+    if wallet not in (*sales_wallets.WALLET_KEYS, sales_wallets.TOTAL):
+        raise AppError("UNKNOWN_WALLET", f"Unknown wallet {wallet!r}.", 404)
+    business = await require_advanced_analytics_enabled(db, user.business_id)
+    rng = sales_wallets.resolve_range(range_, start, end, business.timezone or "Africa/Johannesburg")
+    wallets, total = await sales_wallets.wallet_totals(db, user.business_id, rng)
+    summary = total if wallet == sales_wallets.TOTAL else next(w for w in wallets if w["key"] == wallet)
+    detail = await sales_wallets.wallet_orders(db, user.business_id, rng, wallet, page=page, page_size=page_size)
+    return {
+        "wallet": wallet, "label": sales_wallets.WALLET_LABELS[wallet],
+        "start_date": rng.start_date.isoformat(), "end_date": rng.end_date.isoformat(),
+        "timezone": rng.timezone, "currency": business.currency, "summary": summary, **detail,
+    }
