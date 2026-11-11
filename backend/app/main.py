@@ -188,6 +188,17 @@ def _validate_production_secrets() -> None:
             "UBER_EATS_SANDBOX_ONLY_DEPLOYMENT: no production Uber app configured — "
             "production Uber webhooks cannot be verified on this deployment."
         )
+    if _uber_requires_production and not settings.UBER_EATS_WEBHOOK_SIGNING_KEY:
+        # BUG-0190: not fatal, because Uber has not confirmed which key
+        # production signs with, and setting a signing key turns the
+        # client-secret fallback off. The sandbox was signed with the
+        # dashboard signing key, so this is the likeliest cause if real
+        # orders show up as BAD_SIGNATURE.
+        logger.warning(
+            "UBER_EATS_WEBHOOK_SIGNING_KEY is not set: production Uber webhooks are verified with "
+            "the client secret only. The sandbox signed with the dashboard signing key; if production "
+            "does too, every real order will be refused as BAD_SIGNATURE."
+        )
     _uber_sandbox_touched = bool(
         settings.UBER_EATS_SANDBOX_CLIENT_ID or settings.UBER_EATS_SANDBOX_CLIENT_SECRET
     )
@@ -225,6 +236,18 @@ def _validate_production_secrets() -> None:
         ),
         # Optional keys: checked only once set, since a placeholder signing
         # key is one an attacker could guess and sign forged webhooks with.
+        (
+            bool(settings.UBER_EATS_WEBHOOK_SIGNING_KEY),
+            settings.UBER_EATS_WEBHOOK_SIGNING_KEY,
+            "UBER_EATS_WEBHOOK_SIGNING_KEY",
+            "a placeholder signing key would let anyone sign forged production webhooks",
+        ),
+        (
+            bool(settings.UBER_EATS_WEBHOOK_SECONDARY_SIGNING_KEY),
+            settings.UBER_EATS_WEBHOOK_SECONDARY_SIGNING_KEY,
+            "UBER_EATS_WEBHOOK_SECONDARY_SIGNING_KEY",
+            "a placeholder signing key would let anyone sign forged production webhooks",
+        ),
         (
             bool(settings.UBER_EATS_SANDBOX_WEBHOOK_SIGNING_KEY),
             settings.UBER_EATS_SANDBOX_WEBHOOK_SIGNING_KEY,

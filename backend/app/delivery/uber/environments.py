@@ -24,8 +24,9 @@ which the new key moves into `X-Uber-Signature`. The first real Uber sandbox
 event (2026-11-07) settled it: signed with the dashboard signing key in
 `X-Uber-Signature`. So an environment's dashboard keys, when configured, are
 the only keys accepted (both headers are tried); the client secret is only a
-fallback for an environment without them (production, until its signing-key
-settings exist). The label of the key that matched (never its value) is
+fallback for an environment without them (production signing keys exist
+since BUG-0190 as UBER_EATS_WEBHOOK_SIGNING_KEY / _SECONDARY_SIGNING_KEY;
+until they are set, production falls back to its client secret). The label of the key that matched (never its value) is
 logged.
 """
 
@@ -80,6 +81,14 @@ def get_environment_config(environment: str | None) -> UberEnvironmentConfig:
             client_secret=settings.UBER_EATS_CLIENT_SECRET,
             api_base_url=settings.UBER_EATS_API_BASE_URL.rstrip("/"),
             auth_base_url=settings.UBER_EATS_AUTH_BASE_URL.rstrip("/"),
+            webhook_signing_keys=tuple(
+                (label, value)
+                for label, value in (
+                    ("signing_key", settings.UBER_EATS_WEBHOOK_SIGNING_KEY),
+                    ("secondary_signing_key", settings.UBER_EATS_WEBHOOK_SECONDARY_SIGNING_KEY),
+                )
+                if value
+            ),
         )
     if env == SANDBOX:
         return UberEnvironmentConfig(

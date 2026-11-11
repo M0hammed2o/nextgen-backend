@@ -401,6 +401,16 @@ class Settings(BaseSettings):
     # always uses these and the credentials above.
     UBER_EATS_API_BASE_URL: str = "https://api.uber.com"
     UBER_EATS_AUTH_BASE_URL: str = "https://auth.uber.com"
+    # PRODUCTION dashboard "Basic HMAC" webhook signing keys (BUG-0190),
+    # mirroring the sandbox pair below. The authentic sandbox events were
+    # signed with the dashboard signing key, not the client secret; if
+    # production behaves the same, production needs these or every real
+    # order fails signature verification. Once set, the client secret is no
+    # longer accepted for production webhooks. Optional until Uber confirms
+    # which key production signs with: when empty, the client secret is
+    # tried and a startup warning is logged.
+    UBER_EATS_WEBHOOK_SIGNING_KEY: str = ""
+    UBER_EATS_WEBHOOK_SECONDARY_SIGNING_KEY: str = ""
     # SANDBOX app — Uber issues a separate test application (its own client
     # id/secret) for sandbox work. A DeliveryConnection with
     # environment="sandbox" always uses these, never the production ones, so

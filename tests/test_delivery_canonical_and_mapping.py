@@ -649,3 +649,49 @@ class TestUberEpochTimestamps:
         assert uber_mapping._parse_timestamp(True) is None
         assert uber_mapping._parse_timestamp("not a time") is None
         assert uber_mapping._parse_timestamp(None) is None
+
+
+class TestProductionWebhookSigningKeys:
+    """BUG-0190: production gets its own dashboard signing keys, like the sandbox."""
+
+    BODY = b'{"event_id":"e","event_type":"orders.notification"}'
+    PROD_KEY, PROD_SECONDARY, SANDBOX_KEY = "q" * 64, "r" * 64, "p" * 64
+
+    def _settings(self, **overrides):
+        from backend.app.core.config import get_settings
+        values = {
+            "UBER_EATS_CLIENT_SECRET": "prod-secret",
+            "UBER_EATS_SANDBOX_CLIENT_SECRET": "sandbox-secret",
+            "UBER_EATS_SANDBOX_WEBHOOK_SIGNING_KEY": self.SANDBOX_KEY,
+            "UBER_EATS_SANDBOX_WEBHOOK_SECONDARY_SIGNING_KEY": "",
+            "UBER_EATS_WEBHOOK_SIGNING_KEY": self.PROD_KEY,
+            "UBER_EATS_WEBHOOK_SECONDARY_SIGNING_KEY": self.PROD_SECONDARY,
+        }
+        values.update(overrides)
+        return patch.multiple(get_settings(), **values)
+
+    def _sig(self, key):
+        return hmac.new(key.encode(), self.BODY, hashlib.sha256).hexdigest()
+
+    def test_production_signing_key_proves_production(self):
+        from backend.app.delivery.uber.environments import match_webhook_environment
+        with self._settings():
+            assert match_webhook_environment(self.BODY, self._sig(self.PROD_KEY)) == "production"
+            assert match_webhook_environment(self.BODY, self._sig(self.PROD_SECONDARY)) == "production"
+            assert match_webhook_environment(self.BODY, self._sig(self.SANDBOX_KEY)) == "sandbox"
+
+    def test_client_secret_no_longer_accepted_once_production_keys_are_set(self):
+        from backend.app.delivery.uber.environments import match_webhook_environment
+        with self._settings():
+            assert match_webhook_environment(self.BODY, self._sig("prod-secret")) is None
+
+    def test_without_production_keys_the_client_secret_is_still_tried(self):
+        from backend.app.delivery.uber.environments import match_webhook_environment
+        with self._settings(UBER_EATS_WEBHOOK_SIGNING_KEY="", UBER_EATS_WEBHOOK_SECONDARY_SIGNING_KEY=""):
+            assert match_webhook_environment(self.BODY, self._sig("prod-secret")) == "production"
+
+    def test_the_new_header_is_verified_with_production_keys(self):
+        with self._settings():
+            env = UberEatsAdapter().verified_webhook_environment(
+                self.BODY, {"x-uber-signature": "0" * 64, "x-uber-signature-new": self._sig(self.PROD_SECONDARY)})
+            assert env == "production"
