@@ -184,6 +184,74 @@ def build_menu_messages(
     return messages
 
 
+def _active_items_by_category(categories, items) -> list[tuple]:
+    """[(category_or_None, [active items sorted])] in category sort order,
+    "Other" (None) last. Empty categories are omitted."""
+    by_cat: dict = {}
+    for it in items:
+        if not it.is_active or it.is_deleted:
+            continue
+        by_cat.setdefault(str(it.category_id) if it.category_id else None, []).append(it)
+    out = []
+    for cat in sorted(categories, key=lambda c: c.sort_order):
+        lst = by_cat.get(str(cat.id), [])
+        if lst:
+            out.append((cat, sorted(lst, key=lambda i: i.sort_order)))
+    other = by_cat.get(None, [])
+    if other:
+        out.append((None, other))
+    return out
+
+
+def menu_categories_message(categories, items) -> str:
+    """Category-first menu for large menus: a short, numbered list the
+    customer picks from (name or number) instead of one huge dump."""
+    groups = _active_items_by_category(categories, items)
+    lines = ["📋 *Our Menu*", "", "What are you in the mood for? Reply with a category name or number:", ""]
+    for n, (cat, lst) in enumerate(groups, 1):
+        name = cat.name if cat is not None else "Other"
+        lines.append(f"{n}. *{name}* ({len(lst)})")
+    lines.append("")
+    lines.append('You can also just tell me what you\'d like to order, or say *"full menu"* to see everything. 🍽️')
+    return "\n".join(lines)
+
+
+def menu_category_page(
+    category,
+    cat_items: list,
+    offset: int = 0,
+    currency: str = "ZAR",
+    page_size: int = 12,
+    max_chars: int = 3500,
+) -> tuple[str, int | None]:
+    """One manageable page of a category. Returns (text, next_offset | None).
+    Never splits an item from its description and always stays under
+    ``max_chars`` (<< WhatsApp's 4096 limit)."""
+    name = category.name if category is not None else "Other"
+    header = f"📋 *{name}*"
+    footer_more = '\nReply *more* for the next page, or tell me what you\'d like to order! 🍽️'
+    footer_end = "\nTell me what you'd like to order, or say *menu* for the other categories! 🍽️"
+    lines = [header]
+    used = len(header)
+    i = offset
+    shown = 0
+    while i < len(cat_items) and shown < page_size:
+        it = cat_items[i]
+        unit = [f"  • {it.name} — {format_currency(it.price_cents, currency)}"]
+        if it.description:
+            unit.append(f"    _{it.description}_")
+        unit_text = "\n".join(unit)
+        if shown > 0 and used + len(unit_text) + 1 + len(footer_more) > max_chars:
+            break
+        lines.extend(unit)
+        used += len(unit_text) + 1
+        i += 1
+        shown += 1
+    nxt = i if i < len(cat_items) else None
+    lines.append(footer_more if nxt is not None else footer_end)
+    return "\n".join(lines), nxt
+
+
 def get_todays_active_specials(specials: list[Special]) -> list[Special]:
     """Filter a list of specials to those active today."""
     today_name = date.today().strftime("%a").lower()[:3]

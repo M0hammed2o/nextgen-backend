@@ -426,6 +426,10 @@ def clear_cart(session: ConversationSession) -> None:
         "delivery_fee_cents", "delivery_fee_status", "payment_method",
         "pending_options", "proposed_items", "recommended_items", "superseded_order_id",
         "order_notes_asked", "order_notes",
+        # Cancel must clear ALL pending conversational state, not only the
+        # cart (2026-11-11): a stale family-allocation question would
+        # otherwise swallow the next, unrelated order.
+        "pending_variant_allocation",
     ):
         ctx.pop(key, None)
     session.context_json = ctx
@@ -457,14 +461,18 @@ def cart_summary_text(session: ConversationSession, currency: str = "ZAR") -> st
         price_str = format_currency(item["line_total_cents"], currency)
         lines.append(f"  {item['quantity']}x {item['name']} — {price_str}")
 
-        # Show priced option selections (e.g. "Oat Milk +R10.00")
+        # Show option selections with their price delta ("Beef +R15.00").
+        # An option with no usable name is skipped -- never rendered as a
+        # blank "↳" bullet (live incident 2026-11-11).
         _sel_opts_shown: set[str] = set()
         for opt in (item.get("selected_options") or []):
-            opt_name = opt.get("option_name", "")
-            delta = opt.get("price_delta_cents", 0)
+            opt_name = (opt.get("option_name") or opt.get("name") or "").strip()
+            if not opt_name:
+                continue
+            delta = opt.get("price_delta_cents", 0) or 0
             if delta != 0:
-                sign = "+" if delta > 0 else ""
-                lines.append(f"      ↳ {opt_name} {sign}{format_currency(delta, currency)}")
+                sign = "+" if delta > 0 else "-"
+                lines.append(f"      ↳ {opt_name} {sign}{format_currency(abs(delta), currency)}")
             else:
                 lines.append(f"      ↳ {opt_name}")
             _sel_opts_shown.add(opt_name.lower())
@@ -481,8 +489,16 @@ def cart_summary_text(session: ConversationSession, currency: str = "ZAR") -> st
             qty_str = f"×{ao_qty}" if ao_qty > 1 else ""
             lines.append(f"      ✦ {ao['name']}{qty_str} +{format_currency(ao_total, currency)}")
 
+        # The free-text note repeats chosen option names ("Beef, Fries");
+        # those are already rendered as ↳ lines above, so only show the
+        # remainder (e.g. "no onion") and never a blank note.
         if item.get("special_instructions"):
-            lines.append(f"      📝 {item['special_instructions']}")
+            _note_parts = [
+                p.strip() for p in str(item["special_instructions"]).split(",")
+                if p.strip() and p.strip().lower() not in _sel_opts_shown
+            ]
+            if _note_parts:
+                lines.append(f"      📝 {', '.join(_note_parts)}")
 
     lines.append("─────────────")
     total = cart_total_cents(session)
