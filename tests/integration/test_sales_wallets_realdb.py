@@ -193,12 +193,17 @@ async def test_custom_range_and_validation(db, scenario):
         assert exc.value.status_code == 422
 
 
-async def test_gated_like_the_channel_report(db):
+async def test_available_without_advanced_analytics(db):
+    """Owner decision 2026-11-11: the wallets are on every plan's standard dashboard."""
     b = await _business(db, advanced=False)
     try:
-        with pytest.raises(AppError) as exc:
-            await get_sales_wallets(range_="today", start=None, end=None, user=_owner(b), db=db)
-        assert (exc.value.status_code, exc.value.code) == (409, "ADVANCED_ANALYTICS_NOT_ENABLED")
+        db.add(_order(b, 1, source="UBER_EATS", total=12_300))
+        await db.commit()
+        result = await get_sales_wallets(range_="today", start=None, end=None, user=_owner(b), db=db)
+        assert result["total"]["net_cents"] == 12_300
+        detail = await get_sales_wallet_orders(wallet="UBER_EATS", range_="today", start=None, end=None, page=1,
+                                               page_size=25, user=_owner(b), db=db)
+        assert detail["total_count"] == 1
         with pytest.raises(AppError) as exc:
             await get_sales_wallet_orders(wallet="NOPE", range_="today", start=None, end=None, page=1, page_size=25,
                                           user=_owner(b), db=db)
