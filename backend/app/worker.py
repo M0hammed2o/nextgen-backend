@@ -36,6 +36,7 @@ from backend.app.db.session import DATABASE_URL
 from backend.app.delivery.retention import delivery_webhook_retention_sweep
 from backend.app.delivery.order_service import (
     delivery_accept_deadline_watchdog,
+    delivery_order_recovery_and_reminders,
     process_delivery_cancellation,
     process_delivery_order,
     sync_delivery_order_status,
@@ -784,6 +785,14 @@ class WorkerSettings:
         cron(
             delivery_accept_deadline_watchdog,
             second={0, 30},
+            run_at_startup=True,
+        ),
+        # BUG-0191: re-enqueue orders whose job was lost (Redis restart,
+        # worker crash) and remind staff about orders waiting on them.
+        # Offset from the watchdog so the two never share a tick.
+        cron(
+            delivery_order_recovery_and_reminders,
+            second={15, 45},
             run_at_startup=True,
         ),
         # WhatsApp order-usage threshold alerts (migration 0057_pos_entitlement)

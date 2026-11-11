@@ -68,11 +68,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from types import SimpleNamespace
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
+from arq import Retry
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 from sqlalchemy import and_, or_, select
+from sqlalchemy.exc import InterfaceError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.config import get_settings
@@ -142,6 +147,22 @@ DISPLAY_ID_MATCH_WINDOW = LIVE_DISPLAY_ID_MATCH_WINDOW
 
 _PROVIDER_LABELS = {"UBER_EATS": "Uber Eats", "MR_D": "Mr D"}
 
+#: Errors that mean "the database or Redis was briefly unreachable", not "this
+#: order is wrong": worth retrying the job (BUG-0191(c)).
+_INFRASTRUCTURE_ERRORS: tuple[type[BaseException], ...] = (
+    OperationalError, InterfaceError, RedisConnectionError, RedisTimeoutError, ConnectionError, TimeoutError,
+)
+_RETRY_BACKOFF_SECONDS = 5
+
+#: Lost-job recovery (BUG-0191(b)): a RECEIVED row this old with no job
+#: working on it (its row lock is free) is re-enqueued, at most once per
+#: interval and a bounded number of times.
+_RECOVERY_STALE_SECONDS = 60
+_RECOVERY_MAX_ATTEMPTS = 5
+#: Staff reminders for an order still waiting on a person (BUG-0191(a)):
+#: Uber starts phoning the store at about 90 s.
+_REMINDER_STAGES_SECONDS = (90, 300)
+
 
 # ── ARQ job entry points (registered in backend/app/worker.py) ──────────────
 
@@ -170,14 +191,22 @@ async def process_delivery_order(
                 external_order_id=external_order_id, event_type=event_type,
                 force_accept=force_accept,
             )
-        except (DeliveryProviderTimeout,):
+        except (DeliveryProviderTimeout, *_INFRASTRUCTURE_ERRORS) as exc:
+            # BUG-0191(c): ARQ retries a job only when it raises `arq.Retry`
+            # (any other exception just fails it), so the previous bare
+            # re-raise here never retried: the row sat in RECEIVED until
+            # the watchdog auto-denied it. Raise Retry instead, with a short
+            # back-off (the whole accept window is ~10 minutes). Safe to
+            # repeat: the row is back in RECEIVED (rolled back or reverted),
+            # and _handle_order only acts on RECEIVED under a row lock.
             await db.rollback()
+            job_try = int(ctx.get("job_try") or 1)
             logger.warning(
                 "DELIVERY_ORDER_TRANSIENT_FAILURE: provider=%s business_id=%s "
-                "external_order_id=%s — will be retried.",
-                provider, business_id, external_order_id,
+                "external_order_id=%s try=%s error=%s — retrying.",
+                provider, business_id, external_order_id, job_try, type(exc).__name__,
             )
-            raise
+            raise Retry(defer=_RETRY_BACKOFF_SECONDS * job_try) from exc
         except Exception:
             await db.rollback()
             logger.exception(
@@ -1051,6 +1080,19 @@ async def _publish_alert(
                 business_id, title=f"{label} order {code} needs attention",
                 body=row.failure_reason or row.last_provider_sync_error or row.status,
             )
+        elif alert_type == "delivery_order_denied":
+            # BUG-0191(a): every decline (staff's own, a configuration
+            # problem, or the deadline watchdog) reaches staff's phones,
+            # not only an open live-orders screen.
+            await send_business_notification(
+                business_id, title=f"{label} order {code} was declined",
+                body=row.failure_reason or getattr(row, "deny_reason_text", None) or "Declined.",
+            )
+        elif alert_type == "delivery_order_waiting":
+            await send_business_notification(
+                business_id, title=f"{label} order {code} is waiting for you",
+                body=row.failure_reason or "Accept or decline it now, or it will be declined automatically.",
+            )
     except Exception:
         logger.warning("DELIVERY_ALERT_PUSH_FAILED: business=%s type=%s", business_id, alert_type)
 
@@ -1705,6 +1747,8 @@ async def delivery_accept_deadline_watchdog(ctx: dict) -> None:
                 row.deny_reason_code = _WATCHDOG_DENY_REASON_CODE
                 row.deny_reason_text = _WATCHDOG_DENY_EXPLANATION
                 claimed.append({
+                    "row_id": row.id,
+                    "display_id": row.display_id,
                     "provider": row.provider,
                     "business_id": row.business_id,
                     "external_order_id": row.external_order_id,
@@ -1747,3 +1791,122 @@ async def delivery_accept_deadline_watchdog(ctx: dict) -> None:
                 "DELIVERY_DENY_CALL_UNEXPECTED_ERROR (watchdog): business=%s external_order_id=%s",
                 item["business_id"], item["external_order_id"],
             )
+        # BUG-0191(a): nobody accepted it, so tell staff it was declined.
+        await _publish_alert(
+            item["business_id"], "delivery_order_denied",
+            SimpleNamespace(
+                id=item["row_id"], status="DENIED", provider=item["provider"], display_id=item["display_id"],
+                failure_reason="Nobody accepted it in time, so NextGen declined it automatically.",
+                last_provider_sync_error=None,
+            ),
+            item["external_order_id"],
+        )
+
+
+
+async def delivery_order_recovery_and_reminders(ctx: dict) -> None:
+    """
+    BUG-0191, run every 30 s next to the deadline watchdog.
+
+    (b) Lost-job recovery. Once a webhook is acknowledged, the order's job
+    lives only in Redis; a Redis restart or a worker crash can lose it,
+    leaving the row in RECEIVED until the watchdog declines it ~10 minutes
+    later. A RECEIVED row older than `_RECOVERY_STALE_SECONDS` whose row lock
+    is free (SKIP LOCKED: no job is processing it) is enqueued again. A
+    duplicate of a job that is merely delayed is harmless: `_handle_order`
+    takes the same row lock and acts only on RECEIVED. Each row is
+    re-enqueued at most once per interval and `_RECOVERY_MAX_ATTEMPTS` times.
+
+    (a) Staff reminders. An order still waiting on a person (READY_TO_ACCEPT
+    or NEEDS_MAPPING) sends a push at 90 s (when Uber starts phoning the
+    store) and at 5 minutes. Once per stage per order.
+
+    Never accepts or denies anything itself, and never fails the worker.
+    """
+    from backend.app.db.session import get_redis
+
+    now = datetime.now(timezone.utc)
+    try:
+        redis = await get_redis()
+    except Exception:
+        logger.exception("DELIVERY_RECOVERY_REDIS_UNAVAILABLE")
+        return
+
+    stale_before = now - timedelta(seconds=_RECOVERY_STALE_SECONDS)
+    recover: list[tuple] = []
+    waiting: list[tuple] = []
+    async with ctx["session_factory"]() as db:
+        try:
+            rows = (
+                await db.execute(
+                    select(DeliveryOrder)
+                    .where(
+                        DeliveryOrder.status.in_(("RECEIVED", "READY_TO_ACCEPT", "NEEDS_MAPPING")),
+                        DeliveryOrder.accept_deadline_at.isnot(None),
+                        DeliveryOrder.accept_deadline_at > now,
+                    )
+                    .order_by(DeliveryOrder.created_at.asc())
+                    .limit(_WATCHDOG_BATCH_LIMIT)
+                    .with_for_update(skip_locked=True)
+                )
+            ).scalars().all()
+            for row in rows:
+                if not row.created_at:
+                    continue
+                if row.status == "RECEIVED":
+                    if row.created_at <= stale_before:
+                        recover.append((row.id, row.provider, row.business_id, row.external_order_id))
+                    continue
+                # Copy what the reminder needs while the row is loaded.
+                waiting.append((
+                    SimpleNamespace(
+                        id=row.id, status=row.status, provider=row.provider, display_id=row.display_id,
+                        business_id=row.business_id, external_order_id=row.external_order_id,
+                        accept_deadline_at=row.accept_deadline_at, last_provider_sync_error=None,
+                        failure_reason=None,
+                    ),
+                    (now - row.created_at).total_seconds(),
+                ))
+            await db.rollback()  # read-only: release the row locks
+        except Exception:
+            await db.rollback()
+            logger.exception("DELIVERY_RECOVERY_SCAN_FAILED")
+            return
+
+    for row_id, provider, business_id, external_order_id in recover:
+        try:
+            if not await redis.set(f"delivery:recovery:{row_id}", "1", nx=True, ex=_RECOVERY_STALE_SECONDS):
+                continue
+            attempts = await redis.incr(f"delivery:recovery-count:{row_id}")
+            await redis.expire(f"delivery:recovery-count:{row_id}", 900)
+            if attempts > _RECOVERY_MAX_ATTEMPTS:
+                continue
+            await ctx["redis"].enqueue_job(
+                "process_delivery_order", provider, str(business_id), external_order_id, None,
+            )
+            logger.warning(
+                "DELIVERY_ORDER_RECOVERED: business=%s external_order_id=%s attempt=%s — "
+                "RECEIVED for over %ss with no job on it; re-enqueued.",
+                business_id, external_order_id, attempts, _RECOVERY_STALE_SECONDS,
+            )
+        except Exception:
+            logger.exception("DELIVERY_RECOVERY_ENQUEUE_FAILED: business=%s external_order_id=%s",
+                             business_id, external_order_id)
+
+    for snapshot, age in waiting:
+        for stage in _REMINDER_STAGES_SECONDS:
+            if age < stage:
+                break
+            try:
+                if not await redis.set(f"delivery:reminder:{snapshot.id}:{stage}", "1", nx=True, ex=1800):
+                    continue
+            except Exception:
+                logger.exception("DELIVERY_REMINDER_REDIS_FAILED")
+                break
+            left = max(int((snapshot.accept_deadline_at - now).total_seconds() // 60), 0)
+            action = (
+                "A manager must map its items before it can be accepted."
+                if snapshot.status == "NEEDS_MAPPING" else "Accept or decline it now."
+            )
+            snapshot.failure_reason = f"{action} About {left} min left before it is declined automatically."
+            await _publish_alert(snapshot.business_id, "delivery_order_waiting", snapshot, snapshot.external_order_id)

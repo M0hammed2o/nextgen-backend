@@ -1084,8 +1084,12 @@ class TestFetchTimeoutIsRetryable:
         assert row.status == "RECEIVED"  # ready for a clean retry
         assert db.commits == 1
 
-    async def test_process_delivery_order_job_lets_the_timeout_propagate_for_arq_retry(self):
-        """ARQ's own max_tries must see the exception to actually retry the job."""
+    async def test_process_delivery_order_job_asks_arq_to_retry_a_timeout(self):
+        """
+        BUG-0191(c): ARQ 0.26 retries a job only when it raises `arq.Retry`;
+        any other exception fails it for good. This test used to assert the
+        bare DeliveryProviderTimeout propagated, which ARQ never retried.
+        """
         session = AsyncMock()
 
         async def _raise(*a, **k):
@@ -1096,8 +1100,10 @@ class TestFetchTimeoutIsRetryable:
         cm.__aexit__ = AsyncMock(return_value=False)
         ctx = {"session_factory": MagicMock(return_value=cm)}
 
+        from arq import Retry
+
         with patch("backend.app.delivery.order_service._handle_order", side_effect=_raise):
-            with pytest.raises(DeliveryProviderTimeout):
+            with pytest.raises(Retry):
                 await process_delivery_order(ctx, "UBER_EATS", str(uuid.uuid4()), "order-1", None)
         session.rollback.assert_awaited_once()
 
