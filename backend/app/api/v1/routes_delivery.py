@@ -786,6 +786,113 @@ async def set_store_status(
     )
 
 
+# ── Integration on the provider (Uber PATCH /pos_data) and prep time ────────
+
+class IntegrationUpdateRequest(BaseModel):
+    integration_enabled: bool
+
+
+class PrepTimeRequest(BaseModel):
+    # Uber accepts at most 10,800 s (3 hours).
+    prep_time_minutes: int = Field(ge=1, le=180)
+
+
+@router.post("/connections/{provider}/integration", response_model=DeliveryConnectionResponse)
+async def update_provider_integration(
+    provider: str,
+    body: IntegrationUpdateRequest,
+    user: AuthUser = Depends(require_owner_or_manager),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Switch NextGen's integration with this store off (or back on) ON THE
+    PROVIDER, unlike /disable, which only stops NextGen processing. Off: Uber
+    stops sending this store's orders to NextGen. Uber documents that "Uber
+    or the Merchant" can switch it back on; whether NextGen can is not
+    confirmed, so the response says so. The provider is called first and the
+    local state changes only if it succeeds.
+    """
+    from backend.app.delivery import registry
+    from backend.app.delivery.errors import DeliveryError
+
+    await _require_delivery_module_enabled(db, user.business_id)
+    if provider not in PROVIDER_LABELS:
+        raise AppError("UNKNOWN_PROVIDER", f"Unknown provider {provider!r}", 422)
+    connection = (
+        await db.execute(
+            select(DeliveryConnection).where(
+                DeliveryConnection.business_id == user.business_id,
+                DeliveryConnection.provider == provider,
+            )
+        )
+    ).scalar_one_or_none()
+    if connection is None or not connection.external_store_id:
+        raise NotFoundError("Delivery connection", provider)
+    adapter = registry.get_provider(provider)
+    try:
+        await adapter.update_integration(
+            context=_connection_context(connection), integration_enabled=body.integration_enabled,
+        )
+    except DeliveryError as exc:
+        raise _provider_call_error(provider, exc) from exc
+    previous = connection.status
+    now = datetime.now(timezone.utc)
+    if body.integration_enabled:
+        # Never straight to CONNECTED: same review rule as /enable.
+        connection.status = "ATTENTION_REQUIRED"
+        connection.disconnected_at = None
+        connection.error_reason = (
+            f"Integration switched back on at {PROVIDER_LABELS[provider]}; confirm the store "
+            "is live and approved before it processes real orders."
+        )
+    else:
+        connection.status = "DISABLED"
+        connection.disconnected_at = now
+        connection.error_reason = (
+            f"Integration switched off at {PROVIDER_LABELS[provider]} by the business. "
+            f"{PROVIDER_LABELS[provider]} or the merchant may need to switch it back on."
+        )
+    db.add(AuditEvent(
+        scope=AuditScope.BUSINESS.value, business_id=user.business_id, actor_user_id=user.user_id,
+        action="delivery.connection.provider_integration_changed", target_type="delivery_connection",
+        target_id=connection.id,
+        diff_json={"provider": provider, "previous_status": previous,
+                   "integration_enabled": body.integration_enabled},
+    ))
+    await db.commit()
+    return await _connection_response(db, user.business_id, connection)
+
+
+@router.post("/connections/{provider}/prep-time")
+async def update_prep_time(
+    provider: str,
+    body: PrepTimeRequest,
+    user: AuthUser = Depends(require_owner_or_manager),
+    db: AsyncSession = Depends(get_db),
+):
+    """Set the store's default preparation time on the provider (Uber Update Store Prep Time)."""
+    from backend.app.delivery import registry
+    from backend.app.delivery.errors import DeliveryError
+
+    await _require_delivery_module_enabled(db, user.business_id)
+    connection = await _connection_for_provider_call(db, user.business_id, provider)
+    adapter = registry.get_provider(provider)
+    try:
+        await adapter.update_prep_time(
+            context=_connection_context(connection), prep_time_seconds=body.prep_time_minutes * 60,
+        )
+    except DeliveryError as exc:
+        raise _provider_call_error(provider, exc) from exc
+    db.add(AuditEvent(
+        scope=AuditScope.BUSINESS.value, business_id=user.business_id, actor_user_id=user.user_id,
+        action="delivery.connection.prep_time_changed", target_type="delivery_connection",
+        target_id=connection.id,
+        diff_json={"provider": provider, "prep_time_minutes": body.prep_time_minutes},
+    ))
+    await db.commit()
+    return {"provider": provider, "prep_time_minutes": body.prep_time_minutes}
+
+
 def _connection_context(connection: DeliveryConnection):
     from backend.app.delivery.base import DeliveryOrderContext
 

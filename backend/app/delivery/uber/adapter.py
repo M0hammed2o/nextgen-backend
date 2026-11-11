@@ -117,8 +117,14 @@ class UberEatsAdapter(DeliveryProviderAdapter):
     capabilities = DeliveryCapabilities(
         webhooks=True,
         accept_deny=True,
-        menu_sync=True,
+        # Was True, but nothing ever uploads a menu (upsert_menu is
+        # signature-only, deliberately: a full-menu PUT has irreversible
+        # effects on Uber's side). Advertising it was false (Uber audit,
+        # 2026-11-11). Merchants manage the menu in Uber Eats Manager.
+        menu_sync=False,
         store_pause_resume=True,
+        integration_management=True,
+        prep_time=True,
         # A per-item update endpoint exists, but Uber warns it can 404 until a
         # full menu has been uploaded via PUT — which NextGen deliberately does
         # not do (irreversible side effects). Item 86ing therefore stays
@@ -264,6 +270,27 @@ class UberEatsAdapter(DeliveryProviderAdapter):
             body["reason"] = reason
         await _call(context, lambda c, t, base: uber_client.set_store_status(
             c, t, context.external_store_id, body=body, api_base_url=base,
+        ))
+
+    # ── Integration management and prep time ──────────────────────────────
+
+    async def _update_integration(
+        self, *, context: DeliveryOrderContext, integration_enabled: bool | None, integrator_store_id: str | None,
+    ) -> None:
+        body: dict = {}
+        if integration_enabled is not None:
+            body["integration_enabled"] = bool(integration_enabled)
+        if integrator_store_id is not None:
+            body["integrator_store_id"] = str(integrator_store_id)
+        if not body:
+            return
+        await _call(context, lambda c, t, base: uber_client.update_integration_details(
+            c, t, context.external_store_id, body=body, api_base_url=base,
+        ))
+
+    async def _update_prep_time(self, *, context: DeliveryOrderContext, prep_time_seconds: int) -> None:
+        await _call(context, lambda c, t, base: uber_client.update_store_prep_time(
+            c, t, context.external_store_id, prep_time_seconds=prep_time_seconds, api_base_url=base,
         ))
 
     # ── Menu (read for mapping import; write is signature-only) ───────────

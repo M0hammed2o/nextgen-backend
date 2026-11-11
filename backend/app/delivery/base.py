@@ -65,6 +65,11 @@ class DeliveryCapabilities:
     restaurant_cancel: bool = False
     # Read (never write) the provider's menu, for bulk mapping import.
     catalogue_read: bool = False
+    # Switch this app's integration with the store off/on on the provider's
+    # side, and set our own store reference (Uber `PATCH /pos_data`).
+    integration_management: bool = False
+    # Set the store's default preparation time on the provider.
+    prep_time: bool = False
 
 
 @dataclass(frozen=True)
@@ -287,6 +292,27 @@ class DeliveryProviderAdapter(ABC):
     async def _set_store_status(
         self, *, context: DeliveryOrderContext, status: str, paused_until, reason: str | None
     ) -> None: ...
+
+    # ── Integration management and prep time (not abstract: optional) ─────
+
+    async def update_integration(
+        self, *, context: DeliveryOrderContext, integration_enabled: bool | None = None,
+        integrator_store_id: str | None = None,
+    ) -> None:
+        self._require("integration_management")
+        return await self._update_integration(
+            context=context, integration_enabled=integration_enabled, integrator_store_id=integrator_store_id,
+        )
+
+    async def _update_integration(self, *, context, integration_enabled, integrator_store_id) -> None:
+        raise DeliveryCapabilityUnsupported(self.provider, "integration_management")
+
+    async def update_prep_time(self, *, context: DeliveryOrderContext, prep_time_seconds: int) -> None:
+        self._require("prep_time")
+        return await self._update_prep_time(context=context, prep_time_seconds=prep_time_seconds)
+
+    async def _update_prep_time(self, *, context, prep_time_seconds) -> None:
+        raise DeliveryCapabilityUnsupported(self.provider, "prep_time")
 
     # ── Menu sync — SIGNATURE ONLY for this change ────────────────────────
     #

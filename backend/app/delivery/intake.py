@@ -75,9 +75,14 @@ from backend.app.core.config import get_settings
 from backend.app.delivery import registry
 from backend.app.delivery.canonical import WebhookGateResult
 from backend.app.delivery.tenant_resolver import resolve_delivery_connection
+from shared.enums import AuditScope
+from shared.models.audit import AuditEvent
 from shared.models.delivery import DeliveryOrder, DeliveryWebhookEvent
 
 logger = logging.getLogger("nextgen.delivery.intake")
+
+#: The provider removed this app from the store (Uber provisioning webhook).
+_DEPROVISION_EVENT_TYPES = frozenset({"store.deprovisioned"})
 
 _RAW_PAYLOAD_MAX_BYTES = 64 * 1024  # bound what we store, never the full 10MB order response
 
@@ -287,12 +292,46 @@ async def ingest_delivery_webhook(
     # simply not true for this event class). Commit the event-log row (audit
     # trail preserved) and ack — nothing else to do.
     if not envelope.external_order_id:
+        deprovisioned = envelope.event_type in _DEPROVISION_EVENT_TYPES and connection.status not in (
+            "NOT_CONNECTED", "DISABLED",
+        )
+        if deprovisioned:
+            # The provider removed NextGen from this store: no more orders will
+            # come. Surface it rather than leave the connection looking live.
+            # Never CONNECTED again without the normal activation/review path.
+            previous = connection.status
+            connection.status = "ATTENTION_REQUIRED"
+            connection.disconnected_at = datetime.now(timezone.utc)
+            connection.error_reason = (
+                f"{envelope.event_type}: the provider removed this integration from the store. "
+                "Reconnect the store to receive orders again."
+            )
+            db.add(AuditEvent(
+                scope=AuditScope.BUSINESS.value, business_id=connection.business_id, actor_user_id=None,
+                action="delivery.connection.deprovisioned", target_type="delivery_connection",
+                target_id=connection.id,
+                diff_json={"provider": provider, "previous_status": previous, "event_type": envelope.event_type},
+            ))
         try:
             await db.commit()
         except Exception:
             await db.rollback()
             logger.exception("DELIVERY_WEBHOOK_DB_COMMIT_FAILED: provider=%s", provider)
             return WebhookGateResult(accepted=False, http_status=503, error_category="DB_ERROR")
+        if deprovisioned:
+            logger.warning(
+                "DELIVERY_CONNECTION_DEPROVISIONED: provider=%s business=%s store=%s",
+                provider, connection.business_id, envelope.external_store_id,
+            )
+            try:
+                from backend.app.push_service import send_business_notification
+                await send_business_notification(
+                    connection.business_id, title="Delivery integration removed",
+                    body="The delivery platform removed NextGen from your store. Orders will not arrive "
+                         "until it is reconnected.",
+                )
+            except Exception:
+                logger.warning("DELIVERY_DEPROVISION_PUSH_FAILED: business=%s", connection.business_id)
         return WebhookGateResult(
             accepted=True, error_category="OK",
             business_id=connection.business_id, delivery_connection_id=connection.id,

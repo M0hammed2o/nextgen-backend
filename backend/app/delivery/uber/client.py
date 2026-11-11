@@ -253,3 +253,44 @@ async def get_integration_details(
     """
     store_id = _validated_order_id(store_id)
     return await _get(http_client, f"{api_base_url}/v1/eats/stores/{store_id}/pos_data", token)
+
+
+async def update_integration_details(
+    http_client: httpx.AsyncClient, token: str, store_id: str, *, body: dict, api_base_url: str,
+) -> None:
+    """
+    Update Integration Details (`PATCH /v1/eats/stores/{store_id}/pos_data`,
+    scope `eats.store`, 204 No Content; reference read 2026-11-11).
+    `integration_enabled=false` switches the integration off on Uber's side:
+    GET /pos_data keeps working but most endpoints and webhooks stop, and per
+    Uber "Uber or the Merchant may toggle this back on". The permanent
+    removal, `DELETE /pos_data`, needs a merchant `eats.pos_provisioning`
+    token, which NextGen wipes after activation, so it is not offered.
+    """
+    store_id = _validated_order_id(store_id)
+    url = f"{api_base_url}/v1/eats/stores/{store_id}/pos_data"
+    try:
+        response = await http_client.patch(url, headers=_headers(token), json=body, timeout=_DEFAULT_TIMEOUT_SECONDS)
+    except httpx.TimeoutException as exc:
+        raise DeliveryProviderTimeout(f"UBER_EATS PATCH {url} timed out") from exc
+    except httpx.HTTPError as exc:
+        raise DeliveryProviderError("UBER_EATS", f"transport error: {exc}") from exc
+    if response.status_code not in (200, 204):
+        raise DeliveryProviderError("UBER_EATS", "integration update failed", status_code=response.status_code)
+
+
+async def update_store_prep_time(
+    http_client: httpx.AsyncClient, token: str, store_id: str, *, prep_time_seconds: int, api_base_url: str,
+) -> None:
+    """
+    Update Store Prep Time (`POST /v1/delivery/store/{store_id}/update-store-prep-time`,
+    body `{"default_prep_time": seconds}`, at most 10,800). Listed as required
+    by Uber's Quality & Performance page; the path and body come from
+    third-party mirrors of Uber's reference, so the support request asks Uber
+    to confirm them. See the sandbox result in WORKLOG before relying on it.
+    """
+    store_id = _validated_order_id(store_id)
+    await _post(
+        http_client, f"{api_base_url}/v1/delivery/store/{store_id}/update-store-prep-time", token,
+        {"default_prep_time": int(prep_time_seconds)}, expect_status=(200, 202, 204),
+    )
