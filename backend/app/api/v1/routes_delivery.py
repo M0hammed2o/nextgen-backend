@@ -345,6 +345,8 @@ class DeliveryQueueItem(BaseModel):
     accept_deadline_at: datetime | None
     customer_first_name: str | None
     special_instructions: str | None
+    # BUG-0189: staff see the allergy request before deciding to accept.
+    has_allergy_request: bool = False
     lines: list
     unresolved: list[str]
     can_accept: bool
@@ -382,11 +384,16 @@ class DeliveryQueueItem(BaseModel):
             accept_deadline_at=row.accept_deadline_at,
             customer_first_name=snap.get("customer_first_name"),
             special_instructions=snap.get("special_instructions"),
+            has_allergy_request=bool(snap.get("has_allergy_request")) or any(
+                line.get("allergens") or line.get("allergy_instructions") for line in (snap.get("lines") or [])
+            ),
             lines=[
                 {
                     "title": line.get("title"),
                     "quantity": line.get("quantity"),
                     "special_instructions": line.get("special_instructions"),
+                    "allergens": line.get("allergens") or [],
+                    "allergy_instructions": line.get("allergy_instructions"),
                     "modifiers": [
                         {"title": m.get("title"), "quantity": m.get("quantity"), "removed": m.get("removed")}
                         for m in (line.get("modifiers") or [])

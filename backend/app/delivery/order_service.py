@@ -498,6 +498,28 @@ async def _handle_order(
         await _publish_alert(business_id, "delivery_order_denied", row, external_order_id)
         return
 
+    # BUG-0189: a special request (allergy) we cannot read cannot be relayed
+    # to the kitchen. Uber's Quality & Performance guide requires such an
+    # order to be rejected, with SPECIAL_INSTRUCTIONS, rather than accepted
+    # with the request silently missing.
+    if canonical.special_requests_unreadable:
+        row.failure_reason = (
+            "The order carries a special request (allergy) NextGen could not read, "
+            "so it could not be relayed to the kitchen."
+        )
+        logger.warning(
+            "DELIVERY_ORDER_SPECIAL_REQUEST_UNREADABLE: business=%s external_order_id=%s — denying "
+            "with SPECIAL_INSTRUCTIONS rather than accepting without it.",
+            business_id, external_order_id,
+        )
+        await _issue_deny(
+            db, row=row, connection=connection, reason_code="SPECIAL_INSTRUCTIONS",
+            explanation="An allergy or special request on this order could not be relayed to the kitchen.",
+        )
+        await db.commit()
+        await _publish_alert(business_id, "delivery_order_denied", row, external_order_id)
+        return
+
     existing = await _existing_sale(db, business=business, provider=provider, canonical=canonical)
     if existing is not None:
         # Never book the same sale twice (e.g. a provider report for this
@@ -551,13 +573,19 @@ async def _handle_order(
     # Design gap fix (migration 0046): `auto_accept_enabled` defaults FALSE —
     # a fully-mapped order stops at READY_TO_ACCEPT and waits for an explicit
     # staff accept, which re-enqueues this SAME job with force_accept=True.
-    if not force_accept and not getattr(connection, "auto_accept_enabled", False):
+    # BUG-0189: an order with an allergy request is never auto-accepted —
+    # a person must see the allergen and decide whether the kitchen can
+    # safely make it (or deny it) before Uber is told yes.
+    if not force_accept and (
+        not getattr(connection, "auto_accept_enabled", False) or canonical.has_allergy_request
+    ):
         _transition(db, row, "READY_TO_ACCEPT")
         await db.commit()
         logger.info(
             "DELIVERY_ORDER_READY_TO_ACCEPT: business=%s external_order_id=%s — fully mapped, "
-            "auto_accept_enabled=False, awaiting explicit staff accept.",
+            "awaiting explicit staff accept (auto_accept_enabled=%s, allergy_request=%s).",
             business_id, external_order_id,
+            getattr(connection, "auto_accept_enabled", False), canonical.has_allergy_request,
         )
         await _publish_alert(business_id, "delivery_ready_to_accept", row, external_order_id)
         return
@@ -953,6 +981,7 @@ def _build_snapshot(canonical: CanonicalDeliveryOrder) -> dict:
         "special_instructions": canonical.special_instructions,
         "customer_first_name": canonical.customer_first_name,
         "fulfillment_issues": list(canonical.fulfillment_issues),
+        "has_allergy_request": canonical.has_allergy_request,
         "lines": [
             {
                 "external_id": line.external_item_id,
@@ -961,6 +990,8 @@ def _build_snapshot(canonical: CanonicalDeliveryOrder) -> dict:
                 "unit_price_cents": line.unit_price_cents,
                 "total_price_cents": line.total_price_cents,
                 "special_instructions": line.special_instructions,
+                "allergens": list(line.allergens),
+                "allergy_instructions": line.allergy_instructions,
                 "modifiers": [
                     {
                         "external_id": m.external_id,
@@ -1405,6 +1436,12 @@ def _order_mode(order_type: str | None) -> str:
 def _kitchen_note(provider: str, canonical: CanonicalDeliveryOrder) -> str | None:
     label = _PROVIDER_LABELS.get(provider, provider)
     parts: list[str] = []
+    # BUG-0189: allergy requests lead the ticket, for EVERY line — including a
+    # line mapped as "ignore", which never becomes an order item and would
+    # otherwise take its allergy request with it.
+    allergy = [_allergy_text(line.title, line) for line in canonical.lines if line.has_allergy_request]
+    if allergy:
+        parts.append("ALLERGY ALERT: " + "; ".join(allergy))
     if canonical.display_id:
         parts.append(f"{label} order {canonical.display_id}")
     if canonical.special_instructions:
@@ -1421,8 +1458,20 @@ def _kitchen_note(provider: str, canonical: CanonicalDeliveryOrder) -> str | Non
     return " | ".join(parts) or None
 
 
+def _allergy_text(title: str | None, line: CanonicalDeliveryLine) -> str:
+    bits = []
+    if line.allergens:
+        bits.append("exclude " + ", ".join(line.allergens))
+    if line.allergy_instructions:
+        bits.append(f'"{line.allergy_instructions}"')
+    text = " ".join(bits)
+    return f"{title}: {text}" if title else text
+
+
 def _line_note(line: _ResolvedDeliveryLine) -> str | None:
     parts: list[str] = []
+    if line.canonical.has_allergy_request:
+        parts.append("ALLERGY: " + _allergy_text(None, line.canonical))
     if line.canonical.special_instructions:
         parts.append(line.canonical.special_instructions)
     removed_titles = [m.title for m in line.canonical.modifiers if m.removed]

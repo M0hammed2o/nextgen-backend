@@ -280,6 +280,71 @@ def _fulfillment_issue_text(issue) -> str:
     return " ".join(parts)
 
 
+def _allergen_text(entry) -> str | None:
+    """One `allergens_to_exclude[]` entry as kitchen text: the type (DAIRY -> Dairy), or the customer's own words."""
+    if isinstance(entry, str):
+        return entry.strip() or None
+    if not isinstance(entry, dict):
+        return None
+    free = str(entry.get("freeform_text") or "").strip()
+    kind = str(entry.get("type") or "").strip()
+    if free and (not kind or kind.upper() in ("OTHER", "FREEFORM", "CUSTOM")):
+        return free
+    if kind:
+        label = kind.replace("_", " ").capitalize()
+        return f"{label} ({free})" if free else label
+    return free or None
+
+
+def _parse_special_requests(item: dict) -> tuple[tuple[str, ...], str | None, bool]:
+    """
+    BUG-0189: Uber's `cart.items[].special_requests[].allergy` ->
+    (allergens to exclude, allergy instructions, unreadable).
+
+    Uber documents `special_requests` as a list; a single object is accepted
+    too. Anything present but not readable is reported as unreadable rather
+    than ignored, because a dropped allergy request is a food-safety failure:
+    the caller denies such an order with SPECIAL_INSTRUCTIONS.
+    """
+    raw = item.get("special_requests")
+    if raw in (None, [], {}):
+        return (), None, False
+    requests = raw if isinstance(raw, list) else [raw]
+    allergens: list[str] = []
+    instructions: list[str] = []
+    unreadable = False
+    for request in requests:
+        if not isinstance(request, dict):
+            unreadable = True
+            continue
+        allergy = request.get("allergy")
+        if allergy is None:
+            # Not an allergy request (or one we don't know). Only a known,
+            # empty shape is safe to skip; any other content is unreadable.
+            if any(v not in (None, "", [], {}) for v in request.values()):
+                unreadable = True
+            continue
+        if not isinstance(allergy, dict):
+            unreadable = True
+            continue
+        excluded = allergy.get("allergens_to_exclude") or []
+        if not isinstance(excluded, list):
+            excluded = [excluded]
+        for entry in excluded:
+            text = _allergen_text(entry)
+            if text:
+                allergens.append(text)
+            else:
+                unreadable = True
+        note = allergy.get("allergy_instructions")
+        if isinstance(note, str) and note.strip():
+            instructions.append(note.strip())
+        elif note not in (None, ""):
+            unreadable = True
+    deduped = tuple(dict.fromkeys(allergens))
+    return deduped, ("; ".join(instructions) or None), unreadable
+
+
 def parse_order_details(raw: dict, *, external_store_id: str) -> CanonicalDeliveryOrder:
     """
     Map a raw Get Order Details response to `CanonicalDeliveryOrder`.
@@ -300,6 +365,7 @@ def parse_order_details(raw: dict, *, external_store_id: str) -> CanonicalDelive
             continue
         title = item.get("title") or "Unknown item"
         price = item.get("price")
+        allergens, allergy_instructions, requests_unreadable = _parse_special_requests(item)
         lines.append(
             CanonicalDeliveryLine(
                 external_item_id=_entity_id(item),
@@ -310,6 +376,9 @@ def parse_order_details(raw: dict, *, external_store_id: str) -> CanonicalDelive
                 base_unit_price_cents=_price_cents(price, "base_unit_price"),
                 modifiers=_parse_modifiers(item),
                 special_instructions=item.get("special_instructions") or None,
+                allergens=allergens,
+                allergy_instructions=allergy_instructions,
+                special_requests_unreadable=requests_unreadable,
             )
         )
 
@@ -344,6 +413,7 @@ def parse_order_details(raw: dict, *, external_store_id: str) -> CanonicalDelive
         customer_phone_code=str(eater["phone_code"]) if eater.get("phone_code") else None,
         delivery_address=None,
         fulfillment_issues=fulfillment_issues,
+        cart_special_requests_present=cart.get("special_requests") not in (None, [], {}),
         provider_metadata=provider_metadata,
     )
 

@@ -176,6 +176,16 @@ class UberEatsAdapter(DeliveryProviderAdapter):
             # documented field list — lets a later webhook/report correlate
             # back to the ORDER we created, not just the delivery_orders row.
             "external_reference_id": str(our_order_id),
+            # What this integration actually relays to the kitchen ticket
+            # (BUG-0189): order and item special instructions, and item
+            # special requests (allergies). Promotions are not modelled, so
+            # they are reported as not relayed rather than claimed.
+            "fields_relayed": {
+                "order_special_instructions": True,
+                "item_special_instructions": True,
+                "item_special_requests": True,
+                "promotions": False,
+            },
         }
         await _call(context, lambda c, t, base: uber_client.accept_pos_order(
             c, t, external_order_id, body=body, api_base_url=base,

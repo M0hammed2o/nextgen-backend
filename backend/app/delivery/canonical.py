@@ -163,6 +163,18 @@ class CanonicalDeliveryLine:
     special_instructions: str | None = None
     total_price_cents: int | None = None
     base_unit_price_cents: int | None = None
+    # BUG-0189: the customer's allergy request for this line (Uber
+    # `special_requests[].allergy`): allergens to exclude, as display text,
+    # and the free-text allergy instructions. `special_requests_unreadable`
+    # is True when a special request was present but not in a shape we can
+    # read, so it cannot be relayed and the order must be denied.
+    allergens: tuple[str, ...] = ()
+    allergy_instructions: str | None = None
+    special_requests_unreadable: bool = False
+
+    @property
+    def has_allergy_request(self) -> bool:
+        return bool(self.allergens or self.allergy_instructions)
 
 
 @dataclass
@@ -210,6 +222,10 @@ class CanonicalDeliveryOrder:
     delivery_address: None = None
 
     fulfillment_issues: tuple[str, ...] = ()
+    # BUG-0189: Uber documents special requests per item only. Any cart-level
+    # `special_requests` content is unexpected, so it is never silently
+    # dropped: it makes the order unreadable and the order is denied.
+    cart_special_requests_present: bool = False
 
     # Allow-listed, provider-specific extras a future reconciliation job
     # might want (e.g. Uber's `brand`) — built ONLY via
@@ -219,6 +235,14 @@ class CanonicalDeliveryOrder:
     @property
     def item_count(self) -> int:
         return sum(line.quantity for line in self.lines)
+
+    @property
+    def has_allergy_request(self) -> bool:
+        return any(line.has_allergy_request for line in self.lines)
+
+    @property
+    def special_requests_unreadable(self) -> bool:
+        return self.cart_special_requests_present or any(line.special_requests_unreadable for line in self.lines)
 
 
 @dataclass(frozen=True)
