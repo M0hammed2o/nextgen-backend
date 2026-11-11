@@ -828,6 +828,18 @@ async def update_provider_integration(
     ).scalar_one_or_none()
     if connection is None or not connection.external_store_id:
         raise NotFoundError("Delivery connection", provider)
+    # Security review L1: same state rules as /enable and /disable. Back on
+    # only from DISABLED (a live store must not be knocked to
+    # ATTENTION_REQUIRED); off from anything that has ever been connected.
+    if body.integration_enabled and connection.status != "DISABLED":
+        raise AppError(
+            "DELIVERY_CONNECTION_NOT_DISABLED",
+            "Only a disabled connection can be switched back on.", 409,
+        )
+    if not body.integration_enabled and connection.status == "NOT_CONNECTED":
+        raise AppError(
+            "DELIVERY_CONNECTION_ALREADY_INACTIVE", "This connection was never connected.", 409,
+        )
     adapter = registry.get_provider(provider)
     try:
         await adapter.update_integration(

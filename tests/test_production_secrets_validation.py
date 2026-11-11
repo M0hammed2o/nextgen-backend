@@ -267,6 +267,21 @@ def test_placeholder_production_secondary_signing_key_is_caught(settings):
         main_module._validate_production_secrets()
 
 
+def test_sandbox_key_equal_to_a_production_signing_key_is_caught(settings, monkeypatch):
+    """Security review M2: compared against every production key, not only the client secret."""
+    shared = _valid_secret("h8")
+    settings.UBER_EATS_WEBHOOK_SIGNING_KEY = shared
+    monkeypatch.setattr(settings, "UBER_EATS_SANDBOX_WEBHOOK_SIGNING_KEY", shared)
+    with pytest.raises(RuntimeError, match="UBER_EATS_SANDBOX_WEBHOOK_SIGNING_KEY equals UBER_EATS_WEBHOOK_SIGNING_KEY"):
+        main_module._validate_production_secrets()
+
+
+def test_whitespace_on_a_production_signing_key_is_caught(settings):
+    settings.UBER_EATS_WEBHOOK_SECONDARY_SIGNING_KEY = _valid_secret("i9") + "\n"
+    with pytest.raises(RuntimeError, match="UBER_EATS_WEBHOOK_SECONDARY_SIGNING_KEY has leading or trailing whitespace"):
+        main_module._validate_production_secrets()
+
+
 def test_uber_webhook_defaults_to_disabled_so_production_boots_without_uber_access():
     """
     BUG-0109 regression guard. UBER_EATS_WEBHOOK_ENABLED previously defaulted to

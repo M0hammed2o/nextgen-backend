@@ -19,6 +19,7 @@ from backend.app.delivery.order_service import (
     delivery_order_recovery_and_reminders,
     process_delivery_order,
 )
+from shared.models.audit import AuditEvent
 from shared.models.delivery import DeliveryConnection, DeliveryOrder
 from tests.test_delivery_order_service import ScalarResult, TypedFakeDB, _connection, _delivery_order
 
@@ -62,11 +63,12 @@ def _row(status, *, age_seconds, deadline_in=400, display_id="ABC12"):
     return row
 
 
-async def _run_sweep(rows, redis=None, arq_redis=None):
+async def _run_sweep(rows, redis=None, arq_redis=None, staff_accepted=()):
     redis = redis or FakeRedis()
     arq_redis = arq_redis or FakeRedis()
     db = TypedFakeDB()
     db.register_select(DeliveryOrder, ScalarResult(rows=rows))
+    db.register_select(AuditEvent, ScalarResult(rows=list(staff_accepted)))
     with patch("backend.app.db.session.get_redis", new=AsyncMock(return_value=redis)), \
          patch("backend.app.delivery.order_service._publish_alert", new=AsyncMock()) as alert:
         await delivery_order_recovery_and_reminders(_ctx(db, arq_redis))
@@ -80,8 +82,14 @@ class TestLostJobRecovery:
         await _run_sweep([row], redis, arq_redis)
         await _run_sweep([row], redis, arq_redis)   # next tick, same interval
         assert arq_redis.enqueued == [
-            ("process_delivery_order", "UBER_EATS", str(row.business_id), row.external_order_id, None)
+            ("process_delivery_order", "UBER_EATS", str(row.business_id), row.external_order_id, None, False)
         ]
+
+    async def test_a_staff_accept_survives_recovery(self):
+        """Security review L2: a lost job for an order staff already accepted is re-queued as an accept."""
+        row = _row("RECEIVED", age_seconds=120)
+        arq_redis, _ = await _run_sweep([row], staff_accepted=[row.id])
+        assert arq_redis.enqueued[0][-1] is True
 
     async def test_fresh_received_order_is_left_to_its_own_job(self):
         arq_redis, _ = await _run_sweep([_row("RECEIVED", age_seconds=10)])

@@ -625,9 +625,22 @@ async def _handle_order(
     row.order_id = order.id
     await db.flush()
 
-    outcome, error, status_code = await _accept_with_retries(
-        adapter, external_order_id=external_order_id, context=context, our_order_id=str(order.id),
-    )
+    if (canonical.provider_status_raw or "").upper() == "ACCEPTED":
+        # Security review M1: the provider already reports this order as
+        # accepted — typically a retry after our accept succeeded but the
+        # commit that followed failed. Accepting again could be answered with
+        # a 4xx and misread as a refusal, rolling back a sale the customer has
+        # paid for. The provider's own state is the truth: book the sale.
+        logger.warning(
+            "DELIVERY_ORDER_ALREADY_ACCEPTED_AT_PROVIDER: business=%s external_order_id=%s — "
+            "booking the sale without a second accept call.",
+            business_id, external_order_id,
+        )
+        outcome, error, status_code = "accepted", None, None
+    else:
+        outcome, error, status_code = await _accept_with_retries(
+            adapter, external_order_id=external_order_id, context=context, our_order_id=str(order.id),
+        )
 
     if outcome == "rejected":
         # The provider definitively refused the accept (e.g. the order was
@@ -1867,13 +1880,28 @@ async def delivery_order_recovery_and_reminders(ctx: dict) -> None:
                     ),
                     (now - row.created_at).total_seconds(),
                 ))
+            # Security review L2: a staff member who already pressed Accept
+            # must not be asked again because the job was lost. The accept
+            # route audits `delivery.order.manual_accept_requested` on the row.
+            staff_accepted: set = set()
+            if recover:
+                staff_accepted = set((
+                    await db.execute(
+                        select(AuditEvent.target_id).where(
+                            AuditEvent.target_type == "delivery_order",
+                            AuditEvent.target_id.in_([r[0] for r in recover]),
+                            AuditEvent.action == "delivery.order.manual_accept_requested",
+                        )
+                    )
+                ).scalars().all())
+            recover = [(*r, r[0] in staff_accepted) for r in recover]
             await db.rollback()  # read-only: release the row locks
         except Exception:
             await db.rollback()
             logger.exception("DELIVERY_RECOVERY_SCAN_FAILED")
             return
 
-    for row_id, provider, business_id, external_order_id in recover:
+    for row_id, provider, business_id, external_order_id, force_accept in recover:
         try:
             if not await redis.set(f"delivery:recovery:{row_id}", "1", nx=True, ex=_RECOVERY_STALE_SECONDS):
                 continue
@@ -1882,7 +1910,7 @@ async def delivery_order_recovery_and_reminders(ctx: dict) -> None:
             if attempts > _RECOVERY_MAX_ATTEMPTS:
                 continue
             await ctx["redis"].enqueue_job(
-                "process_delivery_order", provider, str(business_id), external_order_id, None,
+                "process_delivery_order", provider, str(business_id), external_order_id, None, force_accept,
             )
             logger.warning(
                 "DELIVERY_ORDER_RECOVERED: business=%s external_order_id=%s attempt=%s — "

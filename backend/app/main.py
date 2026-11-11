@@ -273,9 +273,20 @@ def _validate_production_secrets() -> None:
         ("UBER_EATS_SANDBOX_WEBHOOK_SIGNING_KEY", settings.UBER_EATS_SANDBOX_WEBHOOK_SIGNING_KEY),
         ("UBER_EATS_SANDBOX_WEBHOOK_SECONDARY_SIGNING_KEY", settings.UBER_EATS_SANDBOX_WEBHOOK_SECONDARY_SIGNING_KEY),
     )
+    # Security review M2: every production key, not only the client secret.
+    # Once production signing keys are set, the client secret is no longer
+    # accepted for production webhooks, so comparing against it alone would
+    # miss the keys actually in use.
+    _uber_production_keys = (
+        ("UBER_EATS_CLIENT_SECRET", settings.UBER_EATS_CLIENT_SECRET),
+        ("UBER_EATS_WEBHOOK_SIGNING_KEY", settings.UBER_EATS_WEBHOOK_SIGNING_KEY),
+        ("UBER_EATS_WEBHOOK_SECONDARY_SIGNING_KEY", settings.UBER_EATS_WEBHOOK_SECONDARY_SIGNING_KEY),
+    )
     for name, value in _uber_sandbox_keys:
-        if value and value == settings.UBER_EATS_CLIENT_SECRET:
-            errors.append(f"{name} equals UBER_EATS_CLIENT_SECRET — sandbox-signed webhooks would prove production")
+        for prod_name, prod_value in _uber_production_keys:
+            if value and prod_value and value == prod_value:
+                errors.append(f"{name} equals {prod_name} — sandbox-signed webhooks would prove production")
+    for name, value in (*_uber_sandbox_keys, *_uber_production_keys[1:]):
         # A pasted trailing newline or space would make every genuine event BAD_SIGNATURE.
         if value and value != value.strip():
             errors.append(f"{name} has leading or trailing whitespace — every genuine webhook would fail verification")
@@ -376,6 +387,11 @@ from backend.app.core.ratelimit import limiter
 app.state.limiter = limiter
 
 
+import time as _time
+
+_last_rate_limit_log = float("-inf")
+
+
 def _rate_limit_handler(request, exc):
     """
     BUG-0170: a delivery marketplace never retries a 429 (Uber's webhook
@@ -386,8 +402,12 @@ def _rate_limit_handler(request, exc):
     """
     if request.url.path.startswith("/v1/webhook/delivery/"):
         from starlette.responses import Response as _Response
-        logger.warning("DELIVERY_WEBHOOK_RATE_LIMITED: path=%s client=%s — answering 503 so the provider retries.",
-                       request.url.path, request.client.host if request.client else "unknown")
+        global _last_rate_limit_log
+        now = _time.monotonic()
+        if now - _last_rate_limit_log >= 60:  # one line a minute, so a flood cannot flood the logs
+            _last_rate_limit_log = now
+            logger.warning("DELIVERY_WEBHOOK_RATE_LIMITED: path=%s client=%s — answering 503 so the provider retries.",
+                           request.url.path, request.client.host if request.client else "unknown")
         return _Response(status_code=503, headers={"Retry-After": "10"})
     return _rate_limit_exceeded_handler(request, exc)
 

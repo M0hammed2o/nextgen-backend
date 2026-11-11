@@ -69,6 +69,22 @@ class TestParse:
             order = parse_order_details(_raw(extra), external_store_id="s")
             assert order.special_requests_unreadable, extra
 
+    def test_shapes_the_review_found_are_unreadable_not_skipped(self):
+        for extra in (
+            {"special_requests": [{"allergy": {"allergens_to_exclude": [{"type": "OTHER"}]}}]},
+            {"special_requests": [{"allergy": {"new_field": "nuts"}}]},
+            {"special_requests": [{"allergy": {}}]},
+            {"special_requests": [{"allergy": {"allergens_to_exclude": [{"type": "DAIRY"}]}, "extra": "x"}]},
+            {"selected_modifier_groups": [{"selected_items": [{"title": "Sauce",
+                                                               "special_requests": [{"allergy": {}}]}]}]},
+        ):
+            assert parse_order_details(_raw(extra), external_store_id="s").special_requests_unreadable, extra
+
+    def test_other_with_words_is_relayed_as_the_words(self):
+        raw = _raw({"special_requests": [{"allergy": {"allergens_to_exclude": [{"type": "OTHER", "freeform_text": "kiwi"}]}}]})
+        line = parse_order_details(raw, external_store_id="s").lines[0]
+        assert line.allergens == ("kiwi",) and not line.special_requests_unreadable
+
     def test_cart_level_special_requests_are_unreadable(self):
         order = parse_order_details(_raw(cart_extra={"special_requests": [{"allergy": {}}]}), external_store_id="s")
         assert order.special_requests_unreadable
@@ -187,6 +203,21 @@ class TestIntake:
         assert row.status == "DENIED"
         adapter.accept_order.assert_not_awaited()
         assert not any(isinstance(o, Order) for o in db.added)
+
+
+async def test_order_uber_already_accepted_is_booked_without_a_second_accept():
+    """Security review M1: a retry after our accept succeeded but the commit failed."""
+    business_id = uuid.uuid4()
+    connection = _connection(business_id, auto_accept_enabled=True)
+    row = _delivery_order(business_id, connection.id)
+    menu_item = _menu_item(business_id)
+    db = _mapped_db(business_id, connection, _business(), row, menu_item)
+    canonical = _canonical_order(lines=[_allergy_line(menu_item)])
+    canonical.provider_status_raw = "ACCEPTED"
+    adapter, _ = await _run(db, canonical, business_id=business_id)
+    adapter.accept_order.assert_not_awaited()
+    assert row.status == "ACCEPTED"
+    assert len([o for o in db.added if isinstance(o, Order)]) == 1
 
 
 async def test_accept_tells_uber_which_fields_are_relayed():

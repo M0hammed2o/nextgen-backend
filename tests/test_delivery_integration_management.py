@@ -123,6 +123,29 @@ class TestRoutes:
                 provider="UBER_EATS", body=routes.IntegrationUpdateRequest(integration_enabled=True), user=user, db=db)
         assert result.status == "ATTENTION_REQUIRED"
 
+    async def test_switching_back_on_a_live_store_is_refused(self):
+        """Security review L1: same state rules as /enable."""
+        user = make_user(role="OWNER")
+        connection = make_connection(user.business_id, status="CONNECTED")
+        adapter = MagicMock(update_integration=AsyncMock())
+        with patch("backend.app.delivery.registry.get_provider", return_value=adapter):
+            with pytest.raises(AppError) as exc:
+                await routes.update_provider_integration(
+                    provider="UBER_EATS", body=routes.IntegrationUpdateRequest(integration_enabled=True),
+                    user=user, db=_db(user, connection, extra=0))
+        assert exc.value.code == "DELIVERY_CONNECTION_NOT_DISABLED"
+        adapter.update_integration.assert_not_awaited()
+        assert connection.status == "CONNECTED"
+
+    async def test_switching_off_a_never_connected_store_is_refused(self):
+        user = make_user(role="OWNER")
+        connection = make_connection(user.business_id, status="NOT_CONNECTED")
+        with pytest.raises(AppError) as exc:
+            await routes.update_provider_integration(
+                provider="UBER_EATS", body=routes.IntegrationUpdateRequest(integration_enabled=False),
+                user=user, db=_db(user, connection, extra=0))
+        assert exc.value.code == "DELIVERY_CONNECTION_ALREADY_INACTIVE"
+
     async def test_provider_failure_changes_nothing(self):
         user = make_user(role="OWNER")
         connection = make_connection(user.business_id, status="CONNECTED")

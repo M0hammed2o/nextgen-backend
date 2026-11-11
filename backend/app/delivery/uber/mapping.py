@@ -288,12 +288,33 @@ def _allergen_text(entry) -> str | None:
         return None
     free = str(entry.get("freeform_text") or "").strip()
     kind = str(entry.get("type") or "").strip()
-    if free and (not kind or kind.upper() in ("OTHER", "FREEFORM", "CUSTOM")):
-        return free
+    if not kind or kind.upper() in ("OTHER", "FREEFORM", "CUSTOM"):
+        # "Other" with no words says nothing the kitchen can act on: unreadable.
+        return free or None
     if kind:
         label = kind.replace("_", " ").capitalize()
         return f"{label} ({free})" if free else label
     return free or None
+
+
+_KNOWN_ALLERGY_KEYS = frozenset({"allergens_to_exclude", "allergy_instructions"})
+
+
+def _nested_special_requests(item: dict, depth: int = 0) -> bool:
+    """True when a modifier somewhere under this item carries special requests (not parsed: unreadable)."""
+    if depth > 4:
+        return False
+    for group in item.get("selected_modifier_groups") or []:
+        if not isinstance(group, dict):
+            continue
+        for sub in group.get("selected_items") or []:
+            if not isinstance(sub, dict):
+                continue
+            if sub.get("special_requests") not in (None, [], {}):
+                return True
+            if _nested_special_requests(sub, depth + 1):
+                return True
+    return False
 
 
 def _parse_special_requests(item: dict) -> tuple[tuple[str, ...], str | None, bool]:
@@ -306,9 +327,10 @@ def _parse_special_requests(item: dict) -> tuple[tuple[str, ...], str | None, bo
     than ignored, because a dropped allergy request is a food-safety failure:
     the caller denies such an order with SPECIAL_INSTRUCTIONS.
     """
+    nested = _nested_special_requests(item)
     raw = item.get("special_requests")
     if raw in (None, [], {}):
-        return (), None, False
+        return (), None, nested
     requests = raw if isinstance(raw, list) else [raw]
     allergens: list[str] = []
     instructions: list[str] = []
@@ -327,6 +349,12 @@ def _parse_special_requests(item: dict) -> tuple[tuple[str, ...], str | None, bo
         if not isinstance(allergy, dict):
             unreadable = True
             continue
+        # Security review L3: content we do not understand, beside or inside
+        # the allergy, is never skipped silently.
+        if any(k != "allergy" and v not in (None, "", [], {}) for k, v in request.items()):
+            unreadable = True
+        if any(k not in _KNOWN_ALLERGY_KEYS and v not in (None, "", [], {}) for k, v in allergy.items()):
+            unreadable = True
         excluded = allergy.get("allergens_to_exclude") or []
         if not isinstance(excluded, list):
             excluded = [excluded]
@@ -341,8 +369,10 @@ def _parse_special_requests(item: dict) -> tuple[tuple[str, ...], str | None, bo
             instructions.append(note.strip())
         elif note not in (None, ""):
             unreadable = True
+    if not allergens and not instructions and not unreadable:
+        unreadable = True  # an allergy object that names nothing we can relay
     deduped = tuple(dict.fromkeys(allergens))
-    return deduped, ("; ".join(instructions) or None), unreadable
+    return deduped, ("; ".join(instructions) or None), unreadable or nested
 
 
 def parse_order_details(raw: dict, *, external_store_id: str) -> CanonicalDeliveryOrder:
