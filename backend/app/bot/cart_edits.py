@@ -122,6 +122,13 @@ def plan_edit(text: str, cart: list[dict], menu_items: list) -> EditPlan | None:
     nm = None
     for nm in re.finditer(r"\b(" + _NUM_ALT + r")\b", head):
         cnt = _num(nm.group(1))
+    if cnt is None:
+        # count stated after the target: "change the fries to onion rings on
+        # one of them" / "... for 2 of them" / "... for one"
+        tail_m = re.search(r"\b(?:on|for|in)\s+(" + _NUM_ALT + r")\b(?:\s+of\s+(?:them|those|these|the\s+\w+))?"
+                           r"|\b(" + _NUM_ALT + r")\s+of\s+(?:them|those|these)\b", low[to_m.end():])
+        if tail_m:
+            cnt = _num(tail_m.group(1) or tail_m.group(2))
     wants_all = bool(_ALL_RE.search(head)) and cnt is None
 
     # candidate lines: carry this group, don't already have the target

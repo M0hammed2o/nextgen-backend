@@ -507,3 +507,83 @@ async def test_menu_full_menu_still_available_and_every_chunk_within_limit():
     assert all(len(ch) + 350 <= WA_LIMIT for ch in chunks)
     all_lines = [ln for ch in chunks for ln in ch.split("\n") if ln.strip().startswith("•")]
     assert len(all_lines) == len(set(all_lines)) == sum(1 for i in items if i.is_active)
+
+
+# ── Live add-ons: loose add-on stem match must not swallow options ───────────
+# Found after the first fix, driving the real worker against the local Super
+# Burger tenant: its add-ons ("Add Pulled Beef", "Upgrade to Large Fries
+# (demo)", "Cheese Melt") stem-matched "beef" / "fries" / "cheese" and routed
+# orders down the DET add-on path, which dropped the options into free-text
+# notes (no Beef +R15, no per-unit sides). The plain fixture had no add-ons.
+from tests.superburger_harness import build_menu_with_add_ons  # noqa: E402
+
+
+async def test_live_add_ons_do_not_hijack_all_beef_two_fries_one_rings():
+    c = Chat(build_menu_with_add_ons())
+    try:
+        r = await c.say("Give me 3 Super Burgers, all beef, 2 with fries and 1 with onion rings")
+        _assert_clean_reply(r)
+        assert _lines(c) == sorted(EXPECTED_405, key=lambda x: (x[1], x[2]))
+        assert c.total() == 40500
+        assert not any(i.get("add_ons") for i in c.cart)
+    finally:
+        c.close()
+
+
+async def test_live_add_ons_cheese_in_the_item_name_is_not_an_add_on():
+    c = Chat(build_menu_with_add_ons())
+    try:
+        r = await c.say("Give me 2 Cheese Burgers chicken with fries")
+        _assert_clean_reply(r)
+        assert _lines(c) == [(2, "Cheese Burger", ["Chicken", "Fries"], 11000, 22000)]
+        assert not any(i.get("add_ons") for i in c.cart)
+    finally:
+        c.close()
+
+
+async def test_live_add_ons_real_add_on_keeps_the_allocated_options_and_prices():
+    c = Chat(build_menu_with_add_ons())
+    try:
+        r = await c.say("Give me 2 Super Burgers beef with fries and cheese melt")
+        _assert_clean_reply(r)
+        assert len(c.cart) == 1
+        line = c.cart[0]
+        assert line["quantity"] == 2
+        assert sorted(o["option_name"] for o in line["selected_options"]) == ["Beef", "Fries"]
+        assert [a["name"] for a in line["add_ons"]] == ["Cheese Melt"]
+        assert line["unit_price_cents"] == 12000 + 1500 + 5000
+        assert c.total() == 2 * 18500
+    finally:
+        c.close()
+
+
+async def test_I2_side_correction_with_the_count_after_the_target_changes_only_that_many():
+    # local-worker run 2026-11-11: "... on one of them" changed all three
+    c = Chat(build_menu_with_add_ons())
+    try:
+        await c.say("Give me 3 Super Burgers beef with fries")
+        r = await c.say("Change the fries to onion rings on one of them")
+        _assert_clean_reply(r)
+        assert _lines(c) == sorted(EXPECTED_405, key=lambda x: (x[1], x[2]))
+        assert c.total() == 40500
+    finally:
+        c.close()
+
+
+async def test_F2_burgers_finds_a_category_named_og_burgers_on_a_large_menu():
+    # the live categories are "OG Burgers", "Cheeseboys", ...: "burgers" must open OG Burgers,
+    # not fall back to the category list
+    from tests.superburger_harness import build_big_menu
+    items, cats = build_big_menu()
+    for cat in cats:
+        if cat.name == "Burgers":
+            cat.name = "OG Burgers"
+    c = Chat(items, categories=cats)
+    try:
+        await c.say("Give me a Cheeseburger")
+        r = await c.say("Show me the burgers menu")
+        _assert_clean_reply(r)
+        assert "Super Burger" in r and "OG Burgers" in r
+        assert c.total() == 9500
+    finally:
+        c.close()

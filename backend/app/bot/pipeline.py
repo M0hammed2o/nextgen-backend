@@ -2038,6 +2038,20 @@ def _det_has_add_on_conflict(
         search_lower = search_text.lower()
         search_words = search_lower.split()
         for _item, avail in avail_by_item:
+            # Words that name one of this item's own option values ("beef"
+            # patty, "fries" side) are option choices, not add-on mentions:
+            # without this, "3 Super Burgers beef with fries" stem-matched the
+            # "Add Pulled Beef" / "Upgrade to Large Fries" add-ons and took the
+            # DET add-on path, which drops the options into free-text notes
+            # and skips per-unit allocation (Super Burger live, 2026-11-11).
+            opt_stems = {
+                w[:4]
+                for g in ((getattr(_item, "options_json", None) or {}).get("option_groups") or [])
+                for o in (g.get("options") or [])
+                for w in str(o.get("name", "")).lower().split()
+                if len(w) >= 4
+            }
+            item_words = [w for w in search_words if len(w) >= 4 and w[:4] not in opt_stems]
             for ao in avail:
                 ao_name = ao["name"].lower()
                 if ao_name in search_lower or search_lower in ao_name:
@@ -2045,7 +2059,7 @@ def _det_has_add_on_conflict(
                 # Word-level stem match: "patties"[:4]="patt" == "patty"[:4]="patt"
                 ao_words = [w for w in ao_name.split() if len(w) >= 4]
                 if any(
-                    any(mw[:4] == aw[:4] for mw in search_words if len(mw) >= 4)
+                    any(mw[:4] == aw[:4] for mw in item_words)
                     for aw in ao_words
                 ):
                     return True
@@ -4018,7 +4032,20 @@ def _category_from_text(groups: list[tuple], low: str):
         if any(re.search(rf"(?<![a-z0-9]){re.escape(f)}(?![a-z0-9])", low) for f in forms if f):
             best.append((len(nm), cat))
     if not best:
-        return None
+        # second pass: one distinctive word of a category name ("burgers" ->
+        # "OG Burgers"), only when exactly one category matches
+        word_hits = []
+        for cat, _lst in groups:
+            if cat is None:
+                continue
+            for w in cat.name.lower().split():
+                if len(w) < 4:
+                    continue
+                forms = {w, w.rstrip("s"), w + "s"}
+                if any(re.search(rf"(?<![a-z0-9]){re.escape(f)}(?![a-z0-9])", low) for f in forms if f):
+                    word_hits.append(cat)
+                    break
+        return word_hits[0] if len(word_hits) == 1 else None
     best.sort(key=lambda x: -x[0])
     if len(best) > 1 and best[0][0] == best[1][0]:
         return None
@@ -4438,6 +4465,17 @@ async def _handle_with_llm(
                 add_ons_map,
                 full_text=norm_text,
             )
+            # The detector is a loose stem match ("cheese" in "Cheese Burgers"
+            # hits the "Cheese Melt" add-on). If no add-on actually resolves
+            # for any matched item it was a false positive -- taking the
+            # add-on path would only drop the item's options into notes.
+            if _has_addon_conflict:
+                _multi_chk = len(det_matches) > 1
+                if not any(
+                    _extract_addons_from_text((_m or norm_text) if _multi_chk else norm_text, _it, add_ons_map)
+                    for _it, _q, _m in det_matches
+                ):
+                    _has_addon_conflict = False
             # A single-unit priced option still yields to the LLM exactly as
             # before (replay conv_p001 pins that). A MULTI-unit line with
             # per-unit options cannot be represented by the LLM's one-options-
@@ -4469,6 +4507,26 @@ async def _handle_with_llm(
                         # Remove add-on names from modifier so they don't also
                         # appear as free special_instructions
                         _clean_mod = _filter_addon_names_from_text(_dm, _resolved_ao)
+                        if id(_di) in _det_pends:
+                            # Options already allocated per unit: keep them
+                            # (priced, structured) alongside the add-ons.
+                            for _ln in option_allocation.build_lines(_det_pends[id(_di)]):
+                                _ln_instr = _line_instructions(_ln["option_names"], _clean_mod or None,
+                                                               getattr(_di, "options_json", None))
+                                state_machine.add_to_cart(
+                                    session,
+                                    menu_item_id=str(_di.id), name=_di.name,
+                                    price_cents=_di.price_cents, quantity=_ln["quantity"],
+                                    selected_options=_ln["selected_options"], add_ons=_resolved_ao,
+                                    options=None, special_instructions=_ln_instr,
+                                )
+                                _lbl = f"{_ln['quantity']}x {_di.name}"
+                                if _ln["option_names"]:
+                                    _lbl += " (" + ", ".join(_ln["option_names"]) + ")"
+                                if _resolved_ao:
+                                    _lbl += " [" + ", ".join(f"+{a['name']}" for a in _resolved_ao) + "]"
+                                det_added.append(_lbl)
+                            continue
                         state_machine.add_to_cart(
                             session,
                             menu_item_id=str(_di.id),

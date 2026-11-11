@@ -89,6 +89,29 @@ def build_big_menu():
     return items, attach_categories(items)
 
 
+LIVE_ADD_ONS = [  # the live Super Burger add-ons (same names/prices as the tenant)
+    ("Cheese Melt", 5000), ("Chilli Cheese Melt", 5000), ("Mushroom Sauce", 3500), ("Cheese Sauce", 3500),
+    ("Pepper Sauce", 3500), ("Chimichurri", 3500), ("Add Pulled Beef", 9500),
+    ("Upgrade to Large Fries (demo)", 2100), ("Add a Soft Drink (demo)", 2800),
+]
+
+
+def build_menu_with_add_ons():
+    """build_menu() plus the live add-ons on the burgers and a 'Cheese Burger' with patty/side groups.
+    The plain fixture had no add-ons, which hid the loose add-on stem match ("beef" ~ "Add Pulled Beef",
+    "fries" ~ "Upgrade to Large Fries", "cheese" ~ "Cheese Melt") that routed live orders down the
+    DET add-on path and dropped their options."""
+    aos = [{"add_on_id": f"ao-{i}", "name": n, "price_cents": p, "min_qty": 0, "max_qty": 3, "default_qty": 1}
+           for i, (n, p) in enumerate(LIVE_ADD_ONS)]
+    menu = build_menu()
+    for it in menu:
+        if it.name in ("Super Burger", "Classic Burger"):
+            it.add_ons = aos
+    menu.append(FakeMenuItem("Cheese Burger", 11000, "Burgers", add_ons=aos,
+                             options_json={"option_groups": [PATTY, SIDE], "removable_ingredients": GARNISH}))
+    return menu
+
+
 def make_runner(menu=None):
     conv = {"id": "sb", "title": "super burger", "turns": []}
     r = ReplayRunner(conv, FakeBusiness(name="Super Burger"), FakeCustomer(), menu or build_menu())
