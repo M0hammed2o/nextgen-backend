@@ -374,7 +374,25 @@ from slowapi.errors import RateLimitExceeded
 from backend.app.core.ratelimit import limiter
 
 app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+def _rate_limit_handler(request, exc):
+    """
+    BUG-0170: a delivery marketplace never retries a 429 (Uber's webhook
+    guide retries only 500/502/503/504, timeouts and network errors), so a
+    rate-limited order webhook would be lost and Uber would auto-cancel the
+    order. Over-limit delivery webhooks answer 503 with Retry-After instead,
+    which Uber retries. Every other route keeps slowapi's 429.
+    """
+    if request.url.path.startswith("/v1/webhook/delivery/"):
+        from starlette.responses import Response as _Response
+        logger.warning("DELIVERY_WEBHOOK_RATE_LIMITED: path=%s client=%s — answering 503 so the provider retries.",
+                       request.url.path, request.client.host if request.client else "unknown")
+        return _Response(status_code=503, headers={"Retry-After": "10"})
+    return _rate_limit_exceeded_handler(request, exc)
+
+
+app.add_exception_handler(RateLimitExceeded, _rate_limit_handler)
 
 # ── Error Handlers ───────────────────────────────────────────────────────────
 

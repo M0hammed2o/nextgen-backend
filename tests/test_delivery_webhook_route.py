@@ -143,3 +143,34 @@ class TestRouteRegistration:
                 getattr(d.call, "__name__", "") for d in getattr(route, "dependencies", [])
             ]
             assert not any(name.startswith("require_") for name in dep_names)
+
+
+class TestRateLimitedWebhookIsRetriable:
+    """BUG-0170: Uber does not retry a 429, so this route must answer 503 + Retry-After when limited."""
+
+    def _request(self, path):
+        request = MagicMock()
+        request.url.path = path
+        request.client.host = "203.0.113.7"
+        return request
+
+    def test_delivery_webhook_over_the_limit_answers_503_with_retry_after(self):
+        from backend.app import main
+        response = main._rate_limit_handler(self._request("/v1/webhook/delivery/UBER_EATS"), MagicMock())
+        assert response.status_code == 503
+        assert response.headers["Retry-After"] == "10"
+
+    def test_every_other_route_keeps_the_429(self):
+        from backend.app import main
+        with patch.object(main, "_rate_limit_exceeded_handler", return_value="slowapi-429") as default:
+            assert main._rate_limit_handler(self._request("/v1/auth/login"), MagicMock()) == "slowapi-429"
+        default.assert_called_once()
+
+    def test_limit_is_registered_for_rate_limit_exceptions(self):
+        from slowapi.errors import RateLimitExceeded
+        from backend.app import main
+        assert main.app.exception_handlers[RateLimitExceeded] is main._rate_limit_handler
+
+    def test_default_limit_has_headroom_for_a_shared_uber_sender_ip(self):
+        from backend.app.core.config import Settings
+        assert Settings.model_fields["DELIVERY_WEBHOOK_RATE_LIMIT_PER_MINUTE"].default >= 600

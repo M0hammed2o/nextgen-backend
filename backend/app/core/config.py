@@ -476,7 +476,12 @@ class Settings(BaseSettings):
     # routes_delivery_webhook.py's module docstring. Generous relative to
     # the auth-endpoint limits above since this is provider-server traffic,
     # not end-user traffic, but still bounded.
-    DELIVERY_WEBHOOK_RATE_LIMIT_PER_MINUTE: int = 120
+    # BUG-0170: raised from 120. Every tenant's Uber webhooks come from Uber's
+    # small sender pool and share one bucket per sender IP, so the old value
+    # was reachable with a few dozen busy stores. Over the limit, this route
+    # answers 503 + Retry-After (main.py::_rate_limit_handler), never 429,
+    # because Uber does not retry a 429.
+    DELIVERY_WEBHOOK_RATE_LIMIT_PER_MINUTE: int = 600
 
     # How long staff have to accept/deny a delivery order before the
     # watchdog cron auto-denies it. Deliberately UNDER Uber's real 11.5-
