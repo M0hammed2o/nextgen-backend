@@ -272,6 +272,9 @@ class ReplayRunner:
         # conversation, identical to a business that never adopted the
         # feature. See test_replay_suite.py's "menu_pages" conv-JSON key.
         self.menu_pages = menu_pages if menu_pages is not None else []
+        # Menu categories handed to _load_menu. [] (the historical behaviour)
+        # unless a test sets it -- only the category-browsing tests do.
+        self.categories: list = []
 
         self.session = ReplaySession()
         self.scripted_llm = ScriptedLLMProvider()
@@ -511,7 +514,7 @@ class ReplayRunner:
         with patch("backend.app.bot.pipeline._load_add_ons_map",
                    return_value=_add_ons_map):
           with patch("backend.app.bot.pipeline._load_menu",
-                   return_value=([], self.menu_items)):
+                   return_value=(self.categories, self.menu_items)):
             with patch("backend.app.bot.pipeline._load_business_menu_pages",
                        return_value=self.menu_pages):
               with patch("backend.app.bot.pipeline._load_specials",

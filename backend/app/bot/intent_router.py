@@ -454,6 +454,10 @@ def is_cart_correction(text: str) -> bool:
         # "no tomato please" never match.
         r"|\bno[,.]?\s+(i\s+)?(want|give\s+me)\s+(just\s+|only\s+)?(?!to\s+add\b)"
         r"(a\s+single|a\b|an\b|one|two|three|four|five|six|\d+)"
+        # "No it is 3 Super Burgers and ..." / "No, I said 3 ..." / "No that's 3 ..."
+        # (live incident 2026-11-11): a restatement of the full order's quantities.
+        r"|\bno[,.]?\s+(it\s+is|it'?s|i\s+said|i\s+meant|that'?s|that\s+is)\s+(just\s+|only\s+)?"
+        r"(a\s+single|a\b|an\b|one|two|three|four|five|six|\d+)\b"
         r")",
         re.I,
     )

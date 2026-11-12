@@ -21,7 +21,9 @@ Pipeline steps:
 15. Update daily usage
 """
 
+import contextvars
 import logging
+import re
 import uuid
 from datetime import datetime, timezone
 
@@ -31,8 +33,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from backend.app.bot import (
+    cart_edits,
     intent_router,
     llm_parser,
+    option_allocation,
     order_creator,
     prompt_builder,
     responses,
@@ -577,6 +581,64 @@ async def _handle_image_request(
     return None
 
 
+# True while the current turn already delivered its reply itself (the
+# multi-chunk menu sends every chunk directly and returns ""), so an empty
+# return value is legitimate and must not trigger the empty-reply guard.
+_reply_sent_directly: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "reply_sent_directly", default=False
+)
+
+
+def _never_empty_reply(fn):
+    """Never answer a customer with an empty message (live incident
+    2026-11-11: "Beef" and "No give me 3 super burgers please" produced an
+    empty / no reply because an LLM turn returned no message text).
+
+    Decorator around the real handler (functools.wraps keeps
+    ``inspect.getsource(_handle_message)`` pointing at the real body): if it
+    returns blank text and did not already send its reply directly, fall back
+    to the most useful honest prompt -- the still-pending option question,
+    else the current cart, else a rephrase request."""
+    import functools
+
+    @functools.wraps(fn)
+    async def _wrapper(db, business, customer, session, msg_text, norm_text, intent):
+        _reply_sent_directly.set(False)
+        result = await fn(db, business, customer, session, msg_text, norm_text, intent)
+        text = result[0]
+        if (text and str(text).strip()) or _reply_sent_directly.get():
+            return result
+        if session.state == ConversationState.HANDOFF.value:
+            return result
+        logger.warning(
+            "EMPTY_RESPONSE_GUARD: handler returned blank text, substituting a prompt. "
+            "state=%s, session_id=%s, msg=%r", session.state, session.id, msg_text[:80],
+        )
+        fallback = None
+        pend = state_machine.get_context(session, "pending_options")
+        if pend and isinstance(pend, list) and isinstance(pend[0], dict) and pend[0].get("options_json"):
+            _seeded = dict(pend[0])
+            option_allocation.seed_from_legacy(_seeded)
+            _missing = option_allocation.missing_groups(_seeded)
+            if _missing:
+                fallback = _alloc_question(_seeded, _missing)
+        if fallback is None and state_machine.get_cart(session):
+            fallback = (
+                "Here's your order so far 🛒\n\n"
+                + state_machine.cart_summary_text(session, business.currency)
+                + "\n\nReply *yes* to confirm, or tell me what you'd like to change."
+            )
+        if fallback is None:
+            fallback = (
+                "Sorry, I didn't quite catch that. 🙏 Tell me what you'd like to order, "
+                "or say *menu* to see what we have."
+            )
+        return (fallback, False, None, None, None)
+
+    return _wrapper
+
+
+@_never_empty_reply
 async def _handle_message(
     db: AsyncSession,
     business: Business,
@@ -734,6 +796,11 @@ async def _handle_message(
 
             return greeting, False, None, None, None
 
+    # ── Menu category browsing (large menus) ─────────────────────────────
+    _browse_result = await _handle_menu_browse(db, business, session, norm_text, current_state)
+    if _browse_result is not None:
+        return _browse_result
+
     if intent == MessageIntent.MENU_REQUEST:
         menu_image_url = getattr(business, "menu_image_url", None)
         # Generic "show me the menu" (no specific product/page named, no
@@ -823,6 +890,21 @@ async def _handle_message(
             )
 
         menu_messages = responses.build_menu_messages(categories, items, business.currency)
+        _wants_full_menu = bool(re.search(
+            r"\b(full|entire|whole|complete)\s+menu\b|\ball\s+(?:the\s+)?(?:items|menu)\b", norm_text.lower()
+        ))
+        if (
+            len(menu_messages) > 1 and not _wants_full_menu
+            and len(responses._active_items_by_category(categories, items)) >= 2
+        ):
+            # A large menu is never dumped as 5+ messages (live incident
+            # 2026-11-11: a chunk arrived twice and the customer was buried):
+            # offer categories first; pages come on request.
+            state_machine.set_context(session, "menu_browse", {"mode": "categories"})
+            return (
+                responses.menu_categories_message(categories, items),
+                False, None, None, None,
+            )
         first_chunk = menu_messages[0]
         if _has_active_order:
             first_chunk = (
@@ -836,6 +918,11 @@ async def _handle_message(
                 header += f"\n📷 View menu image: {menu_image_url}"
             first_chunk = header + "\n\n" + first_chunk + "\n\nLet me know what you'd like to order! 😊"
 
+        if len(menu_messages) > 1 and len(first_chunk) > 4090:
+            # The wrapper text added above pushed chunk 1 past WhatsApp's
+            # 4096-character limit; Meta rejects such a message permanently,
+            # so the customer would silently lose the start of the menu.
+            first_chunk = menu_messages[0]
         if len(menu_messages) == 1:
             # Common case (the overwhelming majority of real menus): one
             # chunk, unchanged behaviour -- returned through the normal
@@ -855,6 +942,7 @@ async def _handle_message(
         # reply's conversation-history persistence for a correct-order
         # guarantee -- the same trade-off this handler's menu-image send
         # already makes.)
+        _reply_sent_directly.set(True)
         for chunk in [first_chunk, *menu_messages[1:]]:
             try:
                 chunk_wamid = await whatsapp_sender.send_text_message(
@@ -1075,6 +1163,43 @@ async def _handle_message(
             False, None, None, None,
         )
 
+    # ── Deterministic edits to existing cart lines (2026-11-11) ──────────
+    # "change one to beef", "change the onion rings to potato skins",
+    # "actually make that 4": applied per unit / per line with prices
+    # recomputed; ambiguous requests are asked about, never guessed.
+    if (
+        current_state in (ConversationState.CONFIRMING_ORDER.value, ConversationState.BUILDING_CART.value)
+        and state_machine.get_cart(session)
+        and not state_machine.get_context(session, "pending_options")
+    ):
+        _, _edit_items = await _load_menu(db, business.id)
+        _edit_plan = cart_edits.plan_edit(norm_text, state_machine.get_cart(session), _edit_items)
+        if _edit_plan is not None:
+            if _edit_plan.kind == "ask":
+                return (_edit_plan.question, False, None, None, None)
+            _edit_labels = cart_edits.apply_edit(session, _edit_plan, state_machine)
+            import copy as _copy_edit
+            state_machine.set_context(
+                session, "confirmed_cart", _copy_edit.deepcopy(state_machine.get_cart(session))
+            )
+            state_machine.transition_state(session, ConversationState.CONFIRMING_ORDER.value)
+            logger.warning(
+                "DET_CART_EDIT: kind=%s, labels=%r, session_id=%s",
+                _edit_plan.kind, _edit_labels, session.id,
+            )
+            _e_mode = state_machine.get_context(session, "order_mode", "PICKUP")
+            _e_total = state_machine.cart_total_cents(session)
+            _e_summary = state_machine.cart_summary_text(session, business.currency)
+            _e_confirm = responses.ask_confirmation_response(
+                _e_summary, _e_total, 0, _e_mode, business.currency
+            )
+            if _e_mode == "DELIVERY":
+                _e_confirm += "\n_Delivery fee will be confirmed by our team._"
+            return (
+                "Updated ✅ " + ", ".join(_edit_labels) + "\n\n" + _e_confirm,
+                False, None, None, None,
+            )
+
     # ── Order confirmation (in CONFIRMING_ORDER state) ───────────────────
     if current_state == ConversationState.CONFIRMING_ORDER.value:
         # Use norm_text for all deterministic checks so SA slang/typos are handled.
@@ -1219,6 +1344,24 @@ async def _handle_message(
                     # a Size group with a Large=+R5 delta) silently charged
                     # the base price only -- found while adding deterministic
                     # option resolution and its regression tests, 2026-10-26.
+                    if _p.get("allocations"):
+                        # Per-unit option allocation (option_allocation.py):
+                        # one cart line per distinct option combination.
+                        _p_alloc = dict(_p)
+                        _p_alloc["quantity"] = _qty
+                        for _ln in option_allocation.build_lines(_p_alloc):
+                            _ln_instr = _line_instructions(_ln["option_names"], _p.get("special_instructions"), _p.get("options_json"))
+                            state_machine.add_to_cart(
+                                session, str(_mi.id), _mi.name, _mi.price_cents,
+                                _ln["quantity"], selected_options=_ln["selected_options"],
+                                options=_p.get("options"),
+                                special_instructions=_ln_instr,
+                            )
+                            _lbl = f"{_ln['quantity']}x {_mi.name}"
+                            if _ln_instr:
+                                _lbl += f" ({_ln_instr})"
+                            _labels_co.append(_lbl)
+                        continue
                     state_machine.add_to_cart(
                         session, str(_mi.id), _mi.name, _mi.price_cents,
                         _qty, selected_options=_p.get("selected_options"),
@@ -1243,6 +1386,39 @@ async def _handle_message(
                 _cfm += "\n_Delivery fee will be confirmed by our team._"
             _lbl_str = ", ".join(_labels_co) if _labels_co else "items"
             return (f"Added to your order: {_lbl_str} ✅\n\n{_cfm}", False, None, None, None)
+
+        # ── Per-unit option allocation (2026-11-11 Super Burger incident) ───
+        # A single pending item with required option groups: resolve the
+        # customer's answer ("Beef", "2 with fries and 1 with onion rings",
+        # "fries for 2 and one with onion rings", "No, 3 super burgers") to
+        # the units still awaiting each group, deterministically, BEFORE any
+        # LLM or standalone-product matching can reinterpret the option
+        # words as new products. See option_allocation.py.
+        if (
+            _pending_opts
+            and (not _proposed_items or _pending_opts[0].get("allocations") is not None)
+            and all(p.get("options_json") for p in _pending_opts[1:])
+        ):
+            _alloc_rest = list(_pending_opts[1:])
+            _alloc_res = await _resolve_pending_allocation(
+                db, business, session, _pending_opts[0], norm_text, rest=_alloc_rest,
+            )
+            if _alloc_res is not None:
+                _alloc_kind, _alloc_payload = _alloc_res
+                if _alloc_kind == "commit":
+                    _committed = await _commit_to_cart_and_confirm([_alloc_payload])
+                    if _alloc_rest:
+                        # More queued items still owe an answer: keep them
+                        # pending and ask the next question.
+                        state_machine.set_context(session, "pending_options", _alloc_rest)
+                        state_machine.transition_state(session, ConversationState.CHOOSING_OPTIONS.value)
+                        _next_q = _alloc_question(
+                            _alloc_rest[0], option_allocation.missing_groups(_alloc_rest[0]) or
+                            option_allocation.required_groups(_alloc_rest[0].get("options_json")),
+                        )
+                        return (_committed[0].split("\n\n")[0] + "\n\n" + _next_q, False, None, None, None)
+                    return _committed
+                return (_alloc_payload, False, None, None, None)
 
         # ── Sub-case: deterministic resolution of a single pending item's
         # required option(s) (e.g. "Hot" answering a Spice Level question) ──
@@ -1300,6 +1476,7 @@ async def _handle_message(
                                 "group_id": _grp.get("id"),
                                 "group_name": _grp.get("name"),
                                 "option_id": _opt.get("id"),
+                                "option_name": _opt["name"],
                                 "name": _opt["name"],
                                 "price_delta_cents": _opt.get("price_delta_cents", 0),
                             })
@@ -1861,6 +2038,20 @@ def _det_has_add_on_conflict(
         search_lower = search_text.lower()
         search_words = search_lower.split()
         for _item, avail in avail_by_item:
+            # Words that name one of this item's own option values ("beef"
+            # patty, "fries" side) are option choices, not add-on mentions:
+            # without this, "3 Super Burgers beef with fries" stem-matched the
+            # "Add Pulled Beef" / "Upgrade to Large Fries" add-ons and took the
+            # DET add-on path, which drops the options into free-text notes
+            # and skips per-unit allocation (Super Burger live, 2026-11-11).
+            opt_stems = {
+                w[:4]
+                for g in ((getattr(_item, "options_json", None) or {}).get("option_groups") or [])
+                for o in (g.get("options") or [])
+                for w in str(o.get("name", "")).lower().split()
+                if len(w) >= 4
+            }
+            item_words = [w for w in search_words if len(w) >= 4 and w[:4] not in opt_stems]
             for ao in avail:
                 ao_name = ao["name"].lower()
                 if ao_name in search_lower or search_lower in ao_name:
@@ -1868,7 +2059,7 @@ def _det_has_add_on_conflict(
                 # Word-level stem match: "patties"[:4]="patt" == "patty"[:4]="patt"
                 ao_words = [w for w in ao_name.split() if len(w) >= 4]
                 if any(
-                    any(mw[:4] == aw[:4] for mw in search_words if len(mw) >= 4)
+                    any(mw[:4] == aw[:4] for mw in item_words)
                     for aw in ao_words
                 ):
                     return True
@@ -3096,6 +3287,9 @@ def _parse_quantity_before(msg_lower: str, item_start: int) -> int:
     tokens = prefix.split()
     if not tokens:
         return 1
+    # "two of your super burgers" / "3 of the cheeseburgers" (BUG-0205)
+    if len(tokens) >= 3 and tokens[-2] == "of" and tokens[-1] in ("your", "ur", "the", "those", "these"):
+        tokens = tokens[:-2]
     last = tokens[-1].rstrip(".,")
     if last.isdigit():
         return max(1, min(int(last), 20))
@@ -3410,11 +3604,91 @@ def _extract_items_from_message(
             # e.g. "... and extra patty" after an item already matched above.
             continuation = _extract_modifier_from_suffix(chunk)
             if continuation:
-                prev_item, prev_qty, prev_mod = all_matched[-1]
+                # The modifier belongs to the last REAL item: a match that is
+                # only an option value of an earlier item ("1 with onion
+                # rings" -> the burger's Side, folded below) is skipped, else
+                # "..., one without onions" would land on the side and vanish.
+                _ti = len(all_matched) - 1
+                while _ti > 0 and any(
+                    _is_enabled_option_value(o_it, all_matched[_ti][0].name) for o_it, _q, _m in all_matched[:_ti]
+                ):
+                    _ti -= 1
+                prev_item, prev_qty, prev_mod = all_matched[_ti]
+                # "2 cheeseburgers, ONE without onions": a leading count smaller
+                # than the previous quantity means the modifier belongs to that
+                # many units only -- split the line instead of applying the
+                # removal to every unit (2026-11-11). Items with required
+                # option groups stay ONE match (their options are allocated per
+                # unit across the whole line); the modifier is tagged "1x: ..."
+                # and option_allocation.build_lines puts it on that many units
+                # only (BUG-0204).
+                _cnt_m = re.match(
+                    r"\s*(?:just\s+|only\s+)?(\d{1,2}|one|two|three|four|five|six)\b\s*(?:of\s+(?:them|those|these))?\s*(?!x\b)",
+                    chunk, re.I,
+                )
+                if _cnt_m:
+                    _tok = _cnt_m.group(1).lower()
+                    _n = int(_tok) if _tok.isdigit() else _WORD_QTY[_tok]
+                    if 0 < _n < prev_qty:
+                        if option_allocation.required_groups(getattr(prev_item, "options_json", None)):
+                            _tagged = ", ".join(
+                                option_allocation.unit_mod_tag(_n, p) for p in continuation.split(",") if p.strip()
+                            )
+                            all_matched[_ti] = (prev_item, prev_qty, f"{prev_mod}, {_tagged}" if prev_mod else _tagged)
+                            continue
+                        all_matched[_ti] = (prev_item, prev_qty - _n, prev_mod)
+                        all_matched.insert(_ti + 1, (prev_item, _n, f"{prev_mod}, {continuation}" if prev_mod else continuation))
+                        continue
                 combined = f"{prev_mod}, {continuation}" if prev_mod else continuation
-                all_matched[-1] = (prev_item, prev_qty, combined)
+                all_matched[_ti] = (prev_item, prev_qty, combined)
 
-    return all_matched
+    return _fold_option_value_matches(all_matched, msg_text)
+
+
+def _fold_option_value_matches(matched: list[tuple], msg_text: str) -> list[tuple]:
+    """Option value vs standalone product (live incident 2026-11-11).
+
+    "3 Super Burgers, 2 with fries and 1 with onion rings": the words "onion
+    rings" are BOTH an enabled option value of the Super Burger's Side group
+    AND the name of a standalone R32 menu item. The chunk-local collision
+    guard in _extract_items_from_chunk only fires when both land in the same
+    chunk, but the message splits on "and"/"," -- so the standalone item was
+    added as a new charged line and the burger's side was never recorded.
+
+    Message-wide rule: a matched item whose name equals an enabled option
+    value of ANOTHER matched item in the same message is that item's option
+    choice, folded into its modifier -- unless the customer clearly asked for
+    an extra/separate one ("extra onion rings", "another", "separately", ...).
+    """
+    if len(matched) < 2:
+        return matched
+    low = msg_text.lower()
+    keep: list[int] = []
+    folded_into: dict[int, str] = {}
+    for ci, (cand_item, _cq, _cm) in enumerate(matched):
+        target_idx = None
+        for oi, (o_item, _oq, _om) in enumerate(matched):
+            if oi != ci and _is_enabled_option_value(o_item, cand_item.name):
+                target_idx = oi
+                break
+        if target_idx is not None:
+            pos = low.find(cand_item.name.lower())
+            window = low[max(0, pos - 25):pos] if pos >= 0 else ""
+            if not option_allocation.EXTRA_MARKER_RE.search(window):
+                folded_into[target_idx] = (
+                    f"{folded_into[target_idx]}, {cand_item.name}" if target_idx in folded_into else cand_item.name
+                )
+                continue
+        keep.append(ci)
+    if not folded_into:
+        return matched
+    result: list[tuple] = []
+    for idx in keep:
+        item, qty, mod = matched[idx]
+        if idx in folded_into:
+            mod = f"{mod}, {folded_into[idx]}" if mod else folded_into[idx]
+        result.append((item, qty, mod))
+    return result
 
 
 # ── Required-option helpers ───────────────────────────────────────────────────
@@ -3538,6 +3812,368 @@ def _capture_options_from_message(item, norm_text: str) -> str | None:
     return ", ".join(found) if found else None
 
 
+# ── Per-unit option allocation helpers (see option_allocation.py) ────────────
+
+_BARE_QTY_CORRECTION_RE = re.compile(
+    r"^\s*(?:no[,.!\s]+)?(?:(?:actually|ok(?:ay)?|sorry|please|hmm+|wait)[,\s]+)*"
+    r"(?:(?:make|change|set|update|let'?s\s+(?:do|make))\s+(?:that|it|them|this|the\s+order|the\s+quantity)?\s*(?:to|into)?\s*"
+    r"|actually\s+)"
+    r"(\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten)\b",
+    re.I,
+)
+_WORD_QTY = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+             "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
+
+
+def _line_instructions(option_names: list[str], modifier: str | None, options_json: dict | None = None) -> str | None:
+    """Free-text note for a cart line: the chosen option names plus any
+    remaining modifier text ("no onion"). Modifier parts that merely repeat an
+    option name -- of THIS line or, via ``options_json``, any other option of
+    the item (e.g. the folded "Onion Rings" of a sibling unit) -- are dropped:
+    chosen options live in the per-unit allocation, not in the free text."""
+    names = [n for n in option_names if n]
+    low = {n.lower() for n in names}
+    for g in ((options_json or {}).get("option_groups") or []):
+        for o in g.get("options", []):
+            low.add(o["name"].lower())
+    shared, _unit = option_allocation.split_unit_mods(modifier)
+    extra = [
+        p.strip() for p in str(shared or "").split(",")
+        if p.strip() and p.strip().lower() not in low
+    ]
+    return ", ".join(names + extra) or None
+
+
+def _pending_name_words(name: str) -> set[str]:
+    return {w for w in re.findall(r"[a-z']+", (name or "").lower()) if len(w) > 1}
+
+
+def _pending_stated_quantity(norm_text: str, name: str) -> int | None:
+    """Quantity the customer states for the pending item itself
+    ("3 super burgers", "make that 4"), or None."""
+    low = norm_text.lower()
+    nm = (name or "").lower().strip()
+    if nm:
+        m = re.search(rf"(?<![a-z0-9]){re.escape(nm)}s?(?![a-z0-9])", low)
+        if m:
+            if re.search(
+                r"(\d|\b(?:one|two|three|four|five|six|seven|eight|nine|ten)\b)\s*x?\s*$",
+                low[:m.start()],
+            ):
+                return _parse_quantity_before(low, m.start())
+            return None
+    m = _BARE_QTY_CORRECTION_RE.match(low)
+    if m:
+        t = m.group(1).lower()
+        return max(1, min(int(t) if t.isdigit() else _WORD_QTY[t], 20))
+    return None
+
+
+def _pending_item_named(norm_text: str, name: str) -> bool:
+    nm = (name or "").lower().strip()
+    return bool(nm) and bool(re.search(rf"(?<![a-z0-9]){re.escape(nm)}s?(?![a-z0-9])", norm_text.lower()))
+
+
+def _fmt_delta(cents: int) -> str:
+    from shared.utils.money import format_currency
+    return format_currency(abs(int(cents)), "ZAR")
+
+
+def _alloc_question(pend: dict, groups: list[dict], note: str = "") -> str:
+    """Question for the first group with units still awaiting it."""
+    g = groups[0]
+    qty = int(pend.get("quantity") or 1)
+    rem = option_allocation.group_remaining(pend, g)
+    name = pend.get("name") or "item"
+    opts = sorted(option_allocation.enabled_options(g), key=lambda x: x.get("sort_order", 0))
+    bullets = "\n".join(
+        f"• {o['name']}" + (f" (+{_fmt_delta(o['price_delta_cents'])})" if (o.get("price_delta_cents") or 0) > 0 else "")
+        for o in opts
+    )
+    gname = g["name"].lower()
+    if rem < qty:
+        head = f"What {gname} for the other {rem} {name}{'s' if rem > 1 else ''}?"
+    elif qty > 1:
+        head = f"What {gname} would you like for your {qty} {name}s?"
+    else:
+        head = f"What {gname} would you like for your {name}?"
+    text = f"{note}{head}\n\n{bullets}"
+    if rem > 1 and len(opts) >= 2:
+        text += (
+            f"\n\nOne choice covers all {rem}, or split them, "
+            f"e.g. \"{rem - 1} {opts[0]['name']} and 1 {opts[1]['name']}\"."
+        )
+    return text
+
+
+async def _resolve_pending_allocation(db, business, session, pending: dict, norm_text: str, rest=None):
+    """Deterministically resolve a single pending item's required option
+    groups from the customer's message. Returns ("commit", pending),
+    ("reply", text) or None (not an option answer -- caller falls through to
+    the existing handlers unchanged)."""
+    import copy as _copy_pa
+    pend = _copy_pa.deepcopy(pending)
+    if not pend.get("options_json"):
+        # Pending items written by the LLM path carry no options_json; look
+        # the menu item up so a bare "Beef" can still be resolved here.
+        _, _menu = await _load_menu(db, business.id)
+        mi = next((i for i in _menu if str(i.id) == str(pend.get("menu_item_id"))), None)
+        if mi is None:
+            nm = (pend.get("name") or "").lower()
+            mi = next((i for i in _menu if i.is_active and not i.is_deleted and i.name.lower() == nm), None)
+        if mi is None or not getattr(mi, "options_json", None):
+            return None
+        pend["options_json"] = mi.options_json
+        pend["menu_item_id"] = str(mi.id)
+        pend["name"] = mi.name
+    if not option_allocation.required_groups(pend.get("options_json")):
+        return None
+
+    option_allocation.seed_from_legacy(pend)
+    qty_changed = False
+    new_qty = _pending_stated_quantity(norm_text, pend.get("name"))
+    if new_qty and new_qty != int(pend.get("quantity") or 1):
+        option_allocation.reset_for_quantity(pend, max(1, min(new_qty, 20)))
+        qty_changed = True
+
+    changed, issues = option_allocation.apply_text_to_pending(
+        pend, norm_text, _pending_name_words(pend.get("name"))
+    )
+    named = _pending_item_named(norm_text, pend.get("name"))
+    if not (changed or issues or qty_changed or named):
+        return None
+
+    state_machine.set_context(session, "pending_options", [pend] + list(rest or []))
+    missing = option_allocation.missing_groups(pend)
+    if issues:
+        g, _status = issues[0]
+        rem = option_allocation.group_remaining(pend, g)
+        opts = option_allocation.enabled_options(g)
+        ex = ""
+        if len(opts) >= 2 and rem >= 2:
+            ex = f" e.g. \"{rem - 1} {opts[0]['name']} and 1 {opts[1]['name']}\""
+        note = (
+            f"I want to get this right -- you have {rem} {pend.get('name')}{'s' if rem > 1 else ''} "
+            f"waiting for a {g['name'].lower()}. Please tell me how many get each one{ex}.\n\n"
+        )
+        return ("reply", _alloc_question(pend, [g], note=note))
+    if missing:
+        logger.warning(
+            "DET_ALLOC_PARTIAL: item=%r, qty=%s, still_missing=%r, session_id=%s",
+            pend.get("name"), pend.get("quantity"), [g["name"] for g in missing], session.id,
+        )
+        return ("reply", _alloc_question(pend, missing))
+    logger.warning(
+        "DET_ALLOC_RESOLVED: item=%r, qty=%s, session_id=%s",
+        pend.get("name"), pend.get("quantity"), session.id,
+    )
+    return ("commit", pend)
+
+
+def _build_alloc_pending(item, qty: int, sel_opts: list[dict], instr: str | None,
+                         norm_text: str, add_ons=None) -> dict | None:
+    """Pending-item dict for an LLM-proposed add, with per-unit allocations
+    seeded from the LLM's resolved options and then from the customer's own
+    words. None when the item has no required option groups (legacy path)."""
+    oj = getattr(item, "options_json", None) or {}
+    if not option_allocation.required_groups(oj):
+        return None
+    instr, unit_mods = option_allocation.split_unit_mods(instr)
+    if not unit_mods and instr:
+        instr, unit_mods = _unit_mods_from_text(instr, norm_text, qty)
+    pend = {
+        "name": item.name, "quantity": qty, "menu_item_id": str(item.id),
+        "options_json": oj, "special_instructions": instr,
+        "selected_options": [
+            {"group_id": o.get("group_id"), "option_id": o.get("option_id"),
+             "option_name": o.get("option_name"), "price_delta_cents": o.get("price_delta_cents", 0),
+             "group_name": o.get("group_name")}
+            for o in (sel_opts or [])
+        ],
+    }
+    if unit_mods:
+        pend["unit_mods"] = unit_mods
+    option_allocation.seed_from_legacy(pend)
+    pend.pop("selected_options", None)
+    _words = _pending_name_words(item.name)
+    option_allocation.apply_text_to_pending(pend, norm_text, _words)
+    if instr and option_allocation.missing_groups(pend):
+        # the LLM's own special_instructions may carry a choice the message didn't
+        option_allocation.apply_text_to_pending(pend, instr, _words)
+    return pend
+
+
+_PARTIAL_REMOVAL_RES = (
+    # "one without onions" / "1 of them no tomato" / "one with no onion"
+    re.compile(r"\b(\d{1,2}|one|two|three|four|five|six)\s+(?:of\s+(?:them|those|these)\s+)?"
+               r"(?:with\s+)?(?:no|without|minus|hold\s+the)\s+([a-z][a-z]+)", re.I),
+    # "no onions on one" / "without tomato for 1 of them"
+    re.compile(r"\b(?:no|without|hold\s+the)\s+([a-z][a-z]+)\s+(?:on|for|in)\s+"
+               r"(\d{1,2}|one|two|three|four|five|six)\b", re.I),
+    # "leave the onions off one" / "take the tomato out of one"
+    re.compile(r"\b(?:leave|take)\s+(?:the\s+)?([a-z][a-z]+)\s+(?:off|out)\s+(?:of\s+)?(?:on\s+)?"
+               r"(\d{1,2}|one|two|three|four|five|six)\b", re.I),
+)
+_REMOVAL_WORD_RE = re.compile(r"\b(no|without|minus|hold|leave|take|off|out)\b", re.I)
+
+
+def _unit_mods_from_text(instr: str, norm_text: str, qty: int) -> tuple[str | None, list[dict]]:
+    """BUG-0204, LLM/untagged path: the customer said "ONE without onions" but
+    the modifier for the whole line says "no onions". Move that removal to the
+    stated number of units. Only parts of ``instr`` (the removal already
+    attributed to THIS item) are moved; nothing is invented."""
+    low = norm_text.lower()
+    found: list[tuple[int, str]] = []
+    for n_rx, rx in enumerate(_PARTIAL_REMOVAL_RES):
+        for m in rx.finditer(low):
+            cnt_tok, ingr = (m.group(1), m.group(2)) if n_rx == 0 else (m.group(2), m.group(1))
+            cnt = int(cnt_tok) if cnt_tok.isdigit() else _WORD_QTY[cnt_tok]
+            if 0 < cnt < qty:
+                found.append((cnt, ingr))
+    if not found:
+        return instr, []
+    shared = [p.strip() for p in instr.split(",") if p.strip()]
+    unit: list[dict] = []
+    for cnt, ingr in found:
+        stem = ingr.rstrip("s")[:5]
+        for p in list(shared):
+            pl = p.lower()
+            if stem in pl and _REMOVAL_WORD_RE.search(pl):
+                shared.remove(p)
+                unit.append({"count": cnt, "mod": p})
+                break
+    return ", ".join(shared) or None, unit
+
+
+def _is_option_value_of_named_item(base_name: str, norm_text: str, items: list) -> bool:
+    """True when ``base_name`` (e.g. "fries") is an enabled option value of
+    ANOTHER menu item the same message names ("3 Super Burgers ... 2 fries").
+    Such a word is that item's option choice, never an ambiguous standalone
+    product -- unless the customer explicitly asked for an extra/separate one."""
+    base = (base_name or "").lower().strip()
+    if not base:
+        return False
+    low = norm_text.lower()
+    for m in re.finditer(rf"(?<![a-z0-9]){re.escape(base)}s?(?![a-z0-9])", low):
+        if option_allocation.EXTRA_MARKER_RE.search(low[max(0, m.start() - 25):m.start()]):
+            return False
+    matched = _extract_items_from_message(norm_text, items, ignore_price_ambiguity=True)
+    for it, _q, _m in matched:
+        if base in it.name.lower().split() or it.name.lower() == base:
+            continue
+        for g in ((getattr(it, "options_json", None) or {}).get("option_groups", []) or []):
+            if not g.get("is_enabled", True):
+                continue
+            for o in g.get("options", []):
+                if o.get("is_enabled", True) and (
+                    o["name"].lower() == base or o["name"].lower().rstrip("s") == base.rstrip("s")
+                ):
+                    return True
+    return False
+
+
+_BROWSE_STATES = {
+    ConversationState.IDLE.value, ConversationState.GREETING.value,
+    ConversationState.BROWSING_MENU.value, ConversationState.BUILDING_CART.value,
+    ConversationState.CONFIRMING_ORDER.value,
+}
+_BROWSE_SIGNAL_RE = re.compile(
+    r"\b(show|see|view|list|browse|menu|options)\b", re.I
+)
+_ORDER_VERB_RE = re.compile(
+    r"\b(give\s+me|i\s+want|i'?ll\s+have|add|order|get\s+me|can\s+i\s+(?:get|have))\b", re.I
+)
+
+
+def _category_from_text(groups: list[tuple], low: str):
+    """Longest category name named as a whole word in ``low`` (plural
+    tolerant); None when none or when two different categories tie."""
+    best = []
+    for cat, _lst in groups:
+        if cat is None:
+            continue
+        nm = cat.name.lower().strip()
+        forms = {nm, nm.rstrip("s"), nm + "s"}
+        if any(re.search(rf"(?<![a-z0-9]){re.escape(f)}(?![a-z0-9])", low) for f in forms if f):
+            best.append((len(nm), cat))
+    if not best:
+        # second pass: one distinctive word of a category name ("burgers" ->
+        # "OG Burgers"), only when exactly one category matches
+        word_hits = []
+        for cat, _lst in groups:
+            if cat is None:
+                continue
+            for w in cat.name.lower().split():
+                if len(w) < 4:
+                    continue
+                forms = {w, w.rstrip("s"), w + "s"}
+                if any(re.search(rf"(?<![a-z0-9]){re.escape(f)}(?![a-z0-9])", low) for f in forms if f):
+                    word_hits.append(cat)
+                    break
+        return word_hits[0] if len(word_hits) == 1 else None
+    best.sort(key=lambda x: -x[0])
+    if len(best) > 1 and best[0][0] == best[1][0]:
+        return None
+    return best[0][1]
+
+
+async def _handle_menu_browse(db, business, session, norm_text: str, current_state: str):
+    """Category-first browsing: "show me the burgers menu", a bare category
+    name / number after the category list, and "more" for the next page.
+    Read-only -- never touches the cart or pending ordering state. Returns a
+    reply tuple, or None when the message is not browsing."""
+    if current_state not in _BROWSE_STATES:
+        return None
+    low = norm_text.lower().strip()
+    state = state_machine.get_context(session, "menu_browse")
+    is_more = bool(state) and state.get("mode") == "category" and bool(
+        re.fullmatch(r"(?:more|next|next\s+page|show\s+more|more\s+please|continue)[.!]?", low)
+    )
+    num = re.fullmatch(r"(\d{1,2})[.)]?", low) if (state and state.get("mode") == "categories") else None
+    wants_cat_signal = bool(_BROWSE_SIGNAL_RE.search(low)) and not _ORDER_VERB_RE.search(low)
+    if not (is_more or num or wants_cat_signal or state):
+        return None
+    categories, items = await _load_menu(db, business.id)
+    groups = responses._active_items_by_category(categories, items)
+    if not groups:
+        return None
+
+    def _page(cat, lst, offset):
+        text, nxt = responses.menu_category_page(cat, lst, offset, business.currency)
+        state_machine.set_context(
+            session, "menu_browse",
+            {"mode": "category", "category_id": str(cat.id) if cat is not None else None, "offset": nxt}
+            if nxt is not None else {"mode": "categories"},
+        )
+        if current_state in (ConversationState.IDLE.value, ConversationState.GREETING.value):
+            state_machine.transition_state(session, ConversationState.BROWSING_MENU.value)
+        return (text, False, None, None, None)
+
+    if is_more:
+        cid = state.get("category_id")
+        for cat, lst in groups:
+            if (str(cat.id) if cat is not None else None) == cid:
+                if state.get("offset") is None:
+                    break
+                return _page(cat, lst, int(state["offset"]))
+        return None
+    if num:
+        n = int(num.group(1))
+        if 1 <= n <= len(groups):
+            cat, lst = groups[n - 1]
+            return _page(cat, lst, 0)
+        return None
+    cat = _category_from_text(groups, low)
+    if cat is not None and (wants_cat_signal or (state and state.get("mode") == "categories" and
+                                                  re.fullmatch(r"[a-z0-9 &'-]+", low) and len(low.split()) <= 4)):
+        lst = next(l for c, l in groups if c is not None and c.id == cat.id)
+        return _page(cat, lst, 0)
+    if state and not wants_cat_signal:
+        # any other message ends browsing (stale "more" must not linger)
+        state_machine.set_context(session, "menu_browse", None)
+    return None
+
+
 def _restore_pre_mutation_snapshot(
     session, pre_mutation_snapshot: tuple[dict, str] | None, reason: str,
 ) -> None:
@@ -3607,6 +4243,14 @@ async def _handle_with_llm(
         and not _SIZE_WORDS.search(norm_text)
     ):
         base_name, variants = _find_size_variants(norm_text, items)
+        if base_name and variants and _is_option_value_of_named_item(base_name, norm_text, items):
+            # "3 Super Burgers, 2 fries as a side": "fries" here is the burger's
+            # Side option value, not an ambiguous standalone Regular/Large
+            # Fries order (live incident 2026-11-11, step 6).
+            logger.warning(
+                "SIZE_AMBIGUITY_SKIPPED_OPTION_VALUE: base=%r, session_id=%s", base_name, session.id,
+            )
+            base_name, variants = None, []
         if base_name and variants:
             # ── Sibling items in the same message, e.g. "a chicken burger
             # and a Coke" ────────────────────────────────────────────────
@@ -3800,17 +4444,37 @@ async def _handle_with_llm(
             # ── Required-option guard ────────────────────────────────────────
             # If any matched item has required option groups that the customer
             # hasn't specified in the message, ask for them before adding to cart.
-            _needs_opts = [
-                (it, qty, mod) for it, qty, mod in det_matches
-                if _get_missing_required_groups(it, mod, norm_text)
-            ]
-            _ready = [
-                (it, qty, mod) for it, qty, mod in det_matches
-                if not _get_missing_required_groups(it, mod, norm_text)
-            ]
+            # Per-unit allocation (option_allocation.py): the customer's own
+            # words ("all beef, 2 with fries and 1 with onion rings") are
+            # applied to the units of each matched item, group by group; only
+            # the groups/units still unanswered are asked about.
+            _det_pends: dict[int, dict] = {}
+            for _it, _qty, _mod in det_matches:
+                _pnd = _build_alloc_pending(_it, _qty, [], _mod, norm_text)
+                if _pnd is not None:
+                    _det_pends[id(_it)] = _pnd
+
+            def _det_item_missing(_it, _mod):
+                if id(_it) in _det_pends:
+                    return option_allocation.missing_groups(_det_pends[id(_it)])
+                return _get_missing_required_groups(_it, _mod, norm_text)
+
+            _needs_opts = [(it, qty, mod) for it, qty, mod in det_matches if _det_item_missing(it, mod)]
+            _ready = [(it, qty, mod) for it, qty, mod in det_matches if not _det_item_missing(it, mod)]
             if _needs_opts:
                 # Add any items that are fully specified
                 for _ri, _rq, _rm in _ready:
+                    if id(_ri) in _det_pends:
+                        for _ln in option_allocation.build_lines(_det_pends[id(_ri)]):
+                            state_machine.add_to_cart(
+                                session,
+                                menu_item_id=str(_ri.id), name=_ri.name,
+                                price_cents=_ri.price_cents, quantity=_ln["quantity"],
+                                selected_options=_ln["selected_options"],
+                                options=None,
+                                special_instructions=_line_instructions(_ln["option_names"], _det_pends[id(_ri)].get("special_instructions"), getattr(_ri, "options_json", None)),
+                            )
+                        continue
                     _si = _rm or _capture_options_from_message(_ri, norm_text)
                     state_machine.add_to_cart(
                         session,
@@ -3818,22 +4482,34 @@ async def _handle_with_llm(
                         price_cents=_ri.price_cents, quantity=_rq,
                         options=None, special_instructions=_si,
                     )
-                # Save the first item needing options to pending context
-                _pend_item, _pend_qty, _pend_mod = _needs_opts[0]
-                _missing_groups = _get_missing_required_groups(_pend_item, _pend_mod)
-                state_machine.set_context(session, "pending_options", [{
-                    "name": _pend_item.name,
-                    "quantity": _pend_qty,
-                    "special_instructions": _pend_mod,
-                    "menu_item_id": str(_pend_item.id),
-                    "options_json": getattr(_pend_item, "options_json", None) or {},
-                }])
+                # Every item still needing options is remembered (previously
+                # only the first was; the rest were silently dropped).
+                _pend_list: list[dict] = []
+                for _ni, _nq, _nm in _needs_opts:
+                    if id(_ni) in _det_pends:
+                        _pend_list.append(_det_pends[id(_ni)])
+                    else:
+                        _pend_list.append({
+                            "name": _ni.name, "quantity": _nq, "special_instructions": _nm,
+                            "menu_item_id": str(_ni.id),
+                            "options_json": getattr(_ni, "options_json", None) or {},
+                        })
+                _first_pend = _pend_list[0]
+                _pend_item = _needs_opts[0][0]
+                _missing_groups = _det_item_missing(_pend_item, _needs_opts[0][2])
+                state_machine.set_context(session, "pending_options", _pend_list)
                 state_machine.transition_state(session, ConversationState.CHOOSING_OPTIONS.value)
                 logger.warning(
                     "DET_OPTIONS_REQUIRED: item=%r, missing=%r, session_id=%s",
                     _pend_item.name, [g["name"] for g in _missing_groups], session.id,
                 )
-                return (_build_option_question(_pend_item.name, _missing_groups),
+                _pre_added = ""
+                if _ready:
+                    _pre_added = "Added " + ", ".join(f"{q}x {i.name}" for i, q, _m in _ready) + " ✅\n\n"
+                if _first_pend.get("allocations") is not None:
+                    return (_pre_added + _alloc_question(_first_pend, _missing_groups),
+                            False, None, None, None)
+                return (_pre_added + _build_option_question(_pend_item.name, _missing_groups),
                         False, None, None, None)
             # ── Phase 8: pricing conflict guard ──────────────────────────────
             # Two kinds of pricing conflict:
@@ -3854,9 +4530,26 @@ async def _handle_with_llm(
                 add_ons_map,
                 full_text=norm_text,
             )
+            # The detector is a loose stem match ("cheese" in "Cheese Burgers"
+            # hits the "Cheese Melt" add-on). If no add-on actually resolves
+            # for any matched item it was a false positive -- taking the
+            # add-on path would only drop the item's options into notes.
+            if _has_addon_conflict:
+                _multi_chk = len(det_matches) > 1
+                if not any(
+                    _extract_addons_from_text((_m or norm_text) if _multi_chk else norm_text, _it, add_ons_map)
+                    for _it, _q, _m in det_matches
+                ):
+                    _has_addon_conflict = False
+            # A single-unit priced option still yields to the LLM exactly as
+            # before (replay conv_p001 pins that). A MULTI-unit line with
+            # per-unit options cannot be represented by the LLM's one-options-
+            # dict-per-item output, so allocation-resolved multi-unit items
+            # carry their own priced selected_options and stay deterministic.
             _has_priced_option = any(
                 _det_has_priced_option(it, norm_text)
-                for it, _, _ in det_matches
+                for it, _q, _ in det_matches
+                if not (id(it) in _det_pends and _q > 1)
             )
             _has_pricing_conflict = _has_addon_conflict or _has_priced_option
 
@@ -3879,6 +4572,28 @@ async def _handle_with_llm(
                         # Remove add-on names from modifier so they don't also
                         # appear as free special_instructions
                         _clean_mod = _filter_addon_names_from_text(_dm, _resolved_ao)
+                        if id(_di) in _det_pends:
+                            # Options already allocated per unit: keep them
+                            # (priced, structured) alongside the add-ons.
+                            _clean_mod = _filter_addon_names_from_text(
+                                _det_pends[id(_di)].get("special_instructions"), _resolved_ao)
+                            for _ln in option_allocation.build_lines(_det_pends[id(_di)]):
+                                _ln_instr = _line_instructions(_ln["option_names"], _clean_mod or None,
+                                                               getattr(_di, "options_json", None))
+                                state_machine.add_to_cart(
+                                    session,
+                                    menu_item_id=str(_di.id), name=_di.name,
+                                    price_cents=_di.price_cents, quantity=_ln["quantity"],
+                                    selected_options=_ln["selected_options"], add_ons=_resolved_ao,
+                                    options=None, special_instructions=_ln_instr,
+                                )
+                                _lbl = f"{_ln['quantity']}x {_di.name}"
+                                if _ln["option_names"]:
+                                    _lbl += " (" + ", ".join(_ln["option_names"]) + ")"
+                                if _resolved_ao:
+                                    _lbl += " [" + ", ".join(f"+{a['name']}" for a in _resolved_ao) + "]"
+                                det_added.append(_lbl)
+                            continue
                         state_machine.add_to_cart(
                             session,
                             menu_item_id=str(_di.id),
@@ -3932,6 +4647,21 @@ async def _handle_with_llm(
                 # ── All items ready — normal DET flow ────────────────────────
                 det_added: list[str] = []
                 for det_item, det_qty, det_modifier in det_matches:
+                    if id(det_item) in _det_pends:
+                        for _ln in option_allocation.build_lines(_det_pends[id(det_item)]):
+                            _ln_instr = _line_instructions(_ln["option_names"], _det_pends[id(det_item)].get("special_instructions"), getattr(det_item, "options_json", None))
+                            state_machine.add_to_cart(
+                                session,
+                                menu_item_id=str(det_item.id), name=det_item.name,
+                                price_cents=det_item.price_cents, quantity=_ln["quantity"],
+                                selected_options=_ln["selected_options"],
+                                options=None, special_instructions=_ln_instr,
+                            )
+                            _lbl = f"{_ln['quantity']}x {det_item.name}"
+                            if _ln_instr:
+                                _lbl += f" ({_ln_instr})"
+                            det_added.append(_lbl)
+                        continue
                     # If suffix extraction found no modifier, also check the full
                     # message for option names (catches "with oat milk" style phrasing).
                     _eff_mod = det_modifier or _capture_options_from_message(det_item, norm_text)
@@ -4644,6 +5374,10 @@ async def _handle_with_llm(
         items_map = {i.name.lower(): i for i in items if i.is_active and not i.is_deleted}
         added: list[str] = []
         unmatched: list[str] = []
+        # Items whose REQUIRED option groups are still unanswered: never added
+        # with a silent default (live incident 2026-11-11 added "3x Super
+        # Burger" with no patty) -- asked about instead.
+        _needs_opts_llm: list[dict] = []
 
         for pi in parsed.items:
             if not pi.name:
@@ -4682,6 +5416,33 @@ async def _handle_with_llm(
                     )
                 else:
                     clean_instr = pi.special_instructions
+                _llm_pend = _build_alloc_pending(
+                    matched_item, safe_qty, sel_opts, clean_instr, norm_text, res_add_ons,
+                )
+                if _llm_pend is not None:
+                    if option_allocation.missing_groups(_llm_pend):
+                        _needs_opts_llm.append(_llm_pend)
+                        continue
+                    for _ln in option_allocation.build_lines(_llm_pend):
+                        _ln_instr = _line_instructions(_ln["option_names"], _llm_pend.get("special_instructions"), getattr(matched_item, "options_json", None))
+                        state_machine.add_to_cart(
+                            session,
+                            menu_item_id=str(matched_item.id),
+                            name=matched_item.name,
+                            price_cents=matched_item.price_cents,
+                            quantity=_ln["quantity"],
+                            selected_options=_ln["selected_options"],
+                            add_ons=res_add_ons,
+                            options=pi.options if pi.options else None,
+                            special_instructions=_ln_instr,
+                        )
+                        _lbl = f"{_ln['quantity']}x {matched_item.name}"
+                        if _ln["option_names"]:
+                            _lbl += f" ({', '.join(_ln['option_names'])})"
+                        if res_add_ons:
+                            _lbl += " [" + ", ".join(f"+{a['name']}" for a in res_add_ons) + "]"
+                        added.append(_lbl)
+                    continue
                 state_machine.add_to_cart(
                     session,
                     menu_item_id=str(matched_item.id),
@@ -4712,8 +5473,47 @@ async def _handle_with_llm(
                 f"Sorry, I couldn't find: {', '.join(unmatched)}. Check our menu for available items."
             )
 
-        # If items were added while resolving a pending options question, clear it.
+        # Required option groups still unanswered for one or more items:
+        # remember them and ask -- do not lock/confirm a cart missing a choice.
+        if _needs_opts_llm:
+            _prior_pending = [
+                p for p in (state_machine.get_context(session, "pending_options") or [])
+                if isinstance(p, dict) and p.get("options_json")
+                and str(p.get("menu_item_id")) not in {str(n.get("menu_item_id")) for n in _needs_opts_llm}
+            ]
+            state_machine.set_context(session, "pending_options", _prior_pending + _needs_opts_llm)
+            # The customer moved past any earlier recommendation/proposal.
+            state_machine.set_context(session, "proposed_items", None)
+            state_machine.transition_state(session, ConversationState.CHOOSING_OPTIONS.value)
+            _q_pend = (_prior_pending + _needs_opts_llm)[0]
+            _q = _alloc_question(_q_pend, option_allocation.missing_groups(_q_pend))
+            _pre = ("Added to your order: " + ", ".join(added) + " ✅\n\n") if added else ""
+            _unm = (
+                f"Sorry, I couldn't find: {', '.join(unmatched)}. Check our menu for available items.\n\n"
+                if unmatched else ""
+            )
+            return (_pre + _unm + _q, True,
+                    llm_response.total_tokens, llm_response.cost_cents, llm_response.provider)
+
+        # If items were added while resolving a pending options question, clear it
+        # -- but never discard a still-unanswered option question for a DIFFERENT
+        # product (live incident 2026-11-11: adding "Onion Rings" wiped the
+        # pending "3x Super Burger" patty question, losing the burgers).
         if session.state == ConversationState.CHOOSING_OPTIONS.value:
+            _added_low = " ".join(added).lower()
+            _still_pending = [
+                p for p in (state_machine.get_context(session, "pending_options") or [])
+                if isinstance(p, dict) and p.get("options_json")
+                and (p.get("name") or "").lower() not in _added_low
+                and option_allocation.missing_groups(p)
+            ]
+            if _still_pending:
+                state_machine.set_context(session, "pending_options", _still_pending)
+                _q = _alloc_question(_still_pending[0], option_allocation.missing_groups(_still_pending[0]))
+                return (
+                    ("Added to your order: " + ", ".join(added) + " ✅\n\n" if added else "") + _q,
+                    True, llm_response.total_tokens, llm_response.cost_cents, llm_response.provider,
+                )
             state_machine.set_context(session, "pending_options", None)
             logger.warning("PENDING_OPTIONS_RESOLVED: cleared pending_options. session_id=%s", session.id)
 
