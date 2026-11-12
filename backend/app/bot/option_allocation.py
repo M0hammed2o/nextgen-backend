@@ -25,6 +25,9 @@ Pending item shape (additions to the existing pending_options dict):
     "allocations": {group_id: [{"option": {id, name, price_delta_cents,
                                            group_id, group_name}, "count": n}]}
 A group is complete when its counts sum to the pending ``quantity``.
+    "unit_mods": [{"count": n, "mod": "no onions"}]
+Per-unit free-text modifiers ("2 Super Burgers, ONE without onions",
+BUG-0204): applied by ``build_lines`` to exactly ``count`` units, never to all.
 """
 from __future__ import annotations
 
@@ -48,6 +51,31 @@ EXTRA_MARKER_RE = re.compile(
     r"on\s+the\s+side\s+as\s+well|more)\b",
     re.I,
 )
+
+
+# "1x: no onions" -- a modifier part that belongs to that many units only
+# (written by pipeline._extract_items_from_message, read back here).
+UNIT_MOD_RE = re.compile(r"^\s*(\d{1,2})x:\s*(.+?)\s*$")
+
+
+def unit_mod_tag(count: int, mod: str) -> str:
+    return f"{count}x: {mod.strip()}"
+
+
+def split_unit_mods(modifier: str | None) -> tuple[str | None, list[dict]]:
+    """Split a comma-joined modifier into (shared text, per-unit mods)."""
+    shared: list[str] = []
+    unit: list[dict] = []
+    for part in str(modifier or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        m = UNIT_MOD_RE.match(part)
+        if m:
+            unit.append({"count": int(m.group(1)), "mod": m.group(2)})
+        else:
+            shared.append(part)
+    return ", ".join(shared) or None, unit
 
 
 @dataclass
@@ -321,6 +349,15 @@ def build_lines(pending: dict) -> list[dict]:
         for a in (pending.get("allocations") or {}).get(g.get("id"), []):
             seq.extend([a["option"]] * a["count"])
         expanded[g.get("id")] = seq[:qty]
+    # per-unit modifiers go on the LAST units, each unit carrying at most one
+    # mod before any unit gets a second ("one without onions, one without
+    # tomato" -> two different burgers)
+    unit_extra: list[list[str]] = [[] for _ in range(qty)]
+    for um in pending.get("unit_mods") or []:
+        n = min(int(um.get("count") or 0), qty)
+        order = sorted(range(qty - 1, -1, -1), key=lambda u: len(unit_extra[u]))
+        for u in order[:n]:
+            unit_extra[u].append(um["mod"])
     lines: list[dict] = []
     index: dict = {}
     for u in range(qty):
@@ -334,10 +371,11 @@ def build_lines(pending: dict) -> list[dict]:
                     "option_id": o.get("id"), "option_name": o["name"], "name": o["name"],
                     "price_delta_cents": o.get("price_delta_cents", 0),
                 })
-        key = tuple((s["group_id"], s["option_id"], s["option_name"]) for s in sel)
+        key = (tuple((s["group_id"], s["option_id"], s["option_name"]) for s in sel), tuple(unit_extra[u]))
         if key in index:
             lines[index[key]]["quantity"] += 1
         else:
             index[key] = len(lines)
-            lines.append({"quantity": 1, "selected_options": sel, "option_names": [s["option_name"] for s in sel]})
+            lines.append({"quantity": 1, "selected_options": sel,
+                          "option_names": [s["option_name"] for s in sel] + unit_extra[u]})
     return lines

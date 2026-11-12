@@ -3287,6 +3287,9 @@ def _parse_quantity_before(msg_lower: str, item_start: int) -> int:
     tokens = prefix.split()
     if not tokens:
         return 1
+    # "two of your super burgers" / "3 of the cheeseburgers" (BUG-0205)
+    if len(tokens) >= 3 and tokens[-2] == "of" and tokens[-1] in ("your", "ur", "the", "those", "these"):
+        tokens = tokens[:-2]
     last = tokens[-1].rstrip(".,")
     if last.isdigit():
         return max(1, min(int(last), 20))
@@ -3601,29 +3604,43 @@ def _extract_items_from_message(
             # e.g. "... and extra patty" after an item already matched above.
             continuation = _extract_modifier_from_suffix(chunk)
             if continuation:
-                prev_item, prev_qty, prev_mod = all_matched[-1]
+                # The modifier belongs to the last REAL item: a match that is
+                # only an option value of an earlier item ("1 with onion
+                # rings" -> the burger's Side, folded below) is skipped, else
+                # "..., one without onions" would land on the side and vanish.
+                _ti = len(all_matched) - 1
+                while _ti > 0 and any(
+                    _is_enabled_option_value(o_it, all_matched[_ti][0].name) for o_it, _q, _m in all_matched[:_ti]
+                ):
+                    _ti -= 1
+                prev_item, prev_qty, prev_mod = all_matched[_ti]
                 # "2 cheeseburgers, ONE without onions": a leading count smaller
                 # than the previous quantity means the modifier belongs to that
                 # many units only -- split the line instead of applying the
-                # removal to every unit (2026-11-11). Only for items without
-                # required option groups (those are allocated per unit by
-                # option_allocation instead).
+                # removal to every unit (2026-11-11). Items with required
+                # option groups stay ONE match (their options are allocated per
+                # unit across the whole line); the modifier is tagged "1x: ..."
+                # and option_allocation.build_lines puts it on that many units
+                # only (BUG-0204).
                 _cnt_m = re.match(
                     r"\s*(?:just\s+|only\s+)?(\d{1,2}|one|two|three|four|five|six)\b\s*(?:of\s+(?:them|those|these))?\s*(?!x\b)",
                     chunk, re.I,
                 )
-                if (
-                    _cnt_m
-                    and not option_allocation.required_groups(getattr(prev_item, "options_json", None))
-                ):
+                if _cnt_m:
                     _tok = _cnt_m.group(1).lower()
                     _n = int(_tok) if _tok.isdigit() else _WORD_QTY[_tok]
                     if 0 < _n < prev_qty:
-                        all_matched[-1] = (prev_item, prev_qty - _n, prev_mod)
-                        all_matched.append((prev_item, _n, f"{prev_mod}, {continuation}" if prev_mod else continuation))
+                        if option_allocation.required_groups(getattr(prev_item, "options_json", None)):
+                            _tagged = ", ".join(
+                                option_allocation.unit_mod_tag(_n, p) for p in continuation.split(",") if p.strip()
+                            )
+                            all_matched[_ti] = (prev_item, prev_qty, f"{prev_mod}, {_tagged}" if prev_mod else _tagged)
+                            continue
+                        all_matched[_ti] = (prev_item, prev_qty - _n, prev_mod)
+                        all_matched.insert(_ti + 1, (prev_item, _n, f"{prev_mod}, {continuation}" if prev_mod else continuation))
                         continue
                 combined = f"{prev_mod}, {continuation}" if prev_mod else continuation
-                all_matched[-1] = (prev_item, prev_qty, combined)
+                all_matched[_ti] = (prev_item, prev_qty, combined)
 
     return _fold_option_value_matches(all_matched, msg_text)
 
@@ -3819,8 +3836,9 @@ def _line_instructions(option_names: list[str], modifier: str | None, options_js
     for g in ((options_json or {}).get("option_groups") or []):
         for o in g.get("options", []):
             low.add(o["name"].lower())
+    shared, _unit = option_allocation.split_unit_mods(modifier)
     extra = [
-        p.strip() for p in str(modifier or "").split(",")
+        p.strip() for p in str(shared or "").split(",")
         if p.strip() and p.strip().lower() not in low
     ]
     return ", ".join(names + extra) or None
@@ -3960,6 +3978,9 @@ def _build_alloc_pending(item, qty: int, sel_opts: list[dict], instr: str | None
     oj = getattr(item, "options_json", None) or {}
     if not option_allocation.required_groups(oj):
         return None
+    instr, unit_mods = option_allocation.split_unit_mods(instr)
+    if not unit_mods and instr:
+        instr, unit_mods = _unit_mods_from_text(instr, norm_text, qty)
     pend = {
         "name": item.name, "quantity": qty, "menu_item_id": str(item.id),
         "options_json": oj, "special_instructions": instr,
@@ -3970,6 +3991,8 @@ def _build_alloc_pending(item, qty: int, sel_opts: list[dict], instr: str | None
             for o in (sel_opts or [])
         ],
     }
+    if unit_mods:
+        pend["unit_mods"] = unit_mods
     option_allocation.seed_from_legacy(pend)
     pend.pop("selected_options", None)
     _words = _pending_name_words(item.name)
@@ -3978,6 +4001,48 @@ def _build_alloc_pending(item, qty: int, sel_opts: list[dict], instr: str | None
         # the LLM's own special_instructions may carry a choice the message didn't
         option_allocation.apply_text_to_pending(pend, instr, _words)
     return pend
+
+
+_PARTIAL_REMOVAL_RES = (
+    # "one without onions" / "1 of them no tomato" / "one with no onion"
+    re.compile(r"\b(\d{1,2}|one|two|three|four|five|six)\s+(?:of\s+(?:them|those|these)\s+)?"
+               r"(?:with\s+)?(?:no|without|minus|hold\s+the)\s+([a-z][a-z]+)", re.I),
+    # "no onions on one" / "without tomato for 1 of them"
+    re.compile(r"\b(?:no|without|hold\s+the)\s+([a-z][a-z]+)\s+(?:on|for|in)\s+"
+               r"(\d{1,2}|one|two|three|four|five|six)\b", re.I),
+    # "leave the onions off one" / "take the tomato out of one"
+    re.compile(r"\b(?:leave|take)\s+(?:the\s+)?([a-z][a-z]+)\s+(?:off|out)\s+(?:of\s+)?(?:on\s+)?"
+               r"(\d{1,2}|one|two|three|four|five|six)\b", re.I),
+)
+_REMOVAL_WORD_RE = re.compile(r"\b(no|without|minus|hold|leave|take|off|out)\b", re.I)
+
+
+def _unit_mods_from_text(instr: str, norm_text: str, qty: int) -> tuple[str | None, list[dict]]:
+    """BUG-0204, LLM/untagged path: the customer said "ONE without onions" but
+    the modifier for the whole line says "no onions". Move that removal to the
+    stated number of units. Only parts of ``instr`` (the removal already
+    attributed to THIS item) are moved; nothing is invented."""
+    low = norm_text.lower()
+    found: list[tuple[int, str]] = []
+    for n_rx, rx in enumerate(_PARTIAL_REMOVAL_RES):
+        for m in rx.finditer(low):
+            cnt_tok, ingr = (m.group(1), m.group(2)) if n_rx == 0 else (m.group(2), m.group(1))
+            cnt = int(cnt_tok) if cnt_tok.isdigit() else _WORD_QTY[cnt_tok]
+            if 0 < cnt < qty:
+                found.append((cnt, ingr))
+    if not found:
+        return instr, []
+    shared = [p.strip() for p in instr.split(",") if p.strip()]
+    unit: list[dict] = []
+    for cnt, ingr in found:
+        stem = ingr.rstrip("s")[:5]
+        for p in list(shared):
+            pl = p.lower()
+            if stem in pl and _REMOVAL_WORD_RE.search(pl):
+                shared.remove(p)
+                unit.append({"count": cnt, "mod": p})
+                break
+    return ", ".join(shared) or None, unit
 
 
 def _is_option_value_of_named_item(base_name: str, norm_text: str, items: list) -> bool:
@@ -4407,7 +4472,7 @@ async def _handle_with_llm(
                                 price_cents=_ri.price_cents, quantity=_ln["quantity"],
                                 selected_options=_ln["selected_options"],
                                 options=None,
-                                special_instructions=_line_instructions(_ln["option_names"], _rm, getattr(_ri, "options_json", None)),
+                                special_instructions=_line_instructions(_ln["option_names"], _det_pends[id(_ri)].get("special_instructions"), getattr(_ri, "options_json", None)),
                             )
                         continue
                     _si = _rm or _capture_options_from_message(_ri, norm_text)
@@ -4510,6 +4575,8 @@ async def _handle_with_llm(
                         if id(_di) in _det_pends:
                             # Options already allocated per unit: keep them
                             # (priced, structured) alongside the add-ons.
+                            _clean_mod = _filter_addon_names_from_text(
+                                _det_pends[id(_di)].get("special_instructions"), _resolved_ao)
                             for _ln in option_allocation.build_lines(_det_pends[id(_di)]):
                                 _ln_instr = _line_instructions(_ln["option_names"], _clean_mod or None,
                                                                getattr(_di, "options_json", None))
@@ -4582,7 +4649,7 @@ async def _handle_with_llm(
                 for det_item, det_qty, det_modifier in det_matches:
                     if id(det_item) in _det_pends:
                         for _ln in option_allocation.build_lines(_det_pends[id(det_item)]):
-                            _ln_instr = _line_instructions(_ln["option_names"], det_modifier, getattr(det_item, "options_json", None))
+                            _ln_instr = _line_instructions(_ln["option_names"], _det_pends[id(det_item)].get("special_instructions"), getattr(det_item, "options_json", None))
                             state_machine.add_to_cart(
                                 session,
                                 menu_item_id=str(det_item.id), name=det_item.name,
@@ -5357,7 +5424,7 @@ async def _handle_with_llm(
                         _needs_opts_llm.append(_llm_pend)
                         continue
                     for _ln in option_allocation.build_lines(_llm_pend):
-                        _ln_instr = _line_instructions(_ln["option_names"], clean_instr, getattr(matched_item, "options_json", None))
+                        _ln_instr = _line_instructions(_ln["option_names"], _llm_pend.get("special_instructions"), getattr(matched_item, "options_json", None))
                         state_machine.add_to_cart(
                             session,
                             menu_item_id=str(matched_item.id),

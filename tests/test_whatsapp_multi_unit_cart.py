@@ -587,3 +587,142 @@ async def test_F2_burgers_finds_a_category_named_og_burgers_on_a_large_menu():
         assert c.total() == 9500
     finally:
         c.close()
+
+
+# ── BUG-0204: per-unit ingredient removal on items WITH required option groups ──
+def _onion_split(chat, name="Super Burger"):
+    """(units with 'onion' removed, units without) for ``name``."""
+    lines = [i for i in chat.cart if i["name"] == name]
+    no_onion = sum(i["quantity"] for i in lines if "no onion" in (i.get("special_instructions") or "").lower())
+    plain = sum(i["quantity"] for i in lines if "onion" not in (i.get("special_instructions") or "").lower().replace("onion rings", ""))
+    return no_onion, plain
+
+
+async def test_B3_two_super_burgers_beef_fries_one_without_onions_on_one_unit_only():
+    c = Chat()
+    try:
+        r = await c.say("Give me 2 Super Burgers beef with fries, one without onions")
+        _assert_clean_reply(r)
+        assert _onion_split(c) == (1, 1), c.summary()
+        for i in c.cart:   # both units keep their required options
+            assert sorted(o["option_name"] for o in i["selected_options"]) == ["Beef", "Fries"], c.summary()
+        assert c.total() == 2 * 13500
+        assert c.state == "CONFIRMING_ORDER"
+    finally:
+        c.close()
+
+
+async def test_B4_removal_survives_the_pending_patty_and_side_questions():
+    c = Chat()
+    try:
+        r = await c.say("Give me 2 Super Burgers, one without onions")
+        _assert_clean_reply(r)
+        assert "patty" in r.lower() and c.cart == []
+        await c.say("Beef")
+        r = await c.say("Fries")
+        _assert_clean_reply(r)
+        assert _onion_split(c) == (1, 1), c.summary()
+        assert c.total() == 2 * 13500
+    finally:
+        c.close()
+
+
+async def test_B5_removal_combined_with_split_sides_lands_on_exactly_one_unit():
+    c = Chat()
+    try:
+        r = await c.say("Give me 3 Super Burgers, all beef, 2 with fries and 1 with onion rings, one without onions")
+        _assert_clean_reply(r)
+        lines = [i for i in c.cart if i["name"] == "Super Burger"]
+        assert sum(i["quantity"] for i in lines) == 3
+        assert _onion_split(c) == (1, 2), c.summary()
+        sides = sorted(o["option_name"] for i in lines for o in i["selected_options"] if o["group_id"] == "grp-side"
+                       for _ in range(i["quantity"]))
+        assert sides == ["Fries", "Fries", "Onion rings"], c.summary()
+        assert c.total() == 40500
+        _assert_no_standalone(c, "Onion Rings")
+    finally:
+        c.close()
+
+
+async def test_B6_llm_path_removal_with_count_applies_to_one_unit_only():
+    # The LLM attributes "no onions" to the whole 2x line; the customer's own words say one.
+    c = Chat()
+    try:
+        llm = add("Super Burger", 2, special_instructions="no onions", options={"Patty": "Beef", "Side": "Fries"})
+        r = await c.say("Two of your signature burgers please, beef and fries, and leave the onions off one", llm=llm)
+        _assert_clean_reply(r)
+        assert _onion_split(c) == (1, 1), c.summary()
+        assert c.total() == 2 * 13500
+    finally:
+        c.close()
+
+
+async def test_B7_quantity_change_after_per_unit_removal_asks_instead_of_guessing():
+    c = Chat()
+    try:
+        await c.say("Give me 2 Super Burgers beef with fries, one without onions")
+        before = _lines(c)
+        r = await c.say("actually make that 3")
+        _assert_clean_reply(r)
+        # two distinct lines of the same burger: which one grows is the customer's call
+        assert _lines(c) == before, c.summary()
+        assert "which" in r.lower()
+    finally:
+        c.close()
+
+
+async def test_B8_cancel_after_per_unit_removal_clears_everything():
+    c = Chat()
+    try:
+        await c.say("Give me 2 Super Burgers, one without onions")
+        r = await c.say("Cancel order")
+        assert "cancel" in r.lower()
+        assert c.cart == [] and not c.ctx.get("pending_options")
+        r = await c.say("Give me 2 Super Burgers beef with fries")
+        _assert_clean_reply(r)
+        assert [(i["quantity"], i.get("special_instructions")) for i in c.cart] == [(2, "Beef, Fries")], c.summary()
+    finally:
+        c.close()
+
+
+async def test_B9_kitchen_order_carries_the_removal_on_exactly_one_item():
+    c = Chat()
+    try:
+        await c.say("Give me 2 Super Burgers beef with fries, one without onions")
+        for step in ("yes", "pickup", "John", "0821234567", "skip"):
+            r = await c.say(step)
+            _assert_clean_reply(r)
+        assert "Order Confirmed" in r
+        order = c.r.created_orders[-1]
+        assert order.subtotal_cents == 27000
+        got = sorted((i["quantity"], tuple(sorted(o["option_name"] for o in i["selected_options"])),
+                      "no onion" in (i.get("special_instructions") or "").lower()) for i in order.items)
+        assert got == [(1, ("Beef", "Fries"), False), (1, ("Beef", "Fries"), True)], order.items
+    finally:
+        c.close()
+
+
+async def test_two_of_your_super_burgers_is_two_not_one():
+    # BUG-0205: "two of your super burgers" was read as 1 (quantity had to be the
+    # word directly before the item), so a stated "beef" over-allocated and the
+    # patty was asked again for a single burger.
+    c = Chat()
+    try:
+        r = await c.say("Can I please get two of your super burgers with beef and fries")
+        _assert_clean_reply(r)
+        assert _lines(c) == [(2, "Super Burger", ["Beef", "Fries"], 13500, 27000)], c.summary()
+    finally:
+        c.close()
+
+
+async def test_B10_per_unit_removal_with_the_live_add_ons_on_the_menu():
+    from tests.superburger_harness import build_menu_with_add_ons
+    c = Chat(menu=build_menu_with_add_ons())
+    try:
+        r = await c.say("Give me 2 Super Burgers beef with fries, one without onions")
+        _assert_clean_reply(r)
+        assert _onion_split(c) == (1, 1), c.summary()
+        assert all(not i.get("add_ons") for i in c.cart), c.summary()
+        assert c.total() == 2 * 13500
+    finally:
+        c.close()
