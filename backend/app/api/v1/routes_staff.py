@@ -26,6 +26,22 @@ def _generate_pin() -> str:
     return f"{secrets.randbelow(10000):04d}"
 
 
+async def _revoke_sessions(db: AsyncSession, user_id: uuid.UUID) -> None:
+    """
+    Revoke every live refresh token for a user. Used when a credential is
+    replaced (PIN rotation) or the account is deactivated, so a session
+    opened with the old credential cannot keep refreshing (BUG-0184 follow-up:
+    rotating a leaked PIN used to leave existing sessions valid for up to
+    REFRESH_TOKEN_EXPIRE_DAYS). An already-issued access token still runs to
+    its own short expiry (STAFF_ACCESS_TOKEN_EXPIRE_MINUTES).
+    """
+    await db.execute(
+        update(RefreshToken)
+        .where(RefreshToken.user_id == user_id, RefreshToken.revoked_at.is_(None))
+        .values(revoked_at=datetime.now(timezone.utc))
+    )
+
+
 def _guard_target(user: AuthUser, staff: BusinessUser, action: str) -> None:
     """
     Role-hierarchy guard shared by every staff-mutating route (update,
@@ -186,8 +202,14 @@ async def update_staff(
 
     _guard_target(user, staff, "update")
 
-    for field, value in body.model_dump(exclude_unset=True).items():
+    changes = body.model_dump(exclude_unset=True)
+    deactivating = changes.get("is_active") is False and staff.is_active
+    for field, value in changes.items():
         setattr(staff, field, value)
+    if deactivating:
+        # Same as DELETE /{staff_id}: otherwise reactivating the account later
+        # would revive refresh tokens issued before it was deactivated.
+        await _revoke_sessions(db, staff.id)
 
     await db.commit()
     await db.refresh(staff)
@@ -218,6 +240,7 @@ async def rotate_pin(
     staff.pin_updated_at = datetime.now(timezone.utc)
     staff.failed_login_attempts = 0
     staff.locked_until = None
+    await _revoke_sessions(db, staff.id)
     await db.commit()
 
     return PinRotateResponse(staff_id=staff.id, pin=body.new_pin)
@@ -256,6 +279,7 @@ async def auto_rotate_pin(
     staff.pin_updated_at = datetime.now(timezone.utc)
     staff.failed_login_attempts = 0
     staff.locked_until = None
+    await _revoke_sessions(db, staff.id)
     await db.commit()
 
     return PinRotateResponse(staff_id=staff.id, pin=new_pin)
@@ -290,11 +314,7 @@ async def deactivate_staff(
 
     # Kill their sessions immediately: revoke all live refresh tokens.
     # Their access token dies on next request via the rbac is_active check.
-    await db.execute(
-        update(RefreshToken)
-        .where(RefreshToken.user_id == staff.id, RefreshToken.revoked_at.is_(None))
-        .values(revoked_at=datetime.now(timezone.utc))
-    )
+    await _revoke_sessions(db, staff.id)
     await db.commit()
 
 

@@ -6,7 +6,7 @@ token creation, refresh, logout, and account lockout.
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.config import get_settings
@@ -128,6 +128,15 @@ class AuthService:
         user.failed_login_attempts = 0
         user.locked_until = None
         user.last_login_at = datetime.now(timezone.utc)
+
+        # A password change ends every other session: revoke all live refresh
+        # tokens BEFORE issuing the new pair, so a session opened with the old
+        # (possibly leaked) password cannot keep refreshing. BUG-0184 follow-up.
+        await self.db.execute(
+            update(RefreshToken)
+            .where(RefreshToken.user_id == user.id, RefreshToken.revoked_at.is_(None))
+            .values(revoked_at=datetime.now(timezone.utc))
+        )
 
         access_token, refresh_raw = await self._issue_tokens(user, ip_address)
         await self.db.commit()

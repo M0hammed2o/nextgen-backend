@@ -32,6 +32,7 @@ sys.path.insert(0, os.path.abspath("."))
 from sqlalchemy import func, select                                    # noqa: E402
 from sqlalchemy.exc import IntegrityError                              # noqa: E402
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine  # noqa: E402
+from scripts._seed_safety import require_local_or_confirmed  # noqa: E402
 
 from backend.app.api.v1 import routes_import, routes_stocktake         # noqa: E402
 from backend.app.core.rbac import AuthUser                             # noqa: E402
@@ -153,6 +154,7 @@ async def run_import(db, business, platform, csv_text, user, **kwargs):
 
 
 async def main():
+    require_local_or_confirmed(os.environ["DATABASE_URL"], "scripts/verify_external_orders_e2e.py")
     engine = create_async_engine(os.environ["DATABASE_URL"], echo=False)
     Session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
