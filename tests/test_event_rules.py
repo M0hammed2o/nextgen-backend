@@ -12,7 +12,13 @@ from backend.app.events.rules import (
     CLOTHING,
     FOOD,
     PaidRange,
+    CONFIGURE,
+    NONE,
+    TRADE,
+    access_level,
+    best_decision,
     billable_days_in_range,
+    evaluate_access,
     has_access,
     quote,
     vendor_status,
@@ -77,8 +83,9 @@ def test_event_without_a_published_calendar_is_a_setup_window():
     assert vendor_status(START, set(), []) == "PENDING"
 
 
-def test_unpaid_billable_day_is_refused():
-    assert not has_access(START, NINETEEN_DAYS, [])
+def test_unpaid_billable_day_cannot_trade_but_may_configure():
+    # Phase 1 (owner 2026-11-18): was "refused" (suspended); now CONFIGURE so the vendor can log in and pay.
+    assert access_level(START, NINETEEN_DAYS, []) == CONFIGURE
     assert vendor_status(START, NINETEEN_DAYS, []) == "UNPAID"
 
 
@@ -87,16 +94,16 @@ def test_paid_day_is_allowed():
     assert vendor_status(START + timedelta(days=2), NINETEEN_DAYS, FIRST_FIVE) == "ACTIVE"
 
 
-def test_billable_day_after_paid_cover_ends_is_refused_and_expired():
+def test_billable_day_after_paid_cover_ends_cannot_trade_and_reads_expired():
     d = START + timedelta(days=5)
-    assert not has_access(d, NINETEEN_DAYS, FIRST_FIVE)
+    assert access_level(d, NINETEEN_DAYS, FIRST_FIVE) == CONFIGURE  # was NONE before Phase 1
     assert vendor_status(d, NINETEEN_DAYS, FIRST_FIVE) == "EXPIRED"
 
 
-def test_unpaid_billable_gap_between_paid_ranges_is_refused():
+def test_unpaid_billable_gap_between_paid_ranges_cannot_trade():
     paid = [PaidRange(START, START), PaidRange(START + timedelta(days=4), START + timedelta(days=4))]
     gap = START + timedelta(days=2)
-    assert not has_access(gap, NINETEEN_DAYS, paid)
+    assert access_level(gap, NINETEEN_DAYS, paid) == CONFIGURE  # was NONE before Phase 1
     assert vendor_status(gap, NINETEEN_DAYS, paid) == "UNPAID"  # future cover exists, so not EXPIRED
 
 
@@ -147,3 +154,62 @@ def test_gap_day_inside_the_event_is_unaffected_by_the_window():
     calendar = {START, START + timedelta(days=2)}
     paid = [PaidRange(START, START + timedelta(days=2))]
     assert has_access(START + timedelta(days=1), calendar, paid)
+
+
+# ── Access levels (Phase 1, owner 2026-11-18) ─────────────────────────────────
+
+def test_trade_only_on_a_paid_billable_day():
+    dec = evaluate_access(START + timedelta(days=2), NINETEEN_DAYS, FIRST_FIVE)
+    assert (dec.level, dec.reason) == (TRADE, "PAID_DAY")
+
+
+def test_no_calendar_is_configure_never_trade_even_with_paid_cover():
+    paid = [PaidRange(START, LAST)]
+    assert evaluate_access(START, set(), []).level == CONFIGURE
+    dec = evaluate_access(START, set(), paid)
+    assert (dec.level, dec.reason) == (CONFIGURE, "CALENDAR_NOT_PUBLISHED")
+
+
+def test_non_billable_day_during_event_is_configure_even_inside_a_paid_range():
+    calendar = {START, START + timedelta(days=2)}
+    paid = [PaidRange(START, START + timedelta(days=2))]
+    dec = evaluate_access(START + timedelta(days=1), calendar, paid)
+    assert (dec.level, dec.reason) == (CONFIGURE, "NOT_AN_EVENT_DAY")
+
+
+def test_unpaid_billable_day_reason():
+    assert evaluate_access(START, NINETEEN_DAYS, []).reason == "NO_PAID_COVER_TODAY"
+
+
+def test_prep_window_is_configure_and_never_trade_even_when_paid():
+    paid = [PaidRange(START, LAST)]
+    dec = evaluate_access(START - timedelta(days=1), NINETEEN_DAYS, paid)
+    assert (dec.level, dec.reason) == (CONFIGURE, "PREP_WINDOW")
+
+
+def test_before_prep_window_and_after_event_are_none():
+    assert evaluate_access(START - timedelta(days=15), NINETEEN_DAYS, []).level == NONE
+    dec = evaluate_access(LAST + timedelta(days=1), NINETEEN_DAYS, [PaidRange(START, LAST)])
+    assert (dec.level, dec.reason) == (NONE, "EVENT_ENDED")
+
+
+def test_cancelled_is_none_even_on_a_paid_day():
+    assert evaluate_access(START, NINETEEN_DAYS, [PaidRange(START, LAST)], cancelled=True).level == NONE
+
+
+def test_prep_days_is_configurable_per_event():
+    assert access_level(START - timedelta(days=30), NINETEEN_DAYS, [], prep_days=30) == CONFIGURE
+    assert access_level(START - timedelta(days=31), NINETEEN_DAYS, [], prep_days=30) == NONE
+    assert access_level(START - timedelta(days=1), NINETEEN_DAYS, [], prep_days=0) == NONE
+    assert access_level(START, NINETEEN_DAYS, [], prep_days=0) == CONFIGURE
+    assert vendor_status(START - timedelta(days=5), NINETEEN_DAYS, [], prep_days=3) == "PENDING"
+
+
+def test_best_decision_takes_the_highest_level():
+    low = evaluate_access(START - timedelta(days=60), NINETEEN_DAYS, [])
+    mid = evaluate_access(START, NINETEEN_DAYS, [])
+    top = evaluate_access(START, NINETEEN_DAYS, [PaidRange(START, START)])
+    assert best_decision([low, mid, top]).level == TRADE
+    assert best_decision([top, low]).level == TRADE
+    assert best_decision([low, mid]).level == CONFIGURE
+    assert best_decision([]).level == NONE

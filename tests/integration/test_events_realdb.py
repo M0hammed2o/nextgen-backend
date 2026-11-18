@@ -79,7 +79,7 @@ async def _vendor(db, event, created, category="FOOD", paid_ranges=(), plan=EVEN
         db.add(EventVendorSubscription(
             event_vendor_id=vendor.id, business_id=biz.id, starts_on=starts_on, ends_on=ends_on,
             day_rate_cents=q.day_rate_cents, billable_days=q.billable_days, amount_cents=q.amount_cents,
-            status="PAID", paid_at=datetime.now(timezone.utc), payment_reference="test",
+            status="PAID", paid_at=datetime.now(timezone.utc), payment_reference=f"test-{uuid.uuid4().hex}",
         ))
     await db.commit()
     return biz, vendor
@@ -101,7 +101,13 @@ async def test_vendor_is_active_on_paid_days_and_suspended_when_cover_ends(db, s
     await reconcile_event_vendor_access(db, _noon(DAYS[2])); await db.commit()
     assert await _state(db, biz.id, vendor.id) == (True, None, "ACTIVE")
 
+    # Phase 1: an unpaid billable day mid-event is CONFIGURE (login allowed so the vendor can pay).
     res = await reconcile_event_vendor_access(db, _noon(DAYS[5])); await db.commit()
+    assert biz.id not in res.businesses_suspended
+    assert await _state(db, biz.id, vendor.id) == (True, None, "EXPIRED")
+
+    # Suspension now happens once the event is over with no further paid cover.
+    res = await reconcile_event_vendor_access(db, _noon(DAYS[18] + timedelta(days=1))); await db.commit()
     assert biz.id in res.businesses_suspended
     assert await _state(db, biz.id, vendor.id) == (False, EVENT_SUSPENSION_REASON, "EXPIRED")
 
@@ -109,7 +115,9 @@ async def test_vendor_is_active_on_paid_days_and_suspended_when_cover_ends(db, s
 async def test_renewal_reactivates_automatically(db, souk):
     event, created = souk
     biz, vendor = await _vendor(db, event, created, paid_ranges=[(DAYS[0], DAYS[4])])
-    await reconcile_event_vendor_access(db, _noon(DAYS[5])); await db.commit()
+    # Before the prep window opens the business is suspended (adapted for Phase 1:
+    # mid-event lapses are CONFIGURE, not suspended).
+    await reconcile_event_vendor_access(db, _noon(START - timedelta(days=30))); await db.commit()
     assert (await _state(db, biz.id, vendor.id))[0] is False
 
     q = quote("FOOD", 10_000, 5_000, DAYS, DAYS[5], DAYS[18])
@@ -129,8 +137,11 @@ async def test_setup_before_the_event_is_allowed_unpaid(db, souk):
     biz, vendor = await _vendor(db, event, created)
     await reconcile_event_vendor_access(db, _noon(START - timedelta(days=2))); await db.commit()
     assert await _state(db, biz.id, vendor.id) == (True, None, "PENDING")
+    # Phase 1: an unpaid billable day is CONFIGURE (active, cannot trade), no longer suspended.
     await reconcile_event_vendor_access(db, _noon(START)); await db.commit()
-    assert await _state(db, biz.id, vendor.id) == (False, EVENT_SUSPENSION_REASON, "UNPAID")
+    assert await _state(db, biz.id, vendor.id) == (True, None, "UNPAID")
+    await reconcile_event_vendor_access(db, _noon(START - timedelta(days=30))); await db.commit()
+    assert await _state(db, biz.id, vendor.id) == (False, EVENT_SUSPENSION_REASON, "PENDING")
 
 
 async def test_an_admin_suspension_is_never_lifted(db, souk):
@@ -158,8 +169,9 @@ async def test_a_business_not_on_the_event_plan_is_never_suspended(db, souk):
 async def test_reconcile_is_idempotent(db, souk):
     event, created = souk
     await _vendor(db, event, created, paid_ranges=[(DAYS[0], DAYS[4])])
-    first = await reconcile_event_vendor_access(db, _noon(DAYS[7])); await db.commit()
-    second = await reconcile_event_vendor_access(db, _noon(DAYS[7])); await db.commit()
+    after = _noon(DAYS[18] + timedelta(days=1))
+    first = await reconcile_event_vendor_access(db, after); await db.commit()
+    second = await reconcile_event_vendor_access(db, after); await db.commit()
     assert first.businesses_suspended
     assert (second.vendor_status_changes, second.businesses_suspended, second.businesses_reactivated) == (0, [], [])
 

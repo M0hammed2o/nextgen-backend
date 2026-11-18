@@ -5,18 +5,21 @@ access for an event vendor lives here, so it can be tested exhaustively.
 Owner decisions (2026-11-18):
 - Food vendors R100 and clothing vendors R50 per *subscribed* day, VAT-inclusive.
 - A subscribed day is a billable event day, whether or not the vendor trades.
+- Real transactions need a PAID subscription covering the current trading date.
 
-Access rule, for a vendor on local date ``D`` (the event's timezone):
+Three access levels for a vendor on local date ``D`` (the event's timezone),
+with ``first``/``last`` the first/last billable day and ``prep_days`` the
+event's preparation period:
 
-    access(D) = covered(D)
-             or (not billable(D) and (has_future_paid(D) or D < first_billable_day))
+    NONE       business suspended: D is before ``first - prep_days``; D is after
+               ``last``; or the vendor/event is cancelled.
+    CONFIGURE  may log in and set up products, stock, staff and images, but may
+               NOT trade: inside the prep window before ``first``; the calendar
+               is not published; an unpaid billable day during the event; a
+               non-billable day during the event.
+    TRADE      D is a billable day covered by a PAID subscription.
 
-- ``covered(D)``: a PAID subscription has starts_on <= D <= ends_on.
-- A billable day with no paid cover is never accessible. Nobody trades at an
-  event day they have not paid for.
-- Non-billable days before the event, or between paid days, stay accessible
-  so a vendor can register and set up products in advance.
-- After the last paid day, with nothing further paid, access ends.
+A business at several events takes the highest level.
 """
 from __future__ import annotations
 
@@ -27,13 +30,22 @@ from typing import Iterable
 FOOD = "FOOD"
 CLOTHING = "CLOTHING"
 
-# Setup access before an event starts is limited to this many days before the
-# first billable day, so a far-future registration (or a returning vendor
-# attached months ahead) does not get months of free trading. Security review
-# M3, 2026-11-18. An event with no published calendar remains a setup window,
-# because vendors must load products before the dates are announced; that is
-# flagged to the owner as a product decision.
-SETUP_WINDOW_DAYS = 14
+# Default preparation period (days before the first billable day during which a
+# vendor may log in and configure). Per-event override: events.prep_days.
+# Security review M3: a far-future registration gets no early access.
+DEFAULT_PREP_DAYS = 14
+SETUP_WINDOW_DAYS = DEFAULT_PREP_DAYS  # backwards-compatible alias
+
+NONE = "NONE"
+CONFIGURE = "CONFIGURE"
+TRADE = "TRADE"
+_RANK = {NONE: 0, CONFIGURE: 1, TRADE: 2}
+
+
+@dataclass(frozen=True)
+class AccessDecision:
+    level: str
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -82,36 +94,71 @@ def quote(
     return Quote(day_rate_cents=rate, billable_days=days, amount_cents=rate * days)
 
 
-def has_access(d: date, billable_days: set[date], paid: list[PaidRange]) -> bool:
-    if any(p.covers(d) for p in paid):
-        return True
-    if d in billable_days:
-        return False
-    has_future_paid = any(p.starts_on > d for p in paid)
+def evaluate_access(
+    d: date,
+    billable_days: set[date],
+    paid: list[PaidRange],
+    prep_days: int = DEFAULT_PREP_DAYS,
+    cancelled: bool = False,
+) -> AccessDecision:
+    """The access level and a machine-readable reason for date ``d``."""
+    if cancelled:
+        return AccessDecision(NONE, "CANCELLED")
     if not billable_days:
-        # Calendar not published yet: setup window (see SETUP_WINDOW_DAYS note).
-        return True
-    first = min(billable_days)
-    window_opens = first - timedelta(days=SETUP_WINDOW_DAYS)
-    if d < window_opens:
-        return False  # too early, even for a vendor who has already paid
-    in_setup_window = d < first
-    return has_future_paid or in_setup_window
+        return AccessDecision(CONFIGURE, "CALENDAR_NOT_PUBLISHED")
+    first, last = min(billable_days), max(billable_days)
+    if d < first - timedelta(days=prep_days):
+        return AccessDecision(NONE, "BEFORE_PREP_WINDOW")
+    if d < first:
+        return AccessDecision(CONFIGURE, "PREP_WINDOW")
+    if d > last:
+        return AccessDecision(NONE, "EVENT_ENDED")
+    if d not in billable_days:
+        return AccessDecision(CONFIGURE, "NOT_AN_EVENT_DAY")
+    if any(p.covers(d) for p in paid):
+        return AccessDecision(TRADE, "PAID_DAY")
+    return AccessDecision(CONFIGURE, "NO_PAID_COVER_TODAY")
 
 
-def vendor_status(d: date, billable_days: set[date], paid: list[PaidRange], cancelled: bool = False) -> str:
+def best_decision(decisions: Iterable[AccessDecision]) -> AccessDecision:
+    """Highest level wins (first one on a tie). No decisions at all means NONE."""
+    best = AccessDecision(NONE, "NO_EVENT")
+    for dec in decisions:
+        if _RANK[dec.level] > _RANK[best.level] or best.reason == "NO_EVENT":
+            best = dec
+    return best
+
+
+def access_level(d: date, billable_days: set[date], paid: list[PaidRange],
+                 prep_days: int = DEFAULT_PREP_DAYS, cancelled: bool = False) -> str:
+    return evaluate_access(d, billable_days, paid, prep_days, cancelled).level
+
+
+def has_access(d: date, billable_days: set[date], paid: list[PaidRange],
+               prep_days: int = DEFAULT_PREP_DAYS) -> bool:
+    """May the vendor log in at all (CONFIGURE or TRADE)?"""
+    return access_level(d, billable_days, paid, prep_days) != NONE
+
+
+def vendor_status(d: date, billable_days: set[date], paid: list[PaidRange], cancelled: bool = False,
+                  prep_days: int = DEFAULT_PREP_DAYS) -> str:
     """The EventVendorStatus value the vendor should have on date ``d``."""
     if cancelled:
         return "CANCELLED"
+    dec = evaluate_access(d, billable_days, paid, prep_days)
     covered_or_future = any(p.covers(d) or p.starts_on > d for p in paid)
-    if has_access(d, billable_days, paid):
-        return "ACTIVE" if covered_or_future else "PENDING"
-    if billable_days and d < min(billable_days) - timedelta(days=SETUP_WINDOW_DAYS):
-        return "PENDING"  # registered (paid or not); the setup window has not opened
-    if paid:
-        # Paid cover existed. Either it ended, or this is an unpaid billable
-        # day between paid ranges; with no future cover it has expired.
-        return "UNPAID" if covered_or_future else "EXPIRED"
-    if billable_days and d < min(billable_days):
-        return "PENDING"  # registered, before the setup window opens
-    return "UNPAID"
+    if dec.level == TRADE:
+        return "ACTIVE"
+    if dec.reason == "BEFORE_PREP_WINDOW":
+        return "PENDING"  # registered (paid or not); the prep window has not opened
+    if dec.level == CONFIGURE:
+        if dec.reason in ("PREP_WINDOW", "CALENDAR_NOT_PUBLISHED"):
+            return "ACTIVE" if covered_or_future else "PENDING"
+        # During the event, not trading today.
+        if dec.reason == "NOT_AN_EVENT_DAY" and covered_or_future:
+            return "ACTIVE"  # a closed day between paid days
+        # An unpaid billable day: UNPAID while later cover exists (or none was
+        # ever bought), EXPIRED once all paid cover is behind us.
+        return "EXPIRED" if paid and not any(p.starts_on > d for p in paid) else "UNPAID"
+    # NONE after the event
+    return "EXPIRED" if paid else "UNPAID"

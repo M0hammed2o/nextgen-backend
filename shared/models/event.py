@@ -54,6 +54,8 @@ class Event(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     food_day_rate_cents: Mapped[int] = mapped_column(Integer, nullable=False)
     clothing_day_rate_cents: Mapped[int] = mapped_column(Integer, nullable=False)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Days before the first billable day during which a vendor may configure (migration 0063).
+    prep_days: Mapped[int] = mapped_column(Integer, nullable=False, default=14, server_default="14")
 
     days = relationship("EventDay", back_populates="event", cascade="all, delete-orphan", order_by="EventDay.day")
     vendors = relationship("EventVendor", back_populates="event", cascade="all, delete-orphan")
@@ -61,6 +63,7 @@ class Event(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     __table_args__ = (
         CheckConstraint("status IN ('DRAFT','OPEN','CLOSED','CANCELLED')", name="status_known"),
         CheckConstraint("food_day_rate_cents >= 0 AND clothing_day_rate_cents >= 0", name="rates_non_negative"),
+        CheckConstraint("prep_days >= 0 AND prep_days <= 90", name="prep_days_range"),
     )
 
 
@@ -137,6 +140,13 @@ class EventVendorSubscription(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     __table_args__ = (
         Index("ix_event_vendor_subscriptions_event_vendor_id", "event_vendor_id"),
         Index("ix_event_vendor_subscriptions_business_id", "business_id"),
+        # One payment reference settles at most one PAID subscription (migration 0063).
+        Index(
+            "uq_event_vendor_subscriptions_payment_reference_paid",
+            "payment_reference",
+            unique=True,
+            postgresql_where=text("status = 'PAID'"),
+        ),
         CheckConstraint("ends_on >= starts_on", name="range_ordered"),
         CheckConstraint("day_rate_cents >= 0 AND billable_days >= 0", name="non_negative"),
         CheckConstraint("amount_cents = day_rate_cents * billable_days", name="amount_matches"),
