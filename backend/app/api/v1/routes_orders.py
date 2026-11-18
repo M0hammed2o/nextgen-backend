@@ -63,6 +63,11 @@ class OrderItemResponse(BaseModel):
     # other line, which was resolved and priced server-side from the live
     # menu catalog (POS orders, and dashboard orders that set menu_item_id).
     is_ad_hoc_price: bool = False
+    # Product variants (migration 0066)
+    variant_id: uuid.UUID | None = None
+    variant_label_snapshot: str | None = None
+    sku_snapshot: str | None = None
+    returned_quantity: int | None = 0
     model_config = {"from_attributes": True}
 
 
@@ -139,6 +144,7 @@ class OrderResponse(BaseModel):
     completed_at: datetime | None
     special_instructions: str | None = None
     cancelled_reason: str | None
+    exchange_of_order_id: uuid.UUID | None = None
     items: list[OrderItemResponse] = []
     payment_allocations: list[PaymentAllocationResponse] = []
     created_at: datetime

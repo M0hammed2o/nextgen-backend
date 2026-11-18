@@ -16,6 +16,7 @@ rationale.
 """
 
 import uuid
+from decimal import ROUND_HALF_UP, Decimal
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Query
@@ -37,7 +38,11 @@ from backend.app.core.rbac import (
     require_staff_or_above,
 )
 from backend.app.db.session import get_db
-from backend.app.inventory.ledger import post_sale_consumption, reverse_sale_consumption
+from backend.app.inventory.ledger import (
+    post_sale_consumption,
+    restore_returned_variant_stock,
+    reverse_sale_consumption,
+)
 from backend.app.pos.pricing import POSAddOnSelection, POSItemInput, resolve_pos_items
 from backend.app.pos.till import compute_expected_cash_cents, compute_variance_cents
 from backend.app.receipts.whatsapp_receipt import (
@@ -53,6 +58,7 @@ from shared.models.business import Business
 from shared.models.order import Order, OrderEvent, OrderItem
 from shared.models.pos_payment import POSPaymentAllocation, POSPaymentLinkIntent
 from shared.models.till import TillSession
+from shared.models.variant import ProductVariant
 from shared.models.user import BusinessUser
 from shared.utils import format_order_number
 
@@ -74,6 +80,9 @@ class POSAddOnSelectionRequest(BaseModel):
 
 class POSOrderItemRequest(BaseModel):
     menu_item_id: uuid.UUID
+    # Required when the item has active variants (422 VARIANT_REQUIRED
+    # otherwise); must be a variant of THIS item in the caller's business.
+    variant_id: uuid.UUID | None = None
     quantity: int = Field(ge=1, le=999)
     selected_option_ids: dict[str, str] = Field(default_factory=dict)
     add_on_selections: list[POSAddOnSelectionRequest] = Field(default_factory=list)
@@ -125,6 +134,10 @@ class POSOrderCreateRequest(BaseModel):
     notify_when_ready: bool = False
     discount_cents: int = Field(default=0, ge=0)
     discount_reason: str | None = Field(default=None, max_length=255)
+    # Exchange: this sale replaces goods returned on an already-refunded POS
+    # order of the same business (refund first via /orders/{id}/refund with
+    # return_items, then ring up the replacement with this link).
+    exchange_of_order_id: uuid.UUID | None = None
 
     # ── Loyalty redemption (POS checkout) ──────────────────────────────────
     # Deliberately no customer_id field — customer_phone is already the
@@ -246,8 +259,17 @@ class TillSessionHistoryEntry(BaseModel):
     closed_by_name: str | None = None
 
 
+class POSReturnLine(BaseModel):
+    order_item_id: uuid.UUID
+    quantity: int = Field(ge=1, le=999)
+
+
 class POSRefundRequest(BaseModel):
     amount_cents: int | None = Field(default=None, ge=1, description="Defaults to a full refund of total_cents")
+    # Line-level return. When given, amount_cents defaults to the value of the
+    # returned units (pro-rated for any order discount/loyalty/VAT-exclusive
+    # adjustment) and may only be LOWER than that (e.g. a restocking fee).
+    return_items: list[POSReturnLine] | None = Field(default=None, min_length=1)
     reason: str | None = Field(default=None, max_length=255)
 
     # Money moving back to the customer does NOT imply food coming back to
@@ -1062,6 +1084,25 @@ async def create_pos_order(
     # ── Till must be open before any sale can be rung up ──────────────────
     till_session = await _get_open_till(db, user.business_id)
 
+    if body.exchange_of_order_id is not None:
+        original_result = await db.execute(
+            select(Order.payment_status, Order.source).where(
+                Order.id == body.exchange_of_order_id,
+                Order.business_id == user.business_id,
+            )
+        )
+        original = original_result.first()
+        if original is None:
+            raise NotFoundError("Order", str(body.exchange_of_order_id))
+        if original.source != OrderSource.POS.value or original.payment_status not in (
+            "REFUNDED", "PARTIALLY_REFUNDED",
+        ):
+            raise AppError(
+                "EXCHANGE_ORIGINAL_NOT_REFUNDED",
+                "An exchange must reference a POS order whose returned goods were already refunded",
+                422,
+            )
+
     biz_check_result = await db.execute(
         select(Business).where(Business.id == user.business_id)
     )
@@ -1121,6 +1162,7 @@ async def create_pos_order(
             ],
             removed_ingredient_ids=item.removed_ingredient_ids,
             special_instructions=item.special_instructions,
+            variant_id=item.variant_id,
         )
         for item in body.items
     ]
@@ -1391,6 +1433,7 @@ async def create_pos_order(
         customer_name=body.customer_name,
         phone_number=body.customer_phone,
         notify_when_ready=body.notify_when_ready,
+        exchange_of_order_id=body.exchange_of_order_id,
         confirmed_at=now,
         accepted_at=now if initial_status == OrderStatus.ACCEPTED else None,
         completed_at=now if initial_status == OrderStatus.COMPLETED else None,
@@ -1426,6 +1469,9 @@ async def create_pos_order(
                 add_ons_snapshot=resolved.add_ons_snapshot or None,
                 removed_ingredients_snapshot=resolved.removed_ingredients_snapshot or None,
                 special_instructions=resolved.special_instructions,
+                variant_id=resolved.variant_id,
+                variant_label_snapshot=resolved.variant_label,
+                sku_snapshot=resolved.sku,
             ))
 
         db.add(OrderEvent(
@@ -1744,9 +1790,66 @@ async def refund_pos_order(
     order = await _load_pos_order_for_reversal(db, user.business_id, order_id)
     await _require_open_till_for_cash_reversal(db, user.business_id, order)
 
-    amount_cents = body.amount_cents or order.total_cents
+    # ── Line-level return (retail/variants): validated BEFORE any mutation ──
+    return_lines: list[tuple[OrderItem, int]] = []
+    if body.return_items:
+        items_by_id = {oi.id: oi for oi in order.items}
+        wanted: dict[uuid.UUID, int] = {}
+        for r in body.return_items:
+            wanted[r.order_item_id] = wanted.get(r.order_item_id, 0) + r.quantity
+        for oi_id, qty in wanted.items():
+            oi = items_by_id.get(oi_id)
+            if oi is None:
+                raise NotFoundError("Order item", str(oi_id))
+            if qty > oi.quantity - (oi.returned_quantity or 0):
+                raise AppError(
+                    "RETURN_EXCEEDS_SOLD",
+                    f"Cannot return {qty} of {oi.name_snapshot}: only "
+                    f"{oi.quantity - (oi.returned_quantity or 0)} left to return",
+                    422,
+                    details={"order_item_id": str(oi_id)},
+                )
+            return_lines.append((oi, qty))
+        # What the customer actually paid per unit: the order total (less any
+        # delivery fee) spread over the item subtotal, so order-level
+        # discounts, loyalty and exclusive VAT are shared out pro rata.
+        items_paid = max(0, order.total_cents - (order.delivery_fee_cents or 0))
+        all_returned = all(
+            (oi.returned_quantity or 0) + wanted.get(oi.id, 0) >= oi.quantity for oi in order.items
+        )
+        if all_returned:
+            computed_cents = items_paid
+        else:
+            ratio = (
+                Decimal(items_paid) / Decimal(order.subtotal_cents)
+                if order.subtotal_cents else Decimal(0)
+            )
+            computed_cents = sum(
+                int((Decimal(oi.unit_price_cents * qty) * ratio).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+                for oi, qty in return_lines
+            )
+        if computed_cents <= 0:
+            raise AppError("RETURN_AMOUNT_ZERO", "The returned goods have no refundable value", 422)
+        if body.amount_cents is not None and body.amount_cents > computed_cents:
+            raise AppError(
+                "REFUND_EXCEEDS_RETURNED_VALUE",
+                f"Refund cannot exceed the value of the returned goods ({computed_cents} cents)",
+                422,
+            )
+        amount_cents = body.amount_cents or computed_cents
+    else:
+        amount_cents = body.amount_cents or order.total_cents
     if amount_cents > order.total_cents:
         raise AppError("REFUND_EXCEEDS_TOTAL", "Refund amount cannot exceed the order total", 422)
+    if (
+        body.restore_stock and not return_lines and amount_cents < order.total_cents
+        and any(oi.variant_id is not None for oi in order.items)
+    ):
+        raise AppError(
+            "RETURN_ITEMS_REQUIRED",
+            "A partial refund that restores variant stock must say which units came back (return_items)",
+            422,
+        )
 
     is_full_refund = amount_cents == order.total_cents
 
@@ -1810,13 +1913,42 @@ async def refund_pos_order(
         )
         business = business_result.scalar_one_or_none()
         if business and business.inventory_enabled:
-            reversed_lines = await reverse_sale_consumption(
-                db,
-                business_id=user.business_id,
-                order_id=order.id,
-                created_by_user_id=user.user_id,
-                notes=f"Refund with stock returned: {body.reason}",
-            )
+            if return_lines and not is_full_refund:
+                # Partial line-level return: restock only the returned
+                # variant units (recipe-based lines have no per-unit mirror).
+                variant_ids = {oi.variant_id for oi, _ in return_lines if oi.variant_id}
+                ing_by_variant = {}
+                if variant_ids:
+                    vrows = await db.execute(
+                        select(ProductVariant.id, ProductVariant.ingredient_id).where(
+                            ProductVariant.business_id == user.business_id,
+                            ProductVariant.id.in_(variant_ids),
+                        )
+                    )
+                    ing_by_variant = {r[0]: r[1] for r in vrows.all()}
+                reversed_lines = await restore_returned_variant_stock(
+                    db,
+                    business_id=user.business_id,
+                    order_id=order.id,
+                    returns=[
+                        (oi.id, oi.returned_quantity or 0, ing_by_variant[oi.variant_id], qty)
+                        for oi, qty in return_lines
+                        if oi.variant_id is not None and ing_by_variant.get(oi.variant_id)
+                    ],
+                    created_by_user_id=user.user_id,
+                    notes=f"Return with stock returned: {body.reason}",
+                )
+            else:
+                reversed_lines = await reverse_sale_consumption(
+                    db,
+                    business_id=user.business_id,
+                    order_id=order.id,
+                    created_by_user_id=user.user_id,
+                    notes=f"Refund with stock returned: {body.reason}",
+                )
+
+    for oi, qty in return_lines:
+        oi.returned_quantity = (oi.returned_quantity or 0) + qty
 
     # Points, unlike stock, default to coming back — see POSRefundRequest.
     # restore_loyalty_points' own docstring for why the default is flipped
@@ -1844,6 +1976,11 @@ async def refund_pos_order(
             "reason": body.reason,
             "restore_stock": body.restore_stock,
             "stock_lines_reversed": reversed_lines,
+            "returned_items": [
+                {"order_item_id": str(oi.id), "variant_id": str(oi.variant_id) if oi.variant_id else None,
+                 "quantity": qty}
+                for oi, qty in return_lines
+            ],
             "restore_loyalty_points": body.restore_loyalty_points,
             "loyalty_points_restored": loyalty_points_restored,
             "pay_by_link_allocations_pending_provider_refund": pay_by_link_flagged,

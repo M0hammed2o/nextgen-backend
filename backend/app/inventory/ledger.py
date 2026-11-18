@@ -242,6 +242,7 @@ def build_line_specs(resolved_items) -> list[LineItemSpec]:
                 selected_option_ids=_selected_option_ids(item.selected_options_snapshot),
                 add_on_selections=_add_on_selections(item.add_ons_snapshot),
                 removed_ref_ids=_removed_ref_ids(item.removed_ingredients_snapshot),
+                variant_ingredient_id=getattr(item, "variant_ingredient_id", None),
             )
         )
     return specs
@@ -476,6 +477,63 @@ async def reverse_sale_consumption(
         already.add(original.ingredient_id)
         written += 1
 
+    return written
+
+
+def return_idempotency_key(order_item_id: uuid.UUID, returned_before: int) -> str:
+    """One restock per (order line, units already returned) - a retried return can post at most once."""
+    return f"RETURN:{order_item_id}:{returned_before}"
+
+
+async def restore_returned_variant_stock(
+    db: AsyncSession,
+    *,
+    business_id: uuid.UUID,
+    order_id: uuid.UUID,
+    returns: list[tuple[uuid.UUID, int, uuid.UUID, int]],
+    created_by_user_id: uuid.UUID | None = None,
+    notes: str | None = None,
+) -> int:
+    """
+    Put back stock for LINE-LEVEL returns of variant lines.
+
+    `returns` = [(order_item_id, units_already_returned_before, ingredient_id, qty)].
+    Posts one positive SALE_REVERSAL movement per line at the cost the
+    original sale deducted at (falling back to the ingredient's current
+    cost), so valuation nets to zero. Does not commit.
+    """
+    written = 0
+    for order_item_id, returned_before, ingredient_id, qty in returns:
+        if qty <= 0:
+            continue
+        original = (
+            await db.execute(
+                select(StockMovement.unit_cost_micro_cents).where(
+                    StockMovement.business_id == business_id,
+                    StockMovement.source_type == StockSourceType.ORDER.value,
+                    StockMovement.source_id == order_id,
+                    StockMovement.ingredient_id == ingredient_id,
+                    StockMovement.movement_type == StockMovementType.SALE_CONSUMPTION.value,
+                ).limit(1)
+            )
+        ).scalar_one_or_none()
+        if original is None:
+            original = (await _ingredient_costs(db, business_id, [ingredient_id])).get(ingredient_id, 0)
+        db.add(
+            build_movement(
+                business_id=business_id,
+                ingredient_id=ingredient_id,
+                quantity_milli=abs(int(qty)) * 1000,
+                movement_type=StockMovementType.SALE_REVERSAL.value,
+                unit_cost_micro_cents=int(original or 0),
+                source_type=StockSourceType.ORDER.value,
+                source_id=order_id,
+                created_by_user_id=created_by_user_id,
+                idempotency_key=return_idempotency_key(order_item_id, returned_before),
+                notes=notes,
+            )
+        )
+        written += 1
     return written
 
 

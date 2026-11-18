@@ -33,11 +33,23 @@ class FakeResult:
         return FakeScalars(self._items)
 
 
+class FakeVariantRows:
+    def scalars(self):
+        return FakeScalars([])
+
+    def all(self):
+        return []
+
+
 class FakeDB:
     def __init__(self, results):
         self._results = list(results)
 
     async def execute(self, stmt):
+        # Variant lookups (migration 0066) are not part of the queued
+        # catalogue results: a business with no variants returns nothing.
+        if "product_variants" in str(stmt):
+            return FakeVariantRows()
         return self._results.pop(0)
 
 
