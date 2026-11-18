@@ -106,6 +106,13 @@ async def get_current_user(
         role=payload["role"],
         token_type=payload.get("type", "access"),
     )
+    # Tokens issued before token_version existed carry no "tv" claim; they
+    # are treated as version 0, which is every user's starting value, so the
+    # deploy itself logs nobody out.
+    try:
+        token_version_claim = int(payload.get("tv", 0) or 0)
+    except (TypeError, ValueError):
+        raise _invalid
 
     # Instant cutoff for deactivated business users AND suspended businesses —
     # one indexed join, no extra round-trip. Business suspension was
@@ -117,7 +124,12 @@ async def get_current_user(
     if user.token_type == "access":
         from shared.models.business import Business
         result = await db.execute(
-            select(BusinessUser.is_active, Business.is_active, Business.suspended_reason)
+            select(
+                BusinessUser.is_active,
+                Business.is_active,
+                Business.suspended_reason,
+                BusinessUser.token_version,
+            )
             .join(Business, Business.id == BusinessUser.business_id)
             .where(BusinessUser.id == user.user_id)
         )
@@ -127,11 +139,20 @@ async def get_current_user(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail={"code": "ACCOUNT_DISABLED", "message": "This account has been disabled"},
             )
-        user_active, business_active, suspended_reason = row
+        user_active, business_active, suspended_reason, current_token_version = row
         if not user_active:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail={"code": "ACCOUNT_DISABLED", "message": "This account has been disabled"},
+            )
+        # Instant cut-off on credential change: shared/auth_sessions.py bumps
+        # token_version whenever a PIN/password is replaced or the account is
+        # deactivated, so an access token issued before that is refused here
+        # on its next request rather than when it expires.
+        if token_version_claim != (current_token_version or 0):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail={"code": "SESSION_REVOKED", "message": "This session has ended. Please sign in again."},
             )
         if not business_active:
             raise HTTPException(

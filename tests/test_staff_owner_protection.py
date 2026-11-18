@@ -75,6 +75,7 @@ def make_staff(role: str, business_id, staff_id=None, is_active=True):
     from datetime import datetime, timezone
 
     return types.SimpleNamespace(
+        token_version=0,  # BusinessUser.token_version server default (migration 0061)
         id=staff_id or uuid.uuid4(),
         business_id=business_id,
         role=role,

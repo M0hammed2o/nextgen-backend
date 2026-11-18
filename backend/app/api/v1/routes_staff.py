@@ -9,14 +9,15 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.errors import AppError, DuplicateError, NotFoundError
 from backend.app.core.rbac import AuthUser, require_owner_or_manager
 from backend.app.core.security import hash_password, hash_pin
 from backend.app.db.session import get_db
-from shared.models.user import BusinessUser, RefreshToken
+from shared.auth_sessions import end_user_sessions
+from shared.models.user import BusinessUser
 
 router = APIRouter(prefix="/business/staff", tags=["staff"])
 
@@ -26,20 +27,14 @@ def _generate_pin() -> str:
     return f"{secrets.randbelow(10000):04d}"
 
 
-async def _revoke_sessions(db: AsyncSession, user_id: uuid.UUID) -> None:
+async def _revoke_sessions(db: AsyncSession, staff: BusinessUser) -> None:
     """
-    Revoke every live refresh token for a user. Used when a credential is
-    replaced (PIN rotation) or the account is deactivated, so a session
-    opened with the old credential cannot keep refreshing (BUG-0184 follow-up:
-    rotating a leaked PIN used to leave existing sessions valid for up to
-    REFRESH_TOKEN_EXPIRE_DAYS). An already-issued access token still runs to
-    its own short expiry (STAFF_ACCESS_TOKEN_EXPIRE_MINUTES).
+    End every session for this user in the caller's transaction: bump
+    token_version (access tokens issued before now fail their next request)
+    and revoke all live refresh tokens. Used on PIN rotation and
+    deactivation. See shared/auth_sessions.py (BUG-0184 / BUG-0206).
     """
-    await db.execute(
-        update(RefreshToken)
-        .where(RefreshToken.user_id == user_id, RefreshToken.revoked_at.is_(None))
-        .values(revoked_at=datetime.now(timezone.utc))
-    )
+    await end_user_sessions(db, staff)
 
 
 def _guard_target(user: AuthUser, staff: BusinessUser, action: str) -> None:
@@ -209,7 +204,7 @@ async def update_staff(
     if deactivating:
         # Same as DELETE /{staff_id}: otherwise reactivating the account later
         # would revive refresh tokens issued before it was deactivated.
-        await _revoke_sessions(db, staff.id)
+        await _revoke_sessions(db, staff)
 
     await db.commit()
     await db.refresh(staff)
@@ -240,7 +235,7 @@ async def rotate_pin(
     staff.pin_updated_at = datetime.now(timezone.utc)
     staff.failed_login_attempts = 0
     staff.locked_until = None
-    await _revoke_sessions(db, staff.id)
+    await _revoke_sessions(db, staff)
     await db.commit()
 
     return PinRotateResponse(staff_id=staff.id, pin=body.new_pin)
@@ -279,7 +274,7 @@ async def auto_rotate_pin(
     staff.pin_updated_at = datetime.now(timezone.utc)
     staff.failed_login_attempts = 0
     staff.locked_until = None
-    await _revoke_sessions(db, staff.id)
+    await _revoke_sessions(db, staff)
     await db.commit()
 
     return PinRotateResponse(staff_id=staff.id, pin=new_pin)
@@ -314,7 +309,7 @@ async def deactivate_staff(
 
     # Kill their sessions immediately: revoke all live refresh tokens.
     # Their access token dies on next request via the rbac is_active check.
-    await _revoke_sessions(db, staff.id)
+    await _revoke_sessions(db, staff)
     await db.commit()
 
 

@@ -84,6 +84,7 @@ def make_business(**overrides):
 
 def make_owner(password="Temp1234", **overrides):
     u = types.SimpleNamespace(
+        token_version=0,  # BusinessUser.token_version server default (migration 0061)
         id=uuid.uuid4(),
         business_id=uuid.uuid4(),
         role="OWNER",

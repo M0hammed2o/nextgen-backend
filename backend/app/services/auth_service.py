@@ -6,7 +6,7 @@ token creation, refresh, logout, and account lockout.
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.config import get_settings
@@ -19,6 +19,7 @@ from backend.app.core.security import (
     verify_pin,
 )
 from shared.models.business import Business
+from shared.auth_sessions import end_user_sessions
 from shared.models.user import BusinessUser, RefreshToken
 from shared.utils import generate_refresh_token
 
@@ -129,14 +130,11 @@ class AuthService:
         user.locked_until = None
         user.last_login_at = datetime.now(timezone.utc)
 
-        # A password change ends every other session: revoke all live refresh
-        # tokens BEFORE issuing the new pair, so a session opened with the old
-        # (possibly leaked) password cannot keep refreshing. BUG-0184 follow-up.
-        await self.db.execute(
-            update(RefreshToken)
-            .where(RefreshToken.user_id == user.id, RefreshToken.revoked_at.is_(None))
-            .values(revoked_at=datetime.now(timezone.utc))
-        )
+        # A password change ends every other session BEFORE the new pair is
+        # issued: bumps token_version (old access tokens die on next request)
+        # and revokes all live refresh tokens. The new pair carries the new
+        # version. BUG-0184 / BUG-0206 follow-up.
+        await end_user_sessions(self.db, user)
 
         access_token, refresh_raw = await self._issue_tokens(user, ip_address)
         await self.db.commit()
@@ -229,6 +227,7 @@ class AuthService:
             business.id,
             user.role,
             expires_minutes=settings.STAFF_ACCESS_TOKEN_EXPIRE_MINUTES,
+            token_version=user.token_version,
         )
         refresh_raw = generate_refresh_token()
         await self._store_refresh_token(user.id, refresh_raw, ip_address)
@@ -282,6 +281,7 @@ class AuthService:
             expires_minutes=(
                 settings.STAFF_ACCESS_TOKEN_EXPIRE_MINUTES if user.role == "STAFF" else None
             ),
+            token_version=user.token_version,
         )
         new_refresh_raw = generate_refresh_token()
         await self._store_refresh_token(user.id, new_refresh_raw, ip_address)
@@ -357,7 +357,9 @@ class AuthService:
         self, user: BusinessUser, ip_address: str | None
     ) -> tuple[str, str]:
         """Create an access + refresh token pair for an OWNER/MANAGER user."""
-        access_token = create_access_token(user.id, user.business_id, user.role)
+        access_token = create_access_token(
+            user.id, user.business_id, user.role, token_version=user.token_version
+        )
         refresh_raw = generate_refresh_token()
         await self._store_refresh_token(user.id, refresh_raw, ip_address)
         return access_token, refresh_raw

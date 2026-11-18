@@ -72,6 +72,7 @@ def _caller(role="OWNER"):
 
 def _staff(business_id, role="STAFF", is_active=True):
     return types.SimpleNamespace(
+        token_version=0,  # BusinessUser.token_version server default (migration 0061)
         id=uuid.uuid4(), business_id=business_id, role=role, is_active=is_active,
         staff_name="Thabo", email=None, pin_hash="x", pin_updated_at=None,
         failed_login_attempts=0, locked_until=None,
@@ -86,6 +87,7 @@ async def test_rotate_pin_revokes_only_the_target_users_sessions():
     revs = db.revocations()
     assert len(revs) == 1
     assert _revoked_user_ids(revs[0]) == {target.id}
+    assert target.token_version == 1  # old access tokens now fail rbac's tv check
     assert db.commits == 1  # PIN change and revocation commit together
 
 
@@ -96,6 +98,7 @@ async def test_auto_rotate_pin_revokes_only_the_target_users_sessions():
     await auto_rotate_pin(staff_id=target.id, user=caller, db=db)
     revs = db.revocations()
     assert len(revs) == 1 and _revoked_user_ids(revs[0]) == {target.id}
+    assert target.token_version == 1
 
 
 async def test_delete_deactivation_revokes_sessions():
@@ -126,10 +129,12 @@ async def test_put_rename_does_not_revoke_sessions(monkeypatch):
     monkeypatch.setattr("backend.app.api.v1.routes_staff.StaffResponse.model_validate", lambda obj: obj)
     await update_staff(staff_id=target.id, body=StaffUpdate(staff_name="Sipho"), user=caller, db=db)
     assert db.revocations() == []
+    assert target.token_version == 0  # a rename ends no session
 
 
 async def test_set_password_revokes_other_sessions_before_issuing_new_tokens(monkeypatch):
     user = types.SimpleNamespace(
+        token_version=0,  # BusinessUser.token_version server default (migration 0061)
         id=uuid.uuid4(), business_id=uuid.uuid4(), email="owner@example.com", password_hash="old-hash",
         is_active=True, must_change_password=True, failed_login_attempts=0, locked_until=None, last_login_at=None,
     )
@@ -159,3 +164,14 @@ async def test_set_password_revokes_other_sessions_before_issuing_new_tokens(mon
     # Revocation happened before the new pair was issued, so the new session survives.
     assert order == [("issue", 1)]
     assert user.password_hash == "new-hash" and user.must_change_password is False
+    assert user.token_version == 1
+
+
+def test_access_token_carries_tv_and_extra_claims_cannot_override_it():
+    import jwt as _jwt
+    from backend.app.core.security import create_access_token
+
+    token = create_access_token(uuid.uuid4(), uuid.uuid4(), "STAFF", extra_claims={"tv": 99}, token_version=3)
+    assert _jwt.decode(token, options={"verify_signature": False})["tv"] == 3
+    default = create_access_token(uuid.uuid4(), uuid.uuid4(), "OWNER")
+    assert _jwt.decode(default, options={"verify_signature": False})["tv"] == 0

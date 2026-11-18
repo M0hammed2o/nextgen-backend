@@ -46,6 +46,11 @@ class BusinessUser(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     last_login_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    token_version: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False,
+        comment="Bumped on every credential change or deactivation; access tokens carry it "
+                "as the 'tv' claim and are rejected on mismatch (shared/auth_sessions.py)",
+    )
 
     # ── Relationships ────────────────────────────────────────────────────
     business = relationship("Business", back_populates="users")

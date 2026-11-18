@@ -130,6 +130,7 @@ async def test_auto_rotate_pin_returns_4_digits():
     business_id = uuid.uuid4()
     caller = make_owner_user(business_id)
     staff = types.SimpleNamespace(
+        token_version=0,  # BusinessUser.token_version server default (migration 0061)
         id=uuid.uuid4(), business_id=business_id, role="STAFF",
         pin_hash=None, pin_updated_at=None,
         failed_login_attempts=3, locked_until="something",

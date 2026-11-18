@@ -37,7 +37,8 @@ from shared.enums import AuditScope, PlanTier
 from shared.models.admin import AdminRole
 from shared.models.audit import AuditEvent
 from shared.models.business import Business
-from shared.models.user import BusinessUser, RefreshToken
+from shared.auth_sessions import end_user_sessions
+from shared.models.user import BusinessUser
 from shared.utils import generate_business_code, generate_temp_password
 
 logger = logging.getLogger("nextgen.admin")
@@ -890,7 +891,6 @@ async def reset_business_user_password(
     complete — enforced by get_business_scoped below, same rule as every
     other onboarder-accessible route.
     """
-    from sqlalchemy import update as sa_update
 
     await get_business_scoped(business_id, user, db)
 
@@ -911,11 +911,9 @@ async def reset_business_user_password(
     target.failed_login_attempts = 0
     target.locked_until = None
 
-    await db.execute(
-        sa_update(RefreshToken)
-        .where(RefreshToken.user_id == target.id, RefreshToken.revoked_at.is_(None))
-        .values(revoked_at=datetime.now(timezone.utc))
-    )
+    # Ends every session: bumps token_version (old access tokens fail on their
+    # next request) and revokes all live refresh tokens (shared/auth_sessions.py).
+    await end_user_sessions(db, target)
     db.add(AuditEvent(
         scope=AuditScope.PLATFORM.value,
         business_id=business_id,
@@ -1101,7 +1099,6 @@ async def complete_onboarding(
     From the next request onward, get_business_scoped denies this
     ONBOARDER access to this business (404) — SUPER_ADMIN is unaffected.
     """
-    from sqlalchemy import update as sa_update
 
     biz = await get_business_scoped(business_id, user, db)
 
@@ -1133,11 +1130,7 @@ async def complete_onboarding(
     now = datetime.now(timezone.utc)
     for account in onboarding_accounts:
         account.is_active = False
-        await db.execute(
-            sa_update(RefreshToken)
-            .where(RefreshToken.user_id == account.id, RefreshToken.revoked_at.is_(None))
-            .values(revoked_at=now)
-        )
+        await end_user_sessions(db, account)
 
     biz.onboarding_completed_at = now
     db.add(AuditEvent(
