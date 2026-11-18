@@ -22,6 +22,7 @@ os.environ.setdefault("RATE_LIMIT_ENABLED", "false")
 sys.path.insert(0, os.path.abspath("."))
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine  # noqa: E402
+from scripts._seed_safety import require_local_or_confirmed  # noqa: E402
 
 from backend.app.inventory.ledger import (  # noqa: E402
     build_movement,
@@ -50,6 +51,7 @@ def check(label, condition, detail=""):
 
 
 async def main():
+    require_local_or_confirmed(os.environ["DATABASE_URL"], "scripts/verify_ciao_e2e.py")
     engine = create_async_engine(os.environ["DATABASE_URL"], echo=False)
     Session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 

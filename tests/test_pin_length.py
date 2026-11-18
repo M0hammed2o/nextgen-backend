@@ -74,6 +74,10 @@ class FakeDB:
         self.commits = 0
 
     async def execute(self, stmt):
+        self.executed = getattr(self, "executed", []) + [stmt]
+        # A bulk UPDATE (refresh-token revocation) needs no queued result.
+        if getattr(stmt, "is_update", False) and not self._results:
+            return FakeResult(None)
         return self._results.pop(0)
 
     def add(self, obj):
@@ -138,3 +142,5 @@ async def test_auto_rotate_pin_returns_4_digits():
     assert res.pin.isdigit()
     assert staff.failed_login_attempts == 0
     assert staff.locked_until is None
+    # BUG-0184 follow-up: the auto-rotation also revokes live sessions.
+    assert any(getattr(st, "is_update", False) and st.table.name == "refresh_tokens" for st in db.executed)

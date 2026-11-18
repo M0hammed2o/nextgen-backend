@@ -15,11 +15,12 @@ import sys
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from scripts._seed_safety import fixture_credential, require_local_or_confirmed  # noqa: E402
 
 OWNER_EMAIL = "owner@splitpay-e2e-b.co.za"
-OWNER_PASSWORD = "SplitPayE2EB2026!Owner"
+OWNER_PASSWORD = fixture_credential("NEXTGEN_SEED_SPLIT_PAYMENTS_E2E_TENANT_B_OWNER_PASSWORD", "SplitPayE2EB2026!Owner")
 CASHIER_NAME = "E2E Cashier B"
-CASHIER_PIN = "8888"
+CASHIER_PIN = fixture_credential("NEXTGEN_SEED_SPLIT_PAYMENTS_E2E_TENANT_B_CASHIER_PIN", "8888")
 
 
 async def seed() -> None:
@@ -32,6 +33,7 @@ async def seed() -> None:
     from shared.utils import generate_business_code
 
     settings = get_settings()
+    require_local_or_confirmed(settings.DATABASE_URL, "scripts/seed_split_payments_e2e_tenant_b.py")
     engine = create_async_engine(settings.DATABASE_URL)
     session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 

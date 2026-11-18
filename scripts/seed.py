@@ -21,12 +21,13 @@ import sys
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from scripts._seed_safety import fixture_credential, require_local_or_confirmed  # noqa: E402
 
 
-DEMO_OWNER_PASSWORD = "BarnOwl2026!Owner"
-DEMO_MANAGER_PASSWORD = "BarnOwl2026!Manager"
-DEMO_CASHIER_PIN = "1234"
-DEMO_SUPER_ADMIN_PASSWORD = "NextGen2026!Admin"
+DEMO_OWNER_PASSWORD = fixture_credential("NEXTGEN_SEED_DEMO_OWNER_PASSWORD", "BarnOwl2026!Owner")
+DEMO_MANAGER_PASSWORD = fixture_credential("NEXTGEN_SEED_DEMO_MANAGER_PASSWORD", "BarnOwl2026!Manager")
+DEMO_CASHIER_PIN = fixture_credential("NEXTGEN_SEED_DEMO_CASHIER_PIN", "1234")
+DEMO_SUPER_ADMIN_PASSWORD = fixture_credential("NEXTGEN_SEED_DEMO_SUPER_ADMIN_PASSWORD", "NextGen2026!Admin")
 
 
 async def seed() -> None:
@@ -51,6 +52,7 @@ async def seed() -> None:
     from shared.utils import generate_business_code
 
     settings = get_settings()
+    require_local_or_confirmed(settings.DATABASE_URL, "scripts/seed.py")
     engine = create_async_engine(settings.DATABASE_URL)
     session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
