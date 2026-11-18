@@ -548,6 +548,9 @@ async def get_order(
     return OrderResponse.model_validate(order)
 
 
+_COMPLETION_STATUSES = frozenset({OrderStatus.COLLECTED, OrderStatus.DELIVERED, OrderStatus.COMPLETED})
+
+
 @router.post("/{order_id}/status", response_model=OrderResponse)
 async def update_order_status(
     order_id: uuid.UUID,
@@ -586,6 +589,14 @@ async def update_order_status(
                 current.value, requested.value,
                 detail="Payment must be confirmed before the order can move to IN_PROGRESS."
             )
+
+    # ── Souk trading gate (security review M2) ──────────────────────────
+    # Completing an order that is not already PAID is the moment a
+    # cash-on-collection sale becomes final, so an event vendor needs a paid
+    # trading day for it. An already-PAID order (money was gated when taken)
+    # may always be moved through the kitchen statuses.
+    if requested in _COMPLETION_STATUSES and order.payment_status != "PAID":
+        await assert_trading_allowed(db, user.business_id)
 
     old_status = order.status
     order.status = requested.value
@@ -1077,8 +1088,9 @@ async def update_payment_status(
             403,
         )
 
-    if new_status == "PAID" and old_payment_status != "PAID":
-        # Recording money received: event vendors need a paid trading day.
+    if new_status in ("PAID", "CASH_ON_COLLECTION") and old_payment_status != "PAID":
+        # Recording money received (or promised on collection): event vendors
+        # need a paid trading day (security review M2).
         await assert_trading_allowed(db, user.business_id)
 
     was_unpaid = old_payment_status in ("UNPAID", "PENDING")

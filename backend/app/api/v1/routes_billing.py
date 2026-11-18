@@ -24,10 +24,11 @@ from datetime import date, datetime
 from backend.app.billing.account_status import compute_account_status
 from backend.app.billing.commercial_invoice_pdf import build_commercial_invoice_pdf
 from backend.app.billing.registry import get_billing_provider
-from backend.app.core.errors import NotFoundError
+from backend.app.core.errors import AppError, NotFoundError
 from backend.app.core.ownership import require_owned
 from backend.app.core.rbac import AuthUser, require_owner, require_owner_or_manager
 from backend.app.db.session import get_db
+from shared.enums import EVENT_PLAN
 from shared.models.billing_invoice import BillingInvoice
 from shared.models.business import Business
 from shared.models.commercial_invoice import CommercialInvoice, UNPAID_ISSUED_STATUSES
@@ -80,6 +81,16 @@ async def _get_business(db: AsyncSession, user: AuthUser) -> Business:
     return business
 
 
+def _refuse_event_vendor(business: Business) -> None:
+    """Security review M1: event vendors pay per event day, never a SaaS subscription."""
+    if business.plan == EVENT_PLAN:
+        raise AppError(
+            "NOT_AVAILABLE_FOR_EVENT_VENDORS",
+            "Event vendors pay per event day and cannot start or manage a SaaS subscription.",
+            409,
+        )
+
+
 @router.get("/status", response_model=BillingStatusResponse)
 async def get_billing_status(
     user: AuthUser = Depends(require_owner),
@@ -110,6 +121,7 @@ async def create_checkout_session(
     not a staff/manager action.
     """
     business = await _get_business(db, user)
+    _refuse_event_vendor(business)
     provider = get_billing_provider()
     url = await provider.create_checkout_session(db, business, body.plan)
     return CheckoutSessionResponse(checkout_url=url)
@@ -127,6 +139,7 @@ async def create_portal_session(
     show "contact support to change your plan" instead of a broken link.
     """
     business = await _get_business(db, user)
+    _refuse_event_vendor(business)
     provider = get_billing_provider()
     if not provider.supports_self_service_portal():
         return PortalSessionResponse(portal_url=None, supported=False)
@@ -141,6 +154,7 @@ async def cancel_subscription(
 ):
     """Cancel the business's active subscription with the active billing provider."""
     business = await _get_business(db, user)
+    _refuse_event_vendor(business)
     provider = get_billing_provider()
     result = await provider.cancel_subscription(db, business)
     if result.success:

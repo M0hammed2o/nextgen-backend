@@ -38,9 +38,15 @@ from backend.app.core.rbac import AuthUser
 from backend.app.db.session import get_db
 from backend.app.events import registration as reg
 from backend.app.events.rules import DEFAULT_PREP_DAYS, PaidRange, evaluate_access, quote
-from backend.app.events.subscriptions import assert_no_overlap
+from backend.app.events.subscriptions import (
+    assert_no_overlap,
+    is_payment_reference_violation,
+    normalise_payment_reference,
+    payment_reference_in_use,
+)
 from backend.app.events.service import (
     EVENT_ADMIN_SUSPENSION_REASON,
+    EVENT_SUSPENSION_REASON,
     reconcile_event_vendor_access,
 )
 from shared.enums import EVENT_PLAN, AuditScope
@@ -156,6 +162,14 @@ class SubscriptionCreate(BaseModel):
 
 class MarkPaid(BaseModel):
     payment_reference: str = Field(min_length=1, max_length=255)
+
+    @field_validator("payment_reference")
+    @classmethod
+    def _normalise(cls, v: str) -> str:
+        v = normalise_payment_reference(v)
+        if not v:
+            raise ValueError("payment_reference must not be blank")
+        return v
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -482,7 +496,9 @@ async def bulk_onboard_vendors(event_id: uuid.UUID, body: BulkVendorRequest,
                     db,
                     fields={"name": row.business_name, "plan": EVENT_PLAN, "industry": _CATEGORY_INDUSTRY[row.category],
                             "pos_enabled": True, "inventory_enabled": True, "currency": "ZAR",
-                            "timezone": event.timezone},
+                            "timezone": event.timezone,
+                            # H1: WhatsApp orders bypass the trading gate; off until approved.
+                            "is_whatsapp_enabled": False},
                     owner_email=str(row.owner_email),
                     owner_full_name=row.owner_full_name,
                 )
@@ -655,7 +671,10 @@ async def suspend_vendor(event_id: uuid.UUID, vendor_id: uuid.UUID, body: Vendor
     biz = (await db.execute(select(Business).where(Business.id == vendor.business_id).with_for_update())).scalar_one()
     if biz.plan != EVENT_PLAN:
         raise AppError("NOT_EVENT_VENDOR", "only event-plan businesses are managed here", 409)
-    if not biz.is_active:
+    # An automatic EVENT_SUBSCRIPTION_ENDED suspension may be upgraded to an
+    # administrative one, so reconcile can never lift it behind the admin's back
+    # (security review L3). Any other suspension is left as it is.
+    if not biz.is_active and biz.suspended_reason != EVENT_SUSPENSION_REASON:
         raise AppError("ALREADY_SUSPENDED", f"this business is already suspended ({biz.suspended_reason})", 409)
     biz.is_active = False
     biz.suspended_reason = EVENT_ADMIN_SUSPENSION_REASON
@@ -683,10 +702,12 @@ async def reinstate_vendor(event_id: uuid.UUID, vendor_id: uuid.UUID,
     return {"vendor_id": vendor.id, "business_active": biz.is_active, "suspended_reason": biz.suspended_reason}
 
 
-async def _load_vendor(db: AsyncSession, event_id: uuid.UUID, vendor_id: uuid.UUID) -> EventVendor:
-    vendor = (await db.execute(
-        select(EventVendor).where(EventVendor.id == vendor_id, EventVendor.event_id == event_id)
-    )).scalar_one_or_none()
+async def _load_vendor(db: AsyncSession, event_id: uuid.UUID, vendor_id: uuid.UUID,
+                       lock: bool = False) -> EventVendor:
+    stmt = select(EventVendor).where(EventVendor.id == vendor_id, EventVendor.event_id == event_id)
+    if lock:
+        stmt = stmt.with_for_update()
+    vendor = (await db.execute(stmt)).scalar_one_or_none()
     if not vendor:
         raise NotFoundError("Event vendor", str(vendor_id))
     return vendor
@@ -735,7 +756,7 @@ async def mark_subscription_paid(event_id: uuid.UUID, subscription_id: uuid.UUID
     event = await _load_event(db, event_id, lock=True)
     sub = await _load_subscription(db, event_id, subscription_id)
     if sub.status == "PAID":
-        if sub.payment_reference == body.payment_reference:
+        if sub.payment_reference is not None and normalise_payment_reference(sub.payment_reference) == body.payment_reference:
             return {"id": sub.id, "status": "PAID", "already_paid": True}
         raise AppError("ALREADY_PAID", "this subscription is already paid under a different reference", 409)
     if sub.status == "VOID":
@@ -751,10 +772,7 @@ async def mark_subscription_paid(event_id: uuid.UUID, subscription_id: uuid.UUID
     if current is None or current.billable_days != sub.billable_days or current.amount_cents != sub.amount_cents:
         raise AppError("QUOTE_STALE",
                        "the event calendar changed since this subscription was quoted; void it and quote again", 409)
-    if (await db.execute(select(EventVendorSubscription.id).where(
-            EventVendorSubscription.status == "PAID",
-            EventVendorSubscription.payment_reference == body.payment_reference,
-            EventVendorSubscription.id != sub.id))).first():
+    if await payment_reference_in_use(db, body.payment_reference, exclude_id=sub.id):
         raise AppError("PAYMENT_REFERENCE_USED", "this payment reference already settles another subscription", 409)
     sub.status = "PAID"
     sub.paid_at = datetime.now(timezone.utc)
@@ -763,10 +781,13 @@ async def mark_subscription_paid(event_id: uuid.UUID, subscription_id: uuid.UUID
                   {"amount_cents": sub.amount_cents}, business_id=sub.business_id))
     try:
         await db.flush()
-    except IntegrityError:
+    except IntegrityError as exc:
         # Another event's mark-paid used the same reference at the same moment
-        # (the partial unique index is the cross-event backstop).
+        # (the partial unique index is the cross-event backstop). Any other
+        # integrity error is a real bug and must not be reported as this one.
         await db.rollback()
+        if not is_payment_reference_violation(exc):
+            raise
         raise AppError("PAYMENT_REFERENCE_USED", "this payment reference already settles another subscription", 409)
     await reconcile_event_vendor_access(db)
     await db.commit()
@@ -790,7 +811,9 @@ async def void_subscription(event_id: uuid.UUID, subscription_id: uuid.UUID,
 @router.post("/{event_id}/vendors/{vendor_id}/cancel")
 async def cancel_vendor(event_id: uuid.UUID, vendor_id: uuid.UUID,
                         user: AuthUser = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
-    vendor = await _load_vendor(db, event_id, vendor_id)
+    # Row lock: a concurrent change to this vendor (a reconcile write, another
+    # cancel) cannot interleave with the status flip (security review L1).
+    vendor = await _load_vendor(db, event_id, vendor_id, lock=True)
     vendor.status = "CANCELLED"
     vendor.status_changed_at = datetime.now(timezone.utc)
     db.add(_audit(user, "admin.event.vendor_cancelled", "event_vendor", vendor.id, {}, business_id=vendor.business_id))

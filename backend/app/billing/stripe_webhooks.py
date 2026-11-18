@@ -245,8 +245,9 @@ async def _handle_subscription_updated(db: AsyncSession, data: dict) -> None:
             biz.is_active = False
             biz.suspended_reason = "Subscription unpaid"
         elif new_status == "ACTIVE":
-            biz.is_active = True
-            biz.suspended_reason = None
+            # M1: lift only a billing-owned suspension (never EVENT_* or manual).
+            from backend.app.billing.lifecycle import lift_billing_suspension
+            lift_billing_suspension(biz)
 
     await db.commit()
     logger.info("Business %s billing status updated to %s", biz.id, new_status)

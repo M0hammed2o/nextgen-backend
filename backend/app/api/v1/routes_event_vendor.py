@@ -37,6 +37,8 @@ from backend.app.events.subscriptions import (
     assert_no_overlap,
     find_vendor,
     load_event_locked,
+    normalise_payment_reference,
+    payment_reference_in_use,
     quote_or_422,
 )
 from shared.enums import AuditScope
@@ -58,7 +60,7 @@ class PaymentClaim(BaseModel):
     @field_validator("reference")
     @classmethod
     def _strip(cls, v: str) -> str:
-        v = v.strip()
+        v = normalise_payment_reference(v)
         if not v:
             raise ValueError("reference must not be blank")
         return v
@@ -159,9 +161,7 @@ async def claim_payment(subscription_id: uuid.UUID, body: PaymentClaim,
     sub = await _own_subscription_locked(db, user, subscription_id)
     if sub.status != "UNPAID":
         raise AppError("SUBSCRIPTION_NOT_UNPAID", f"only an unpaid subscription can be claimed (this one is {sub.status})", 409)
-    if (await db.execute(select(EventVendorSubscription.id).where(
-            EventVendorSubscription.status == "PAID",
-            EventVendorSubscription.payment_reference == body.reference).limit(1))).first():
+    if await payment_reference_in_use(db, body.reference):
         raise AppError("PAYMENT_REFERENCE_USED", "this payment reference is already used on a paid subscription", 409)
     if sub.payment_claim_reference == body.reference:
         return {**_sub_out(sub), "already_claimed": True}

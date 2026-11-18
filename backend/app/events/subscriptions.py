@@ -7,7 +7,7 @@ from __future__ import annotations
 import uuid
 from datetime import date
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -23,6 +23,30 @@ async def load_event_locked(db: AsyncSession, event_id: uuid.UUID) -> Event:
     if not event:
         raise NotFoundError("Event", str(event_id))
     return event
+
+
+def normalise_payment_reference(ref: str) -> str:
+    """Strip and upper-case, so 'ab 1' vs ' AB 1' cannot both be accepted as different references."""
+    return ref.strip().upper()
+
+
+async def payment_reference_in_use(db: AsyncSession, reference: str, exclude_id: uuid.UUID | None = None) -> bool:
+    """
+    Is this (normalised) reference already on a PAID subscription? The stored
+    side is normalised in SQL too, so a legacy mixed-case value still matches.
+    """
+    stmt = select(EventVendorSubscription.id).where(
+        EventVendorSubscription.status == "PAID",
+        func.upper(func.btrim(EventVendorSubscription.payment_reference)) == reference,
+    )
+    if exclude_id is not None:
+        stmt = stmt.where(EventVendorSubscription.id != exclude_id)
+    return (await db.execute(stmt.limit(1))).first() is not None
+
+
+def is_payment_reference_violation(exc: Exception) -> bool:
+    """True only for the partial unique index on a PAID payment_reference (not any other IntegrityError)."""
+    return "payment_reference_paid" in str(getattr(exc, "orig", exc))
 
 
 def quote_or_422(event: Event, category: str, starts_on: date, ends_on: date) -> Quote:

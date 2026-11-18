@@ -9,9 +9,19 @@ own timezone.
 
 Non-event businesses (any plan other than EVENT_PLAN) are never affected.
 
-Not applied to WhatsApp-originated orders: the protected bot pipeline files
-are out of scope for this change (see WORKLOG.md). Event vendors are provisioned
-with no WhatsApp number, so that channel is not reachable for them today.
+NOT applied to WhatsApp-originated orders: the protected bot pipeline files
+(pipeline.py, order_creator.py, ...) are out of scope for the change that added
+this gate, so a bot order is NOT checked here. The earlier assumption that
+event vendors "have no WhatsApp number, so that channel is unreachable" was
+false (security review H1): an event vendor's owner could connect their own
+number through Embedded Signup. The interim mitigation is therefore:
+  - every /business/whatsapp/connection mutation is refused for event-plan
+    businesses (403 EVENT_WHATSAPP_NOT_AVAILABLE);
+  - event vendors are provisioned with is_whatsapp_enabled = false, and
+    migration 0065 switched it off for existing event-plan businesses.
+OWNER APPROVAL NEEDED: gate bot order creation for event vendors (call
+assert_trading_allowed from the bot's order-creation path, which means editing
+the protected files). Until then WhatsApp must stay off for event vendors.
 """
 from __future__ import annotations
 

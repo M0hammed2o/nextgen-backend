@@ -522,7 +522,7 @@ async def reconcile_event_vendors(ctx: dict) -> None:
 
     async with ctx["session_factory"]() as db:
         try:
-            await reconcile_event_vendor_access(db)
+            await reconcile_event_vendor_access(db, lock_events=True)
             await db.commit()
         except Exception:
             await db.rollback()

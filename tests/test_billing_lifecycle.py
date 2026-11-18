@@ -9,6 +9,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from backend.app.billing.lifecycle import (
+    SUSPENDED_GRACE_ELAPSED,
     GRACE_PERIOD_DAYS,
     is_past_grace_period,
     mark_invoice_paid,
@@ -29,7 +30,7 @@ def make_business(**overrides):
 
 def test_mark_invoice_paid_reactivates_and_resets_period():
     business = make_business(
-        billing_status="PAST_DUE", is_active=False, suspended_reason="overdue",
+        billing_status="PAST_DUE", is_active=False, suspended_reason=SUSPENDED_GRACE_ELAPSED,
         billing_period_started_at=datetime.now(timezone.utc) - timedelta(days=45),
     )
     now_before_call = datetime.now(timezone.utc)
@@ -87,3 +88,16 @@ def test_suspend_for_nonpayment_disables_without_deleting_data():
     assert business.suspended_reason is not None
     # Never touches anything but these three fields — no data deletion of any kind.
     assert hasattr(business, "id")
+
+
+# ── Security review M1: billing never lifts a non-billing suspension ──────────
+
+import pytest
+
+
+@pytest.mark.parametrize("reason", ["EVENT_ADMIN_SUSPENDED", "EVENT_SUBSCRIPTION_ENDED", "overdue", "Fraud review"])
+def test_mark_invoice_paid_does_not_lift_a_non_billing_suspension(reason):
+    business = make_business(billing_status="PAST_DUE", is_active=False, suspended_reason=reason)
+    mark_invoice_paid(business)
+    assert business.billing_status == "ACTIVE"
+    assert (business.is_active, business.suspended_reason) == (False, reason)
