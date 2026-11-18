@@ -87,6 +87,7 @@ async def provision_business(
     trial: bool = False,
     onboarded_by_admin_id: uuid.UUID | None = None,
     allow_external_identity: bool = False,
+    owner_password_hash: str | None = None,
 ) -> ProvisionedBusiness:
     """
     Create a business (and optionally its owner) in the caller's transaction.
@@ -98,6 +99,11 @@ async def provision_business(
     modal does this today). Bulk callers (event vendors, branch templates)
     leave it False, so no external identity can ever be copied in bulk. A
     key present with a None value is not an identity, so it is ignored.
+
+    ``owner_password_hash`` (self-service registration): a bcrypt hash of the
+    password the owner chose. No temporary password is generated and
+    ``must_change_password`` is False. Admin flows leave it None and are
+    unchanged.
     """
     if not allow_external_identity:
         forbidden = {k for k in FORBIDDEN_FIELDS & set(fields) if fields[k] is not None}
@@ -121,17 +127,21 @@ async def provision_business(
     owner = None
     temp_password = None
     if owner_email:
-        temp_password = generate_temp_password()
+        if owner_password_hash is None:
+            temp_password = generate_temp_password()
+            password_hash = await run_in_threadpool(hash_password, temp_password)
+        else:
+            password_hash = owner_password_hash
         owner = BusinessUser(
             business_id=biz.id,
             role="OWNER",
             email=owner_email.lower().strip(),
-            # bcrypt is CPU-bound (~0.8 s here); run it off the event loop so a
+            # bcrypt is CPU-bound (~0.8 s here); hashed off the event loop (above) so a
             # bulk import does not stall every other admin request.
-            password_hash=await run_in_threadpool(hash_password, temp_password),
+            password_hash=password_hash,
             staff_name=owner_full_name,
             is_active=True,
-            must_change_password=True,
+            must_change_password=owner_password_hash is None,
         )
         db.add(owner)
         await db.flush()

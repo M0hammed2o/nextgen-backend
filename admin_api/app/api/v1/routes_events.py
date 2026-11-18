@@ -36,7 +36,9 @@ from admin_api.app.services.provisioning import ensure_owner_email_free, provisi
 from backend.app.core.errors import AppError, NotFoundError
 from backend.app.core.rbac import AuthUser
 from backend.app.db.session import get_db
+from backend.app.events import registration as reg
 from backend.app.events.rules import DEFAULT_PREP_DAYS, PaidRange, evaluate_access, quote
+from backend.app.events.subscriptions import assert_no_overlap
 from backend.app.events.service import (
     EVENT_ADMIN_SUSPENSION_REASON,
     reconcile_event_vendor_access,
@@ -139,6 +141,12 @@ class BulkVendorRequest(BaseModel):
 class BulkVendorCsvRequest(BaseModel):
     csv_text: str = Field(min_length=1, max_length=2_000_000)
     dry_run: bool = False
+
+
+class RegistrationUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    open: bool
+    rotate_code: bool = False
 
 
 class SubscriptionCreate(BaseModel):
@@ -246,6 +254,8 @@ async def get_event(event_id: uuid.UUID, user: AuthUser = Depends(require_super_
     return {
         "id": event.id, "name": event.name, "slug": event.slug, "venue": event.venue, "timezone": event.timezone,
         "status": event.status, "prep_days": event.prep_days, "notes": event.notes,
+        "registration_open": event.registration_open,
+        "has_registration_code": event.registration_code_hash is not None,
         "food_day_rate_cents": event.food_day_rate_cents,
         "clothing_day_rate_cents": event.clothing_day_rate_cents,
         "days": [{"day": d.day, "is_billable": d.is_billable} for d in event.days],
@@ -323,6 +333,29 @@ async def set_event_status(event_id: uuid.UUID, body: EventStatusUpdate,
     await reconcile_event_vendor_access(db)
     await db.commit()
     return await get_event(event.id, user, db)
+
+
+@router.post("/{event_id}/registration")
+async def update_registration(event_id: uuid.UUID, body: RegistrationUpdate,
+                              user: AuthUser = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
+    """
+    Open or close vendor self-registration and optionally rotate the shared
+    code. A new code is returned in plaintext in THIS response only; just its
+    bcrypt hash is stored, and neither the code nor the hash is logged or
+    audited. Opening an event that has no code yet generates one.
+    """
+    event = await _load_event(db, event_id, lock=True)
+    code = None
+    if body.rotate_code or (body.open and event.registration_code_hash is None):
+        code = reg.generate_code()
+        event.registration_code_hash = await reg.hash_code(code)
+    event.registration_open = body.open
+    db.add(_audit(user, "admin.event.registration_updated", "event", event.id,
+                  {"open": body.open, "code_rotated": code is not None}))
+    await db.commit()
+    return {"registration_open": event.registration_open,
+            "has_registration_code": event.registration_code_hash is not None,
+            "registration_code": reg.display_code(code) if code else None}
 
 
 @router.put("/{event_id}/calendar")
@@ -576,7 +609,9 @@ async def list_vendors(
             "access_level": dec.level, "access_reason": dec.reason,
             "subscriptions": [{"id": s.id, "starts_on": s.starts_on, "ends_on": s.ends_on,
                                "billable_days": s.billable_days, "amount_cents": s.amount_cents,
-                               "status": s.status, "paid_at": s.paid_at}
+                               "status": s.status, "paid_at": s.paid_at,
+                               "payment_claim_reference": s.payment_claim_reference,
+                               "payment_claimed_at": s.payment_claimed_at}
                               for s in sorted(v.subscriptions, key=lambda s: s.starts_on)],
         })
     return {"items": items, "total": int(total)}
@@ -666,6 +701,7 @@ async def create_subscription(event_id: uuid.UUID, vendor_id: uuid.UUID, body: S
     if vendor.status == "CANCELLED":
         raise AppError("VENDOR_CANCELLED", "this vendor was cancelled", 409)
     q = _quote_or_422(event, vendor.category, body.starts_on, body.ends_on)
+    await assert_no_overlap(db, vendor.id, body.starts_on, body.ends_on)
     sub = EventVendorSubscription(
         event_vendor_id=vendor.id, business_id=vendor.business_id, starts_on=body.starts_on, ends_on=body.ends_on,
         day_rate_cents=q.day_rate_cents, billable_days=q.billable_days, amount_cents=q.amount_cents, status="UNPAID",

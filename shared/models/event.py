@@ -56,6 +56,9 @@ class Event(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Days before the first billable day during which a vendor may configure (migration 0063).
     prep_days: Mapped[int] = mapped_column(Integer, nullable=False, default=14, server_default="14")
+    # Vendor self-registration (migration 0064). Only a bcrypt hash of the code is stored.
+    registration_open: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    registration_code_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     days = relationship("EventDay", back_populates="event", cascade="all, delete-orphan", order_by="EventDay.day")
     vendors = relationship("EventVendor", back_populates="event", cascade="all, delete-orphan")
@@ -134,6 +137,9 @@ class EventVendorSubscription(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="UNPAID")
     paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     payment_reference: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # What the vendor says it paid with (migration 0064). Never marks anything paid.
+    payment_claim_reference: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    payment_claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     vendor = relationship("EventVendor", back_populates="subscriptions")
 
