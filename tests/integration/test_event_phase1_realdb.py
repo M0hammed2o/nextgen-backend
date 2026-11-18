@@ -306,7 +306,8 @@ async def test_database_refuses_a_reused_reference_on_paid_rows(db, bag):
     await _pay(db, ev, a, ref)
     sub_b = (await db.execute(select(EventVendorSubscription).where(
         EventVendorSubscription.business_id == b["business_id"]))).scalar_one()
-    sub_b.status, sub_b.paid_at, sub_b.payment_reference = "PAID", datetime.now(timezone.utc), ref
+    # mark-paid stores references normalised (strip + upper-case, review L6); the index sees that form
+    sub_b.status, sub_b.paid_at, sub_b.payment_reference = "PAID", datetime.now(timezone.utc), ref.strip().upper()
     with pytest.raises(IntegrityError):
         await db.commit()
     await db.rollback()
