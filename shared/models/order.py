@@ -246,6 +246,13 @@ class Order(Base, UUIDPrimaryKeyMixin, TimestampMixin):
                  "cash. NULL means nothing has been refunded, or the "
                  "refund involved no cash at all."
     )
+    # Exchange link (migration 0066): this sale replaces goods returned on
+    # the referenced order (which must already be refunded).
+    exchange_of_order_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("orders.id", ondelete="SET NULL"),
+        nullable=True, index=True,
+    )
+
 
     # ── Relationships ────────────────────────────────────────────────────
     items = relationship("OrderItem", back_populates="order", lazy="selectin")
@@ -322,6 +329,19 @@ class OrderItem(Base, UUIDPrimaryKeyMixin):
                  "at order time, immutable like the other snapshot columns"
     )
     special_instructions: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Product variants (migration 0066). variant_id is SET NULL on delete so
+    # history survives; the snapshots below are what receipts/reports read.
+    variant_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("product_variants.id", ondelete="SET NULL"),
+        nullable=True, index=True,
+    )
+    variant_label_snapshot: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    sku_snapshot: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    returned_quantity: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0",
+        comment="Units returned through a line-level POS refund (exchange/return)",
+    )
 
     # BUG-0016 fix (migration 0038): True only for a dashboard-typed
     # name+price_cents line with no menu_item_id — a caller-asserted price

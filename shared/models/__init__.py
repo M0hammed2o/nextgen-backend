@@ -36,12 +36,14 @@ from shared.models.specials import Special
 from shared.models.stocktake import StocktakeLine, StocktakeSession
 from shared.models.till import TillSession
 from shared.models.usage_alert import UsageAlert
+from shared.models.variant import ProductVariant
 from shared.models.user import AdminRefreshToken, BusinessUser, RefreshToken
 from shared.models.wastage import WastageEntry
 from shared.models.whatsapp_connection import WhatsAppConnection
 
 __all__ = [
     "Base",
+    "ProductVariant",
     "AdminUser",
     "AdminRefreshToken",
     "AiEmailCaseStudy",
