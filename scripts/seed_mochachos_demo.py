@@ -43,6 +43,7 @@ import sys
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from scripts._seed_safety import looks_local  # noqa: E402
 
 OWNER_EMAIL = "owner@mochachos-demo.nextgenintelligence.co.za"
 MANAGER_EMAIL = "manager@mochachos-demo.nextgenintelligence.co.za"
@@ -237,19 +238,11 @@ def _parse_args():
     parser.add_argument(
         "--yes", action="store_true",
         help="Required to actually write when DATABASE_URL's host does not look like a local/disposable one "
-             "(see _looks_local below). Has no effect with --dry-run.",
+             "(see scripts/_seed_safety.py looks_local). Has no effect with --dry-run.",
     )
     return parser.parse_args()
 
 
-def _looks_local(database_url: str) -> bool:
-    """
-    Best-effort, conservative check used only to decide whether to demand
-    --yes - never used to decide whether the migration/seed CAN run, and
-    never logs the URL itself, only this computed boolean.
-    """
-    lowered = database_url.lower()
-    return any(marker in lowered for marker in ("localhost", "127.0.0.1", "::1", "nextgen_test"))
 
 
 async def seed(dry_run: bool, confirmed: bool) -> None:
@@ -262,22 +255,29 @@ async def seed(dry_run: bool, confirmed: bool) -> None:
     from shared.utils import generate_business_code
 
     database_url = os.environ["DATABASE_URL"]
-    local_target = _looks_local(database_url)
+    local_target = looks_local(database_url)
     print(f"Target environment: {'local/disposable (matched a known local marker)' if local_target else 'NOT recognised as local - treating as a real/remote database'}")
     if not local_target and not dry_run and not confirmed:
         print(
             "\nRefusing to write: DATABASE_URL does not look like a local/disposable database, "
             "and --dry-run was not passed. If you really mean to seed this target, re-run with --yes.\n"
             "(This check only looks at whether the host matches a known local marker - it never reads "
-            "or prints the connection string itself.)"
+            "or prints the connection string itself.)",
+            file=sys.stderr,
         )
-        return
+        # Non-zero, like scripts/_seed_safety.require_local_or_confirmed, so a
+        # wrapper or CI step never mistakes a refusal for a successful seed.
+        raise SystemExit(2)
     if dry_run:
         print("DRY RUN - no writes will be committed.\n")
 
     owner_password, owner_generated = _resolve_credential("MOCHACHOS_OWNER_PASSWORD", _generate_password)
     manager_password, manager_generated = _resolve_credential("MOCHACHOS_MANAGER_PASSWORD", _generate_password)
     staff_pin, staff_pin_generated = _resolve_credential("MOCHACHOS_STAFF_PIN", _generate_pin)
+    if not (len(staff_pin) == 4 and staff_pin.isdigit()):
+        # The staff till's PinKeypad is fixed at 4 digits; any other PIN is unusable.
+        print("MOCHACHOS_STAFF_PIN must be exactly 4 digits (value not shown).", file=sys.stderr)
+        raise SystemExit(2)
 
     engine = create_async_engine(database_url)
     session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)

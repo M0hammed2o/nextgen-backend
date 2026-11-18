@@ -19,13 +19,14 @@ import sys
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from scripts._seed_safety import fixture_credential, require_local_or_confirmed  # noqa: E402
 
 OWNER_EMAIL = "owner@splitpay-e2e.co.za"
-OWNER_PASSWORD = "SplitPayE2E2026!Owner"
+OWNER_PASSWORD = fixture_credential("NEXTGEN_SEED_SPLIT_PAYMENTS_E2E_OWNER_PASSWORD", "SplitPayE2E2026!Owner")
 MANAGER_EMAIL = "manager@splitpay-e2e.co.za"
-MANAGER_PASSWORD = "SplitPayE2E2026!Manager"
+MANAGER_PASSWORD = fixture_credential("NEXTGEN_SEED_SPLIT_PAYMENTS_E2E_MANAGER_PASSWORD", "SplitPayE2E2026!Manager")
 CASHIER_NAME = "E2E Cashier"
-CASHIER_PIN = "9999"
+CASHIER_PIN = fixture_credential("NEXTGEN_SEED_SPLIT_PAYMENTS_E2E_CASHIER_PIN", "9999")
 
 # Reserved sentinel for the TEMPLATE_REQUIRED scenario — matched by
 # meta_mock_server.py.
@@ -55,6 +56,7 @@ async def seed() -> None:
     from shared.utils import generate_business_code
 
     settings = get_settings()
+    require_local_or_confirmed(settings.DATABASE_URL, "scripts/seed_split_payments_e2e.py")
     engine = create_async_engine(settings.DATABASE_URL)
     session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
