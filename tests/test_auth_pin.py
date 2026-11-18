@@ -93,6 +93,7 @@ def make_staff(pin="1234", **overrides):
         failed_login_attempts=0,
         locked_until=None,
         last_login_at=None,
+        token_version=0,  # BusinessUser.token_version server default (migration 0061)
     )
     for k, v in overrides.items():
         setattr(s, k, v)

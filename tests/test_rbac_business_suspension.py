@@ -45,7 +45,7 @@ def _payload(business_id):
 
 async def test_active_user_and_active_business_passes():
     business_id = uuid.uuid4()
-    db = FakeDB(row=(True, True, None))  # user_active, business_active, suspended_reason
+    db = FakeDB(row=(True, True, None, 0))  # user_active, business_active, suspended_reason, token_version
 
     with patch("backend.app.core.rbac.decode_access_token", return_value=_payload(business_id)):
         user = await get_current_user(request=MagicMock(), credentials=FakeCredentials(), db=db)
@@ -55,7 +55,7 @@ async def test_active_user_and_active_business_passes():
 
 async def test_suspended_business_is_blocked_even_with_active_user():
     business_id = uuid.uuid4()
-    db = FakeDB(row=(True, False, "Payment overdue"))
+    db = FakeDB(row=(True, False, "Payment overdue", 0))
 
     with patch("backend.app.core.rbac.decode_access_token", return_value=_payload(business_id)):
         with pytest.raises(HTTPException) as exc:
@@ -68,7 +68,7 @@ async def test_suspended_business_is_blocked_even_with_active_user():
 
 async def test_deactivated_user_is_blocked_even_with_active_business():
     business_id = uuid.uuid4()
-    db = FakeDB(row=(False, True, None))
+    db = FakeDB(row=(False, True, None, 0))
 
     with patch("backend.app.core.rbac.decode_access_token", return_value=_payload(business_id)):
         with pytest.raises(HTTPException) as exc:
