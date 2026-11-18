@@ -17,6 +17,7 @@ from backend.app.core.ownership import require_owned
 from backend.app.core.pagination import CursorParams, PaginatedResponse, PaginationMeta, encode_cursor
 from backend.app.core.rbac import AuthUser, require_owner_or_manager, require_staff_or_above
 from backend.app.db.session import get_db
+from backend.app.events.trading import assert_trading_allowed
 from backend.app.pos.pricing import POSAddOnSelection, POSItemInput, resolve_pos_items
 from backend.app.receipts.whatsapp_receipt import (
     ReceiptDestinationUnavailable,
@@ -274,6 +275,9 @@ async def create_order(
     instead of always 0.
     """
     from sqlalchemy import update as sa_update
+
+    # Event vendors may only create real sales on a paid trading day.
+    await assert_trading_allowed(db, user.business_id)
 
     # ── Resolve every catalog-priced item against the live menu BEFORE any
     #    mutation — an invalid menu_item_id/option/add-on must never consume
@@ -1072,6 +1076,10 @@ async def update_payment_status(
             "Moving a PAID order back to an unpaid status requires an owner or manager.",
             403,
         )
+
+    if new_status == "PAID" and old_payment_status != "PAID":
+        # Recording money received: event vendors need a paid trading day.
+        await assert_trading_allowed(db, user.business_id)
 
     was_unpaid = old_payment_status in ("UNPAID", "PENDING")
     payment_required = order.payment_required

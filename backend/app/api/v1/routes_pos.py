@@ -25,6 +25,7 @@ from sqlalchemy import update as sa_update
 from sqlalchemy.exc import IntegrityError, MultipleResultsFound
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.app.events.trading import assert_trading_allowed
 from backend.app.api.v1.routes_orders import OrderResponse
 from backend.app.core.config import get_settings
 from backend.app.core.errors import AppError, NotFoundError
@@ -814,6 +815,7 @@ async def create_pos_payment_intent(
     allocation. Never returns the raw payment link — only a safe status the
     Staff app can poll (GET .../{id}).
     """
+    await assert_trading_allowed(db, user.business_id)
     biz_result = await db.execute(select(Business).where(Business.id == user.business_id))
     business = biz_result.scalar_one_or_none()
     if not business:
@@ -950,6 +952,7 @@ async def resend_pos_payment_intent(
     db: AsyncSession = Depends(get_db),
 ):
     """Re-sends the SAME link for a still-PENDING intent — never creates a second payable link."""
+    await assert_trading_allowed(db, user.business_id)
     intent = await _load_pos_payment_intent(db, user.business_id, intent_id, for_update=True)
     if _maybe_expire(intent):
         await db.commit()
@@ -1043,6 +1046,9 @@ async def create_pos_order(
         existing_order = existing.scalar_one_or_none()
         if existing_order:
             return OrderResponse.model_validate(existing_order)
+
+    # ── Event vendors may only trade on a paid trading day (souk gate) ─────
+    await assert_trading_allowed(db, user.business_id)
 
     # ── Till must be open before any sale can be rung up ──────────────────
     till_session = await _get_open_till(db, user.business_id)
