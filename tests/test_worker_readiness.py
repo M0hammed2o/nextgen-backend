@@ -197,6 +197,26 @@ async def test_meta_verify_webhook_uses_constant_time_compare():
     spy.assert_called_once_with("the-real-token", "the-real-token")
 
 
+def _fake_webhook_db(routing_row):
+    """
+    A minimal db double that makes migration 0059's routing lookup
+    (SELECT Business.id, Business.whatsapp_routing_generation ...) resolve
+    successfully, so these tests exercise the ARQ-enqueue behaviour they're
+    actually about rather than the fail-closed routing-lookup-failure path
+    (covered separately in test_whatsapp_number_handover_routing_generation.py
+    and test_webhook_post_routing_lookup_failure_fails_closed_5xx below).
+    `_stamp_last_webhook`'s own two UPDATE calls also go through this same
+    `execute`, which is fine — their result is never inspected.
+    """
+    fake_db = AsyncMock()
+    fake_result = MagicMock()
+    fake_result.first = MagicMock(return_value=routing_row)
+    fake_db.execute = AsyncMock(return_value=fake_result)
+    fake_db.commit = AsyncMock()
+    fake_db.rollback = AsyncMock()
+    return fake_db
+
+
 async def test_webhook_post_enqueue_failure_returns_5xx():
     from backend.app.api.v1.routes_webhook import receive_webhook
 
@@ -224,7 +244,10 @@ async def test_webhook_post_enqueue_failure_returns_5xx():
     with patch("backend.app.api.v1.routes_webhook.settings") as mock_settings:
         mock_settings.ENVIRONMENT = "development"  # signature check not under test here
 
-        response = await receive_webhook(fake_request, x_hub_signature_256=None)
+        response = await receive_webhook(
+            fake_request, x_hub_signature_256=None,
+            db=_fake_webhook_db((uuid.uuid4(), 1)),
+        )
 
     assert response.status_code >= 500
     import json as jsonlib2
@@ -259,9 +282,65 @@ async def test_webhook_post_success_still_returns_200():
     with patch("backend.app.api.v1.routes_webhook.settings") as mock_settings:
         mock_settings.ENVIRONMENT = "development"
 
-        result = await receive_webhook(fake_request, x_hub_signature_256=None)
+        result = await receive_webhook(
+            fake_request, x_hub_signature_256=None,
+            db=_fake_webhook_db((uuid.uuid4(), 1)),
+        )
 
     assert result == {"status": "ok"}
+
+
+async def test_webhook_post_routing_lookup_failure_fails_closed_5xx():
+    """
+    Migration 0059: if the routing-lookup itself fails (infra, not "no
+    business"), the webhook must fail CLOSED with a retryable 5xx -- never
+    fall back to enqueueing without a routing snapshot, which would mean an
+    infra blip is exactly when the new tenant-isolation protection goes
+    missing. This must look identical to an ARQ enqueue failure to the
+    caller (same 503/"enqueue_failed" contract), so Meta retries.
+    """
+    from backend.app.api.v1.routes_webhook import receive_webhook
+
+    payload = {
+        "object": "whatsapp_business_account",
+        "entry": [{
+            "changes": [{
+                "value": {
+                    "metadata": {"phone_number_id": "123", "display_phone_number": "+27..."},
+                    "messages": [{"id": "wamid.3", "from": "27821234567", "type": "text", "text": {"body": "hi"}}],
+                },
+            }],
+        }],
+    }
+    import json as jsonlib
+    body = jsonlib.dumps(payload).encode("utf-8")
+
+    fake_request = MagicMock()
+    fake_request.url.path = "/v1/webhook/meta"
+    fake_request.client.host = "203.0.113.1"
+    fake_request.headers = {"content-type": "application/json"}
+    fake_request.body = AsyncMock(return_value=body)
+    # Never actually reached if the fix works -- a lookup failure must stop
+    # this change before it gets anywhere near enqueueing.
+    fake_request.app.state.arq_pool.enqueue_job = AsyncMock(
+        side_effect=AssertionError("must not enqueue after a failed routing lookup")
+    )
+
+    fake_db = AsyncMock()
+    fake_db.execute = AsyncMock(side_effect=ConnectionError("db pool exhausted"))
+    fake_db.commit = AsyncMock()
+    fake_db.rollback = AsyncMock()
+
+    with patch("backend.app.api.v1.routes_webhook.settings") as mock_settings:
+        mock_settings.ENVIRONMENT = "development"
+
+        response = await receive_webhook(fake_request, x_hub_signature_256=None, db=fake_db)
+
+    assert response.status_code >= 500
+    import json as jsonlib2
+    body_out = jsonlib2.loads(response.body)
+    assert body_out["status"] == "enqueue_failed"
+    fake_request.app.state.arq_pool.enqueue_job.assert_not_called()
 
 
 # ── SSE: suspended business / deactivated staff ──────────────────────────────

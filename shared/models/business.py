@@ -41,6 +41,17 @@ class Business(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         String(64), nullable=True,
         comment="Optional WABA ID for reference"
     )
+    # Migration 0059 — fail-closed WhatsApp number handover. Bumped every
+    # time whatsapp_phone_number_id changes (admin_api's update_business).
+    # The webhook handler snapshots (business_id, this value) into the
+    # enqueued job at accept time; the worker refuses to process a job whose
+    # snapshot no longer matches this business's CURRENT generation, closing
+    # the race where a message queued before a number reassignment executes
+    # after it under the new owner. See pipeline.py::_process.
+    whatsapp_routing_generation: Mapped[int] = mapped_column(
+        Integer, default=1, nullable=False,
+        comment="Bumped on every whatsapp_phone_number_id change — see routes_webhook.py/pipeline.py"
+    )
     is_whatsapp_enabled: Mapped[bool] = mapped_column(
         Boolean, default=True, nullable=False,
         comment="Platform-admin kill switch. Toggle WhatsApp bot on/off without "

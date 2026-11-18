@@ -76,6 +76,8 @@ async def process_inbound_message(
     msg_type: str,
     raw_payload: dict,
     contact_name: str | None = None,
+    expected_business_id: uuid.UUID | None = None,
+    expected_routing_generation: int | None = None,
 ) -> None:
     """
     Full message processing pipeline.
@@ -91,6 +93,8 @@ async def process_inbound_message(
             msg_type=msg_type,
             raw_payload=raw_payload,
             contact_name=contact_name,
+            expected_business_id=expected_business_id,
+            expected_routing_generation=expected_routing_generation,
         )
         await db.commit()
         logger.info("PIPELINE_COMMITTED: wa_message_id=%s", wa_message_id)
@@ -112,6 +116,8 @@ async def _process(
     msg_type: str,
     raw_payload: dict,
     contact_name: str | None,
+    expected_business_id: uuid.UUID | None = None,
+    expected_routing_generation: int | None = None,
 ) -> None:
     logger.warning(
         "PIPELINE_START: wa_message_id=%s, phone_number_id=%s, wa_id=%s, type=%s",
@@ -122,16 +128,52 @@ async def _process(
     )
 
     # ── 1. Resolve business ──────────────────────────────────────────────
-    result = await db.execute(
-        select(Business).where(Business.whatsapp_phone_number_id == phone_number_id)
-    )
-    business = result.scalar_one_or_none()
-    if not business:
-        logger.warning(
-            "PIPELINE_NO_BUSINESS: phone_number_id=%s — no business registered",
-            phone_number_id,
+    # Migration 0059 (fail-closed WhatsApp number handover): when the caller
+    # snapshotted an expected business + routing generation at webhook-accept
+    # time, re-fetch by THAT id and verify the snapshot still matches the
+    # business's CURRENT state before doing anything else. This closes the
+    # race where a message queued before a whatsapp_phone_number_id
+    # reassignment gets executed (first try, or an ARQ retry) after the
+    # reassignment completes — a fresh lookup by phone_number_id alone would
+    # silently resolve to the NEW owner for a message that was never sent to
+    # them. Any caller that hasn't been updated to pass a snapshot (both
+    # None) falls back to the original lookup-by-phone-number-only
+    # behaviour, unchanged.
+    if expected_business_id is not None:
+        result = await db.execute(select(Business).where(Business.id == expected_business_id))
+        business = result.scalar_one_or_none()
+        if not business:
+            logger.error(
+                "PIPELINE_QUARANTINE_BUSINESS_GONE: wa_message_id=%s, expected_business_id=%s — "
+                "business no longer exists, refusing to process",
+                wa_message_id, expected_business_id,
+            )
+            return
+        generation_matches = (
+            expected_routing_generation is None
+            or business.whatsapp_routing_generation == expected_routing_generation
         )
-        return
+        if business.whatsapp_phone_number_id != phone_number_id or not generation_matches:
+            logger.error(
+                "PIPELINE_QUARANTINE_ROUTING_CHANGED: wa_message_id=%s, phone_number_id=%s — "
+                "ownership changed since this message was accepted (expected business_id=%s "
+                "generation=%s; business %s now holds phone_number_id=%s generation=%s) — "
+                "refusing to process under a possibly-wrong tenant",
+                wa_message_id, phone_number_id, expected_business_id, expected_routing_generation,
+                business.id, business.whatsapp_phone_number_id, business.whatsapp_routing_generation,
+            )
+            return
+    else:
+        result = await db.execute(
+            select(Business).where(Business.whatsapp_phone_number_id == phone_number_id)
+        )
+        business = result.scalar_one_or_none()
+        if not business:
+            logger.warning(
+                "PIPELINE_NO_BUSINESS: phone_number_id=%s — no business registered",
+                phone_number_id,
+            )
+            return
 
     logger.info(
         "PIPELINE_BUSINESS_FOUND: business_id=%s, name=%s, active=%s, whatsapp_enabled=%s",
@@ -144,6 +186,36 @@ async def _process(
     # ── 2. Check active ──────────────────────────────────────────────────
     if not business.is_active:
         logger.info("PIPELINE_BUSINESS_INACTIVE: business_id=%s, skipping", business.id)
+        return
+
+    # ── 2.5. Fast-path duplicate check ───────────────────────────────────
+    # wa_message_id is GLOBALLY unique (shared/models/message.py), so a
+    # message already recorded by an earlier delivery (any business, any
+    # time) can never be legitimately reprocessed. Checking this BEFORE
+    # _get_or_create_customer matters specifically for the WhatsApp-number-
+    # handover case (migration 0059): without this check, a sequential
+    # retry of an already-processed wa_message_id that now resolves to a
+    # DIFFERENT business (because the number moved on) would still call
+    # _get_or_create_customer under the new owner first — creating a real,
+    # if otherwise-inert, Customer row under a tenant this person never
+    # actually messaged, even though the authoritative step-4 dedup INSERT
+    # below correctly stops any reply or cart/order mutation either way.
+    # Found and reproduced empirically, 2026-10-29 (see
+    # test_whatsapp_number_handover_routing_generation.py), not assumed.
+    # This is a plain SELECT, not the race-safe guard — step 4's
+    # INSERT ... ON CONFLICT remains the one that actually closes the
+    # concurrent-delivery race (BUG-0157); this is a cheap, early exit for
+    # the much more common sequential-retry case, which no longer needs a
+    # customer lookup/creation at all once this check fires.
+    already_processed = (
+        await db.execute(select(Message.id).where(Message.wa_message_id == wa_message_id))
+    ).scalar_one_or_none()
+    if already_processed is not None:
+        logger.info(
+            "PIPELINE_DUPLICATE_FAST_PATH: wa_message_id=%s already processed — skipping before any "
+            "customer lookup under business_id=%s",
+            wa_message_id, business.id,
+        )
         return
 
     # ── 3. Get/create customer ───────────────────────────────────────────

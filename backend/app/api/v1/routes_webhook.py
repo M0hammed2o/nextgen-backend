@@ -362,6 +362,63 @@ async def receive_webhook(
             # message handling below (see _stamp_last_webhook docstring).
             await _stamp_last_webhook(db, phone_number_id)
 
+            # Fail-closed WhatsApp routing binding (migration 0059): resolve
+            # the business and its current routing generation ONCE, at
+            # webhook-accept time, and snapshot both into every job enqueued
+            # for this change. The worker (pipeline.py::_process) re-checks
+            # this snapshot against the business's CURRENT generation before
+            # processing — if a number reassignment happened in between, the
+            # snapshot is stale and the job is refused rather than silently
+            # processed under the new owner.
+            #
+            # This lookup is the tenant-isolation boundary itself, so unlike
+            # _stamp_last_webhook just above it (genuinely best-effort, never
+            # allowed to affect message handling), a FAILED lookup must never
+            # silently fall back to the unprotected pre-0059 path — that
+            # would mean an infra blip is exactly when the protection this
+            # migration exists for goes missing. Instead: fail CLOSED with a
+            # RETRYABLE error. This change's message(s) are not enqueued now,
+            # and `enqueue_failed` is set so the handler returns 503 — the
+            # same signal/contract an actual ARQ enqueue failure already
+            # uses (see the bottom of this function and
+            # test_webhook_post_enqueue_failure_returns_5xx), so Meta retries
+            # with its own backoff and the message is attempted again once
+            # the lookup can actually succeed, rather than being either lost
+            # or processed unsafely.
+            #
+            # A lookup that SUCCEEDS and genuinely finds no business is a
+            # different, permanent condition — retrying won't help an
+            # unregistered number, so that case is still just dropped and
+            # logged (200), not treated as a retryable failure.
+            try:
+                routing_result = await db.execute(
+                    select(Business.id, Business.whatsapp_routing_generation).where(
+                        Business.whatsapp_phone_number_id == phone_number_id
+                    )
+                )
+                routing_row = routing_result.first()
+            except Exception:
+                logger.exception(
+                    "WEBHOOK_ROUTING_LOOKUP_FAILED: phone_number_id=%s — failing CLOSED, "
+                    "not enqueueing; Meta will retry this delivery",
+                    phone_number_id,
+                )
+                try:
+                    await db.rollback()
+                except Exception:
+                    pass
+                enqueue_failed = True
+                continue
+
+            if routing_row is None:
+                logger.warning(
+                    "WEBHOOK_POST_NO_BUSINESS_FOR_NUMBER: phone_number_id=%s — "
+                    "no business currently owns this number, dropping change without enqueueing",
+                    phone_number_id,
+                )
+                continue
+            expected_business_id, expected_routing_generation = routing_row
+
             contacts = value.get("contacts", [])
             contact_name = None
             if contacts:
@@ -432,6 +489,8 @@ async def receive_webhook(
                         msg_type,
                         message,
                         contact_name,
+                        expected_business_id,
+                        expected_routing_generation,
                     )
                     logger.warning(
                         "WEBHOOK_POST_ENQUEUED: wa_message_id=%s, wa_id=%s",

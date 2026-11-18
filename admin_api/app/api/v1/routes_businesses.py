@@ -635,6 +635,19 @@ async def update_business(
                 422,
             )
 
+    # Fail-closed WhatsApp number handover (migration 0059): bump the
+    # routing generation BEFORE applying the new number, whenever it's
+    # actually changing (not on a no-op PATCH that happens to repeat the
+    # same value). A queued-but-not-yet-processed message snapshot this
+    # generation at webhook-accept time; bumping it here is what lets the
+    # worker detect "ownership moved on" and refuse to process a stale job
+    # under the new owner. See pipeline.py::_process / routes_webhook.py.
+    if (
+        "whatsapp_phone_number_id" in changes
+        and changes["whatsapp_phone_number_id"] != biz.whatsapp_phone_number_id
+    ):
+        biz.whatsapp_routing_generation += 1
+
     for field, value in changes.items():
         setattr(biz, field, value)
     db.add(AuditEvent(
