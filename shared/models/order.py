@@ -69,6 +69,11 @@ class Order(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     # ── Customer Info (snapshot) ─────────────────────────────────────────
     customer_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     phone_number: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    notify_when_ready: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false",
+        comment="POS only: the customer consented to a WhatsApp message when the order is READY. "
+                "A phone number alone (e.g. captured for loyalty) is never consent."
+    )
     delivery_address: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # ── Timestamps ───────────────────────────────────────────────────────

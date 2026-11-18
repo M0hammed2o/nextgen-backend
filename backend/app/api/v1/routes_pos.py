@@ -120,6 +120,9 @@ class POSOrderCreateRequest(BaseModel):
     table_number: str | None = Field(default=None, max_length=32)
     customer_name: str | None = Field(default=None, max_length=255)
     customer_phone: str | None = Field(default=None, max_length=32)
+    # Explicit consent to a WhatsApp "your order is ready" message. A phone
+    # number alone (loyalty) is never consent. Requires customer_phone.
+    notify_when_ready: bool = False
     discount_cents: int = Field(default=0, ge=0)
     discount_reason: str | None = Field(default=None, max_length=255)
 
@@ -176,6 +179,12 @@ class POSOrderCreateRequest(BaseModel):
                 raise ValueError("cash_tendered_cents is required for a CASH payment")
         elif self.cash_tendered_cents is not None:
             raise ValueError("cash_tendered_cents is only valid for a CASH payment")
+        return self
+
+    @model_validator(mode="after")
+    def validate_notify_consent(self) -> "POSOrderCreateRequest":
+        if self.notify_when_ready and not self.customer_phone:
+            raise ValueError("customer_phone is required when notify_when_ready is set")
         return self
 
     @model_validator(mode="after")
@@ -1381,6 +1390,7 @@ async def create_pos_order(
         currency=currency,
         customer_name=body.customer_name,
         phone_number=body.customer_phone,
+        notify_when_ready=body.notify_when_ready,
         confirmed_at=now,
         accepted_at=now if initial_status == OrderStatus.ACCEPTED else None,
         completed_at=now if initial_status == OrderStatus.COMPLETED else None,

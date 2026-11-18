@@ -716,15 +716,31 @@ async def update_order_status(
 
     # ── Notify customer via WhatsApp (fire and forget) ────────────────────
     try:
-        if order.customer_id:
+        # Consent (souk review): a POS order's customer_phone is also captured
+        # for loyalty, so a linked customer is NOT consent to be messaged. A
+        # POS order gets exactly one customer message, READY, and only when the
+        # cashier recorded the customer's explicit notify_when_ready consent.
+        # WhatsApp/other sources keep their existing behaviour.
+        is_pos_order = order.source == OrderSource.POS.value
+        notify_allowed = (not is_pos_order) or (
+            requested == OrderStatus.READY and bool(order.notify_when_ready)
+        )
+        if notify_allowed and (order.customer_id or (is_pos_order and order.phone_number)):
             from shared.models.customer import Customer
             from backend.app.bot.whatsapp_sender import send_notification_message
             from backend.app.payments.messages import build_payment_message
 
-            cust_row = await db.execute(
-                select(Customer.wa_id).where(Customer.id == order.customer_id)
-            )
-            wa_id = cust_row.scalar_one_or_none()
+            wa_id = None
+            if order.customer_id:
+                cust_row = await db.execute(
+                    select(Customer.wa_id).where(Customer.id == order.customer_id)
+                )
+                wa_id = cust_row.scalar_one_or_none()
+            if not wa_id and is_pos_order and order.phone_number:
+                # Walk-up customer with no WhatsApp identity: use the consented number.
+                normalised = normalize_sa_mobile(order.phone_number)
+                if normalised:
+                    wa_id = normalised[1:] if normalised.startswith("+") else normalised
 
             biz_row = await db.execute(
                 select(Business).where(Business.id == order.business_id)
