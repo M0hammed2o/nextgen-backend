@@ -20,12 +20,13 @@ import csv
 import io
 import logging
 import uuid
+from typing import Annotated
 from datetime import date, datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import APIRouter, Depends
-from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
-from sqlalchemy import func, select
+from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -35,8 +36,11 @@ from admin_api.app.services.provisioning import ensure_owner_email_free, provisi
 from backend.app.core.errors import AppError, NotFoundError
 from backend.app.core.rbac import AuthUser
 from backend.app.db.session import get_db
-from backend.app.events.rules import quote
-from backend.app.events.service import reconcile_event_vendor_access
+from backend.app.events.rules import DEFAULT_PREP_DAYS, PaidRange, evaluate_access, quote
+from backend.app.events.service import (
+    EVENT_ADMIN_SUSPENSION_REASON,
+    reconcile_event_vendor_access,
+)
 from shared.enums import EVENT_PLAN, AuditScope
 from shared.models.audit import AuditEvent
 from shared.models.business import Business
@@ -67,6 +71,7 @@ class EventCreate(BaseModel):
     clothing_day_rate_cents: int = Field(default=5_000, ge=0, le=1_000_000)
     days: list[EventDayIn] = Field(default_factory=list, max_length=366)
     notes: str | None = None
+    prep_days: int = Field(default=DEFAULT_PREP_DAYS, ge=0, le=90)
 
     @field_validator("timezone")
     @classmethod
@@ -76,6 +81,24 @@ class EventCreate(BaseModel):
         except (ZoneInfoNotFoundError, ValueError):
             raise ValueError("unknown timezone")
         return v
+
+
+class EventUpdate(BaseModel):
+    """Editable event fields. Rates are deliberately not editable: they are frozen into quotes."""
+    model_config = ConfigDict(extra="forbid")
+    name: str | None = Field(default=None, min_length=2, max_length=255)
+    venue: str | None = Field(default=None, max_length=255)
+    notes: str | None = None
+    prep_days: int | None = Field(default=None, ge=0, le=90)
+
+
+class VendorUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    stall_code: str | None = Field(default=None, max_length=64)
+
+
+class VendorSuspend(BaseModel):
+    reason: str = Field(min_length=1, max_length=500)
 
 
 class EventStatusUpdate(BaseModel):
@@ -129,10 +152,16 @@ class MarkPaid(BaseModel):
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-async def _load_event(db: AsyncSession, event_id: uuid.UUID) -> Event:
-    event = (
-        await db.execute(select(Event).where(Event.id == event_id).options(selectinload(Event.days)))
-    ).scalar_one_or_none()
+async def _load_event(db: AsyncSession, event_id: uuid.UUID, lock: bool = False) -> Event:
+    """
+    With ``lock=True`` the event row is locked (SELECT ... FOR UPDATE) until the
+    transaction ends, so mark-paid, create-subscription and calendar-replace
+    for one event are serialized. Days are read after the lock is held.
+    """
+    stmt = select(Event).where(Event.id == event_id).options(selectinload(Event.days))
+    if lock:
+        stmt = stmt.with_for_update(of=Event)
+    event = (await db.execute(stmt)).scalar_one_or_none()
     if not event:
         raise NotFoundError("Event", str(event_id))
     return event
@@ -183,7 +212,8 @@ async def create_event(body: EventCreate, user: AuthUser = Depends(require_super
         raise AppError("DUPLICATE_EVENT_DAY", "each date may appear only once", 422)
     event = Event(name=body.name, slug=await _unique_event_slug(db, body.name), venue=body.venue,
                   timezone=body.timezone, status="DRAFT", food_day_rate_cents=body.food_day_rate_cents,
-                  clothing_day_rate_cents=body.clothing_day_rate_cents, notes=body.notes)
+                  clothing_day_rate_cents=body.clothing_day_rate_cents, notes=body.notes,
+                  prep_days=body.prep_days)
     db.add(event)
     await db.flush()
     db.add_all([EventDay(event_id=event.id, day=d, is_billable=b) for d, b in days.items()])
@@ -215,7 +245,8 @@ async def get_event(event_id: uuid.UUID, user: AuthUser = Depends(require_super_
     )).all())
     return {
         "id": event.id, "name": event.name, "slug": event.slug, "venue": event.venue, "timezone": event.timezone,
-        "status": event.status, "food_day_rate_cents": event.food_day_rate_cents,
+        "status": event.status, "prep_days": event.prep_days, "notes": event.notes,
+        "food_day_rate_cents": event.food_day_rate_cents,
         "clothing_day_rate_cents": event.clothing_day_rate_cents,
         "days": [{"day": d.day, "is_billable": d.is_billable} for d in event.days],
         "billable_day_count": len(_billable(event)),
@@ -223,6 +254,62 @@ async def get_event(event_id: uuid.UUID, user: AuthUser = Depends(require_super_
         "active_vendors": counts.get("ACTIVE", 0),
         "revenue_paid_cents": int(money.get("PAID", 0)),       # VAT-inclusive
         "revenue_outstanding_cents": int(money.get("UNPAID", 0)),
+    }
+
+
+@router.patch("/{event_id}")
+async def update_event(event_id: uuid.UUID, body: EventUpdate,
+                       user: AuthUser = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
+    """Edit name, venue, notes or the preparation period. Rates are never editable here."""
+    changes = body.model_dump(exclude_unset=True)
+    if not changes or (changes.get("name", "x") is None) or (changes.get("prep_days", 0) is None):
+        raise AppError("NO_VALID_FIELDS", "send at least one of name, venue, notes, prep_days "
+                       "(name and prep_days cannot be null)", 422)
+    event = await _load_event(db, event_id, lock=True)
+    before = {k: getattr(event, k) for k in changes}
+    for k, v in changes.items():
+        setattr(event, k, v)
+    db.add(_audit(user, "admin.event.updated", "event", event.id, {"from": before, "to": changes}))
+    await db.flush()
+    if "prep_days" in changes:
+        await reconcile_event_vendor_access(db)  # the access window moved
+    await db.commit()
+    return await get_event(event.id, user, db)
+
+
+@router.get("/{event_id}/revenue")
+async def event_revenue(event_id: uuid.UUID, user: AuthUser = Depends(require_super_admin),
+                        db: AsyncSession = Depends(get_db)):
+    """Paid and outstanding totals (VAT-inclusive), per category and per billable day."""
+    event = await _load_event(db, event_id)
+    rows = (await db.execute(
+        select(EventVendor, EventVendorSubscription)
+        .join(EventVendorSubscription, EventVendorSubscription.event_vendor_id == EventVendor.id)
+        .where(EventVendor.event_id == event.id)
+    )).all()
+    by_category = {c: {"paid_cents": 0, "outstanding_cents": 0, "vendors": 0} for c in ("FOOD", "CLOTHING")}
+    for cat, n in (await db.execute(
+            select(EventVendor.category, func.count()).where(EventVendor.event_id == event.id)
+            .group_by(EventVendor.category))).all():
+        by_category[cat]["vendors"] = int(n)
+    paid_total = outstanding_total = 0
+    billable = sorted(_billable(event))
+    per_day = {d: {"vendors": set(), "cents": 0} for d in billable}
+    for vendor, sub in rows:
+        if sub.status == "PAID":
+            by_category[vendor.category]["paid_cents"] += sub.amount_cents
+            paid_total += sub.amount_cents
+            for d in billable:
+                if sub.starts_on <= d <= sub.ends_on:
+                    per_day[d]["vendors"].add(vendor.id)
+                    per_day[d]["cents"] += sub.day_rate_cents
+        elif sub.status == "UNPAID":
+            by_category[vendor.category]["outstanding_cents"] += sub.amount_cents
+            outstanding_total += sub.amount_cents
+    return {
+        "paid_cents": paid_total, "outstanding_cents": outstanding_total, "by_category": by_category,
+        "by_day": [{"day": d, "vendors_covered": len(per_day[d]["vendors"]),
+                    "paid_cents_attributed": per_day[d]["cents"]} for d in billable],
     }
 
 
@@ -246,7 +333,7 @@ async def replace_calendar(event_id: uuid.UUID, body: CalendarUpdate,
     PAID subscription may not be removed or made non-billable, because that
     vendor has paid for it. Existing subscriptions keep their frozen price.
     """
-    event = await _load_event(db, event_id)
+    event = await _load_event(db, event_id, lock=True)
     new_days = {d.day: d.is_billable for d in body.days}
     if len(new_days) != len(body.days):
         raise AppError("DUPLICATE_EVENT_DAY", "each date may appear only once", 422)
@@ -438,24 +525,127 @@ async def bulk_onboard_vendors_csv(event_id: uuid.UUID, body: BulkVendorCsvReque
     return await bulk_onboard_vendors(event_id, BulkVendorRequest(vendors=rows, dry_run=body.dry_run), user, db)
 
 
+def _escape_like(q: str) -> str:
+    return q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 @router.get("/{event_id}/vendors")
-async def list_vendors(event_id: uuid.UUID, user: AuthUser = Depends(require_super_admin),
-                       db: AsyncSession = Depends(get_db)):
-    await _load_event(db, event_id)
+async def list_vendors(
+    event_id: uuid.UUID,
+    user: AuthUser = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db),
+    status: Annotated[str | None, Query(pattern="^(PENDING|ACTIVE|UNPAID|EXPIRED|CANCELLED)$")] = None,
+    category: Annotated[str | None, Query(pattern="^(FOOD|CLOTHING)$")] = None,
+    q: Annotated[str | None, Query(max_length=100)] = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+):
+    event = await _load_event(db, event_id)
+    conds = [EventVendor.event_id == event_id]
+    if status:
+        conds.append(EventVendor.status == status)
+    if category:
+        conds.append(EventVendor.category == category)
+    if q and q.strip():
+        like = f"%{_escape_like(q.strip())}%"
+        conds.append(or_(Business.name.ilike(like, escape="\\"),
+                         EventVendor.stall_code.ilike(like, escape="\\"),
+                         Business.business_code.ilike(like, escape="\\")))
+    total = (await db.execute(
+        select(func.count()).select_from(EventVendor).join(Business, Business.id == EventVendor.business_id)
+        .where(*conds))).scalar_one()
     rows = (await db.execute(
-        select(EventVendor, Business.name, Business.business_code, Business.is_active)
+        select(EventVendor, Business.name, Business.business_code, Business.is_active, Business.suspended_reason)
         .join(Business, Business.id == EventVendor.business_id)
-        .where(EventVendor.event_id == event_id)
+        .where(*conds)
         .options(selectinload(EventVendor.subscriptions))
-        .order_by(EventVendor.stall_code.nulls_last(), Business.name)
+        .order_by(EventVendor.stall_code.nulls_last(), Business.name, EventVendor.id)
+        .limit(limit).offset(offset)
     )).all()
-    return [{
-        "vendor_id": v.id, "business_id": v.business_id, "business_name": name, "business_code": code,
-        "business_active": active, "category": v.category, "stall_code": v.stall_code, "status": v.status,
-        "subscriptions": [{"id": s.id, "starts_on": s.starts_on, "ends_on": s.ends_on, "billable_days": s.billable_days,
-                           "amount_cents": s.amount_cents, "status": s.status, "paid_at": s.paid_at}
-                          for s in sorted(v.subscriptions, key=lambda s: s.starts_on)],
-    } for v, name, code, active in rows]
+    local_day = datetime.now(timezone.utc).astimezone(ZoneInfo(event.timezone)).date()
+    billable = set(_billable(event))
+    items = []
+    for v, name, code, active, suspended_reason in rows:
+        paid = [PaidRange(s.starts_on, s.ends_on) for s in v.subscriptions if s.status == "PAID"]
+        dec = evaluate_access(local_day, billable, paid, event.prep_days,
+                              cancelled=v.status == "CANCELLED" or event.status == "CANCELLED")
+        items.append({
+            "vendor_id": v.id, "business_id": v.business_id, "business_name": name, "business_code": code,
+            "business_active": active, "suspended_reason": suspended_reason, "category": v.category,
+            "stall_code": v.stall_code, "status": v.status,
+            "access_level": dec.level, "access_reason": dec.reason,
+            "subscriptions": [{"id": s.id, "starts_on": s.starts_on, "ends_on": s.ends_on,
+                               "billable_days": s.billable_days, "amount_cents": s.amount_cents,
+                               "status": s.status, "paid_at": s.paid_at}
+                              for s in sorted(v.subscriptions, key=lambda s: s.starts_on)],
+        })
+    return {"items": items, "total": int(total)}
+
+
+@router.patch("/{event_id}/vendors/{vendor_id}")
+async def update_vendor(event_id: uuid.UUID, vendor_id: uuid.UUID, body: VendorUpdate,
+                        user: AuthUser = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
+    """Allocate (or clear, with null) the vendor's stall. Unique per event."""
+    if "stall_code" not in body.model_fields_set:
+        raise AppError("NO_VALID_FIELDS", "send stall_code (null clears it)", 422)
+    vendor = await _load_vendor(db, event_id, vendor_id)
+    stall = body.stall_code.strip() if body.stall_code is not None else None
+    if body.stall_code is not None and not stall:
+        raise AppError("INVALID_STALL_CODE", "stall_code cannot be blank", 422)
+    if stall and (await db.execute(select(EventVendor.id).where(
+            EventVendor.event_id == event_id, EventVendor.stall_code == stall,
+            EventVendor.id != vendor.id))).scalar_one_or_none():
+        raise AppError("STALL_TAKEN", f"stall {stall} is already allocated at this event", 409)
+    previous = vendor.stall_code
+    vendor.stall_code = stall
+    db.add(_audit(user, "admin.event.vendor_stall_changed", "event_vendor", vendor.id,
+                  {"from": previous, "to": stall}, business_id=vendor.business_id))
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise AppError("STALL_TAKEN", f"stall {stall} is already allocated at this event", 409)
+    return {"vendor_id": vendor.id, "stall_code": stall}
+
+
+@router.post("/{event_id}/vendors/{vendor_id}/suspend")
+async def suspend_vendor(event_id: uuid.UUID, vendor_id: uuid.UUID, body: VendorSuspend,
+                         user: AuthUser = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
+    """
+    Suspend the vendor's business with the reserved reason EVENT_ADMIN_SUSPENDED.
+    The hourly reconcile never lifts it; only reinstate does. The free-text
+    reason is kept in the audit trail, not on the business.
+    """
+    vendor = await _load_vendor(db, event_id, vendor_id)
+    biz = (await db.execute(select(Business).where(Business.id == vendor.business_id).with_for_update())).scalar_one()
+    if biz.plan != EVENT_PLAN:
+        raise AppError("NOT_EVENT_VENDOR", "only event-plan businesses are managed here", 409)
+    if not biz.is_active:
+        raise AppError("ALREADY_SUSPENDED", f"this business is already suspended ({biz.suspended_reason})", 409)
+    biz.is_active = False
+    biz.suspended_reason = EVENT_ADMIN_SUSPENSION_REASON
+    db.add(_audit(user, "admin.event.vendor_suspended", "event_vendor", vendor.id, {"reason": body.reason},
+                  business_id=biz.id))
+    await db.commit()
+    return {"vendor_id": vendor.id, "business_active": False, "suspended_reason": EVENT_ADMIN_SUSPENSION_REASON}
+
+
+@router.post("/{event_id}/vendors/{vendor_id}/reinstate")
+async def reinstate_vendor(event_id: uuid.UUID, vendor_id: uuid.UUID,
+                           user: AuthUser = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
+    """Lift only EVENT_ADMIN_SUSPENDED, then reconcile (which may still suspend if the vendor has no access)."""
+    vendor = await _load_vendor(db, event_id, vendor_id)
+    biz = (await db.execute(select(Business).where(Business.id == vendor.business_id).with_for_update())).scalar_one()
+    if biz.is_active or biz.suspended_reason != EVENT_ADMIN_SUSPENSION_REASON:
+        raise AppError("NOT_ADMIN_SUSPENDED", "this business is not suspended by an event administrator", 409)
+    biz.is_active = True
+    biz.suspended_reason = None
+    db.add(_audit(user, "admin.event.vendor_reinstated", "event_vendor", vendor.id, {}, business_id=biz.id))
+    await db.flush()
+    await reconcile_event_vendor_access(db)
+    await db.commit()
+    await db.refresh(biz)
+    return {"vendor_id": vendor.id, "business_active": biz.is_active, "suspended_reason": biz.suspended_reason}
 
 
 async def _load_vendor(db: AsyncSession, event_id: uuid.UUID, vendor_id: uuid.UUID) -> EventVendor:
@@ -471,7 +661,7 @@ async def _load_vendor(db: AsyncSession, event_id: uuid.UUID, vendor_id: uuid.UU
 async def create_subscription(event_id: uuid.UUID, vendor_id: uuid.UUID, body: SubscriptionCreate,
                               user: AuthUser = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
     """Quote a 1-day, multi-day or full-event subscription. Created UNPAID; mark it paid when payment arrives."""
-    event = await _load_event(db, event_id)
+    event = await _load_event(db, event_id, lock=True)
     vendor = await _load_vendor(db, event_id, vendor_id)
     if vendor.status == "CANCELLED":
         raise AppError("VENDOR_CANCELLED", "this vendor was cancelled", 409)
@@ -504,6 +694,9 @@ async def _load_subscription(db, event_id, subscription_id) -> EventVendorSubscr
 async def mark_subscription_paid(event_id: uuid.UUID, subscription_id: uuid.UUID, body: MarkPaid,
                                  user: AuthUser = Depends(require_super_admin), db: AsyncSession = Depends(get_db)):
     """Record payment. Idempotent for the same reference. Access is applied immediately, not at the next hourly run."""
+    # Serialize with calendar replace / quoting for this event: lock the event
+    # row first (always event, then subscription, so lock order is consistent).
+    event = await _load_event(db, event_id, lock=True)
     sub = await _load_subscription(db, event_id, subscription_id)
     if sub.status == "PAID":
         if sub.payment_reference == body.payment_reference:
@@ -513,7 +706,6 @@ async def mark_subscription_paid(event_id: uuid.UUID, subscription_id: uuid.UUID
         raise AppError("SUBSCRIPTION_VOID", "a void subscription cannot be paid", 409)
     # The calendar may have changed since this was quoted: the price must
     # still match today's calendar, or it is re-quoted first (review M4).
-    event = await _load_event(db, event_id)
     vendor = (await db.execute(select(EventVendor).where(EventVendor.id == sub.event_vendor_id))).scalar_one()
     try:
         current = quote(vendor.category, sub.day_rate_cents, sub.day_rate_cents, _billable(event),
@@ -523,12 +715,23 @@ async def mark_subscription_paid(event_id: uuid.UUID, subscription_id: uuid.UUID
     if current is None or current.billable_days != sub.billable_days or current.amount_cents != sub.amount_cents:
         raise AppError("QUOTE_STALE",
                        "the event calendar changed since this subscription was quoted; void it and quote again", 409)
+    if (await db.execute(select(EventVendorSubscription.id).where(
+            EventVendorSubscription.status == "PAID",
+            EventVendorSubscription.payment_reference == body.payment_reference,
+            EventVendorSubscription.id != sub.id))).first():
+        raise AppError("PAYMENT_REFERENCE_USED", "this payment reference already settles another subscription", 409)
     sub.status = "PAID"
     sub.paid_at = datetime.now(timezone.utc)
     sub.payment_reference = body.payment_reference
     db.add(_audit(user, "admin.event.subscription_paid", "event_vendor_subscription", sub.id,
                   {"amount_cents": sub.amount_cents}, business_id=sub.business_id))
-    await db.flush()
+    try:
+        await db.flush()
+    except IntegrityError:
+        # Another event's mark-paid used the same reference at the same moment
+        # (the partial unique index is the cross-event backstop).
+        await db.rollback()
+        raise AppError("PAYMENT_REFERENCE_USED", "this payment reference already settles another subscription", 409)
     await reconcile_event_vendor_access(db)
     await db.commit()
     return {"id": sub.id, "status": "PAID", "already_paid": False}

@@ -109,7 +109,7 @@ async def test_bulk_onboarding_creates_isolated_event_businesses(db, cleanup):
         assert biz.payment_api_key is None and biz.payment_webhook_secret is None
         owner = (await db.execute(select(BusinessUser).where(BusinessUser.business_id == biz.id))).scalar_one()
         assert owner.role == "OWNER" and owner.must_change_password is True
-    vendors = await list_vendors(ev["id"], ADMIN, db)
+    vendors = (await list_vendors(ev["id"], ADMIN, db))["items"]
     assert sorted(s["amount_cents"] for v in vendors for s in v["subscriptions"]) == [95_000, 190_000]
     assert all(s["status"] == "UNPAID" for v in vendors for s in v["subscriptions"])
 
@@ -137,7 +137,7 @@ async def test_a_permanent_tenant_cannot_be_put_on_event_billing(db, cleanup, te
 async def test_payment_activates_immediately_and_is_idempotent(db, cleanup):
     ev = await _souk(db, cleanup)
     res = await bulk_onboard_vendors(ev["id"], BulkVendorRequest(vendors=[_row(cleanup)]), ADMIN, db)
-    vendor = (await list_vendors(ev["id"], ADMIN, db))[0]
+    vendor = (await list_vendors(ev["id"], ADMIN, db))["items"][0]
     sub_id = vendor["subscriptions"][0]["id"]
     assert (await mark_subscription_paid(ev["id"], sub_id, MarkPaid(payment_reference="EFT-001"), ADMIN, db))["already_paid"] is False
     again = await mark_subscription_paid(ev["id"], sub_id, MarkPaid(payment_reference="EFT-001"), ADMIN, db)
@@ -146,7 +146,7 @@ async def test_payment_activates_immediately_and_is_idempotent(db, cleanup):
         await mark_subscription_paid(ev["id"], sub_id, MarkPaid(payment_reference="EFT-999"), ADMIN, db)
     assert exc.value.code == "ALREADY_PAID"
     await db.rollback()
-    vendor = (await list_vendors(ev["id"], ADMIN, db))[0]
+    vendor = (await list_vendors(ev["id"], ADMIN, db))["items"][0]
     assert vendor["status"] == "ACTIVE" and vendor["business_active"] is True
     assert res["vendors"][0]["business_id"] == vendor["business_id"]
 
@@ -154,7 +154,7 @@ async def test_payment_activates_immediately_and_is_idempotent(db, cleanup):
 async def test_a_paid_day_cannot_be_removed_from_the_calendar(db, cleanup):
     ev = await _souk(db, cleanup)
     await bulk_onboard_vendors(ev["id"], BulkVendorRequest(vendors=[_row(cleanup)]), ADMIN, db)
-    sub_id = (await list_vendors(ev["id"], ADMIN, db))[0]["subscriptions"][0]["id"]
+    sub_id = (await list_vendors(ev["id"], ADMIN, db))["items"][0]["subscriptions"][0]["id"]
     await mark_subscription_paid(ev["id"], sub_id, MarkPaid(payment_reference="EFT-002"), ADMIN, db)
     with pytest.raises(AppError) as exc:
         await replace_calendar(ev["id"], CalendarUpdate(days=[EventDayIn(day=d) for d in DAYS[:-1]]), ADMIN, db)
@@ -204,7 +204,7 @@ async def test_h1_single_business_create_still_works_with_and_without_a_whatsapp
 async def test_stale_quote_cannot_be_marked_paid(db, cleanup):
     ev = await _souk(db, cleanup)
     await bulk_onboard_vendors(ev["id"], BulkVendorRequest(vendors=[_row(cleanup)]), ADMIN, db)
-    sub_id = (await list_vendors(ev["id"], ADMIN, db))[0]["subscriptions"][0]["id"]
+    sub_id = (await list_vendors(ev["id"], ADMIN, db))["items"][0]["subscriptions"][0]["id"]
     # Calendar changes before payment: two more billable days.
     extra = [DAYS[-1] + timedelta(days=i) for i in (1, 2)]
     await replace_calendar(ev["id"], CalendarUpdate(days=[EventDayIn(day=d) for d in DAYS + extra]), ADMIN, db)
@@ -228,7 +228,7 @@ async def test_a_paid_range_cannot_gain_an_unpaid_billable_day(db, cleanup):
     cleanup["events"].append(ev["id"])
     await bulk_onboard_vendors(ev["id"], BulkVendorRequest(
         vendors=[_row(cleanup, starts_on=DAYS[0], ends_on=DAYS[2])]), ADMIN, db)
-    sub_id = (await list_vendors(ev["id"], ADMIN, db))[0]["subscriptions"][0]["id"]
+    sub_id = (await list_vendors(ev["id"], ADMIN, db))["items"][0]["subscriptions"][0]["id"]
     await mark_subscription_paid(ev["id"], sub_id, MarkPaid(payment_reference="EFT-GAP"), ADMIN, db)
     with pytest.raises(AppError) as exc:
         await replace_calendar(ev["id"], CalendarUpdate(days=[EventDayIn(day=d) for d in DAYS[:3]]), ADMIN, db)

@@ -14,10 +14,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.app.core.crypto import decrypt_credential, encrypt_credential
 from backend.app.core.errors import AppError, NotFoundError
 from backend.app.core.ownership import require_owned
-from backend.app.core.rbac import AuthUser, require_owner_or_manager, require_staff_or_above
+from backend.app.core.rbac import (
+    AuthUser,
+    require_any_business_user,
+    require_owner_or_manager,
+    require_staff_or_above,
+)
 from backend.app.db.session import get_db
 from backend.app.payments.registry import get_provider
-from shared.enums import AuditScope
+from backend.app.events.service import business_access_decision
+from shared.enums import EVENT_PLAN, AuditScope
+from shared.models.event import Event, EventVendor
 from backend.app.api.v1.routes_assets import asset_public_url
 from shared.models.asset import Asset
 from shared.models.audit import AuditEvent
@@ -688,6 +695,46 @@ class PaymentHealthResponse(BaseModel):
     provider: str
     checked_at: datetime
     detail: str | None = None
+
+
+@router.get("/event-access")
+async def get_event_access(
+    user: AuthUser = Depends(require_any_business_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    The calling business's own event-vendor access (souk). business_id comes
+    only from the JWT; only this business's event/vendor/subscription rows
+    are read. For a business that is not an event vendor, access_level and
+    reason are null (trading is not event-gated).
+    """
+    from sqlalchemy.orm import selectinload
+
+    plan = (await db.execute(select(Business.plan).where(Business.id == user.business_id))).scalar_one_or_none()
+    if plan != EVENT_PLAN:
+        return {"is_event_vendor": False, "access_level": None, "reason": None, "events": []}
+    decision = await business_access_decision(db, user.business_id)
+    vendors = (await db.execute(
+        select(EventVendor)
+        .where(EventVendor.business_id == user.business_id)
+        .options(selectinload(EventVendor.subscriptions), selectinload(EventVendor.event).selectinload(Event.days))
+    )).scalars().all()
+    events = []
+    for v in vendors:
+        days = [d.day for d in v.event.days if d.is_billable]
+        events.append({
+            "event_id": v.event.id, "event_name": v.event.name, "venue": v.event.venue,
+            "timezone": v.event.timezone, "event_status": v.event.status, "prep_days": v.event.prep_days,
+            "days": sorted(days), "first_day": min(days) if days else None, "last_day": max(days) if days else None,
+            "calendar_published": bool(days),
+            "stall_code": v.stall_code, "category": v.category, "vendor_status": v.status,
+            "subscriptions": [
+                {"starts_on": sub.starts_on, "ends_on": sub.ends_on, "billable_days": sub.billable_days,
+                 "amount_cents": sub.amount_cents, "status": sub.status, "paid_at": sub.paid_at}
+                for sub in sorted(v.subscriptions, key=lambda x: x.starts_on)
+            ],
+        })
+    return {"is_event_vendor": True, "access_level": decision.level, "reason": decision.reason, "events": events}
 
 
 @router.get("/payments/health", response_model=PaymentHealthResponse)
