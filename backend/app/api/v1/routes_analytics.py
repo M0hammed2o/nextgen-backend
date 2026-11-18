@@ -44,7 +44,7 @@ from backend.app.analytics.revenue import (
     voided_cents_expr,
     voided_count_expr,
 )
-from backend.app.analytics import product_rankings, sales_wallets
+from backend.app.analytics import product_rankings, sales_wallets, variant_report
 from backend.app.core.errors import AppError
 from backend.app.core.rbac import AuthUser, require_owner_or_manager
 from backend.app.db.session import get_db
@@ -698,6 +698,25 @@ async def get_product_performance(
     business = await _report_business(db, user.business_id)
     rng = sales_wallets.resolve_range(range_, start, end, business.timezone or "Africa/Johannesburg")
     result = await product_rankings.product_performance(db, user.business_id, rng, menu_item_id)
+    return {
+        "range": rng.range, "start_date": rng.start_date.isoformat(), "end_date": rng.end_date.isoformat(),
+        "timezone": rng.timezone, "currency": business.currency, **result,
+    }
+
+
+@router.get("/variants")
+async def get_variant_sales(
+    range_: str = Query(default="7d", alias="range", pattern=_RANGE_PATTERN),
+    start: date | None = Query(default=None),
+    end: date | None = Query(default=None),
+    menu_item_id: uuid.UUID | None = Query(default=None),
+    user: AuthUser = Depends(require_owner_or_manager),
+    db: AsyncSession = Depends(get_db),
+):
+    """Sales, returns and net by product variant (size/colour/SKU)."""
+    business = await _report_business(db, user.business_id)
+    rng = sales_wallets.resolve_range(range_, start, end, business.timezone or "Africa/Johannesburg")
+    result = await variant_report.variant_sales(db, user.business_id, rng, menu_item_id=menu_item_id)
     return {
         "range": rng.range, "start_date": rng.start_date.isoformat(), "end_date": rng.end_date.isoformat(),
         "timezone": rng.timezone, "currency": business.currency, **result,

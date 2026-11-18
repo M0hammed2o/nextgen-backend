@@ -428,6 +428,7 @@ from backend.app.api.v1.routes_menu import router as menu_router
 from backend.app.api.v1.routes_orders import router as orders_router
 from backend.app.api.v1.routes_customers import router as customers_router
 from backend.app.api.v1.routes_pos import router as pos_router
+from backend.app.api.v1.routes_variants import router as variants_router
 from backend.app.api.v1.routes_external_orders import router as external_orders_router
 from backend.app.api.v1.routes_delivery import router as delivery_router
 from backend.app.api.v1.routes_import import router as import_router
@@ -467,6 +468,7 @@ app.include_router(menu_router, prefix=PREFIX)
 app.include_router(orders_router, prefix=PREFIX)
 app.include_router(customers_router, prefix=PREFIX)
 app.include_router(pos_router, prefix=PREFIX)
+app.include_router(variants_router, prefix=PREFIX)
 # Ciao Pizza P0 — inventory module. Every route below is additionally
 # gated per tenant by Business.inventory_enabled, so registering them
 # does not change behaviour for tenants without the module.
