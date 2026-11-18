@@ -106,6 +106,13 @@ class Business(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     # ── Currency ─────────────────────────────────────────────────────────
     currency: Mapped[str] = mapped_column(String(3), default="ZAR", nullable=False)
 
+    # ── Industry (DECISION-0060, migration 0062) ─────────────────────────
+    # Selects industry-specific defaults and modules; every industry shares
+    # the same order, pricing and inventory core.
+    industry: Mapped[str] = mapped_column(
+        String(32), default="RESTAURANT", server_default="RESTAURANT", nullable=False
+    )
+
     # ── Billing / Plan ───────────────────────────────────────────────────
     plan: Mapped[str] = mapped_column(String(32), default="STARTER", nullable=False)
     billing_status: Mapped[str] = mapped_column(

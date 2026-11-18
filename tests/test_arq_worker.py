@@ -395,12 +395,15 @@ class TestWorkerSettings:
         deletes at 400 — backend/app/delivery/retention.py) — and (added
         2026-11-11, BUG-0191) delivery_order_recovery_and_reminders
         (re-enqueues lost delivery-order jobs, reminds staff; never accepts
-        or denies) — cron jobs must be registered.
-        Count was 6, then 7, then 8, then 9, then 10, now 11; bumped deliberately each
+        or denies) — and (added 2026-11-18, souk foundation, migration
+        0062) reconcile_event_vendors (activates/expires event-plan vendors
+        from their paid event subscriptions; only lifts its own
+        EVENT_SUBSCRIPTION_ENDED suspensions) — cron jobs must be registered.
+        Count was 6, then 7, then 8, then 9, then 10, then 11, now 12; bumped deliberately each
         time, not a weakened assertion (this test still enumerates every job
         by name below).
         """
-        assert len(WorkerSettings.cron_jobs) == 11
+        assert len(WorkerSettings.cron_jobs) == 12
         names = {c.name for c in WorkerSettings.cron_jobs}
         assert "cron:run_outbox_batch" in names
         assert "cron:cancel_stale_delivery_fee_orders" in names
@@ -413,6 +416,7 @@ class TestWorkerSettings:
         assert "cron:check_whatsapp_usage_alerts" in names
         assert "cron:delivery_webhook_retention_sweep" in names
         assert "cron:delivery_order_recovery_and_reminders" in names
+        assert "cron:reconcile_event_vendors" in names
 
     def test_max_tries_is_positive(self):
         """max_tries must be > 0 so infrastructure failures can be retried."""

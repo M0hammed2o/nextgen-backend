@@ -511,6 +511,24 @@ async def suspend_past_due_businesses(ctx: dict) -> None:
             logger.exception("Billing grace-period suspension job failed — rolled back.")
 
 
+async def reconcile_event_vendors(ctx: dict) -> None:
+    """
+    Hourly: activate and expire temporary-event (souk) vendors automatically,
+    from their PAID event subscriptions. See backend/app/events/service.py.
+    Only businesses on the event plan are touched, and only suspensions
+    carrying EVENT_SUBSCRIPTION_ENDED are ever lifted. Never deletes data.
+    """
+    from backend.app.events.service import reconcile_event_vendor_access
+
+    async with ctx["session_factory"]() as db:
+        try:
+            await reconcile_event_vendor_access(db)
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            logger.exception("Event vendor access reconcile failed — rolled back.")
+
+
 async def sweep_trial_and_invoice_expiry(ctx: dict) -> None:
     """
     Companion sweep to `suspend_past_due_businesses` above, run on the same
@@ -765,6 +783,14 @@ class WorkerSettings:
         cron(
             suspend_past_due_businesses,
             minute=0,
+            second=0,
+            run_at_startup=True,
+        ),
+        # Activate/expire temporary-event (souk) vendors from their paid
+        # event subscriptions — hourly, offset from the billing sweeps.
+        cron(
+            reconcile_event_vendors,
+            minute=5,
             second=0,
             run_at_startup=True,
         ),

@@ -34,6 +34,55 @@ class PlanTier(str, enum.Enum):
     ENTERPRISE = "ENTERPRISE"
 
 
+# Set on businesses provisioned for a temporary event (souk, fair). Deliberately
+# NOT a PlanTier member: the admin plan editors validate against PlanTier, so
+# no one can switch an ordinary tenant onto event billing by editing its plan,
+# and backend/app/events/service.py only ever manages businesses on this plan.
+EVENT_PLAN = "EVENT"
+
+
+# ── Industries (DECISION-0060) ───────────────────────────────────────────────
+
+class Industry(str, enum.Enum):
+    RESTAURANT = "RESTAURANT"
+    CAFE = "CAFE"
+    TAKEAWAY = "TAKEAWAY"
+    BUTCHERY = "BUTCHERY"
+    BAKERY = "BAKERY"
+    CLOTHING_RETAIL = "CLOTHING_RETAIL"
+    GENERAL_RETAIL = "GENERAL_RETAIL"
+    EVENT_FOOD = "EVENT_FOOD"
+    EVENT_RETAIL = "EVENT_RETAIL"
+
+
+# ── Temporary events / souk (PRODUCT_ROADMAP.md §13, Wave 1) ────────────────
+
+class EventStatus(str, enum.Enum):
+    DRAFT = "DRAFT"
+    OPEN = "OPEN"
+    CLOSED = "CLOSED"
+    CANCELLED = "CANCELLED"
+
+
+class EventVendorCategory(str, enum.Enum):
+    FOOD = "FOOD"
+    CLOTHING = "CLOTHING"
+
+
+class EventVendorStatus(str, enum.Enum):
+    PENDING = "PENDING"      # registered; setting up before the event or before a paid day
+    ACTIVE = "ACTIVE"        # covered by a paid subscription (today or a future paid day)
+    UNPAID = "UNPAID"        # a billable event day with no paid cover, never paid
+    EXPIRED = "EXPIRED"      # paid cover existed and has ended
+    CANCELLED = "CANCELLED"  # removed by an administrator; never auto-reactivated
+
+
+class EventSubscriptionStatus(str, enum.Enum):
+    UNPAID = "UNPAID"
+    PAID = "PAID"
+    VOID = "VOID"
+
+
 # ── Orders ───────────────────────────────────────────────────────────────────
 
 class OrderStatus(str, enum.Enum):
