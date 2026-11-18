@@ -142,6 +142,9 @@ async def test_prep_days_defaults_to_14_and_is_editable(db, bag):
     out = await update_event(ev["id"], EventUpdate(name="Renamed Souk", venue="Hall 2", prep_days=30), ADMIN, db)
     assert (out["name"], out["venue"], out["prep_days"]) == ("Renamed Souk", "Hall 2", 30)
     assert out["food_day_rate_cents"] == 10_000
+    assert "notes" in ev and "notes" in out and out["notes"] is None
+    noted = await update_event(ev["id"], EventUpdate(notes="Bring ID"), ADMIN, db)
+    assert noted["notes"] == "Bring ID" and noted["prep_days"] == 30  # PATCH response has GET shape
 
 
 async def test_prep_days_range_is_enforced_in_api_and_database(db, bag):
