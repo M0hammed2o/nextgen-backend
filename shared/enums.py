@@ -35,9 +35,10 @@ class PlanTier(str, enum.Enum):
 
 
 # Set on businesses provisioned for a temporary event (souk, fair). Deliberately
-# NOT a PlanTier member: the admin plan editors validate against PlanTier, so
-# no one can switch an ordinary tenant onto event billing by editing its plan,
-# and backend/app/events/service.py only ever manages businesses on this plan.
+# NOT a PlanTier member, so an ONBOARDER (whose plan edits are validated against
+# PlanTier) cannot put a tenant on event billing. A SUPER_ADMIN's free-form plan
+# edit is not validated, so a super admin can; that is a trusted role.
+# backend/app/events/service.py only ever manages businesses on this plan.
 EVENT_PLAN = "EVENT"
 
 

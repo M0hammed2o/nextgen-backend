@@ -39,7 +39,9 @@ from shared.models.event import Event, EventVendor
 logger = logging.getLogger(__name__)
 
 EVENT_SUSPENSION_REASON = "EVENT_SUBSCRIPTION_ENDED"
-_MANAGED_EVENT_STATUSES = ("DRAFT", "OPEN", "CLOSED")
+# CANCELLED is included so cancelling an event ends its vendors' access
+# (security review M2); a cancelled event never grants access.
+_MANAGED_EVENT_STATUSES = ("DRAFT", "OPEN", "CLOSED", "CANCELLED")
 
 
 @dataclass
@@ -71,7 +73,7 @@ async def reconcile_event_vendor_access(db: AsyncSession, now: datetime | None =
         billable = {d.day for d in event.days if d.is_billable}
         for vendor in event.vendors:
             paid = [PaidRange(s.starts_on, s.ends_on) for s in vendor.subscriptions if s.status == "PAID"]
-            cancelled = vendor.status == "CANCELLED"
+            cancelled = vendor.status == "CANCELLED" or event.status == "CANCELLED"
             new_status = vendor_status(local_day, billable, paid, cancelled=cancelled)
             if new_status != vendor.status:
                 vendor.status = new_status

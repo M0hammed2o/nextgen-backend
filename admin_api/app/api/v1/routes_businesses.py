@@ -27,6 +27,7 @@ from admin_api.app.core.deps import (
     require_super_admin,
 )
 from admin_api.app.services.onboarding import GoLiveResult, compute_go_live_checks
+from admin_api.app.services.provisioning import provision_business
 from backend.app.api.v1.routes_setup import SetupProgress, compute_setup_progress
 from backend.app.billing.trials import extend_trial, start_trial
 from backend.app.core.errors import AppError, DuplicateError, NotFoundError
@@ -39,7 +40,7 @@ from shared.models.audit import AuditEvent
 from shared.models.business import Business
 from shared.auth_sessions import end_user_sessions
 from shared.models.user import BusinessUser
-from shared.utils import generate_business_code, generate_temp_password
+from shared.utils import generate_temp_password
 
 logger = logging.getLogger("nextgen.admin")
 router = APIRouter(prefix="/admin/businesses", tags=["admin-businesses"])
@@ -450,83 +451,22 @@ async def create_business(
                 "FIELD_NOT_ALLOWED", "ONBOARDER cannot set whatsapp_order_allowance", 403,
             )
 
-    # Auto-generate slug from name if not provided
-    import re as _re
-    slug = body.slug
-    if not slug:
-        slug = _re.sub(r"[^a-z0-9]+", "-", body.name.lower()).strip("-")
-        if not slug:
-            slug = "business"
-
-    # Ensure slug uniqueness — append suffix if needed
-    base_slug = slug
-    for suffix in range(20):
-        candidate = base_slug if suffix == 0 else f"{base_slug}-{suffix}"
-        existing = await db.execute(
-            select(Business.id).where(Business.slug == candidate)
-        )
-        if not existing.scalar_one_or_none():
-            slug = candidate
-            break
-    else:
-        raise AppError("SLUG_GENERATION_FAILED", "Could not generate unique slug", 500)
-    body_slug = slug
-
-    # If owner_email provided, check email uniqueness
-    if body.owner_email:
-        email_check = await db.execute(
-            select(BusinessUser.id).where(
-                BusinessUser.email == body.owner_email.lower().strip()
-            )
-        )
-        if email_check.scalar_one_or_none():
-            raise DuplicateError("User", "email")
-
-    # Generate unique business code
-    for _ in range(10):
-        code = generate_business_code()
-        check = await db.execute(
-            select(Business.id).where(Business.business_code == code)
-        )
-        if not check.scalar_one_or_none():
-            break
-    else:
-        raise AppError("CODE_GENERATION_FAILED", "Could not generate unique business code", 500)
-
-    # Create business
-    biz_data = body.model_dump(exclude={"owner_email", "owner_full_name", "slug", "start_trial"})
-    biz = Business(
-        business_code=code, slug=body_slug,
+    # Slug, business code, owner-email uniqueness, the business row and the
+    # owner login all come from the shared provisioning service, so bulk flows
+    # (souk vendors, branches) follow exactly the same rules.
+    provisioned = await provision_business(
+        db,
+        fields=body.model_dump(exclude={"owner_email", "owner_full_name", "slug", "start_trial"}),
+        requested_slug=body.slug,
+        owner_email=body.owner_email,
+        owner_full_name=body.owner_full_name,
+        trial=body.start_trial,
         onboarded_by_admin_id=user.user_id if user.role == AdminRole.ONBOARDER else None,
-        **biz_data,
+        # This route creates one specific business; its own WhatsApp number may be set here.
+        allow_external_identity=True,
     )
-    if body.start_trial:
-        start_trial(biz)
-    else:
-        # No trial period — e.g. a client already invoiced/paying from day
-        # one. Explicit ACTIVE rather than leaving the model's default
-        # billing_status="TRIAL" with no trial_ends_at set, which would
-        # otherwise read as an immediately-EXPIRED trial via
-        # compute_account_status (see backend/app/billing/account_status.py).
-        biz.billing_status = "ACTIVE"
-    db.add(biz)
-    await db.flush()  # Get biz.id before creating user
-
-    # Optionally create owner user in same transaction, with a generated
-    # temporary password — same policy as POST /admin/businesses/{id}/owner.
-    owner_temp_password: str | None = None
-    if body.owner_email:
-        owner_temp_password = generate_temp_password()
-        owner = BusinessUser(
-            business_id=biz.id,
-            role="OWNER",
-            email=body.owner_email.lower().strip(),
-            password_hash=hash_password(owner_temp_password),
-            staff_name=body.owner_full_name,
-            is_active=True,
-            must_change_password=True,
-        )
-        db.add(owner)
+    biz = provisioned.business
+    owner_temp_password = provisioned.owner_temporary_password
 
     db.add(AuditEvent(
         scope=AuditScope.PLATFORM.value,

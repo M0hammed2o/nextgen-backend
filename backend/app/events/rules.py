@@ -21,11 +21,19 @@ Access rule, for a vendor on local date ``D`` (the event's timezone):
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from typing import Iterable
 
 FOOD = "FOOD"
 CLOTHING = "CLOTHING"
+
+# Setup access before an event starts is limited to this many days before the
+# first billable day, so a far-future registration (or a returning vendor
+# attached months ahead) does not get months of free trading. Security review
+# M3, 2026-11-18. An event with no published calendar remains a setup window,
+# because vendors must load products before the dates are announced; that is
+# flagged to the owner as a product decision.
+SETUP_WINDOW_DAYS = 14
 
 
 @dataclass(frozen=True)
@@ -80,10 +88,15 @@ def has_access(d: date, billable_days: set[date], paid: list[PaidRange]) -> bool
     if d in billable_days:
         return False
     has_future_paid = any(p.starts_on > d for p in paid)
-    # An event whose calendar has not been published yet (no billable days)
-    # is entirely a setup window: vendors can register and load products.
-    before_event = (not billable_days) or d < min(billable_days)
-    return has_future_paid or before_event
+    if not billable_days:
+        # Calendar not published yet: setup window (see SETUP_WINDOW_DAYS note).
+        return True
+    first = min(billable_days)
+    window_opens = first - timedelta(days=SETUP_WINDOW_DAYS)
+    if d < window_opens:
+        return False  # too early, even for a vendor who has already paid
+    in_setup_window = d < first
+    return has_future_paid or in_setup_window
 
 
 def vendor_status(d: date, billable_days: set[date], paid: list[PaidRange], cancelled: bool = False) -> str:
@@ -93,8 +106,12 @@ def vendor_status(d: date, billable_days: set[date], paid: list[PaidRange], canc
     covered_or_future = any(p.covers(d) or p.starts_on > d for p in paid)
     if has_access(d, billable_days, paid):
         return "ACTIVE" if covered_or_future else "PENDING"
+    if billable_days and d < min(billable_days) - timedelta(days=SETUP_WINDOW_DAYS):
+        return "PENDING"  # registered (paid or not); the setup window has not opened
     if paid:
         # Paid cover existed. Either it ended, or this is an unpaid billable
         # day between paid ranges; with no future cover it has expired.
         return "UNPAID" if covered_or_future else "EXPIRED"
+    if billable_days and d < min(billable_days):
+        return "PENDING"  # registered, before the setup window opens
     return "UNPAID"

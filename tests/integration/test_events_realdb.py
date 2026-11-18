@@ -229,3 +229,19 @@ async def test_industry_is_checked(db):
                     currency="ZAR", timezone="Africa/Johannesburg", industry="SPACESHIPS"))
     with pytest.raises(IntegrityError):
         await db.commit()
+
+
+async def test_cancelling_the_event_ends_vendor_access(db, souk):
+    """Security review M2: a cancelled event must not leave its vendors trading forever."""
+    event, created = souk
+    event_id = event.id
+    biz, vendor = await _vendor(db, event, created, paid_ranges=[(DAYS[0], DAYS[18])])
+    biz_id, vendor_id = biz.id, vendor.id
+    await reconcile_event_vendor_access(db, _noon(DAYS[2])); await db.commit()
+    assert (await _state(db, biz_id, vendor_id))[0] is True
+    ev = (await db.execute(select(Event).where(Event.id == event_id))).scalar_one()
+    ev.status = "CANCELLED"
+    await db.commit()
+    res = await reconcile_event_vendor_access(db, _noon(DAYS[3])); await db.commit()
+    assert biz_id in res.businesses_suspended
+    assert await _state(db, biz_id, vendor_id) == (False, EVENT_SUSPENSION_REASON, "CANCELLED")

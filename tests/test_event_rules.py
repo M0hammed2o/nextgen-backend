@@ -115,3 +115,35 @@ def test_after_the_event_access_ends():
 
 def test_cancelled_vendor_is_always_cancelled():
     assert vendor_status(START, NINETEEN_DAYS, [PaidRange(START, LAST)], cancelled=True) == "CANCELLED"
+
+
+# ── Setup window (security review M3, 2026-11-18) ─────────────────────────────
+
+from backend.app.events.rules import SETUP_WINDOW_DAYS  # noqa: E402
+
+
+def test_setup_window_opens_exactly_14_days_before_the_first_billable_day():
+    assert SETUP_WINDOW_DAYS == 14
+    assert has_access(START - timedelta(days=14), NINETEEN_DAYS, [])
+    assert not has_access(START - timedelta(days=15), NINETEEN_DAYS, [])
+
+
+def test_far_future_registration_gets_no_free_access_and_reads_pending():
+    d = START - timedelta(days=120)
+    assert not has_access(d, NINETEEN_DAYS, [])
+    assert vendor_status(d, NINETEEN_DAYS, []) == "PENDING"
+
+
+def test_paying_early_does_not_open_access_before_the_window():
+    """A vendor who paid for the whole event still cannot trade months ahead."""
+    d = START - timedelta(days=60)
+    paid = [PaidRange(START, LAST)]
+    assert not has_access(d, NINETEEN_DAYS, paid)
+    assert vendor_status(d, NINETEEN_DAYS, paid) == "PENDING"
+    assert has_access(START - timedelta(days=3), NINETEEN_DAYS, paid)  # inside the window
+
+
+def test_gap_day_inside_the_event_is_unaffected_by_the_window():
+    calendar = {START, START + timedelta(days=2)}
+    paid = [PaidRange(START, START + timedelta(days=2))]
+    assert has_access(START + timedelta(days=1), calendar, paid)
