@@ -436,6 +436,8 @@ from backend.app.api.v1.routes_inventory import router as inventory_router
 from backend.app.api.v1.routes_recipes import router as recipes_router
 from backend.app.api.v1.routes_receipts import digital_receipts_usage_router, router as receipts_router
 from backend.app.api.v1.routes_receipt_public import router as receipt_public_router
+from backend.app.api.v1.routes_event_public import router as event_public_router
+from backend.app.api.v1.routes_event_vendor import router as event_vendor_router
 from backend.app.api.v1.routes_stocktake import router as stocktake_router
 from backend.app.api.v1.routes_wastage import router as wastage_router
 from backend.app.api.v1.routes_billing import router as billing_settings_router
@@ -487,6 +489,11 @@ app.include_router(digital_receipts_usage_router, prefix=PREFIX)
 # docstring for why this is mounted under the standard /v1 prefix rather
 # than an unprecedented un-prefixed route).
 app.include_router(receipt_public_router, prefix=PREFIX)
+# Souk (temporary events): public event page + vendor self-registration
+# (unauthenticated, per-IP rate limited) and vendor self-service subscriptions
+# (JWT business_id, OWNER/MANAGER).
+app.include_router(event_public_router, prefix=PREFIX)
+app.include_router(event_vendor_router, prefix=PREFIX)
 app.include_router(billing_settings_router, prefix=PREFIX)
 app.include_router(loyalty_router, prefix=PREFIX)
 app.include_router(specials_router, prefix=PREFIX)

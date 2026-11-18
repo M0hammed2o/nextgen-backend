@@ -389,6 +389,10 @@ class Settings(BaseSettings):
     # backend/app/receipts/token.py) — this is defence in depth, not the
     # only protection.
     RECEIPT_PUBLIC_RATE_LIMIT_PER_MINUTE: int = 30
+    # Souk public event page and vendor self-registration (unauthenticated, per client IP).
+    EVENT_PUBLIC_RATE_LIMIT_PER_MINUTE: int = 30
+    EVENT_REGISTER_RATE_LIMIT_PER_MINUTE: int = 5
+    EVENT_REGISTER_RATE_LIMIT_PER_HOUR: int = 20
 
     # ── Delivery marketplace integrations (Uber Eats live API) ────────────
     # Platform-wide app credentials (Uber issues ONE client_id/secret per
