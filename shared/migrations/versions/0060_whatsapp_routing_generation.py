@@ -1,7 +1,7 @@
 """Add businesses.whatsapp_routing_generation (fail-closed WhatsApp number handover)
 
-Revision ID: 0059_whatsapp_routing_generation
-Revises: 0058_business_menu_images
+Revision ID: 0060_whatsapp_routing_generation
+Revises: 0059_delivery_kitchen_flow
 Create Date: 2026-10-29
 
 Purely additive, fully reversible: one new NOT NULL column with a server
@@ -24,8 +24,12 @@ matches the business's CURRENT generation before processing — see
 from alembic import op
 import sqlalchemy as sa
 
-revision = "0059_whatsapp_routing_generation"
-down_revision = "0058_business_menu_images"
+# Renumbered 2026-11-18 from 0059_whatsapp_routing_generation (parent 0058) during the
+# migration-chain reconciliation: 0059_delivery_kitchen_flow took 0059. This revision was
+# never applied to production (prod head was 0058_business_menu_images), only to disposable
+# test databases. A disposable DB stamped with the old id must be recreated.
+revision = "0060_whatsapp_routing_generation"
+down_revision = "0059_delivery_kitchen_flow"
 branch_labels = None
 depends_on = None
 
