@@ -275,6 +275,14 @@ class DeliveryOrder(Base, UUIDPrimaryKeyMixin, TimestampMixin):
             unique=True,
             postgresql_where=text("order_id IS NOT NULL"),
         ),
+        # Non-unique: provider display codes are short and reused over time.
+        # Read by the CSV importer to refuse a second sale for an order the
+        # live API already booked (migration 0059).
+        Index(
+            "ix_delivery_orders_business_provider_display_id",
+            "business_id", "provider", "display_id",
+            postgresql_where=text("display_id IS NOT NULL"),
+        ),
     )
 
     business_id: Mapped[uuid.UUID] = mapped_column(
@@ -289,6 +297,11 @@ class DeliveryOrder(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         nullable=True,
     )
     external_order_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    display_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True,
+        comment="Provider's short human order code (Uber display_id) — what a "
+                "courier quotes at the counter. Not unique. Migration 0059.",
+    )
     external_store_id: Mapped[str] = mapped_column(
         String(128), nullable=False, comment="Snapshot for audit, not used for lookups."
     )
@@ -302,9 +315,11 @@ class DeliveryOrder(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     status: Mapped[str] = mapped_column(
         String(24), default="RECEIVED", nullable=False,
         comment="RECEIVED / FETCHING / NEEDS_MAPPING / READY_TO_ACCEPT / "
-                "ACCEPTED / DENIED / FULFILLED / CANCELLED / FAILED / UNKNOWN "
-                "(UNKNOWN added to the CHECK constraint in migration 0045 — "
-                "BUG-0094 item 4)",
+                "ACCEPTED / ACCEPT_UNCONFIRMED / DENIED / FULFILLED / CANCELLED / "
+                "FAILED / UNKNOWN (UNKNOWN added to the CHECK constraint in "
+                "migration 0045 — BUG-0094 item 4; ACCEPT_UNCONFIRMED in 0059 — "
+                "the sale stands but the provider never confirmed our accept, "
+                "so the deadline watchdog must not deny it)",
     )
     # The real canonical sale, once (and only if/when) it exists. Nullable —
     # a NEEDS_MAPPING / DENIED / FAILED order never gets one, by design: an
@@ -352,6 +367,13 @@ class DeliveryOrder(Base, UUIDPrimaryKeyMixin, TimestampMixin):
                 "external_product_mappings, surfaced for manual staff mapping.",
     )
     failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Outcome of the most recent outbound status push to the provider
+    # (ready-for-pickup, restaurant-initiated cancel) — migration 0059.
+    last_provider_sync_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_provider_sync_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     def __repr__(self) -> str:
         return f"<DeliveryOrder {self.provider} external_order_id={self.external_order_id!r} [{self.status}]>"

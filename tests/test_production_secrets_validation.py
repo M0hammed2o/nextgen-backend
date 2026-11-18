@@ -40,6 +40,8 @@ def settings():
         "UBER_EATS_WEBHOOK_ENABLED": s.UBER_EATS_WEBHOOK_ENABLED,
         "UBER_EATS_CLIENT_ID": s.UBER_EATS_CLIENT_ID,
         "UBER_EATS_CLIENT_SECRET": s.UBER_EATS_CLIENT_SECRET,
+        "UBER_EATS_WEBHOOK_SIGNING_KEY": s.UBER_EATS_WEBHOOK_SIGNING_KEY,
+        "UBER_EATS_WEBHOOK_SECONDARY_SIGNING_KEY": s.UBER_EATS_WEBHOOK_SECONDARY_SIGNING_KEY,
         "SQL_ECHO_ENABLED": s.SQL_ECHO_ENABLED,
         "DATABASE_URL": s.DATABASE_URL,
         "REDIS_URL": s.REDIS_URL,
@@ -63,6 +65,8 @@ def settings():
     s.UBER_EATS_WEBHOOK_ENABLED = True
     s.UBER_EATS_CLIENT_ID = _valid_secret("e5")
     s.UBER_EATS_CLIENT_SECRET = _valid_secret("f6")
+    s.UBER_EATS_WEBHOOK_SIGNING_KEY = ""
+    s.UBER_EATS_WEBHOOK_SECONDARY_SIGNING_KEY = ""
     s.SQL_ECHO_ENABLED = False
     yield s
     for key, value in original.items():
@@ -233,6 +237,49 @@ def test_missing_uber_secrets_ignored_when_webhook_disabled(settings):
 
 def test_valid_uber_production_config_passes(settings):
     main_module._validate_production_secrets()  # must not raise (fixture baseline)
+
+
+def test_missing_production_signing_key_warns_but_boots(settings, caplog):
+    """BUG-0190: optional until Uber confirms the production key, but never silent."""
+    import logging
+    with caplog.at_level(logging.WARNING):
+        main_module._validate_production_secrets()  # must not raise
+    assert "UBER_EATS_WEBHOOK_SIGNING_KEY is not set" in caplog.text
+
+
+def test_valid_production_signing_key_passes_without_warning(settings, caplog):
+    import logging
+    settings.UBER_EATS_WEBHOOK_SIGNING_KEY = _valid_secret("g7")
+    with caplog.at_level(logging.WARNING):
+        main_module._validate_production_secrets()
+    assert "UBER_EATS_WEBHOOK_SIGNING_KEY is not set" not in caplog.text
+
+
+def test_placeholder_production_signing_key_is_caught(settings):
+    settings.UBER_EATS_WEBHOOK_SIGNING_KEY = "CHANGE-ME"
+    with pytest.raises(RuntimeError, match="UBER_EATS_WEBHOOK_SIGNING_KEY"):
+        main_module._validate_production_secrets()
+
+
+def test_placeholder_production_secondary_signing_key_is_caught(settings):
+    settings.UBER_EATS_WEBHOOK_SECONDARY_SIGNING_KEY = "your-signing-key-here"
+    with pytest.raises(RuntimeError, match="UBER_EATS_WEBHOOK_SECONDARY_SIGNING_KEY"):
+        main_module._validate_production_secrets()
+
+
+def test_sandbox_key_equal_to_a_production_signing_key_is_caught(settings, monkeypatch):
+    """Security review M2: compared against every production key, not only the client secret."""
+    shared = _valid_secret("h8")
+    settings.UBER_EATS_WEBHOOK_SIGNING_KEY = shared
+    monkeypatch.setattr(settings, "UBER_EATS_SANDBOX_WEBHOOK_SIGNING_KEY", shared)
+    with pytest.raises(RuntimeError, match="UBER_EATS_SANDBOX_WEBHOOK_SIGNING_KEY equals UBER_EATS_WEBHOOK_SIGNING_KEY"):
+        main_module._validate_production_secrets()
+
+
+def test_whitespace_on_a_production_signing_key_is_caught(settings):
+    settings.UBER_EATS_WEBHOOK_SECONDARY_SIGNING_KEY = _valid_secret("i9") + "\n"
+    with pytest.raises(RuntimeError, match="UBER_EATS_WEBHOOK_SECONDARY_SIGNING_KEY has leading or trailing whitespace"):
+        main_module._validate_production_secrets()
 
 
 def test_uber_webhook_defaults_to_disabled_so_production_boots_without_uber_access():

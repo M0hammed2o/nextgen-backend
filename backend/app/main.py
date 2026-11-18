@@ -165,9 +165,47 @@ def _validate_production_secrets() -> None:
     # integration rather than writing a new bespoke if-block — that is the
     # actual fix for the "keeps recurring" problem, not just adding one more
     # line for Uber.
+    # Uber issues separate production and sandbox apps. Production
+    # credentials are required whenever webhooks are on, unless the
+    # deployment is EXPLICITLY declared sandbox-only
+    # (UBER_EATS_SANDBOX_ONLY_DEPLOYMENT=true) with a complete sandbox pair
+    # and no production value set at all — Uber's path to production
+    # approval runs through sandbox testing first, sometimes on the only
+    # deployment there is. Never implied by a missing variable: that would
+    # silently 200-ack every genuine production order as BAD_SIGNATURE
+    # (BUG-0089). A half-configured pair, in either environment, is fatal.
+    _uber_sandbox_ready = not (
+        _looks_like_placeholder(settings.UBER_EATS_SANDBOX_CLIENT_ID)
+        or _looks_like_placeholder(settings.UBER_EATS_SANDBOX_CLIENT_SECRET)
+    )
+    _uber_production_touched = bool(settings.UBER_EATS_CLIENT_ID or settings.UBER_EATS_CLIENT_SECRET)
+    _uber_sandbox_only = (
+        settings.UBER_EATS_SANDBOX_ONLY_DEPLOYMENT and _uber_sandbox_ready and not _uber_production_touched
+    )
+    _uber_requires_production = settings.UBER_EATS_WEBHOOK_ENABLED and not _uber_sandbox_only
+    if settings.UBER_EATS_WEBHOOK_ENABLED and _uber_sandbox_only:
+        logger.warning(
+            "UBER_EATS_SANDBOX_ONLY_DEPLOYMENT: no production Uber app configured — "
+            "production Uber webhooks cannot be verified on this deployment."
+        )
+    if _uber_requires_production and not settings.UBER_EATS_WEBHOOK_SIGNING_KEY:
+        # BUG-0190: not fatal, because Uber has not confirmed which key
+        # production signs with, and setting a signing key turns the
+        # client-secret fallback off. The sandbox was signed with the
+        # dashboard signing key, so this is the likeliest cause if real
+        # orders show up as BAD_SIGNATURE.
+        logger.warning(
+            "UBER_EATS_WEBHOOK_SIGNING_KEY is not set: production Uber webhooks are verified with "
+            "the client secret only. The sandbox signed with the dashboard signing key; if production "
+            "does too, every real order will be refused as BAD_SIGNATURE."
+        )
+    _uber_sandbox_touched = bool(
+        settings.UBER_EATS_SANDBOX_CLIENT_ID or settings.UBER_EATS_SANDBOX_CLIENT_SECRET
+    )
+    _uber_requires_sandbox_pair = settings.UBER_EATS_WEBHOOK_ENABLED and _uber_sandbox_touched
     _webhook_secret_requirements = (
         (
-            settings.UBER_EATS_WEBHOOK_ENABLED,
+            _uber_requires_production,
             settings.UBER_EATS_CLIENT_SECRET,
             "UBER_EATS_CLIENT_SECRET",
             "Uber Eats webhook signatures cannot be verified — every genuine, "
@@ -176,16 +214,82 @@ def _validate_production_secrets() -> None:
             "delivery_orders row is ever created for the watchdog to rescue)",
         ),
         (
-            settings.UBER_EATS_WEBHOOK_ENABLED,
+            _uber_requires_production,
             settings.UBER_EATS_CLIENT_ID,
             "UBER_EATS_CLIENT_ID",
             "the platform-wide Uber Eats operational token cannot be minted — "
             "every accepted order's fetch/accept/deny call would fail",
         ),
+        (
+            _uber_requires_sandbox_pair,
+            settings.UBER_EATS_SANDBOX_CLIENT_SECRET,
+            "UBER_EATS_SANDBOX_CLIENT_SECRET",
+            "sandbox webhook signatures cannot be verified — every sandbox test "
+            "order would be discarded as BAD_SIGNATURE",
+        ),
+        (
+            _uber_requires_sandbox_pair,
+            settings.UBER_EATS_SANDBOX_CLIENT_ID,
+            "UBER_EATS_SANDBOX_CLIENT_ID",
+            "the sandbox operational token cannot be minted — every sandbox "
+            "test order's fetch/accept/deny call would fail",
+        ),
+        # Optional keys: checked only once set, since a placeholder signing
+        # key is one an attacker could guess and sign forged webhooks with.
+        (
+            bool(settings.UBER_EATS_WEBHOOK_SIGNING_KEY),
+            settings.UBER_EATS_WEBHOOK_SIGNING_KEY,
+            "UBER_EATS_WEBHOOK_SIGNING_KEY",
+            "a placeholder signing key would let anyone sign forged production webhooks",
+        ),
+        (
+            bool(settings.UBER_EATS_WEBHOOK_SECONDARY_SIGNING_KEY),
+            settings.UBER_EATS_WEBHOOK_SECONDARY_SIGNING_KEY,
+            "UBER_EATS_WEBHOOK_SECONDARY_SIGNING_KEY",
+            "a placeholder signing key would let anyone sign forged production webhooks",
+        ),
+        (
+            bool(settings.UBER_EATS_SANDBOX_WEBHOOK_SIGNING_KEY),
+            settings.UBER_EATS_SANDBOX_WEBHOOK_SIGNING_KEY,
+            "UBER_EATS_SANDBOX_WEBHOOK_SIGNING_KEY",
+            "a placeholder signing key would let anyone sign forged sandbox webhooks",
+        ),
+        (
+            bool(settings.UBER_EATS_SANDBOX_WEBHOOK_SECONDARY_SIGNING_KEY),
+            settings.UBER_EATS_SANDBOX_WEBHOOK_SECONDARY_SIGNING_KEY,
+            "UBER_EATS_SANDBOX_WEBHOOK_SECONDARY_SIGNING_KEY",
+            "a placeholder signing key would let anyone sign forged sandbox webhooks",
+        ),
     )
     for enabled, secret_value, secret_name, consequence in _webhook_secret_requirements:
         if enabled and _looks_like_placeholder(secret_value):
             errors.append(f"{secret_name} is not configured but its webhook is enabled — {consequence}")
+
+    # Production is tried first when proving a webhook's environment, so a
+    # sandbox key equal to the production secret would make every sandbox-
+    # signed event prove "production" and reach live restaurants' books.
+    _uber_sandbox_keys = (
+        ("UBER_EATS_SANDBOX_CLIENT_SECRET", settings.UBER_EATS_SANDBOX_CLIENT_SECRET),
+        ("UBER_EATS_SANDBOX_WEBHOOK_SIGNING_KEY", settings.UBER_EATS_SANDBOX_WEBHOOK_SIGNING_KEY),
+        ("UBER_EATS_SANDBOX_WEBHOOK_SECONDARY_SIGNING_KEY", settings.UBER_EATS_SANDBOX_WEBHOOK_SECONDARY_SIGNING_KEY),
+    )
+    # Security review M2: every production key, not only the client secret.
+    # Once production signing keys are set, the client secret is no longer
+    # accepted for production webhooks, so comparing against it alone would
+    # miss the keys actually in use.
+    _uber_production_keys = (
+        ("UBER_EATS_CLIENT_SECRET", settings.UBER_EATS_CLIENT_SECRET),
+        ("UBER_EATS_WEBHOOK_SIGNING_KEY", settings.UBER_EATS_WEBHOOK_SIGNING_KEY),
+        ("UBER_EATS_WEBHOOK_SECONDARY_SIGNING_KEY", settings.UBER_EATS_WEBHOOK_SECONDARY_SIGNING_KEY),
+    )
+    for name, value in _uber_sandbox_keys:
+        for prod_name, prod_value in _uber_production_keys:
+            if value and prod_value and value == prod_value:
+                errors.append(f"{name} equals {prod_name} — sandbox-signed webhooks would prove production")
+    for name, value in (*_uber_sandbox_keys, *_uber_production_keys[1:]):
+        # A pasted trailing newline or space would make every genuine event BAD_SIGNATURE.
+        if value and value != value.strip():
+            errors.append(f"{name} has leading or trailing whitespace — every genuine webhook would fail verification")
 
     if errors:
         msg = (
@@ -281,7 +385,34 @@ from slowapi.errors import RateLimitExceeded
 from backend.app.core.ratelimit import limiter
 
 app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+import time as _time
+
+_last_rate_limit_log = float("-inf")
+
+
+def _rate_limit_handler(request, exc):
+    """
+    BUG-0170: a delivery marketplace never retries a 429 (Uber's webhook
+    guide retries only 500/502/503/504, timeouts and network errors), so a
+    rate-limited order webhook would be lost and Uber would auto-cancel the
+    order. Over-limit delivery webhooks answer 503 with Retry-After instead,
+    which Uber retries. Every other route keeps slowapi's 429.
+    """
+    if request.url.path.startswith("/v1/webhook/delivery/"):
+        from starlette.responses import Response as _Response
+        global _last_rate_limit_log
+        now = _time.monotonic()
+        if now - _last_rate_limit_log >= 60:  # one line a minute, so a flood cannot flood the logs
+            _last_rate_limit_log = now
+            logger.warning("DELIVERY_WEBHOOK_RATE_LIMITED: path=%s client=%s — answering 503 so the provider retries.",
+                           request.url.path, request.client.host if request.client else "unknown")
+        return _Response(status_code=503, headers={"Retry-After": "10"})
+    return _rate_limit_exceeded_handler(request, exc)
+
+
+app.add_exception_handler(RateLimitExceeded, _rate_limit_handler)
 
 # ── Error Handlers ───────────────────────────────────────────────────────────
 

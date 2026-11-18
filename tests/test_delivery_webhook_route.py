@@ -41,11 +41,6 @@ class FakeRequest:
         return self._body
 
 
-class FakeResponse:
-    def __init__(self):
-        self.status_code = 200
-
-
 class TestRateLimitScope:
     def test_route_uses_a_fixed_shared_limit_scope_not_the_path_default(self):
         """
@@ -64,6 +59,14 @@ class TestRateLimitScope:
 
 
 class TestWebhookRouteHandler:
+    """
+    Uber's webhook reference: "Your service should return an HTTP 200
+    response code with an empty response body". Every outcome is therefore
+    a bare status code — the gate result lives in the log line and in
+    delivery_webhook_events.error_category, never in the response (which
+    also used to tell a forger whether their signature was rejected).
+    """
+
     async def test_reads_raw_body_before_any_parsing(self, monkeypatch):
         """
         `request.body()` must be awaited and its exact bytes passed through
@@ -72,7 +75,6 @@ class TestWebhookRouteHandler:
         raw = b'{"event_id": "e1"}'
         pool = AsyncMock()
         request = FakeRequest(raw, headers={}, arq_pool=pool)
-        response = FakeResponse()
 
         captured = {}
 
@@ -82,51 +84,50 @@ class TestWebhookRouteHandler:
             return WebhookGateResult(accepted=True, error_category="OK")
 
         with patch.object(routes_delivery_webhook, "ingest_delivery_webhook", fake_ingest):
-            await routes_delivery_webhook.delivery_webhook.__wrapped__(
-                "UBER_EATS", request, response, db=MagicMock(),
+            result = await routes_delivery_webhook.delivery_webhook.__wrapped__(
+                "UBER_EATS", request, db=MagicMock(),
             )
         assert captured["raw_body"] == raw
         assert captured["provider"] == "UBER_EATS"
+        assert result.status_code == 200
+        assert result.body == b""
 
     async def test_no_arq_pool_returns_503_never_a_false_200(self):
         request = FakeRequest(b"{}", headers={}, arq_pool=None)
-        response = FakeResponse()
 
         result = await routes_delivery_webhook.delivery_webhook.__wrapped__(
-            "UBER_EATS", request, response, db=MagicMock(),
+            "UBER_EATS", request, db=MagicMock(),
         )
-        assert response.status_code == 503
-        assert result["status"] == "service_unavailable"
+        assert result.status_code == 503
+        assert result.body == b""
 
     async def test_gate_result_status_code_is_propagated_onto_the_response(self):
         pool = AsyncMock()
         request = FakeRequest(b"{}", headers={}, arq_pool=pool)
-        response = FakeResponse()
 
         async def fake_ingest(db, *, provider, raw_body, headers, arq_pool):
             return WebhookGateResult(accepted=False, http_status=503, error_category="ENQUEUE_FAILED")
 
         with patch.object(routes_delivery_webhook, "ingest_delivery_webhook", fake_ingest):
             result = await routes_delivery_webhook.delivery_webhook.__wrapped__(
-                "UBER_EATS", request, response, db=MagicMock(),
+                "UBER_EATS", request, db=MagicMock(),
             )
-        assert response.status_code == 503
-        assert result["error_category"] == "ENQUEUE_FAILED"
+        assert result.status_code == 503
+        assert result.body == b""
 
-    async def test_gate_rejection_still_returns_200_by_default(self):
+    async def test_gate_rejection_still_returns_200_with_an_empty_body(self):
         pool = AsyncMock()
         request = FakeRequest(b"{}", headers={}, arq_pool=pool)
-        response = FakeResponse()
 
         async def fake_ingest(db, *, provider, raw_body, headers, arq_pool):
             return WebhookGateResult(accepted=False, http_status=200, error_category="BAD_SIGNATURE")
 
         with patch.object(routes_delivery_webhook, "ingest_delivery_webhook", fake_ingest):
             result = await routes_delivery_webhook.delivery_webhook.__wrapped__(
-                "MR_D", request, response, db=MagicMock(),
+                "MR_D", request, db=MagicMock(),
             )
-        assert response.status_code == 200
-        assert result["status"] == "rejected"
+        assert result.status_code == 200
+        assert result.body == b"", "the response must not reveal that the signature was rejected"
 
 
 class TestRouteRegistration:
@@ -142,3 +143,34 @@ class TestRouteRegistration:
                 getattr(d.call, "__name__", "") for d in getattr(route, "dependencies", [])
             ]
             assert not any(name.startswith("require_") for name in dep_names)
+
+
+class TestRateLimitedWebhookIsRetriable:
+    """BUG-0170: Uber does not retry a 429, so this route must answer 503 + Retry-After when limited."""
+
+    def _request(self, path):
+        request = MagicMock()
+        request.url.path = path
+        request.client.host = "203.0.113.7"
+        return request
+
+    def test_delivery_webhook_over_the_limit_answers_503_with_retry_after(self):
+        from backend.app import main
+        response = main._rate_limit_handler(self._request("/v1/webhook/delivery/UBER_EATS"), MagicMock())
+        assert response.status_code == 503
+        assert response.headers["Retry-After"] == "10"
+
+    def test_every_other_route_keeps_the_429(self):
+        from backend.app import main
+        with patch.object(main, "_rate_limit_exceeded_handler", return_value="slowapi-429") as default:
+            assert main._rate_limit_handler(self._request("/v1/auth/login"), MagicMock()) == "slowapi-429"
+        default.assert_called_once()
+
+    def test_limit_is_registered_for_rate_limit_exceptions(self):
+        from slowapi.errors import RateLimitExceeded
+        from backend.app import main
+        assert main.app.exception_handlers[RateLimitExceeded] is main._rate_limit_handler
+
+    def test_default_limit_has_headroom_for_a_shared_uber_sender_ip(self):
+        from backend.app.core.config import Settings
+        assert Settings.model_fields["DELIVERY_WEBHOOK_RATE_LIMIT_PER_MINUTE"].default >= 600

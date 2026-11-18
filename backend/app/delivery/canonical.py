@@ -60,6 +60,11 @@ class DeliveryOrderStatus(str, enum.Enum):
                       the real provider deadline.
     READY_TO_ACCEPT - fully mapped, accept/deny handshake outstanding
     ACCEPTED        - accept_pos_order succeeded; the real Order now exists
+    ACCEPT_UNCONFIRMED - the real Order exists and the kitchen has it, but
+                      the accept call timed out / failed without proving the
+                      provider rejected it. Never auto-denied by the watchdog
+                      (the food is being made); a human confirms on the
+                      provider's side or retries the accept.
     DENIED          - deny_pos_order succeeded (or was forced by the
                       accept-deadline watchdog)
     FULFILLED       - terminal, order completed on the provider side
@@ -74,6 +79,7 @@ class DeliveryOrderStatus(str, enum.Enum):
     NEEDS_MAPPING = "NEEDS_MAPPING"
     READY_TO_ACCEPT = "READY_TO_ACCEPT"
     ACCEPTED = "ACCEPTED"
+    ACCEPT_UNCONFIRMED = "ACCEPT_UNCONFIRMED"
     DENIED = "DENIED"
     FULFILLED = "FULFILLED"
     CANCELLED = "CANCELLED"
@@ -115,11 +121,21 @@ class DeliveryConnectionStatus(str, enum.Enum):
 
 @dataclass(frozen=True)
 class CanonicalDeliveryModifier:
-    """One selected modifier on a line, still in the provider's own words."""
+    """
+    One modifier on a line, still in the provider's own words.
+
+    `removed=True` is a DEFAULT ingredient the customer took out (Uber's
+    `removed_items`, e.g. "no sugar") — it must reduce stock, never add a
+    charge. `group_title` is the provider's modifier-group name ("Choose
+    size"), kept so a manager can tell what a bare option title belongs to.
+    """
     external_id: str | None
     title: str
     quantity: int = 1
     price_cents: int | None = None
+    removed: bool = False
+    group_external_id: str | None = None
+    group_title: str | None = None
 
 
 @dataclass(frozen=True)
@@ -137,9 +153,28 @@ class CanonicalDeliveryLine:
     external_item_id: str | None
     title: str
     quantity: int
+    # Provider's per-unit price INCLUDING selected modifiers (Uber
+    # `price.unit_price`), the line total (`price.total_price`) and the
+    # per-unit price before modifiers (`price.base_unit_price`) — all the
+    # channel's own prices, which can legitimately differ from the in-store
+    # menu price.
     unit_price_cents: int | None = None
     modifiers: tuple[CanonicalDeliveryModifier, ...] = ()
     special_instructions: str | None = None
+    total_price_cents: int | None = None
+    base_unit_price_cents: int | None = None
+    # BUG-0189: the customer's allergy request for this line (Uber
+    # `special_requests[].allergy`): allergens to exclude, as display text,
+    # and the free-text allergy instructions. `special_requests_unreadable`
+    # is True when a special request was present but not in a shape we can
+    # read, so it cannot be relayed and the order must be denied.
+    allergens: tuple[str, ...] = ()
+    allergy_instructions: str | None = None
+    special_requests_unreadable: bool = False
+
+    @property
+    def has_allergy_request(self) -> bool:
+        return bool(self.allergens or self.allergy_instructions)
 
 
 @dataclass
@@ -161,6 +196,13 @@ class CanonicalDeliveryOrder:
     ready_for_pickup_at: datetime | None = None
     currency: str = "ZAR"
 
+    # Uber's own definitions (v2 Get Order Details, read 2026-10-26):
+    #   sub_total — "The total cost of each line item in the cart."
+    #   total     — "The cost of the entire order, including taxes and fees
+    #               that will be paid out to the Merchant excluding
+    #               Marketplace Fees."
+    #   total_fee — "The total of the fees charged on the order that will be
+    #               paid out to the Merchant."
     subtotal_cents: int | None = None
     tax_cents: int | None = None
     fee_cents: int | None = None
@@ -172,10 +214,18 @@ class CanonicalDeliveryOrder:
     special_instructions: str | None = None
     customer_first_name: str | None = None
     customer_phone: str | None = None
+    # Uber masks the eater's number behind a proxy line; `phone_code` is the
+    # access code to dial with it ("The phone code to access the phone
+    # number above") — NOT a country/dialling prefix.
+    customer_phone_code: str | None = None
     # Deliberately always None, and typed that way — see module docstring.
     delivery_address: None = None
 
     fulfillment_issues: tuple[str, ...] = ()
+    # BUG-0189: Uber documents special requests per item only. Any cart-level
+    # `special_requests` content is unexpected, so it is never silently
+    # dropped: it makes the order unreadable and the order is denied.
+    cart_special_requests_present: bool = False
 
     # Allow-listed, provider-specific extras a future reconciliation job
     # might want (e.g. Uber's `brand`) — built ONLY via
@@ -185,6 +235,31 @@ class CanonicalDeliveryOrder:
     @property
     def item_count(self) -> int:
         return sum(line.quantity for line in self.lines)
+
+    @property
+    def has_allergy_request(self) -> bool:
+        return any(line.has_allergy_request for line in self.lines)
+
+    @property
+    def special_requests_unreadable(self) -> bool:
+        return self.cart_special_requests_present or any(line.special_requests_unreadable for line in self.lines)
+
+
+@dataclass(frozen=True)
+class CanonicalCatalogueEntry:
+    """
+    One sellable entity in a provider's menu, read (never written) for the
+    mapping screen's bulk import. `kind` is ITEM (sold on its own, listed
+    under a category) or MODIFIER (offered inside a modifier group); an
+    entity used both ways yields one entry of each kind. `price_cents` is
+    the channel's own price, which can legitimately differ from the
+    in-store menu price.
+    """
+    kind: str
+    external_id: str
+    title: str
+    price_cents: int | None = None
+    group_title: str | None = None
 
 
 @dataclass(frozen=True)

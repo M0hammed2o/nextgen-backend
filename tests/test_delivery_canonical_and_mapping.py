@@ -8,6 +8,7 @@ import hashlib
 import hmac
 
 import pytest
+from unittest.mock import patch
 
 from backend.app.delivery.base import (
     DeliveryCapabilities,
@@ -191,6 +192,36 @@ class TestUberWebhookEnvelope:
     def test_non_dict_payload_returns_none(self):
         assert uber_mapping.parse_webhook_envelope(["not", "a", "dict"]) is None
 
+    def test_store_provisioned_uses_webhook_msg_uuid_as_its_id(self):
+        """Shape of the real sandbox `store.provisioned` received 2026-11-07 (ids replaced): no event_id, no meta."""
+        payload = {
+            "store_id": "0b6f2a3e-1d2c-4e5f-8a9b-7c6d5e4f3a21",
+            "event_type": "store.provisioned",
+            "webhook_meta": {
+                "client_id": "test-client",
+                "webhook_msg_uuid": "0372bae4-c3ca-4dae-b3ec-cc3282853828",
+                "webhook_config_id": "eats-pos-provision-platform.provisioning-update",
+                "webhook_msg_timestamp": 1794010099,
+            },
+            "resource_href": "https://api.uber.com/v1/eats/stores/0b6f2a3e-1d2c-4e5f-8a9b-7c6d5e4f3a21/pos_data",
+            "partner_store_id": "biz-1",
+            "perform_refresh_menu": False,
+        }
+        envelope = uber_mapping.parse_webhook_envelope(payload)
+        assert envelope.event_id == "0372bae4-c3ca-4dae-b3ec-cc3282853828"
+        assert envelope.event_type == "store.provisioned"
+        assert envelope.external_store_id == "0b6f2a3e-1d2c-4e5f-8a9b-7c6d5e4f3a21"
+        assert envelope.external_order_id is None, "a store event never becomes an order job"
+
+    def test_event_id_wins_over_webhook_msg_uuid(self):
+        envelope = uber_mapping.parse_webhook_envelope(
+            {"event_id": "evt-1", "webhook_meta": {"webhook_msg_uuid": "msg-1"}, "meta": {"user_id": "s"}})
+        assert envelope.event_id == "evt-1"
+
+    @pytest.mark.parametrize("webhook_meta", [{}, {"webhook_msg_uuid": ""}, "not-a-dict", None])
+    def test_no_usable_id_anywhere_returns_none(self, webhook_meta):
+        assert uber_mapping.parse_webhook_envelope({"store_id": "s", "webhook_meta": webhook_meta}) is None
+
     def test_resource_href_is_never_read_into_the_envelope(self):
         """SSRF hardening — nothing in WebhookEnvelope carries resource_href at all."""
         payload = {"event_id": "e", "meta": {}, "resource_href": "http://evil.internal/steal"}
@@ -218,56 +249,126 @@ class TestMapCurrentState:
 # ── Get Order Details parsing ────────────────────────────────────────────────
 
 class TestParseOrderDetails:
-    def test_maps_confirmed_fields(self):
-        raw = {
-            "id": "order-1",
-            "display_id": "A1B2",
+    """
+    Fixture shapes follow Uber's own v2 Get Order Details example
+    (developer.uber.com/docs/eats/references/api/v2/get-eats-order-orderid,
+    read 2026-10-26) — not guesses. The previous fixture used a flat
+    `price.amount` and a "+1" `phone_code`, neither of which exists in that
+    reference, so the old test passed while real payloads would have priced
+    every line at R0.
+    """
+
+    @staticmethod
+    def _money(amount, currency="ZAR"):
+        return {"amount": amount, "currency_code": currency, "formatted_amount": f"R{amount / 100:.2f}"}
+
+    def _documented_order(self):
+        m = self._money
+        return {
+            "id": "f9f363d1-e1c2-4595-b477-c649845bc953",
+            "display_id": "BC953",
             "current_state": "CREATED",
             "type": "DELIVERY_BY_UBER",
-            "brand": "Ciao Pizza",
-            "placed_at": "2026-09-22T10:00:00Z",
-            "eater": {"first_name": "Sam", "phone": "5551234", "phone_code": "+1"},
+            "brand": "UBER_EATS",
+            "placed_at": "2026-10-26T18:30:00+02:00",
+            "estimated_ready_for_pickup_at": "2026-10-26T18:50:00+02:00",
+            "store": {"id": "store-from-payload-NEVER-trusted"},
+            "eater": {"first_name": "Larry", "phone": "+27 21 555 0100", "phone_code": "555 55 555"},
             "cart": {
+                "special_instructions": "Ring the bell",
                 "items": [
                     {
-                        "id": "item-1",
-                        "external_data": "menu-item-large-margherita",
-                        "title": "Large Margherita",
+                        "id": "Muffin",
+                        "instance_id": "Muffin-Instance",
+                        "title": "Fresh-baked muffin",
+                        "external_data": "free text set by some other integrator",
                         "quantity": 2,
-                        "price": {"amount": 15000},
+                        "price": {
+                            "unit_price": m(350), "total_price": m(700),
+                            "base_unit_price": m(300), "base_total_price": m(600),
+                        },
                         "selected_modifier_groups": [
-                            {"selected_items": [{"id": "mod-1", "title": "Extra Cheese", "quantity": 1, "price": {"amount": 1000}}]}
+                            {
+                                "id": "Choose-flavor", "title": "Choose flavor",
+                                "selected_items": [{
+                                    "id": "Chocolate-deluxe", "title": "Chocolate deluxe", "quantity": 1,
+                                    "price": {"unit_price": m(50), "total_price": m(50)},
+                                }],
+                                "removed_items": None,
+                            },
+                            {
+                                "id": "Add-sugar", "title": "Add sugar", "selected_items": None,
+                                "removed_items": [{
+                                    "id": "Sugar", "title": "Sugar", "quantity": 0,
+                                    "price": {"unit_price": m(0)}, "default_quantity": 2,
+                                }],
+                            },
                         ],
                     }
                 ],
-                "fulfillment_issues": [],
+                "fulfillment_issues": [{
+                    "fulfillment_issue_type": "OUT_OF_ITEM",
+                    "fulfillment_action_type": "REMOVE_ITEM",
+                    "root_item": {"id": "Donut", "title": "Chocolate donut"},
+                }],
             },
             "payment": {
                 "charges": {
-                    "sub_total": 30000, "tax": 4500, "total_fee": 3000, "total": 34500, "cash_amount_due": 0,
+                    "total": m(1399), "sub_total": m(700), "tax": m(0),
+                    "total_fee": m(699), "cash_amount_due": m(0),
                 }
             },
         }
-        canonical = uber_mapping.parse_order_details(raw, external_store_id="store-abc")
-        assert canonical.external_order_id == "order-1"
+
+    def test_maps_documented_fields(self):
+        canonical = uber_mapping.parse_order_details(self._documented_order(), external_store_id="store-abc")
+        assert canonical.external_order_id == "f9f363d1-e1c2-4595-b477-c649845bc953"
+        assert canonical.display_id == "BC953"
         assert canonical.external_store_id == "store-abc"  # from the caller, never from `raw`
         assert canonical.provider_status_raw == "CREATED"
-        assert canonical.subtotal_cents == 30000
-        assert canonical.tax_cents == 4500
-        assert canonical.fee_cents == 3000
-        assert canonical.total_cents == 34500
+        assert canonical.order_type == "DELIVERY_BY_UBER"
+        assert canonical.currency == "ZAR"
+        assert canonical.subtotal_cents == 700
+        assert canonical.tax_cents == 0
+        assert canonical.fee_cents == 699
+        assert canonical.total_cents == 1399
         assert canonical.restaurant_net_cents is None  # never inferred
         assert canonical.delivery_address is None
-        assert len(canonical.lines) == 1
-        line = canonical.lines[0]
-        assert line.external_item_id == "menu-item-large-margherita"
+        assert canonical.special_instructions == "Ring the bell"
+        assert canonical.ready_for_pickup_at is not None
+        assert canonical.fulfillment_issues == ("OUT_OF_ITEM Chocolate donut (REMOVE_ITEM)",)
+
+    def test_line_prices_come_from_the_nested_money_objects(self):
+        line = uber_mapping.parse_order_details(self._documented_order(), external_store_id="s").lines[0]
         assert line.quantity == 2
-        assert line.unit_price_cents == 15000
-        assert len(line.modifiers) == 1
-        assert line.modifiers[0].title == "Extra Cheese"
-        assert line.modifiers[0].price_cents == 1000
-        assert canonical.customer_first_name == "Sam"
-        assert canonical.customer_phone == "+15551234"
+        assert line.unit_price_cents == 350, "price.unit_price.amount — includes the selected modifier"
+        assert line.total_price_cents == 700
+        assert line.base_unit_price_cents == 300
+
+    def test_mapping_key_is_the_entity_id_not_free_text_external_data(self):
+        line = uber_mapping.parse_order_details(self._documented_order(), external_store_id="s").lines[0]
+        assert line.external_item_id == "Muffin"
+
+    def test_selected_and_removed_modifiers_are_both_captured(self):
+        line = uber_mapping.parse_order_details(self._documented_order(), external_store_id="s").lines[0]
+        added = [m for m in line.modifiers if not m.removed]
+        removed = [m for m in line.modifiers if m.removed]
+        assert [(m.external_id, m.title, m.price_cents, m.group_title) for m in added] == [
+            ("Chocolate-deluxe", "Chocolate deluxe", 50, "Choose flavor"),
+        ]
+        assert [(m.external_id, m.title) for m in removed] == [("Sugar", "Sugar")]
+        assert removed[0].price_cents is None, "taking an ingredient out never adds a charge"
+
+    def test_phone_code_is_an_access_code_not_a_dialling_prefix(self):
+        canonical = uber_mapping.parse_order_details(self._documented_order(), external_store_id="s")
+        assert canonical.customer_first_name == "Larry"
+        assert canonical.customer_phone == "+27 21 555 0100"
+        assert canonical.customer_phone_code == "555 55 555"
+
+    def test_flat_amount_price_is_still_accepted_as_a_fallback(self):
+        raw = {"id": "o1", "cart": {"items": [{"id": "i", "title": "X", "quantity": 1, "price": {"amount": 1500}}]}}
+        line = uber_mapping.parse_order_details(raw, external_store_id="s1").lines[0]
+        assert line.unit_price_cents == 1500
 
     def test_missing_price_object_does_not_crash(self):
         raw = {"id": "o1", "cart": {"items": [{"title": "Mystery Item", "quantity": 1}]}}
@@ -288,3 +389,309 @@ class TestParseOrderDetails:
         assert set(canonical.provider_metadata.keys()) <= {"brand", "type", "current_state"}
         assert "eater" not in canonical.provider_metadata
         assert "Secret Name" not in str(canonical.provider_metadata)
+
+
+class TestNonOrderEventsNeverBecomeOrders:
+    def test_store_event_with_top_level_store_id_parses_without_an_order_id(self):
+        envelope = uber_mapping.parse_webhook_envelope({
+            "event_id": "evt-store-1", "event_type": "store.provisioned", "store_id": "store-9",
+        })
+        assert envelope.external_store_id == "store-9"
+        assert envelope.external_order_id is None
+
+    def test_unknown_event_type_carrying_a_resource_id_is_not_treated_as_an_order(self):
+        """Uber: "new event types may be added in the future without notice"."""
+        envelope = uber_mapping.parse_webhook_envelope({
+            "event_id": "evt-x", "event_type": "delivery.state_changed",
+            "meta": {"user_id": "store-1", "resource_id": "something-else"},
+        })
+        assert envelope.external_order_id is None
+
+    @pytest.mark.parametrize("event_type", [
+        "orders.notification", "orders.scheduled.notification",
+        "orders.cancel", "orders.failure", "orders.customer_order_edit",
+    ])
+    def test_order_lifecycle_events_keep_their_order_id(self, event_type):
+        envelope = uber_mapping.parse_webhook_envelope({
+            "event_id": "e", "event_type": event_type,
+            "meta": {"user_id": "store-1", "resource_id": "order-1"},
+        })
+        assert envelope.external_order_id == "order-1"
+
+
+class TestMenuCatalogueParsing:
+    def test_items_and_modifiers_are_classified_and_priced(self):
+        raw = {
+            "items": [
+                {"id": "Coffee", "title": {"translations": {"en_us": "Coffee"}}, "price_info": {"price": 3000}},
+                {"id": "Milk", "title": {"translations": {"en_us": "Milk"}}, "price_info": {"price": 500}},
+                {"id": "Orphan", "title": {"translations": {"en_us": "Not on any menu"}}},
+            ],
+            "categories": [{"id": "Drinks", "entities": [{"type": "ITEM", "id": "Coffee"}]}],
+            "modifier_groups": [
+                {"id": "Add-milk", "title": {"translations": {"en_us": "Add milk"}},
+                 "modifier_options": [{"type": "ITEM", "id": "Milk"}]},
+                {"id": "Extras", "title": {"translations": {"en_us": "Extras"}},
+                 "modifier_options": [{"type": "ITEM", "id": "Milk"}]},
+            ],
+        }
+        entries = uber_mapping.parse_menu_catalogue(raw)
+        by_key = {(e.kind, e.external_id): e for e in entries}
+        assert set(by_key) == {("ITEM", "Coffee"), ("MODIFIER", "Milk")}, "one entry per entity per kind"
+        assert by_key[("ITEM", "Coffee")].price_cents == 3000
+        assert by_key[("MODIFIER", "Milk")].group_title == "Add milk"
+        assert by_key[("MODIFIER", "Milk")].title == "Milk"
+
+    def test_malformed_menu_degrades_to_nothing_not_a_crash(self):
+        assert uber_mapping.parse_menu_catalogue({"items": "nope", "categories": [None]}) == []
+
+
+class TestWebhookEnvironmentIsProvenBySignature:
+    def _settings(self, **overrides):
+        from backend.app.core.config import get_settings
+        settings = get_settings()
+        values = {
+            "UBER_EATS_CLIENT_SECRET": "prod-secret", "UBER_EATS_SANDBOX_CLIENT_SECRET": "sandbox-secret",
+            # No dashboard keys: the client secret is then each environment's key.
+            "UBER_EATS_SANDBOX_WEBHOOK_SIGNING_KEY": "", "UBER_EATS_SANDBOX_WEBHOOK_SECONDARY_SIGNING_KEY": "",
+        }
+        values.update(overrides)
+        return patch.multiple(settings, **values)
+
+    def test_each_app_secret_proves_its_own_environment(self):
+        from backend.app.delivery.uber.environments import match_webhook_environment
+
+        body = b'{"event_id": "e"}'
+        with self._settings():
+            prod_sig = hmac.new(b"prod-secret", body, hashlib.sha256).hexdigest()
+            sandbox_sig = hmac.new(b"sandbox-secret", body, hashlib.sha256).hexdigest()
+            assert match_webhook_environment(body, prod_sig) == "production"
+            assert match_webhook_environment(body, sandbox_sig) == "sandbox"
+            assert match_webhook_environment(body, "0" * 64) is None
+            assert match_webhook_environment(body, None) is None
+
+    def test_an_unconfigured_environment_can_never_match(self):
+        from backend.app.delivery.uber.environments import match_webhook_environment
+
+        body = b"{}"
+        empty_sig = hmac.new(b"", body, hashlib.sha256).hexdigest()
+        with self._settings(UBER_EATS_SANDBOX_CLIENT_SECRET=""):
+            assert match_webhook_environment(body, empty_sig) is None
+
+    def test_adapter_reports_the_verified_environment(self):
+        body = b'{"event_id": "e"}'
+        with self._settings():
+            sig = hmac.new(b"sandbox-secret", body, hashlib.sha256).hexdigest()
+            adapter = UberEatsAdapter()
+            assert adapter.verified_webhook_environment(body, {"x-uber-signature": sig}) == "sandbox"
+            assert adapter.verify_webhook_signature(body, {"x-uber-signature": sig}) is True
+
+
+class TestUberWebhookSigningKeys:
+    """
+    Dashboard "Basic HMAC" keys (Uber webhook-setup guide, read 2026-11-06):
+    X-Uber-Signature is keyed by the signing key, X-Uber-Signature-New by the
+    secondary key during a rotation, after which the new key moves into
+    X-Uber-Signature. The first real Uber sandbox event (2026-11-07) was
+    signed with the signing key, so once dashboard keys are configured the
+    Eats guide's client secret is no longer accepted.
+    """
+
+    PRIMARY, SECONDARY = "p" * 64, "s" * 64
+    BODY = b'{"event_id":"e","event_type":"orders.notification"}'
+
+    def _settings(self, **overrides):
+        from backend.app.core.config import get_settings
+        values = {
+            "UBER_EATS_CLIENT_SECRET": "prod-secret",
+            "UBER_EATS_SANDBOX_CLIENT_SECRET": "sandbox-secret",
+            "UBER_EATS_SANDBOX_WEBHOOK_SIGNING_KEY": self.PRIMARY,
+            "UBER_EATS_SANDBOX_WEBHOOK_SECONDARY_SIGNING_KEY": self.SECONDARY,
+        }
+        values.update(overrides)
+        return patch.multiple(get_settings(), **values)
+
+    @staticmethod
+    def _sig(key, body):
+        return hmac.new(key.encode(), body, hashlib.sha256).hexdigest()
+
+    def _env(self, headers, body=None):
+        return UberEatsAdapter().verified_webhook_environment(self.BODY if body is None else body, headers)
+
+    def test_primary_key_in_the_primary_header(self):
+        with self._settings():
+            assert self._env({"x-uber-signature": self._sig(self.PRIMARY, self.BODY)}) == "sandbox"
+
+    def test_secondary_key_in_the_rotation_header(self):
+        with self._settings():
+            assert self._env({
+                "x-uber-signature": "0" * 64,
+                "x-uber-signature-new": self._sig(self.SECONDARY, self.BODY),
+            }) == "sandbox"
+
+    def test_secondary_key_after_rotation_moves_into_the_primary_header(self):
+        with self._settings():
+            assert self._env({"x-uber-signature": self._sig(self.SECONDARY, self.BODY)}) == "sandbox"
+
+    def test_client_secret_is_refused_once_signing_keys_are_configured(self):
+        with self._settings():
+            assert self._env({"x-uber-signature": self._sig("sandbox-secret", self.BODY)}) is None
+            assert self._env({"x-uber-signature-new": self._sig("sandbox-secret", self.BODY)}) is None
+
+    def test_a_refused_client_secret_signature_is_logged_loudly(self, caplog):
+        import logging
+        with self._settings(), caplog.at_level(logging.INFO, logger="backend.app.delivery.uber.environments"):
+            assert self._env({"x-uber-signature": self._sig("sandbox-secret", self.BODY)}) is None
+            assert self._env({"x-uber-signature": self._sig("q" * 64, self.BODY)}) is None
+        warnings = [r for r in caplog.records if "SIGNED_WITH_CLIENT_SECRET_REFUSED" in r.getMessage()]
+        assert len(warnings) == 1 and "environment=sandbox" in warnings[0].getMessage()
+        assert "sandbox-secret" not in caplog.text
+
+    def test_client_secret_is_refused_with_only_a_secondary_key_configured(self):
+        with self._settings(UBER_EATS_SANDBOX_WEBHOOK_SIGNING_KEY=""):
+            assert self._env({"x-uber-signature": self._sig("sandbox-secret", self.BODY)}) is None
+            assert self._env({"x-uber-signature": self._sig(self.SECONDARY, self.BODY)}) == "sandbox"
+
+    def test_client_secret_is_the_fallback_without_signing_keys(self):
+        with self._settings(UBER_EATS_SANDBOX_WEBHOOK_SIGNING_KEY="",
+                            UBER_EATS_SANDBOX_WEBHOOK_SECONDARY_SIGNING_KEY=""):
+            assert self._env({"x-uber-signature": self._sig("sandbox-secret", self.BODY)}) == "sandbox"
+
+    def test_production_without_signing_keys_still_uses_its_client_secret(self):
+        with self._settings():
+            assert self._env({"x-uber-signature": self._sig("prod-secret", self.BODY)}) == "production"
+
+    def test_header_names_are_matched_case_insensitively(self):
+        from starlette.datastructures import Headers
+        with self._settings():
+            headers = Headers({"X-Uber-Signature-New": self._sig(self.SECONDARY, self.BODY)})
+            assert self._env(headers) == "sandbox"
+
+    def test_uppercase_hex_digest_is_accepted(self):
+        with self._settings():
+            assert self._env({"x-uber-signature": self._sig(self.PRIMARY, self.BODY).upper()}) == "sandbox"
+
+    def test_wrong_key_is_refused(self):
+        with self._settings():
+            assert self._env({"x-uber-signature": self._sig("q" * 64, self.BODY)}) is None
+            assert self._env({"x-uber-signature-new": self._sig("q" * 64, self.BODY)}) is None
+
+    def test_tampered_body_is_refused(self):
+        with self._settings():
+            sig = self._sig(self.PRIMARY, self.BODY)
+            assert self._env({"x-uber-signature": sig}, body=self.BODY.replace(b'"e"', b'"f"')) is None
+            # A re-serialised (re-spaced) body is a different byte string.
+            assert self._env({"x-uber-signature": sig}, body=self.BODY.replace(b":", b": ")) is None
+
+    def test_missing_signature_is_refused(self):
+        with self._settings():
+            assert self._env({}) is None
+            assert self._env({"x-uber-signature": ""}) is None
+
+    @pytest.mark.parametrize("value", [
+        "sha256=" + "a" * 64,                 # prefixed, Meta-style
+        "a" * 63, "a" * 65,                   # wrong length
+        "g" * 64,                              # not hex
+        "é" * 64,                        # non-ASCII would make compare_digest raise
+        "abc, def",
+    ])
+    def test_malformed_header_is_refused_without_raising(self, value):
+        with self._settings():
+            assert self._env({"x-uber-signature": value, "x-uber-signature-new": value}) is None
+
+    def test_prefixed_header_is_refused_even_with_the_right_digest(self):
+        with self._settings():
+            assert self._env({"x-uber-signature": "sha256=" + self._sig(self.PRIMARY, self.BODY)}) is None
+
+    def test_unset_signing_keys_never_match_an_empty_key(self):
+        with self._settings(UBER_EATS_SANDBOX_WEBHOOK_SIGNING_KEY="",
+                            UBER_EATS_SANDBOX_WEBHOOK_SECONDARY_SIGNING_KEY="",
+                            UBER_EATS_SANDBOX_CLIENT_SECRET="", UBER_EATS_CLIENT_SECRET=""):
+            assert self._env({"x-uber-signature": self._sig("", self.BODY)}) is None
+
+    def test_sandbox_keys_never_prove_production(self):
+        with self._settings():
+            assert self._env({"x-uber-signature": self._sig(self.PRIMARY, self.BODY)}) == "sandbox"
+            assert self._env({"x-uber-signature": self._sig("prod-secret", self.BODY)}) == "production"
+
+    def test_log_names_the_key_label_never_its_value(self, caplog):
+        import logging
+        with self._settings(), caplog.at_level(logging.INFO, logger="backend.app.delivery.uber.environments"):
+            self._env({"x-uber-signature-new": self._sig(self.SECONDARY, self.BODY)})
+        text = caplog.text
+        assert "key=secondary_signing_key" in text and "header=x-uber-signature-new" in text
+        assert self.SECONDARY not in text and self.PRIMARY not in text
+
+    def test_log_reports_each_presented_header_separately(self, caplog):
+        import logging
+        with self._settings(), caplog.at_level(logging.INFO, logger="backend.app.delivery.uber.environments"):
+            self._env({"x-uber-signature": self._sig(self.PRIMARY, self.BODY),
+                       "x-uber-signature-new": self._sig(self.SECONDARY, self.BODY)})
+            self._env({"x-uber-signature": self._sig(self.PRIMARY, self.BODY), "x-uber-signature-new": "0" * 64})
+        first, second = [r.getMessage() for r in caplog.records if "SIGNATURE_VERIFIED" in r.getMessage()]
+        assert "key=signing_key header=x-uber-signature " in first
+        assert "x-uber-signature=signing_key, x-uber-signature-new=secondary_signing_key" in first
+        assert "x-uber-signature-new=none" in second
+        assert self.SECONDARY not in caplog.text and self.PRIMARY not in caplog.text
+
+
+class TestUberEpochTimestamps:
+    """Uber (2026-10-29): epoch timestamps are UTC and may be seconds OR milliseconds."""
+
+    def test_seconds_and_milliseconds_parse_to_the_same_instant(self):
+        seconds = uber_mapping._parse_timestamp(1761771000)
+        assert seconds is not None and seconds.tzinfo is not None
+        assert uber_mapping._parse_timestamp(1761771000000) == seconds
+        assert uber_mapping._parse_timestamp(1761771000.5) == uber_mapping._parse_timestamp(1761771000500)
+
+    def test_iso_strings_and_junk(self):
+        assert uber_mapping._parse_timestamp("2026-10-29T20:50:00Z").isoformat() == "2026-10-29T20:50:00+00:00"
+        assert uber_mapping._parse_timestamp(True) is None
+        assert uber_mapping._parse_timestamp("not a time") is None
+        assert uber_mapping._parse_timestamp(None) is None
+
+
+class TestProductionWebhookSigningKeys:
+    """BUG-0190: production gets its own dashboard signing keys, like the sandbox."""
+
+    BODY = b'{"event_id":"e","event_type":"orders.notification"}'
+    PROD_KEY, PROD_SECONDARY, SANDBOX_KEY = "q" * 64, "r" * 64, "p" * 64
+
+    def _settings(self, **overrides):
+        from backend.app.core.config import get_settings
+        values = {
+            "UBER_EATS_CLIENT_SECRET": "prod-secret",
+            "UBER_EATS_SANDBOX_CLIENT_SECRET": "sandbox-secret",
+            "UBER_EATS_SANDBOX_WEBHOOK_SIGNING_KEY": self.SANDBOX_KEY,
+            "UBER_EATS_SANDBOX_WEBHOOK_SECONDARY_SIGNING_KEY": "",
+            "UBER_EATS_WEBHOOK_SIGNING_KEY": self.PROD_KEY,
+            "UBER_EATS_WEBHOOK_SECONDARY_SIGNING_KEY": self.PROD_SECONDARY,
+        }
+        values.update(overrides)
+        return patch.multiple(get_settings(), **values)
+
+    def _sig(self, key):
+        return hmac.new(key.encode(), self.BODY, hashlib.sha256).hexdigest()
+
+    def test_production_signing_key_proves_production(self):
+        from backend.app.delivery.uber.environments import match_webhook_environment
+        with self._settings():
+            assert match_webhook_environment(self.BODY, self._sig(self.PROD_KEY)) == "production"
+            assert match_webhook_environment(self.BODY, self._sig(self.PROD_SECONDARY)) == "production"
+            assert match_webhook_environment(self.BODY, self._sig(self.SANDBOX_KEY)) == "sandbox"
+
+    def test_client_secret_no_longer_accepted_once_production_keys_are_set(self):
+        from backend.app.delivery.uber.environments import match_webhook_environment
+        with self._settings():
+            assert match_webhook_environment(self.BODY, self._sig("prod-secret")) is None
+
+    def test_without_production_keys_the_client_secret_is_still_tried(self):
+        from backend.app.delivery.uber.environments import match_webhook_environment
+        with self._settings(UBER_EATS_WEBHOOK_SIGNING_KEY="", UBER_EATS_WEBHOOK_SECONDARY_SIGNING_KEY=""):
+            assert match_webhook_environment(self.BODY, self._sig("prod-secret")) == "production"
+
+    def test_the_new_header_is_verified_with_production_keys(self):
+        with self._settings():
+            env = UberEatsAdapter().verified_webhook_environment(
+                self.BODY, {"x-uber-signature": "0" * 64, "x-uber-signature-new": self._sig(self.PROD_SECONDARY)})
+            assert env == "production"

@@ -47,7 +47,7 @@ class Order(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     )
     payment_status: Mapped[str] = mapped_column(
         String(32), default="PENDING", nullable=False,
-        comment="PENDING / PAID / CASH_ON_COLLECTION"
+        comment="UNPAID / PENDING / PAID / FAILED / REFUNDED / PARTIALLY_REFUNDED / VOIDED / CASH_ON_COLLECTION"
     )
 
     # ── Order Details ────────────────────────────────────────────────────
@@ -57,7 +57,7 @@ class Order(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     )
     source: Mapped[str] = mapped_column(
         String(32), default="WHATSAPP", nullable=False,
-        comment="WHATSAPP / MANUAL / ADMIN"
+        comment="WHATSAPP / MANUAL / ADMIN / POS / UBER_EATS / MR_D / OTHER_EXTERNAL — see shared.enums.OrderSource"
     )
 
     # ── Money (cents) ────────────────────────────────────────────────────

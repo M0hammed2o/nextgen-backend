@@ -218,3 +218,55 @@ async def test_unknown_order_is_404():
             body=PaymentUpdateRequest(payment_status="PAID"),
             user=user, db=db,
         )
+
+
+# ── Rejected: a marketplace order's payment was collected externally ───────
+# Before this fix, nothing stopped staff relabelling a UBER_EATS/MR_D order's
+# payment_method as CASH — the till itself stayed correct (it sums by
+# till_session_id, which marketplace orders never have), but the payment-mix
+# report would silently count externally-collected revenue as cash taken by
+# the restaurant. Found during the delivery-integration Phase 1 audit,
+# 2026-10-26 (see KNOWN_BUGS.md).
+
+async def test_owner_cannot_edit_payment_on_a_uber_eats_order():
+    user = make_user(role="OWNER")
+    order = make_order(user.business_id, payment_status="PAID", source="UBER_EATS")
+    db = FakeDB([FakeResult(scalar=order)])
+
+    with pytest.raises(AppError) as exc_info:
+        await update_payment_status(
+            order_id=order.id,
+            body=PaymentUpdateRequest(payment_status="PAID", payment_method="CASH"),
+            user=user, db=db,
+        )
+    assert exc_info.value.code == "EXTERNAL_ORDER_PAYMENT_LOCKED"
+    assert db.commits == 0
+
+
+async def test_staff_cannot_edit_payment_on_a_mr_d_order():
+    user = make_user(role="STAFF")
+    order = make_order(user.business_id, payment_status="PAID", source="MR_D")
+    db = FakeDB([FakeResult(scalar=order)])
+
+    with pytest.raises(AppError) as exc_info:
+        await update_payment_status(
+            order_id=order.id,
+            body=PaymentUpdateRequest(payment_status="PAID", payment_method="CARD"),
+            user=user, db=db,
+        )
+    assert exc_info.value.code == "EXTERNAL_ORDER_PAYMENT_LOCKED"
+
+
+async def test_whatsapp_order_payment_edit_is_unaffected_by_the_new_guard():
+    # Regression guard: the fix must only gate EXTERNAL_ORDER_SOURCES, never
+    # the ordinary WhatsApp/POS/manual sources this endpoint exists for.
+    user = make_user(role="STAFF")
+    order = make_order(user.business_id, payment_status="UNPAID", source="WHATSAPP")
+    db = FakeDB([FakeResult(scalar=order)])
+
+    result = await update_payment_status(
+        order_id=order.id,
+        body=PaymentUpdateRequest(payment_status="PAID", payment_method="CASH"),
+        user=user, db=db,
+    )
+    assert result.payment_status == "PAID"

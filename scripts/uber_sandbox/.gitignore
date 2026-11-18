@@ -1,0 +1,10 @@
+# Local sandbox state: secrets, logins, captured webhooks, logs. Never commit.
+sandbox.env
+logins.local.txt
+tenants.json
+captures/
+*.log
+*.bak
+current_tunnel_url.txt
+shots*/
+__pycache__/

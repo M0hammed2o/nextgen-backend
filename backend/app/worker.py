@@ -33,10 +33,13 @@ from backend.app.bot.pipeline import process_inbound_message
 from backend.app.bot.whatsapp_sender import send_notification_message
 from backend.app.core.config import WORKER_HEARTBEAT_REDIS_KEY, get_settings
 from backend.app.db.session import DATABASE_URL
+from backend.app.delivery.retention import delivery_webhook_retention_sweep
 from backend.app.delivery.order_service import (
     delivery_accept_deadline_watchdog,
+    delivery_order_recovery_and_reminders,
     process_delivery_cancellation,
     process_delivery_order,
+    sync_delivery_order_status,
 )
 from shared.models.business import Business
 from shared.models.customer import Customer
@@ -731,6 +734,7 @@ class WorkerSettings:
         process_whatsapp_message,
         process_delivery_order,
         process_delivery_cancellation,
+        sync_delivery_order_status,
     ]
     on_startup = startup
     on_shutdown = shutdown
@@ -800,6 +804,14 @@ class WorkerSettings:
             second={0, 30},
             run_at_startup=True,
         ),
+        # BUG-0191: re-enqueue orders whose job was lost (Redis restart,
+        # worker crash) and remind staff about orders waiting on them.
+        # Offset from the watchdog so the two never share a tick.
+        cron(
+            delivery_order_recovery_and_reminders,
+            second={15, 45},
+            run_at_startup=True,
+        ),
         # WhatsApp order-usage threshold alerts (migration 0057_pos_entitlement)
         # — monitoring/reporting only, once daily, off-peak alongside the
         # stale-WhatsApp-connection sweep above.
@@ -807,6 +819,15 @@ class WorkerSettings:
             check_whatsapp_usage_alerts,
             hour=3,
             minute=30,
+            second=0,
+            run_at_startup=False,
+        ),
+        # Delivery webhook event retention (redact at 30 days, delete at
+        # 400) — once daily, off-peak. See backend/app/delivery/retention.py.
+        cron(
+            delivery_webhook_retention_sweep,
+            hour=3,
+            minute=45,
             second=0,
             run_at_startup=False,
         ),
