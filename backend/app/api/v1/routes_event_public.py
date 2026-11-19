@@ -43,7 +43,7 @@ Enumeration and error design
 # required query parameter (every POST /register got 422; found by the HTTP E2E).
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Literal
 from zoneinfo import ZoneInfo
 
@@ -182,8 +182,18 @@ def _accepted(tz_name: str, billable: set, prep_days: int) -> dict:
                     "confirm it."),
         # Informational: a vendor registering long before the event cannot log in yet.
         "access_level": decision.level,
-        "login_opens_on": (min(billable) - timedelta(days=prep_days)) if billable else None,
+        # Null means "now": once the prep window has opened, a past date would
+        # tell the vendor to wait for a day that has already gone.
+        "login_opens_on": login_opens_on(local_day, billable, prep_days),
     }
+
+
+def login_opens_on(local_day: date, billable: set, prep_days: int) -> date | None:
+    """First day an event vendor can log in, or None when that is today or earlier (or no billable days)."""
+    if not billable:
+        return None
+    opens = min(billable) - timedelta(days=prep_days)
+    return opens if opens > local_day else None
 
 
 async def _email_taken(db: AsyncSession, email: str) -> bool:

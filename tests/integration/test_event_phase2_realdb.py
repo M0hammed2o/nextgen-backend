@@ -282,6 +282,13 @@ async def test_registration_input_policy(db, bag):
             _body(bag, ev["code"], **bad)
 
 
+async def test_login_opens_on_is_null_when_login_is_already_open(db, bag):
+    """E2E finding: an event starting today answered 'You can log in from <past date>'."""
+    ev = await _open_event(db, bag, days=[TODAY, TODAY + timedelta(days=1)])
+    v = await _register(db, bag, ev)
+    assert v["access_level"] != "NONE" and v["login_opens_on"] is None
+
+
 async def test_far_future_registration_is_suspended_until_the_prep_window(db, bag):
     far = [TODAY + timedelta(days=60), TODAY + timedelta(days=61)]
     ev = await _open_event(db, bag, days=far)
