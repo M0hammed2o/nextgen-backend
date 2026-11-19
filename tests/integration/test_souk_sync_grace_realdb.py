@@ -265,6 +265,19 @@ async def test_non_event_business_never_gets_grace(db, bag):
     assert r.status_code == 403 and _code(r) == "BUSINESS_SUSPENDED"
 
 
+async def test_restaurant_that_once_traded_at_a_souk_gets_no_grace(db, bag):
+    # A business with real paid vendor rows at an ended event, but no longer on the EVENT plan,
+    # carrying the exact end-of-event reason: the plan check alone must refuse the grace.
+    _, v, owner_row, _, _, grace = await _ended_vendor(db, bag, [_day(-1)])
+    assert grace is not None
+    await db.execute(update(Business).where(Business.id == v["business_id"]).values(plan="STARTER"))
+    await db.commit()
+    assert await event_sync_grace_until(db, v["business_id"]) is None
+    async with _client() as c:
+        r = await c.get("/v1/business/orders", headers=_bearer(owner_row))
+    assert r.status_code == 403 and _code(r) == "BUSINESS_SUSPENDED"
+
+
 # == allowlist through the real app ============================================
 
 async def test_allowlist_over_http_during_grace(db, bag):
