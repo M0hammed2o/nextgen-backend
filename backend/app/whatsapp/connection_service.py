@@ -272,6 +272,12 @@ async def _claim_routing_number(
             "business. Disconnect it there first, or choose a different number.",
         )
 
+    if (business.whatsapp_phone_number_id, business.whatsapp_business_account_id) != (
+        connection.phone_number_id, connection.waba_id,
+    ):
+        # Order-ready template approval (migration 0071) was confirmed for the
+        # previous WABA/number; a different one needs re-confirmation.
+        business.whatsapp_ready_template_approved = False
     business.whatsapp_phone_number_id = connection.phone_number_id
     business.whatsapp_business_account_id = connection.waba_id
     connection.status = "CONNECTED"
@@ -346,6 +352,9 @@ async def disconnect(
     # previously never cleared by disconnect() at all).
     if business.whatsapp_business_account_id == connection.waba_id:
         business.whatsapp_business_account_id = None
+
+    # The order-ready template approval belonged to this WABA (migration 0071).
+    business.whatsapp_ready_template_approved = False
 
     connection.status = "DISCONNECTED"
     connection.status_reason = "Disconnected by owner"

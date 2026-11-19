@@ -361,3 +361,38 @@ async def test_ready_send_path_raising_still_returns_the_ready_order(db, stalls)
     reasons = (await db.execute(select(OrderEvent.reason).where(OrderEvent.order_id == order.id))).scalars().all()
     assert order_ready.REASON_SEND_FAILED in reasons
     assert (await _fresh(db, Order, order.id)).status == "READY"
+
+
+# -- review L-4: template approval is per WABA/number ---------------------------------------
+
+async def test_disconnect_clears_template_approval(db, stalls):
+    st = await _ready_vendor(db, stalls)
+    with patch("backend.app.whatsapp.graph_client.MetaGraphClient.unsubscribe_app", new=AsyncMock()):
+        await wa_connect.disconnect_whatsapp(_user(st.business_id), db)
+    assert (await _fresh(db, Business, st.business_id)).whatsapp_ready_template_approved is False
+
+
+@pytest.mark.parametrize("same", [True, False])
+async def test_claiming_a_different_number_clears_template_approval(db, stalls, same):
+    from backend.app.whatsapp import connection_service
+    st = await _ready_vendor(db, stalls)
+    biz = await _fresh(db, Business, st.business_id)
+    conn = (await db.execute(select(WhatsAppConnection).where(
+        WhatsAppConnection.business_id == st.business_id))).scalar_one()
+    await db.execute(update(Business).where(Business.id == st.business_id).values(
+        whatsapp_business_account_id=conn.waba_id))
+    await db.commit()
+    biz = await _fresh(db, Business, st.business_id)
+    if not same:
+        conn.phone_number_id = f"8{uuid.uuid4().int % 10**12:012d}"
+        conn.waba_id = f"w-new-{uuid.uuid4().hex[:6]}"
+    outcome = await connection_service._claim_routing_number(db, biz, conn, None)
+    assert outcome.success
+    assert (await _fresh(db, Business, st.business_id)).whatsapp_ready_template_approved is same
+
+
+async def test_admin_number_change_clears_template_approval(db, stalls):
+    st = await _ready_vendor(db, stalls, plan="STARTER", connection=None)
+    out = await update_business(st.business_id, BusinessUpdate(
+        whatsapp_phone_number_id=f"7{uuid.uuid4().int % 10**12:012d}"), ADMIN, db)
+    assert out.whatsapp_ready_template_approved is False

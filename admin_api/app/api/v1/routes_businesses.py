@@ -638,6 +638,11 @@ async def update_business(
     # approval needs a template name.
     template_fields = ("whatsapp_ready_template_name", "whatsapp_ready_template_language")
     template_changed = any(f in changes and changes[f] != getattr(biz, f) for f in template_fields)
+    # A different WhatsApp number/WABA also needs the template re-confirmed.
+    template_changed = template_changed or any(
+        f in changes and changes[f] != getattr(biz, f)
+        for f in ("whatsapp_phone_number_id", "whatsapp_business_account_id")
+    )
     if template_changed and "whatsapp_ready_template_approved" not in changes:
         changes["whatsapp_ready_template_approved"] = False
     if changes.get("whatsapp_ready_template_approved") is True:
