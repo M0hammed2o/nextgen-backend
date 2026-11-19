@@ -189,6 +189,10 @@ class FakeUpdateDB:
 
             def scalar_one_or_none(self):
                 return self._item
+
+            def scalar(self):
+                # update_item's has_variants EXISTS probe: this item has no variants.
+                return False
         return _Result(self._item)
 
     async def commit(self):

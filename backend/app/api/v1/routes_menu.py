@@ -18,6 +18,39 @@ from backend.app.core.rbac import AuthUser, require_owner_or_manager, require_st
 from backend.app.db.session import get_db
 from shared.models.asset import Asset
 from shared.models.menu import MenuAddOn, MenuCategory, MenuItem, menu_item_add_ons
+from shared.models.variant import ProductVariant
+
+
+def _has_active_variants_expr():
+    """
+    Correlated EXISTS: does this menu item have at least one ACTIVE variant?
+
+    Same rule the POS uses for VARIANT_REQUIRED (routes_pos.py) and the same
+    set GET /menu/items/{id}/variants returns by default, so `has_variants`
+    tells the till exactly whether that request can return anything. Used as
+    an extra column on the list query (one statement for the whole list, the
+    ix_product_variants_menu_item_id index serves each probe) - never per row.
+    The business_id match is defence in depth: variants are always created in
+    the item's own business.
+    """
+    return (
+        select(ProductVariant.id)
+        .where(
+            ProductVariant.menu_item_id == MenuItem.id,
+            ProductVariant.business_id == MenuItem.business_id,
+            ProductVariant.is_active.is_(True),
+        )
+        .exists()
+    )
+
+
+def _item_response(item: MenuItem, has_variants: bool) -> "ItemResponse":
+    return ItemResponse.model_validate(item).model_copy(update={"has_variants": bool(has_variants)})
+
+
+async def _item_has_variants(db: AsyncSession, item: MenuItem) -> bool:
+    result = await db.execute(select(_has_active_variants_expr()).where(MenuItem.id == item.id))
+    return bool(result.scalar())
 
 
 async def _resolve_item_image(db: AsyncSession, business_id: uuid.UUID, image_asset_id) -> tuple[str | None, "Asset | None"]:
@@ -199,6 +232,10 @@ class ItemResponse(BaseModel):
     sort_order: int
     image_url: str | None
     requires_preparation: bool = True
+    # True when the item has at least one ACTIVE product variant (migration
+    # 0066). Lets the staff till skip GET /items/{id}/variants for ordinary
+    # products. Additive: older clients ignore it.
+    has_variants: bool = False
     model_config = {"from_attributes": True}
 
 
@@ -314,7 +351,7 @@ async def list_items(
     db: AsyncSession = Depends(get_db),
 ):
     query = (
-        select(MenuItem)
+        select(MenuItem, _has_active_variants_expr().label("has_variants"))
         .where(
             MenuItem.business_id == user.business_id,
             MenuItem.is_deleted == False,
@@ -327,7 +364,7 @@ async def list_items(
 
     query = query.order_by(MenuItem.sort_order, MenuItem.name)
     result = await db.execute(query)
-    return [ItemResponse.model_validate(item) for item in result.scalars().all()]
+    return [_item_response(item, has_variants) for item, has_variants in result.all()]
 
 
 @router.post("/items", response_model=ItemResponse, status_code=201)
@@ -358,7 +395,7 @@ async def create_item(
         asset.entity_id = item.id
     await db.commit()
     await db.refresh(item)
-    return ItemResponse.model_validate(item)
+    return _item_response(item, False)  # a brand-new item cannot have variants yet
 
 
 @router.put("/items/{item_id}", response_model=ItemResponse)
@@ -401,7 +438,7 @@ async def update_item(
 
     await db.commit()
     await db.refresh(item)
-    return ItemResponse.model_validate(item)
+    return _item_response(item, await _item_has_variants(db, item))
 
 
 @router.delete("/items/{item_id}", status_code=204)

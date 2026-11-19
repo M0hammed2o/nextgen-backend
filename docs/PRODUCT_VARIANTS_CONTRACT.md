@@ -24,6 +24,11 @@ inventory ledger; nothing restaurant-specific changed (an item with no variants 
 | GET | `/business/pos/lookup?barcode=..` or `?sku=..` (exactly one; active only) | staff+, POS enabled |
 | GET | `/business/analytics/variants?range=7d&menu_item_id=` | owner/manager |
 
+Menu items: `GET /business/menu/items` (and the `POST`/`PUT /business/menu/items` responses) carry
+`has_variants: bool` = the item has at least one ACTIVE variant (same rule as `VARIANT_REQUIRED` and the default
+variants GET). Computed in the list query as one correlated `EXISTS` per row (no extra query per item). The staff
+till skips `GET .../variants` when it is `false`, and still asks when it is `true` or absent (older backend).
+
 `VariantCreate`: `{sku, barcode?, attributes{str:str}, price_cents?, cost_cents?, sort_order?, track_stock=true, opening_stock?}`.
 `MatrixCreate`: `{sku_prefix, sizes[], colours[], price_cents?, cost_cents?, track_stock=true, opening_stock?}` ->
 SKU `<PREFIX>-<SIZE>-<COLOUR>` upper-cased, spaces removed; all-or-nothing; max 200 combinations.
