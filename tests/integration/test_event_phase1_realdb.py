@@ -240,6 +240,23 @@ async def test_admin_suspension_is_never_lifted_by_reconcile_only_by_reinstate(d
     assert await _refused(reinstate_vendor(ev["id"], v["vendor_id"], ADMIN, db)) == "NOT_ADMIN_SUSPENDED"
 
 
+async def test_vendor_list_filters_suspended_vendors_separately_from_status(db, bag):
+    """E2E finding: the admin UI offered status=SUSPENDED, which the API (rightly)
+    rejects. Suspension is a business state, filtered with `suspended`."""
+    ev = await _event(db, bag)
+    a, b = await _vendors(db, ev, bag, [_row(bag, starts=DAYS[0], ends=DAYS[4]), _row(bag, starts=DAYS[0], ends=DAYS[4])])
+    await _pay(db, ev, a)
+    await _pay(db, ev, b)
+    await suspend_vendor(ev["id"], a["vendor_id"], VendorSuspend(reason="complaint"), ADMIN, db)
+    only_suspended = await list_vendors(ev["id"], ADMIN, db, suspended=True)
+    assert [i["vendor_id"] for i in only_suspended["items"]] == [a["vendor_id"]] and only_suspended["total"] == 1
+    not_suspended = await list_vendors(ev["id"], ADMIN, db, suspended=False)
+    assert [i["vendor_id"] for i in not_suspended["items"]] == [b["vendor_id"]]
+    assert (await list_vendors(ev["id"], ADMIN, db))["total"] == 2
+    # Combines with the status filter (the suspended vendor's subscription is still ACTIVE).
+    assert (await list_vendors(ev["id"], ADMIN, db, status="ACTIVE", suspended=True))["total"] == 1
+
+
 async def test_reinstate_refuses_another_suspension_reason(db, bag):
     ev = await _event(db, bag)
     [v] = await _vendors(db, ev, bag, [_row(bag)])

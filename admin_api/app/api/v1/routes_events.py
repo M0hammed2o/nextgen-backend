@@ -615,11 +615,18 @@ async def list_vendors(
     q: Annotated[str | None, Query(max_length=100)] = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
+    suspended: Annotated[bool | None, Query()] = None,
 ):
+    """`status` is the EventVendor lifecycle status. Suspension is not one of
+    those statuses: it is the vendor business being switched off
+    (Business.is_active false, with a suspended_reason: admin suspension or the
+    event access window), so it is filtered separately with `suspended`."""
     event = await _load_event(db, event_id)
     conds = [EventVendor.event_id == event_id]
     if status:
         conds.append(EventVendor.status == status)
+    if suspended is not None:
+        conds.append(Business.is_active.is_(not suspended))
     if category:
         conds.append(EventVendor.category == category)
     if q and q.strip():
