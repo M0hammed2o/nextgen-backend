@@ -69,6 +69,51 @@ def _amount_currency_ok(
     return True
 
 
+async def _flag_event_payment_outside_trading(db: AsyncSession, order: Order, provider_name: str) -> None:
+    """
+    Record an OrderEvent + AuditEvent "paid on a non-trading day" when an
+    event-plan business receives a provider payment while it may not trade
+    (organiser review). Restaurants: nothing is recorded; the Business row is
+    normally already in the session (the webhook route loaded it to verify the
+    signature), so db.get adds no query. Never raises: a failure here must not
+    stop a real payment being recorded.
+    """
+    try:
+        from backend.app.events.trading import bot_trade_refusal
+        from shared.enums import EVENT_PLAN, AuditScope
+        from shared.models.audit import AuditEvent
+
+        business = await db.get(Business, order.business_id)
+        if business is None or business.plan != EVENT_PLAN:
+            return
+        refusal = await bot_trade_refusal(db, business)
+        if refusal is None:
+            return
+        db.add(OrderEvent(
+            order_id=order.id,
+            business_id=order.business_id,
+            old_status=order.status,
+            new_status=order.status,
+            reason="Paid on a non-trading day (event vendor): flagged for organiser review",
+        ))
+        db.add(AuditEvent(
+            scope=AuditScope.BUSINESS.value,
+            business_id=order.business_id,
+            actor_user_id=None,
+            action="event.payment.outside_trading_day",
+            target_type="order",
+            target_id=order.id,
+            diff_json={"reason": refusal, "provider": provider_name, "order_number": order.order_number,
+                       "total_cents": order.total_cents},
+        ))
+        logger.warning(
+            "%s webhook: event vendor order %s paid on a non-trading day (%s) - flagged",
+            provider_name, order.order_number, refusal,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not evaluate the event trading flag for order %s", getattr(order, "id", None))
+
+
 async def _mark_order_paid(
     db: AsyncSession,
     order_id_str: str,
@@ -130,6 +175,9 @@ async def _mark_order_paid(
         new_status=order.status,
         reason=f"Payment confirmed via {provider_name} webhook",
     ))
+    # Souk WhatsApp gate: NOT gated (the customer's money has already moved),
+    # but an event vendor paid on a non-trading day is flagged for review.
+    await _flag_event_payment_outside_trading(db, order, provider_name)
     await db.commit()
     await db.refresh(order)
 

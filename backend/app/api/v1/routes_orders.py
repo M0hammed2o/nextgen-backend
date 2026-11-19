@@ -26,6 +26,7 @@ from backend.app.receipts.whatsapp_receipt import (
 )
 from backend.app.utils.phone import normalize_sa_mobile
 from shared.enums import (
+    EVENT_PLAN,
     EXTERNAL_ORDER_SOURCES,
     ORDER_STATUS_TRANSITIONS,
     AuditScope,
@@ -615,6 +616,11 @@ async def update_order_status(
     # may always be moved through the kitchen statuses.
     if requested in _COMPLETION_STATUSES and order.payment_status != "PAID":
         await assert_trading_allowed(db, user.business_id)
+    # Souk WhatsApp gate: accepting an online-payment order creates a payment
+    # link below (money requested from the customer), so an event vendor needs
+    # a paid trading day for it. Checked before anything is changed.
+    if requested == OrderStatus.ACCEPTED and order.payment_required:
+        await assert_trading_allowed(db, user.business_id)
 
     old_status = order.status
     order.status = requested.value
@@ -766,7 +772,13 @@ async def update_order_status(
             business_obj = biz_row.scalar_one_or_none()
             phone_number_id = business_obj.whatsapp_phone_number_id if business_obj else None
 
-            if wa_id and phone_number_id:
+            if is_pos_order and business_obj is not None and business_obj.plan == EVENT_PLAN:
+                # Souk event vendor (BUG-0210): READY goes through an approved
+                # template on the vendor's own WABA, opt-out checked, recorded
+                # on the order. Restaurants never take this branch.
+                from backend.app.events.order_ready import send_event_order_ready
+                await send_event_order_ready(db, business_obj, order, wa_id)
+            elif wa_id and phone_number_id:
                 # For online-payment-required orders accepted: send payment instructions
                 # instead of (or in addition to) the generic accepted message.
                 if requested == OrderStatus.ACCEPTED and order.payment_required and business_obj:
@@ -915,6 +927,10 @@ async def set_delivery_fee(
     if order.status != OrderStatus.PENDING_DELIVERY_FEE.value:
         from backend.app.core.errors import InvalidTransitionError
         raise InvalidTransitionError(order.status, "FEE_SENT")
+
+    # Souk WhatsApp gate: quoting a delivery fee asks the customer to commit
+    # to a sale, so an event vendor needs a paid trading day for it.
+    await assert_trading_allowed(db, user.business_id)
 
     biz_result = await db.execute(select(Business).where(Business.id == user.business_id))
     business = biz_result.scalar_one_or_none()

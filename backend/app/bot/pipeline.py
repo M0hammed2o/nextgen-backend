@@ -45,7 +45,8 @@ from backend.app.bot import (
     whatsapp_sender,
 )
 from backend.app.core.errors import DailyLimitError
-from shared.enums import ConversationState, MessageIntent
+from backend.app.events.trading import bot_event_context, bot_trade_refusal
+from shared.enums import EVENT_PLAN, ConversationState, MessageIntent, OrderStatus
 from shared.models.business import Business
 from shared.models.customer import Customer
 from shared.models.menu import MenuCategory, MenuItem
@@ -280,8 +281,8 @@ async def _process(
     norm_text = _normalize_msg(msg_text)
     if norm_text != msg_text:
         logger.info(
-            "MSG_NORMALIZED: original=%r normalized=%r",
-            msg_text[:80], norm_text[:80],
+            "MSG_NORMALIZED: original_len=%d normalized_len=%d",
+            len(msg_text), len(norm_text),
         )
 
     # ── 6b. Detect opt-out intent early ──────────────────────────────────
@@ -322,6 +323,13 @@ async def _process(
         raw_payload=raw_payload,
         intent=intent.value if intent else None,
     )
+
+    # ── 7b. Souk event-vendor WhatsApp gate (EVENT plan only) ─────────────
+    # Owner-approved (docs/EVENT_WHATSAPP.md). Restaurants skip this on the
+    # already-loaded plan value: no extra query, no behaviour change.
+    if getattr(business, "plan", None) == EVENT_PLAN:
+        if await _event_vendor_soft_gate(db, business, customer, wa_id):
+            return
 
     # ── 8. Check daily message limit ─────────────────────────────────────
     try:
@@ -424,12 +432,12 @@ async def _process(
 
     # ── 11. Process based on intent + state ──────────────────────────────
     logger.warning(
-        "PIPELINE_HANDLE_START: business_id=%s, wa_id=%s, intent=%s, session_state=%s, msg_text=%r",
+        "PIPELINE_HANDLE_START: business_id=%s, wa_id=%s, intent=%s, session_state=%s, msg_len=%d",
         business.id,
         wa_id,
         intent.value if intent else "None",
         session.state,
-        msg_text[:80],
+        len(msg_text),
     )
 
     response_text, is_llm, llm_tokens, llm_cost, llm_provider = await _handle_message(
@@ -446,13 +454,12 @@ async def _process(
     if response_text:
         logger.warning(
             "PIPELINE_SENDING_REPLY: business_id=%s, wa_id=%s, intent=%s, "
-            "is_llm=%s, text_len=%d, text_preview=%r",
+            "is_llm=%s, text_len=%d",
             business.id,
             wa_id,
             intent.value if intent else "UNKNOWN",
             is_llm,
             len(response_text),
-            response_text[:80],
         )
         await _send_response(
             db=db,
@@ -684,7 +691,7 @@ def _never_empty_reply(fn):
             return result
         logger.warning(
             "EMPTY_RESPONSE_GUARD: handler returned blank text, substituting a prompt. "
-            "state=%s, session_id=%s, msg=%r", session.state, session.id, msg_text[:80],
+            "state=%s, session_id=%s, msg_len=%d", session.state, session.id, len(msg_text),
         )
         fallback = None
         pend = state_machine.get_context(session, "pending_options")
@@ -731,10 +738,10 @@ async def _handle_message(
     """
     current_state = session.state
     logger.warning(
-        "HANDLE_MSG: intent=%s, state=%s, msg=%r",
+        "HANDLE_MSG: intent=%s, state=%s, msg_len=%d",
         intent.value if intent else "None",
         current_state,
-        msg_text[:80],
+        len(msg_text),
     )
 
     # ── Outstanding named-variant-family allocation (BUG-0172) ──────────
@@ -793,8 +800,8 @@ async def _handle_message(
         }
         if current_state in _CONFIRM_YIELD_STATES and intent_router.is_confirmation(norm_text):
             logger.warning(
-                "HANDLE_BRANCH: GREETING → yielding to %s confirmation handler, msg=%r",
-                current_state, msg_text[:40],
+                "HANDLE_BRANCH: GREETING → yielding to %s confirmation handler, msg_len=%d",
+                current_state, len(msg_text),
             )
             # Fall through: do NOT return — let CONFIRMING_ORDER / WAITING_DELIVERY_FEE_APPROVAL
             # handlers below run for this message.
@@ -1335,8 +1342,8 @@ async def _handle_message(
             state_machine.clear_cart(session)
             state_machine.transition_state(session, ConversationState.BUILDING_CART.value)
             logger.warning(
-                "CART_CORRECTION: cleared cart, transitioning to BUILDING_CART, rebuilding via LLM. session_id=%s, msg=%r",
-                session.id, msg_text[:80],
+                "CART_CORRECTION: cleared cart, transitioning to BUILDING_CART, rebuilding via LLM. session_id=%s, msg_len=%d",
+                session.id, len(msg_text),
             )
             return await _handle_with_llm(
                 db, business, customer, session, msg_text, intent=MessageIntent.ORDER_START,
@@ -1375,7 +1382,7 @@ async def _handle_message(
                 state_machine.transition_state(session, ConversationState.BUILDING_CART.value)
                 logger.warning(
                     "ONLY_WANT_REPLACEMENT: cleared cart, rebuilding via DET/LLM. "
-                    "session_id=%s, msg=%r", session.id, msg_text[:80],
+                    "session_id=%s, msg_len=%d", session.id, len(msg_text),
                 )
                 return await _handle_with_llm(
                     db, business, customer, session,
@@ -1709,8 +1716,8 @@ async def _handle_message(
         or intent_router.is_confirmation(norm_text)
     ):
         logger.warning(
-            "REC_ACCEPT: acceptance detected, %d stored item(s), session_id=%s, msg=%r",
-            len(_recommended), session.id, msg_text[:60],
+            "REC_ACCEPT: acceptance detected, %d stored item(s), session_id=%s, msg_len=%d",
+            len(_recommended), session.id, len(msg_text),
         )
         return await _handle_recommendation_acceptance(db, business, customer, session, _recommended)
 
@@ -5029,7 +5036,7 @@ async def _handle_with_llm(
         # Sub-case C: real cart item removal — fall through to LLM
         logger.warning(
             "DET_REMOVE_FALLTHROUGH: no ingredient match, forwarding to LLM. "
-            "session_id=%s, msg=%r", session.id, msg_text[:80],
+            "session_id=%s, msg_len=%d", session.id, len(msg_text),
         )
 
     # ── Deterministic modifier reversal ("actually leave the tomato") ────────
@@ -5877,17 +5884,17 @@ async def _handle_with_llm(
         if _cart_is_empty and not _has_menu_items:
             logger.warning(
                 "ORDER_MUTATION_GUARD_SKIPPED: empty cart + no items in msg, letting LLM response through. "
-                "intent=%s action=%s msg=%r",
-                intent.value if intent else "None", parsed.action, msg_text[:80],
+                "intent=%s action=%s msg_len=%d",
+                intent.value if intent else "None", parsed.action, len(msg_text),
             )
             # Fall through to catch-all below — LLM's chitchat response is returned
         else:
             logger.warning(
-                "ORDER_MUTATION_MISSED: intent=%s parsed_action=%s state=%s msg=%r",
+                "ORDER_MUTATION_MISSED: intent=%s parsed_action=%s state=%s msg_len=%d",
                 intent.value if intent else "None",
                 parsed.action,
                 session.state,
-                msg_text[:80],
+                len(msg_text),
             )
             if intent == MessageIntent.ORDER_REMOVE:
                 retry_msg = "Sorry, I didn't catch which item to remove. Could you tell me the name of the item you'd like taken off? 😊"
@@ -6105,6 +6112,146 @@ async def _cancel_prior_live_orders(
         logger.exception("Failed to cancel prior live orders for customer %s", customer.id)
 
 
+# ── Souk event-vendor WhatsApp gate (docs/EVENT_WHATSAPP.md) ─────────────────
+# Session-context key: the event-local day the "not taking WhatsApp orders"
+# notice was last sent, so a customer gets it at most once per day.
+_EVENT_NOTICE_DAY_KEY = "event_closed_notice_day"
+_PENDING_DELIVERY_STATUSES = (OrderStatus.PENDING_DELIVERY_FEE.value, OrderStatus.FEE_SENT.value)
+
+
+async def _event_refusal_cleanup(db: AsyncSession, business: Business, session) -> None:
+    """
+    An event vendor's bot was refused on a non-trading day: cancel a still-
+    pending delivery order (PENDING_DELIVERY_FEE/FEE_SENT, stock reversed, same
+    pattern as a rejected fee), drop the cart and every order-in-progress key,
+    go IDLE. A superseded live order is NEVER cancelled here: clear_cart only
+    forgets superseded_order_id. Never raises (SAVEPOINT-isolated).
+    """
+    pending_order_id = _parse_uuid(state_machine.get_context(session, "pending_order_id"))
+    if pending_order_id is not None:
+        try:
+            async with db.begin_nested():
+                previous_status = (await db.execute(
+                    select(_Order.status).where(
+                        _Order.id == pending_order_id, _Order.business_id == business.id,
+                    )
+                )).scalar_one_or_none()
+                if previous_status in _PENDING_DELIVERY_STATUSES:
+                    cancelled = (await db.execute(
+                        _sa_update(_Order)
+                        .where(
+                            _Order.id == pending_order_id,
+                            _Order.business_id == business.id,
+                            _Order.status == previous_status,
+                        )
+                        .values(status="CANCELLED", cancelled_reason="Event vendor not trading today")
+                        .returning(_Order.id)
+                    )).scalar_one_or_none()
+                    if cancelled is not None:
+                        db.add(_OrderEvent(
+                            order_id=pending_order_id,
+                            business_id=business.id,
+                            old_status=previous_status,
+                            new_status="CANCELLED",
+                            reason="Event vendor not trading today (WhatsApp gate)",
+                        ))
+                        from backend.app.inventory.cancellation import reverse_consumption_on_cancel
+                        await reverse_consumption_on_cancel(
+                            db,
+                            business_id=business.id,
+                            inventory_enabled=bool(getattr(business, "inventory_enabled", False)),
+                            order_id=pending_order_id,
+                            previous_status=previous_status,
+                        )
+                    await db.flush()
+        except Exception:
+            logger.exception(
+                "EVENT_GATE_PENDING_CANCEL_FAILED: business_id=%s, order_id=%s",
+                business.id, pending_order_id,
+            )
+    state_machine.clear_cart(session)
+    state_machine.transition_state(session, ConversationState.IDLE.value)
+
+
+async def _event_trade_gate(
+    db: AsyncSession, business: Business, session,
+) -> tuple[str, bool, int | None, int | None, str | None] | None:
+    """
+    Hard gate for the bot's order paths. None = may proceed (always None for a
+    restaurant, with no query). Otherwise cleans up and returns the customer
+    notice as the handler's reply.
+    """
+    refusal = await bot_trade_refusal(db, business)
+    if refusal is None:
+        return None
+    logger.warning(
+        "EVENT_BOT_ORDER_REFUSED: business_id=%s, reason=%s, session_id=%s",
+        business.id, refusal, session.id,
+    )
+    await _event_refusal_cleanup(db, business, session)
+    ctx = await bot_event_context(db, business.id)
+    state_machine.set_context(session, _EVENT_NOTICE_DAY_KEY, ctx.local_day)
+    return responses.event_whatsapp_closed_response(business, ctx.event_name), False, None, None, None
+
+
+async def _event_vendor_soft_gate(db: AsyncSession, business: Business, customer: Customer, wa_id: str) -> bool:
+    """
+    Early gate for an EVENT-plan business, after the inbound message row is
+    persisted and before the daily limit / session / LLM. True = stop here.
+
+    - WhatsApp switched off for the vendor, or no usable credentials (no own
+      connection, NEEDS_ATTENTION, DISCONNECTED; never the platform token):
+      nothing is processed and nothing is sent (H-1 residual, M-4).
+    - Not a trading day: cart and pending delivery order cleaned up, the
+      notice sent at most once per event-local day, no LLM call.
+    Never raises into the pipeline.
+    """
+    if not getattr(business, "is_whatsapp_enabled", False):
+        logger.warning("EVENT_WA_DISABLED: business_id=%s - inbound recorded, not processed", business.id)
+        return True
+    from backend.app.whatsapp.token_resolver import resolve_whatsapp_credentials
+    try:
+        async with db.begin_nested():
+            credentials = await resolve_whatsapp_credentials(db, business)
+    except Exception:
+        logger.exception("EVENT_WA_CREDENTIALS_FAILED: business_id=%s", business.id)
+        credentials = None
+    if credentials is None:
+        logger.warning("EVENT_WA_NO_CREDENTIALS: business_id=%s - inbound recorded, not processed", business.id)
+        return True
+
+    refusal = await bot_trade_refusal(db, business)
+    if refusal is None:
+        return False
+
+    session = await state_machine.get_or_create_session(db, business.id, customer.id)
+    await _event_refusal_cleanup(db, business, session)
+    ctx = await bot_event_context(db, business.id)
+    already_told = state_machine.get_context(session, _EVENT_NOTICE_DAY_KEY) == ctx.local_day
+    logger.warning(
+        "EVENT_BOT_NOT_TRADING: business_id=%s, reason=%s, notice=%s, session_id=%s",
+        business.id, refusal, "skipped" if already_told else "sent", session.id,
+    )
+    if not already_told:
+        state_machine.set_context(session, _EVENT_NOTICE_DAY_KEY, ctx.local_day)
+        await _send_response(
+            db=db,
+            business=business,
+            customer=customer,
+            wa_id=wa_id,
+            text=responses.event_whatsapp_closed_response(business, ctx.event_name),
+            intent="EVENT_NOT_TRADING",
+        )
+    try:
+        await usage_tracker.increment_usage(
+            db, business.id, business.timezone,
+            inbound_messages=1, outbound_messages=0 if already_told else 1,
+        )
+    except Exception:
+        logger.exception("EVENT_GATE_USAGE_ERROR: business_id=%s", business.id)
+    return True
+
+
 async def _cancel_superseded_order(
     db: AsyncSession,
     business: Business,
@@ -6186,6 +6333,12 @@ async def _handle_order_confirmation(
     session,
 ) -> tuple[str, bool, int | None, int | None, str | None]:
     """Handle order confirmation — check details, create order."""
+
+    # ── Souk event vendor: no order on a non-trading day (hard gate) ─────
+    # Before any superseded-order cancellation or order creation.
+    _gate_reply = await _event_trade_gate(db, business, session)
+    if _gate_reply is not None:
+        return _gate_reply
 
     # ── Ask pickup vs delivery if not yet chosen ─────────────────────────
     order_mode = state_machine.get_context(session, "order_mode", None)
@@ -6290,8 +6443,8 @@ async def _handle_order_confirmation(
             state_machine.set_context(session, "pending_order_id", str(order.id))
             state_machine.transition_state(session, ConversationState.WAITING_DELIVERY_FEE_APPROVAL.value)
             logger.warning(
-                "DELIVERY_FEE_PENDING: order_id=%s, address=%r, session_id=%s",
-                order.id, delivery_address, session.id,
+                "DELIVERY_FEE_PENDING: order_id=%s, address_len=%d, session_id=%s",
+                order.id, len(str(delivery_address)), session.id,
             )
             return (
                 "Got it! 📍 Your delivery address has been noted.\n\n"
@@ -6661,11 +6814,20 @@ async def _finalize_pending_delivery_order(
     """
     Finalise a PENDING_DELIVERY_FEE or FEE_SENT order after the customer has
     approved the fee and provided their payment method.
-    Updates the order: sets fee, total, payment_status, status → NEW.
+    Updates the order: payment_status, status → NEW. The fee and total are
+    NOT rewritten here (H-3): set_delivery_fee (routes_orders.py) already
+    stored the fee and the VAT/discount-correct total on the order, and a
+    PENDING_DELIVERY_FEE order still carries its creation total. Only an
+    order still PENDING_DELIVERY_FEE/FEE_SENT is finalised; one cancelled
+    meanwhile (fee timeout, staff) is never resurrected.
     """
     from shared.utils.money import format_currency
 
-    fee_cents = state_machine.get_context(session, "delivery_fee_cents", 0)
+    # ── Souk event vendor: no finalisation on a non-trading day (hard gate) ──
+    _gate_reply = await _event_trade_gate(db, business, session)
+    if _gate_reply is not None:
+        return _gate_reply
+
     pending_order_id = state_machine.get_context(session, "pending_order_id")
     if getattr(business, "online_payment_required", False):
         payment_method = None
@@ -6681,19 +6843,31 @@ async def _finalize_pending_delivery_order(
                 .where(
                     _Order.id == _parse_uuid(pending_order_id),
                     _Order.business_id == business.id,
+                    # H-3: never resurrect a cancelled (timed-out / staff) order.
+                    _Order.status.in_((
+                        OrderStatus.PENDING_DELIVERY_FEE.value, OrderStatus.FEE_SENT.value,
+                    )),
                 )
                 .values(
-                    delivery_fee_cents=fee_cents,
-                    total_cents=_Order.subtotal_cents + fee_cents,
                     status="NEW",
                     payment_status=payment_status,
                     payment_required=getattr(business, "online_payment_required", False),
                 )
-                .returning(_Order.order_number, _Order.subtotal_cents)
+                .returning(_Order.order_number, _Order.delivery_fee_cents, _Order.total_cents)
             )
             row = result.one_or_none()
-            order_number = row.order_number if row else "—"
-            subtotal = row.subtotal_cents if row else 0
+            if row is None:
+                # Expired or cancelled meanwhile: nothing was placed.
+                logger.warning(
+                    "DELIVERY_FINALISE_NOT_PENDING: order_id=%s no longer awaiting fee approval, "
+                    "session_id=%s", pending_order_id, session.id,
+                )
+                state_machine.clear_cart(session)
+                state_machine.transition_state(session, ConversationState.IDLE.value)
+                return responses.delivery_order_expired_response(), False, None, None, None
+            order_number = row.order_number
+            fee_cents = row.delivery_fee_cents or 0
+            total_cents = row.total_cents
 
             db.add(_OrderEvent(
                 order_id=_parse_uuid(pending_order_id),
@@ -6716,7 +6890,7 @@ async def _finalize_pending_delivery_order(
                         "order_id": pending_order_id,
                         "order_number": order_number,
                         "status": "NEW",
-                        "total_cents": subtotal + fee_cents,
+                        "total_cents": total_cents,
                         "created_at": datetime.now(timezone.utc).isoformat(),
                     }),
                 )
@@ -6727,12 +6901,12 @@ async def _finalize_pending_delivery_order(
             state_machine.transition_state(session, ConversationState.ORDER_PLACED.value)
             await usage_tracker.increment_usage(
                 db, business.id, business.timezone,
-                orders_created=1, revenue_cents=subtotal + fee_cents,
+                orders_created=1, revenue_cents=total_cents,
             )
             return (
                 f"✅ *Order Confirmed!*\n\nOrder Number: *{order_number}*\n"
                 f"Delivery fee: {format_currency(fee_cents, business.currency)}\n"
-                f"💰 *Total: {format_currency(subtotal + fee_cents, business.currency)}*\n"
+                f"💰 *Total: {format_currency(total_cents, business.currency)}*\n"
                 f"Payment: *{'Cash on delivery' if payment_method == 'CASH_ON_COLLECTION' else 'Card'}*\n\n"
                 f"🚗 We'll be on our way once your order is ready!",
                 False, None, None, None,

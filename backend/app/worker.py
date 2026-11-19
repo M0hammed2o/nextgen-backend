@@ -32,6 +32,7 @@ from backend.app.bot.outbox_worker import _process_batch
 from backend.app.bot.pipeline import process_inbound_message
 from backend.app.bot.whatsapp_sender import send_notification_message
 from backend.app.core.config import WORKER_HEARTBEAT_REDIS_KEY, get_settings
+from backend.app.core.middleware import setup_logging
 from backend.app.db.session import DATABASE_URL
 from backend.app.delivery.retention import delivery_webhook_retention_sweep
 from backend.app.delivery.order_service import (
@@ -70,6 +71,10 @@ async def startup(ctx: dict) -> None:
     The worker uses a small pool (5 connections) separate from the API's pool,
     preventing the outbox worker from competing with request-handling connections.
     """
+    # Souk WhatsApp review H-2: the bot pipeline runs HERE, not in the API
+    # process, so the PII/token masking filter must be installed here too
+    # (main.py's setup_logging call never runs in the worker).
+    setup_logging(get_settings().ENVIRONMENT)
     engine = create_async_engine(
         DATABASE_URL,
         pool_size=5,

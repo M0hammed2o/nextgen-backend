@@ -1564,6 +1564,10 @@ async def create_pos_order(
         customer_name=body.customer_name,
         phone_number=body.customer_phone,
         notify_when_ready=body.notify_when_ready,
+        # Consent provenance (migration 0071): the authenticated caller (JWT)
+        # recorded it at sale time.
+        notify_consent_at=sale_at if body.notify_when_ready else None,
+        notify_consent_by_user_id=user.user_id if body.notify_when_ready else None,
         exchange_of_order_id=body.exchange_of_order_id,
         confirmed_at=sale_at,
         accepted_at=sale_at if initial_status == OrderStatus.ACCEPTED else None,

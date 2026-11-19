@@ -740,8 +740,26 @@ async def get_event_access(
                 for sub in sorted(v.subscriptions, key=lambda x: x.starts_on)
             ],
         })
+    # Souk WhatsApp gate: whether the till may offer the order-ready opt-in,
+    # and what the vendor still needs to go live (manager screen).
+    from backend.app.events.order_ready import (
+        SUGGESTED_TEMPLATE_BODY, SUGGESTED_TEMPLATE_CATEGORY, SUGGESTED_TEMPLATE_LANGUAGE,
+        SUGGESTED_TEMPLATE_NAME, ready_notify_status,
+    )
+    business = (await db.execute(select(Business).where(Business.id == user.business_id))).scalar_one()
+    ready = await ready_notify_status(db, business)
+    whatsapp = {
+        "state": ready.state, "whatsapp_enabled": ready.whatsapp_enabled,
+        "connection_status": ready.connection_status, "template_name": ready.template_name,
+        "template_language": ready.template_language, "template_approved": ready.template_approved,
+        "suggested_template": {
+            "name": SUGGESTED_TEMPLATE_NAME, "language": SUGGESTED_TEMPLATE_LANGUAGE,
+            "category": SUGGESTED_TEMPLATE_CATEGORY, "body": SUGGESTED_TEMPLATE_BODY,
+        },
+    }
     return {"is_event_vendor": True, "access_level": decision.level, "reason": decision.reason, "events": events,
-            "email_verification": email_verification}
+            "email_verification": email_verification,
+            "ready_notify_available": ready.available, "whatsapp": whatsapp}
 
 
 @router.get("/payments/health", response_model=PaymentHealthResponse)

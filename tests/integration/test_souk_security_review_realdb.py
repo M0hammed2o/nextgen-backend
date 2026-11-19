@@ -191,13 +191,21 @@ async def test_h1_event_vendor_cannot_start_exchange_check_or_test_whatsapp(db, 
     assert biz.whatsapp_phone_number_id is None and biz.whatsapp_business_account_id is None
 
 
-async def test_h1_the_refusal_holds_even_if_whatsapp_is_enabled_for_the_event_business(db, bag):
+async def test_h1_refusal_is_lifted_only_once_a_super_admin_enables_whatsapp_for_the_vendor(db, bag):
+    # Souk WhatsApp gate (owner-approved): bot orders now pass the event
+    # trading gate, so the interim refusal is lifted for ONE vendor once a
+    # SUPER_ADMIN sets is_whatsapp_enabled. Before that it still holds (test above).
     ev = await _event(db, bag)
     [v] = await _vendors(db, ev, bag, [_row(bag)])
     await db.execute(update(Business).where(Business.id == v["business_id"]).values(is_whatsapp_enabled=True))
     await db.commit()
-    code = await _code(wa_connect.start_connect.__wrapped__(None, _user(v["business_id"]), db))
-    assert code == "EVENT_WHATSAPP_NOT_AVAILABLE"
+    minted = type("Minted", (), {"token": "state-token", "expires_in": 600})()
+    with (
+        patch.object(wa_connect, "get_redis", AsyncMock()),
+        patch.object(wa_connect, "mint_connect_state", AsyncMock(return_value=minted)),
+    ):
+        out = await wa_connect.start_connect.__wrapped__(None, _user(v["business_id"]), db)
+    assert out.state == "state-token"
 
 
 async def test_h1_admin_bulk_and_self_registered_vendors_have_whatsapp_disabled(db, bag):

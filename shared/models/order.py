@@ -82,6 +82,17 @@ class Order(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         comment="POS only: the customer consented to a WhatsApp message when the order is READY. "
                 "A phone number alone (e.g. captured for loyalty) is never consent."
     )
+    # Consent provenance (migration 0071): when, and which business user
+    # recorded the notify_when_ready consent at the till. Not FK-enforced,
+    # same pattern as cancelled_by_user_id.
+    notify_consent_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+        comment="When the cashier recorded notify_when_ready consent (POS)."
+    )
+    notify_consent_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True,
+        comment="Business user (JWT) who recorded notify_when_ready consent; not FK-enforced."
+    )
     delivery_address: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # ── Timestamps ───────────────────────────────────────────────────────

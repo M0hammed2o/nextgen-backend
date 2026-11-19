@@ -126,16 +126,25 @@ async def test_l4_admin_create_event_plan_business_never_has_whatsapp(db, bag):
     assert biz.is_whatsapp_enabled is False and biz.whatsapp_phone_number_id is None
 
 
-async def test_l4_admin_patch_cannot_enable_whatsapp_or_give_a_number_to_an_event_business(db, bag):
+async def test_l4_admin_patch_never_gives_a_number_to_an_event_business(db, bag):
+    # Souk WhatsApp gate (owner-approved) replaced the interim "never enable"
+    # rule: a SUPER_ADMIN may now switch WhatsApp on for ONE event vendor
+    # (bot orders pass the trading gate), but nobody may type a number or WABA
+    # id for it: those only come from the vendor's own Embedded Signup.
     ev = await create_business(BusinessCreate(name=f"Ev {uuid.uuid4().hex[:5]}", plan="EVENT"), ADMIN, db)
     bag["extra_biz"].append(ev.id)
-    assert await _code(update_business(ev.id, BusinessUpdate(is_whatsapp_enabled=True), ADMIN, db)) == (
-        422, "EVENT_PLAN_WHATSAPP_NOT_ALLOWED")
     assert await _code(update_business(
         ev.id, BusinessUpdate(whatsapp_phone_number_id=f"pn-{uuid.uuid4().hex}"), ADMIN, db)) == (
         422, "EVENT_PLAN_WHATSAPP_NOT_ALLOWED")
+    assert await _code(update_business(
+        ev.id, BusinessUpdate(whatsapp_business_account_id=f"waba-{uuid.uuid4().hex[:8]}"), ADMIN, db)) == (
+        422, "EVENT_PLAN_WHATSAPP_NOT_ALLOWED")
     ok = await update_business(ev.id, BusinessUpdate(name="Renamed"), ADMIN, db)
     assert ok.name == "Renamed" and ok.is_whatsapp_enabled is False
+    on = await update_business(ev.id, BusinessUpdate(is_whatsapp_enabled=True), ADMIN, db)
+    assert on.is_whatsapp_enabled is True and on.whatsapp_phone_number_id is None
+    off = await update_business(ev.id, BusinessUpdate(is_whatsapp_enabled=False), ADMIN, db)
+    assert off.is_whatsapp_enabled is False  # the per-vendor kill switch
 
 
 async def test_l4_admin_patch_to_event_plan_forces_whatsapp_off_and_refuses_a_number(db, bag):
@@ -150,6 +159,7 @@ async def test_l4_admin_patch_to_event_plan_forces_whatsapp_off_and_refuses_a_nu
     out = await update_business(
         biz.id, BusinessUpdate(plan="EVENT", whatsapp_phone_number_id=None), ADMIN, db)
     assert out.plan == "EVENT" and out.is_whatsapp_enabled is False and out.whatsapp_phone_number_id is None
-    # enabling it afterwards is refused
-    assert await _code(update_business(biz.id, BusinessUpdate(is_whatsapp_enabled=True), ADMIN, db)) == (
-        422, "EVENT_PLAN_WHATSAPP_NOT_ALLOWED")
+    # Souk WhatsApp gate: enabling it afterwards is a separate, explicit
+    # super-admin decision (allowed); the plan change itself never enables it.
+    out = await update_business(biz.id, BusinessUpdate(is_whatsapp_enabled=True), ADMIN, db)
+    assert out.is_whatsapp_enabled is True and out.whatsapp_phone_number_id is None

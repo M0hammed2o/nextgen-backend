@@ -354,6 +354,28 @@ def busy_response(business: Business) -> str:
     )
 
 
+def event_whatsapp_closed_response(business: Business, event_name: str | None) -> str:
+    """Souk event vendor on a non-trading day (WhatsApp gate). Deliberately
+    never says why (paid/unpaid is between the vendor and the organiser)."""
+    vendor = getattr(business, "brand_display_name", None) or business.name
+    return (
+        f"Sorry, *{vendor}* isn't taking WhatsApp orders right now. "
+        f"WhatsApp ordering is only open on their trading days at {event_name or 'the event'}. "
+        "Nothing has been ordered and you have not been charged. "
+        "Please visit the stall, or message again on a trading day."
+    )
+
+
+def delivery_order_expired_response() -> str:
+    """A late fee approval / payment choice for an order that was already
+    cancelled (fee timeout or staff): nothing is placed (H-3)."""
+    return (
+        "Sorry, this order has expired or was cancelled, so it has not been placed "
+        "and you have not been charged. 🙏\n\n"
+        "Please send your order again if you'd still like it."
+    )
+
+
 def fallback_response(business: Business) -> str:
     """Response when we can't understand the message."""
     if business.fallback_text:
