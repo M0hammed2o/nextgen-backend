@@ -322,6 +322,29 @@ class TokenMaskingFilter(logging.Filter):
         return True
 
 
+class ArqJobArgsFilter(logging.Filter):
+    """
+    Souk WhatsApp review L-5. arq logs every job start as
+    `'%6.2fs → %s(%s)%s'` with the job's positional arguments repr'd. For
+    process_whatsapp_message those are the customer's wa_id, the raw message
+    text and the raw webhook payload, as bare values that the key-based
+    TokenMaskingFilter cannot recognise. The argument string is replaced by
+    its length. Any other record passes through untouched.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if (
+            isinstance(record.msg, str)
+            and " → %s(%s)" in record.msg
+            and isinstance(record.args, tuple)
+            and len(record.args) >= 3
+        ):
+            args = list(record.args)
+            args[2] = f"<{len(str(args[2]))} chars of job arguments redacted>"
+            record.args = tuple(args)
+        return True
+
+
 class CorrelationIDMiddleware(BaseHTTPMiddleware):
     """
     Assigns a correlation ID to every request.
@@ -429,3 +452,16 @@ def setup_logging(environment: str = "development") -> None:
         # handlers, which a root-handler filter would never reach.
         for handler in logger_obj.handlers:
             handler.addFilter(mask_filter)
+
+    # Review L-5: the ARQ worker. arq.cli configures its own `arq` logger with
+    # its own handler (propagate left on), so its records reached both that
+    # unfiltered handler and the root handler (twice, once root has one).
+    # Mask on arq's handlers (job arguments redacted by ArqJobArgsFilter) and
+    # stop propagation so each arq line is printed once, by arq's handler.
+    arq_logger = logging.getLogger("arq")
+    if arq_logger.handlers:
+        for handler in arq_logger.handlers:
+            _add_mask_filter(handler, mask_filter)
+            if not any(isinstance(f, ArqJobArgsFilter) for f in handler.filters):
+                handler.addFilter(ArqJobArgsFilter())
+        arq_logger.propagate = False

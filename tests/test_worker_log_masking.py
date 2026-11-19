@@ -87,3 +87,40 @@ def test_pipeline_does_not_log_raw_customer_text_or_address():
     assert "norm_text[:" not in src
     assert "text_preview=%r" not in src
     assert "address=%r" not in src
+
+
+@pytest.fixture
+def arq_logger_like_cli():
+    """What arq.cli's dictConfig leaves behind: an `arq` logger with its own handler."""
+    arq = logging.getLogger("arq")
+    saved = (arq.handlers[:], arq.propagate, arq.level)
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    arq.handlers = [handler]
+    arq.propagate = True
+    arq.setLevel(logging.INFO)
+    try:
+        yield stream
+    finally:
+        arq.handlers, arq.propagate = saved[0], saved[1]
+        arq.setLevel(saved[2])
+
+
+@pytest.mark.asyncio
+async def test_arq_job_start_line_is_redacted_and_printed_once(bare_root_logger, arq_logger_like_cli):
+    """Review L-5: arq logs job args (wa_id, message text, payload) as bare reprs."""
+    bare_root_logger.handlers = []
+    with patch.object(worker, "create_async_engine", MagicMock()), \
+         patch.object(worker, "async_sessionmaker", MagicMock()):
+        await worker.startup({})
+    root_stream = io.StringIO()
+    bare_root_logger.handlers[0].setStream(root_stream)
+
+    job_args = "'1234567890', 'wamid.X', '27831234567', 'deliver to 12 Main Road', 'text', {}"
+    logging.getLogger("arq.worker").info("%6.2fs → %s(%s)%s", 0.05, "j1:process_whatsapp_message", job_args, "")
+    logging.getLogger("arq.worker").info("recording health: %s", "j_complete=1")
+    out = arq_logger_like_cli.getvalue()
+    assert "27831234567" not in out and "12 Main Road" not in out
+    assert "j1:process_whatsapp_message" in out and "chars of job arguments redacted" in out
+    assert "recording health: j_complete=1" in out  # other arq lines untouched
+    assert root_stream.getvalue() == ""  # not duplicated through the root handler
