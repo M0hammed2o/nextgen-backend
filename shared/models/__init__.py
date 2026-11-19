@@ -29,6 +29,7 @@ from shared.models.menu_image import BusinessMenuImage
 from shared.models.event import Event, EventDay, EventVendor, EventVendorSubscription
 from shared.models.message import Message
 from shared.models.order import Order, OrderEvent, OrderItem
+from shared.models.offline_review import OfflineCaptureReview
 from shared.models.pos_payment import POSPaymentAllocation, POSPaymentLinkIntent
 from shared.models.push_subscription import PushSubscription
 from shared.models.recipe import Recipe, RecipeItem
@@ -77,6 +78,7 @@ __all__ = [
     "LoyaltyReward",
     "LoyaltyTransaction",
     "MenuAddOn",
+    "OfflineCaptureReview",
     "MenuCategory",
     "MenuItem",
     "Message",
