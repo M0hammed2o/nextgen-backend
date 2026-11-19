@@ -345,3 +345,19 @@ async def test_pos_consent_provenance_recorded(db, stalls):
         out[consent] = await _fresh(db, Order, o.id)
     assert out[True].notify_consent_by_user_id == owner.user_id and out[True].notify_consent_at is not None
     assert out[False].notify_consent_by_user_id is None and out[False].notify_consent_at is None
+
+
+async def test_ready_send_path_raising_still_returns_the_ready_order(db, stalls):
+    """Review L-3: a failure inside the ready send must not roll back/expire the
+    committed status change; the route still returns the READY order."""
+    st = await _ready_vendor(db, stalls)
+    order = await _order(db, st.business_id, status="IN_PROGRESS", payment_status="PAID", notify_when_ready=True,
+                         phone_number="0821234544")
+    with _no_redis(), patch("backend.app.bot.whatsapp_sender.send_template_message",
+                            new=AsyncMock(side_effect=RuntimeError("boom"))):
+        out = await update_order_status(order.id, StatusUpdateRequest(status="READY"),
+                                        _user(st.business_id, "STAFF"), db)
+    assert out.status == "READY" and out.id == order.id
+    reasons = (await db.execute(select(OrderEvent.reason).where(OrderEvent.order_id == order.id))).scalars().all()
+    assert order_ready.REASON_SEND_FAILED in reasons
+    assert (await _fresh(db, Order, order.id)).status == "READY"
