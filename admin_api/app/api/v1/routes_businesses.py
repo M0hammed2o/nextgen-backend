@@ -163,6 +163,13 @@ class BusinessUpdate(BaseModel):
     # since it is a billing-tier concept.
     pos_enabled: bool | None = None
     whatsapp_order_allowance: int | None = Field(default=None, ge=0)
+    # Order-ready template (migration 0071, souk WhatsApp gate). SUPER_ADMIN
+    # only (deliberately NOT in ONBOARDER_PATCH_ALLOWED_FIELDS): `approved`
+    # records that a super admin confirmed the template is APPROVED in the
+    # business's own WhatsApp Manager. NextGen never creates templates.
+    whatsapp_ready_template_name: str | None = Field(default=None, max_length=512)
+    whatsapp_ready_template_language: str | None = Field(default=None, max_length=16)
+    whatsapp_ready_template_approved: bool | None = None
 
 
 class LimitsUpdate(BaseModel):
@@ -240,6 +247,9 @@ class BusinessAdminResponse(BaseModel):
     whatsapp_order_allowance: int | None = None
     onboarded_by_admin_id: uuid.UUID | None
     onboarding_completed_at: datetime | None
+    whatsapp_ready_template_name: str | None = None
+    whatsapp_ready_template_language: str | None = None
+    whatsapp_ready_template_approved: bool = False
     # Populated only by POST /admin/businesses when owner_email was provided —
     # shown once, never returned by GET/PATCH.
     owner_temporary_password: str | None = None
@@ -622,6 +632,22 @@ async def update_business(
                     "whatsapp_phone_number_id in the same request", 422,
                 )
             changes["is_whatsapp_enabled"] = False
+
+    # Order-ready template: renaming it (or changing its language) clears the
+    # super-admin approval unless approval is re-confirmed in the same request;
+    # approval needs a template name.
+    template_fields = ("whatsapp_ready_template_name", "whatsapp_ready_template_language")
+    template_changed = any(f in changes and changes[f] != getattr(biz, f) for f in template_fields)
+    if template_changed and "whatsapp_ready_template_approved" not in changes:
+        changes["whatsapp_ready_template_approved"] = False
+    if changes.get("whatsapp_ready_template_approved") is True:
+        if not changes.get("whatsapp_ready_template_name", biz.whatsapp_ready_template_name):
+            raise AppError(
+                "READY_TEMPLATE_NAME_REQUIRED",
+                "Set whatsapp_ready_template_name before marking the template approved", 422,
+            )
+    if changes.get("whatsapp_ready_template_approved") is None:
+        changes.pop("whatsapp_ready_template_approved", None)
 
     # Fail-closed WhatsApp number handover (migration 0059): bump the
     # routing generation BEFORE applying the new number, whenever it's

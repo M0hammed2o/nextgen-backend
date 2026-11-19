@@ -10,7 +10,7 @@ Model 1: whatsapp_access_token_encrypted REMOVED.
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -324,6 +324,23 @@ class Business(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     whatsapp_payment_link_template_language: Mapped[str | None] = mapped_column(
         String(16), nullable=True,
         comment="Per-business override of settings.POS_PAYMENT_LINK_TEMPLATE_LANGUAGE."
+    )
+    # ── Order-ready template (migration 0071, souk WhatsApp gate, BUG-0210) ──
+    # The template the business submitted in ITS OWN WhatsApp Manager (NextGen
+    # never creates templates through the API). `approved` is set only by a
+    # SUPER_ADMIN after confirming Meta approved it on that WABA; renaming the
+    # template clears it. See backend/app/notifications/order_ready.py.
+    whatsapp_ready_template_name: Mapped[str | None] = mapped_column(
+        String(512), nullable=True,
+        comment="Meta template name for the order-ready message on this business's own WABA."
+    )
+    whatsapp_ready_template_language: Mapped[str | None] = mapped_column(
+        String(16), nullable=True,
+        comment="Meta template language code for whatsapp_ready_template_name, e.g. 'en_US'."
+    )
+    whatsapp_ready_template_approved: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false"),
+        comment="SUPER_ADMIN confirmed the template is APPROVED in the business's own WhatsApp Manager."
     )
 
     # ── Delivery marketplace integrations (migration 0044) ───────────────
