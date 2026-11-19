@@ -45,7 +45,7 @@ from backend.app.bot import (
     whatsapp_sender,
 )
 from backend.app.core.errors import DailyLimitError
-from shared.enums import ConversationState, MessageIntent
+from shared.enums import ConversationState, MessageIntent, OrderStatus
 from shared.models.business import Business
 from shared.models.customer import Customer
 from shared.models.menu import MenuCategory, MenuItem
@@ -6661,11 +6661,15 @@ async def _finalize_pending_delivery_order(
     """
     Finalise a PENDING_DELIVERY_FEE or FEE_SENT order after the customer has
     approved the fee and provided their payment method.
-    Updates the order: sets fee, total, payment_status, status → NEW.
+    Updates the order: payment_status, status → NEW. The fee and total are
+    NOT rewritten here (H-3): set_delivery_fee (routes_orders.py) already
+    stored the fee and the VAT/discount-correct total on the order, and a
+    PENDING_DELIVERY_FEE order still carries its creation total. Only an
+    order still PENDING_DELIVERY_FEE/FEE_SENT is finalised; one cancelled
+    meanwhile (fee timeout, staff) is never resurrected.
     """
     from shared.utils.money import format_currency
 
-    fee_cents = state_machine.get_context(session, "delivery_fee_cents", 0)
     pending_order_id = state_machine.get_context(session, "pending_order_id")
     if getattr(business, "online_payment_required", False):
         payment_method = None
@@ -6681,19 +6685,31 @@ async def _finalize_pending_delivery_order(
                 .where(
                     _Order.id == _parse_uuid(pending_order_id),
                     _Order.business_id == business.id,
+                    # H-3: never resurrect a cancelled (timed-out / staff) order.
+                    _Order.status.in_((
+                        OrderStatus.PENDING_DELIVERY_FEE.value, OrderStatus.FEE_SENT.value,
+                    )),
                 )
                 .values(
-                    delivery_fee_cents=fee_cents,
-                    total_cents=_Order.subtotal_cents + fee_cents,
                     status="NEW",
                     payment_status=payment_status,
                     payment_required=getattr(business, "online_payment_required", False),
                 )
-                .returning(_Order.order_number, _Order.subtotal_cents)
+                .returning(_Order.order_number, _Order.delivery_fee_cents, _Order.total_cents)
             )
             row = result.one_or_none()
-            order_number = row.order_number if row else "—"
-            subtotal = row.subtotal_cents if row else 0
+            if row is None:
+                # Expired or cancelled meanwhile: nothing was placed.
+                logger.warning(
+                    "DELIVERY_FINALISE_NOT_PENDING: order_id=%s no longer awaiting fee approval, "
+                    "session_id=%s", pending_order_id, session.id,
+                )
+                state_machine.clear_cart(session)
+                state_machine.transition_state(session, ConversationState.IDLE.value)
+                return responses.delivery_order_expired_response(), False, None, None, None
+            order_number = row.order_number
+            fee_cents = row.delivery_fee_cents or 0
+            total_cents = row.total_cents
 
             db.add(_OrderEvent(
                 order_id=_parse_uuid(pending_order_id),
@@ -6716,7 +6732,7 @@ async def _finalize_pending_delivery_order(
                         "order_id": pending_order_id,
                         "order_number": order_number,
                         "status": "NEW",
-                        "total_cents": subtotal + fee_cents,
+                        "total_cents": total_cents,
                         "created_at": datetime.now(timezone.utc).isoformat(),
                     }),
                 )
@@ -6727,12 +6743,12 @@ async def _finalize_pending_delivery_order(
             state_machine.transition_state(session, ConversationState.ORDER_PLACED.value)
             await usage_tracker.increment_usage(
                 db, business.id, business.timezone,
-                orders_created=1, revenue_cents=subtotal + fee_cents,
+                orders_created=1, revenue_cents=total_cents,
             )
             return (
                 f"✅ *Order Confirmed!*\n\nOrder Number: *{order_number}*\n"
                 f"Delivery fee: {format_currency(fee_cents, business.currency)}\n"
-                f"💰 *Total: {format_currency(subtotal + fee_cents, business.currency)}*\n"
+                f"💰 *Total: {format_currency(total_cents, business.currency)}*\n"
                 f"Payment: *{'Cash on delivery' if payment_method == 'CASH_ON_COLLECTION' else 'Card'}*\n\n"
                 f"🚗 We'll be on our way once your order is ready!",
                 False, None, None, None,

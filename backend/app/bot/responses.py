@@ -354,6 +354,16 @@ def busy_response(business: Business) -> str:
     )
 
 
+def delivery_order_expired_response() -> str:
+    """A late fee approval / payment choice for an order that was already
+    cancelled (fee timeout or staff): nothing is placed (H-3)."""
+    return (
+        "Sorry, this order has expired or was cancelled, so it has not been placed "
+        "and you have not been charged. 🙏\n\n"
+        "Please send your order again if you'd still like it."
+    )
+
+
 def fallback_response(business: Business) -> str:
     """Response when we can't understand the message."""
     if business.fallback_text:
