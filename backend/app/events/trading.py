@@ -26,6 +26,7 @@ the protected files). Until then WhatsApp must stay off for event vendors.
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
@@ -41,10 +42,22 @@ from shared.models.business import Business
 # it is only believable inside this window. The 72h bound is what limits
 # backdating abuse: a vendor cannot claim a paid day from last week.
 OFFLINE_CAPTURE_MAX_AGE = timedelta(hours=72)
+# Souk security review H-2. A vendor on an unpaid (CONFIGURE-only) day can still
+# log in and sync, and a device timestamp cannot be proven, so event-plan
+# businesses get a shorter window and extra flags. OWNER MAY ADJUST all three
+# (documented in docs/OFFLINE_POS_SYNC_CONTRACT.md).
+EVENT_OFFLINE_CAPTURE_MAX_AGE = timedelta(hours=36)
+# Any plan: a capture this much older than the sync is flagged "late_sync".
+OFFLINE_LATE_SYNC_THRESHOLD = timedelta(hours=12)
+REASON_CAPTURE_DAY_UNPAID_AT_SYNC = "capture_day_unpaid_at_sync"
+REASON_LATE_SYNC = "late_sync"
+REASON_CASHIER_DIFFERS = "cashier_differs_from_syncer"
 OFFLINE_CAPTURE_MAX_FUTURE_SKEW = timedelta(minutes=5)
 
 
-def validate_capture_window(captured_at: datetime, now: datetime | None = None) -> datetime:
+def validate_capture_window(
+    captured_at: datetime, now: datetime | None = None, max_age: timedelta = OFFLINE_CAPTURE_MAX_AGE,
+) -> datetime:
     """
     Return `captured_at` as an aware UTC datetime, or raise 422
     OFFLINE_CAPTURE_TOO_OLD / OFFLINE_CAPTURE_IN_FUTURE. A naive timestamp is
@@ -55,12 +68,12 @@ def validate_capture_window(captured_at: datetime, now: datetime | None = None) 
         raise AppError("OFFLINE_CAPTURE_NO_TIMEZONE", "offline_captured_at must include a timezone offset", 422)
     now = now or datetime.now(timezone.utc)
     captured = captured_at.astimezone(timezone.utc)
-    if captured < now - OFFLINE_CAPTURE_MAX_AGE:
+    if captured < now - max_age:
         raise AppError(
             "OFFLINE_CAPTURE_TOO_OLD",
             "This offline sale was captured too long ago to be accepted",
             422,
-            details={"max_age_hours": int(OFFLINE_CAPTURE_MAX_AGE.total_seconds() // 3600)},
+            details={"max_age_hours": int(max_age.total_seconds() // 3600)},
         )
     if captured > now + OFFLINE_CAPTURE_MAX_FUTURE_SKEW:
         raise AppError(
@@ -69,6 +82,43 @@ def validate_capture_window(captured_at: datetime, now: datetime | None = None) 
             422,
         )
     return captured
+
+
+@dataclass
+class OfflineCaptureGate:
+    """Result of judging an offline capture: the aware-UTC capture time and any review reasons."""
+    captured_at: datetime
+    reasons: list[str] = field(default_factory=list)
+
+
+async def offline_capture_gate(
+    db: AsyncSession, business_id: uuid.UUID, captured_at: datetime, now: datetime | None = None,
+) -> OfflineCaptureGate:
+    """
+    Judge an offline capture for `business_id` (from the JWT). Raises like
+    assert_trading_allowed(captured_at=...). Plan-specific rules:
+    - EVENT plan: window is EVENT_OFFLINE_CAPTURE_MAX_AGE (36h); the capture
+      day must be a paid TRADE day; and if the access decision AT SYNC TIME is
+      not TRADE the sale is still accepted but gets reason
+      capture_day_unpaid_at_sync (a vendor trading on unpaid days by
+      backdating into a paid one).
+    - Any plan: a capture more than OFFLINE_LATE_SYNC_THRESHOLD older than
+      the sync gets reason late_sync.
+    """
+    now = now or datetime.now(timezone.utc)
+    plan = (await db.execute(select(Business.plan).where(Business.id == business_id))).scalar_one_or_none()
+    is_event = plan == EVENT_PLAN
+    captured = validate_capture_window(
+        captured_at, now, EVENT_OFFLINE_CAPTURE_MAX_AGE if is_event else OFFLINE_CAPTURE_MAX_AGE,
+    )
+    reasons: list[str] = []
+    if is_event:
+        await _require_trade_at(db, business_id, captured)
+        if (await business_access_decision(db, business_id, now)).level != TRADE:
+            reasons.append(REASON_CAPTURE_DAY_UNPAID_AT_SYNC)
+    if captured < now - OFFLINE_LATE_SYNC_THRESHOLD:
+        reasons.append(REASON_LATE_SYNC)
+    return OfflineCaptureGate(captured_at=captured, reasons=reasons)
 
 
 _MESSAGES = {
@@ -98,12 +148,16 @@ async def assert_trading_allowed(
     `captured_at` behaviour is exactly the online behaviour.
     """
     if captured_at is not None:
-        captured_at = validate_capture_window(captured_at, now)
-        now = captured_at
+        await offline_capture_gate(db, business_id, captured_at, now)
+        return
     plan = (await db.execute(select(Business.plan).where(Business.id == business_id))).scalar_one_or_none()
     if plan != EVENT_PLAN:
         return
-    decision = await business_access_decision(db, business_id, now)
+    await _require_trade_at(db, business_id, now)
+
+
+async def _require_trade_at(db: AsyncSession, business_id: uuid.UUID, at: datetime | None) -> None:
+    decision = await business_access_decision(db, business_id, at)
     if decision.level == TRADE:
         return
     raise AppError(

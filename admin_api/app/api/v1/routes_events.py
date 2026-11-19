@@ -53,6 +53,7 @@ from shared.enums import EVENT_PLAN, AuditScope
 from shared.models.audit import AuditEvent
 from shared.models.business import Business
 from shared.models.event import Event, EventDay, EventVendor, EventVendorSubscription
+from shared.models.order import Order
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin/events", tags=["admin-events"])
@@ -613,6 +614,32 @@ async def list_vendors(
     )).all()
     local_day = datetime.now(timezone.utc).astimezone(ZoneInfo(event.timezone)).date()
     billable = set(_billable(event))
+    # H-2: offline sales awaiting an owner's review, per vendor business. This is
+    # the admin plane (platform-wide by design), so the organiser sees it too and
+    # not only the vendor's own manager.
+    flagged_by_business: dict[uuid.UUID, int] = {}
+    page_business_ids = [v.business_id for v, *_ in rows]
+    if page_business_ids:
+        flagged_by_business = {
+            bid: int(n) for bid, n in (await db.execute(
+                select(Order.business_id, func.count(Order.id))
+                .where(Order.business_id.in_(page_business_ids),
+                       Order.is_offline_capture.is_(True),
+                       Order.offline_review_required.is_(True),
+                       Order.offline_acknowledged_at.is_(None))
+                .group_by(Order.business_id)
+            )).all()
+        }
+    # L-2: payment-claim references used by more than one live subscription at this event.
+    claim_owners: dict[str, set[uuid.UUID]] = {}
+    for sub_id, claim in (await db.execute(
+        select(EventVendorSubscription.id, EventVendorSubscription.payment_claim_reference)
+        .join(EventVendor, EventVendor.id == EventVendorSubscription.event_vendor_id)
+        .where(EventVendor.event_id == event_id,
+               EventVendorSubscription.payment_claim_reference.is_not(None),
+               EventVendorSubscription.status != "VOID")
+    )).all():
+        claim_owners.setdefault(normalise_payment_reference(claim), set()).add(sub_id)
     items = []
     for v, name, code, active, suspended_reason in rows:
         paid = [PaidRange(s.starts_on, s.ends_on) for s in v.subscriptions if s.status == "PAID"]
@@ -623,11 +650,17 @@ async def list_vendors(
             "business_active": active, "suspended_reason": suspended_reason, "category": v.category,
             "stall_code": v.stall_code, "status": v.status,
             "access_level": dec.level, "access_reason": dec.reason,
+            "flagged_offline_orders": flagged_by_business.get(v.business_id, 0),
             "subscriptions": [{"id": s.id, "starts_on": s.starts_on, "ends_on": s.ends_on,
                                "billable_days": s.billable_days, "amount_cents": s.amount_cents,
                                "status": s.status, "paid_at": s.paid_at,
                                "payment_claim_reference": s.payment_claim_reference,
-                               "payment_claimed_at": s.payment_claimed_at}
+                               "payment_claimed_at": s.payment_claimed_at,
+                               "payment_claim_shared": bool(
+                                   s.payment_claim_reference
+                                   and s.status != "VOID"
+                                   and claim_owners.get(normalise_payment_reference(s.payment_claim_reference),
+                                                        set()) - {s.id})}
                               for s in sorted(v.subscriptions, key=lambda s: s.starts_on)],
         })
     return {"items": items, "total": int(total)}
