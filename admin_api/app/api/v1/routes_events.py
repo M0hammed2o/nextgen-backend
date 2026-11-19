@@ -644,6 +644,7 @@ async def list_vendors(
     # the admin plane (platform-wide by design), so the organiser sees it too and
     # not only the vendor's own manager.
     flagged_by_business: dict[uuid.UUID, int] = {}
+    pending_reviews_by_business: dict[uuid.UUID, int] = {}
     page_business_ids = [v.business_id for v, *_ in rows]
     if page_business_ids:
         flagged_by_business = {
@@ -654,6 +655,17 @@ async def list_vendors(
                        Order.offline_review_required.is_(True),
                        Order.offline_acknowledged_at.is_(None))
                 .group_by(Order.business_id)
+            )).all()
+        }
+        # BUG-0208 review L-3: late uploads still awaiting an owner/manager
+        # decision (read-only), so reviews stranded after the grace are visible.
+        from shared.models.offline_review import OFFLINE_REVIEW_PENDING, OfflineCaptureReview
+        pending_reviews_by_business = {
+            bid: int(n) for bid, n in (await db.execute(
+                select(OfflineCaptureReview.business_id, func.count(OfflineCaptureReview.id))
+                .where(OfflineCaptureReview.business_id.in_(page_business_ids),
+                       OfflineCaptureReview.status == OFFLINE_REVIEW_PENDING)
+                .group_by(OfflineCaptureReview.business_id)
             )).all()
         }
     # L-2: payment-claim references used by more than one live subscription at this event.
@@ -677,6 +689,7 @@ async def list_vendors(
             "stall_code": v.stall_code, "status": v.status,
             "access_level": dec.level, "access_reason": dec.reason,
             "flagged_offline_orders": flagged_by_business.get(v.business_id, 0),
+            "pending_offline_reviews": pending_reviews_by_business.get(v.business_id, 0),
             "subscriptions": [{"id": s.id, "starts_on": s.starts_on, "ends_on": s.ends_on,
                                "billable_days": s.billable_days, "amount_cents": s.amount_cents,
                                "status": s.status, "paid_at": s.paid_at,

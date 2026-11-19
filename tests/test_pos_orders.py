@@ -178,6 +178,7 @@ async def _run(body, user, business=None, till=None, resolved_items=None, extra_
     results = []
     if body.idempotency_key:
         results.append(FakeResult(scalar=None))  # no existing order with this key
+        results.append(FakeResult())  # BUG-0208 info-1: lock + no offline review queued for this key
     results.append(FakeResult(scalar=till))
     results.append(FakeResult(scalar=business))
     results.append(FakeResult(row=(1, "ZAR")))  # order_number_sequence, currency
@@ -549,6 +550,7 @@ async def _run_with_loyalty(body, user, *, program=None, customer=None, reward=N
     results = []
     if body.idempotency_key:
         results.append(FakeResult(scalar=None))
+        results.append(FakeResult())  # BUG-0208 info-1: lock + no offline review queued for this key
     results.append(FakeResult(scalar=till))
     results.append(FakeResult(scalar=business))
     results.append(FakeResult(scalar=program))  # program lookup
@@ -652,6 +654,7 @@ async def test_pos_loyalty_redemption_refused_for_non_entitled_business_nothing_
 
     db = FakeDB([
         FakeResult(scalar=None),  # idempotency lookup: no existing order
+        FakeResult(),  # BUG-0208 info-1: lock + no offline review queued for this key
         FakeResult(scalar=till),
         FakeResult(scalar=business),
     ])

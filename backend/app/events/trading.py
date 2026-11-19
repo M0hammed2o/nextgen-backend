@@ -79,6 +79,11 @@ REASON_POST_EVENT_GRACE_SYNC = "post_event_grace_sync"
 # An offline capture refused by the automatic age bound and later approved by
 # an owner/manager from the late-upload review queue.
 REASON_LATE_CAPTURE_APPROVED = "late_capture_approved"
+# Review M-1 (coordinator decision under the owner rule "suspicious offline
+# transactions require explicit review"): during the sync-only grace a device
+# clock can be backdated, so EVERY offline upload in grace is held for an
+# owner/manager instead of posting. Stored on the review, carried to the order.
+REASON_POST_EVENT_GRACE_UPLOAD = "post_event_grace_upload"
 
 
 def validate_capture_window(
@@ -173,9 +178,20 @@ async def event_sync_grace_until(
       reason never gets grace;
     - the business is on the EVENT plan (a restaurant never gets grace);
     - at some event that is not CANCELLED, where this vendor is not
-      CANCELLED, the vendor's last paid TRADE day L ended at or before `now`
-      and `now` is before end(L) + EVENT_SYNC_GRACE, with end(L) the end of
-      local date L in that event's timezone.
+      CANCELLED and has at least one paid TRADE day, the grace ANCHOR ended at
+      or before `now` and `now` is before end(anchor) + EVENT_SYNC_GRACE. The
+      anchor is the later of the vendor's last paid TRADE day and the event's
+      last billable day; end(d) is the end of local date d in the event's
+      timezone.
+
+    Why that anchor (review L-3): the reconcile job only suspends once access
+    becomes NONE, and for a vendor with any paid day that is after the
+    event's LAST billable day (an unpaid day during the event is CONFIGURE,
+    not a suspension). Anchoring on the last paid day alone gave a vendor who
+    paid only early days little or no grace once it was finally suspended. No
+    suspension timestamp is stored (that would be a cached flag plus a schema
+    change); the end of the event's last billable day is the earliest moment
+    the automatic suspension can happen, and it is derived live.
 
     A cancelled event or vendor contributes nothing, even if it had paid days.
     business_id must come from the caller's JWT.
@@ -205,8 +221,9 @@ async def event_sync_grace_until(
         paid = [PaidRange(s.starts_on, s.ends_on) for s in vendor.subscriptions if s.status == "PAID"]
         last = last_paid_trade_day(billable, paid)
         if last is None:
-            continue
-        ended = datetime.combine(last + timedelta(days=1), time(0), tzinfo=ZoneInfo(event.timezone))
+            continue  # never paid for a trading day: nothing legitimate to upload
+        anchor = max(last, max(billable))
+        ended = datetime.combine(anchor + timedelta(days=1), time(0), tzinfo=ZoneInfo(event.timezone))
         ended = ended.astimezone(timezone.utc)
         until = ended + EVENT_SYNC_GRACE
         if ended <= now < until and (best is None or until > best):

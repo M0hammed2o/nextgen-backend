@@ -695,6 +695,9 @@ async def update_business(
     return _business_response(biz, user.role)
 
 
+_RESERVED_SUSPENSION_REASONS = frozenset({"EVENT_SUBSCRIPTION_ENDED", "EVENT_ADMIN_SUSPENDED"})
+
+
 @router.post("/{business_id}/suspend", response_model=BusinessAdminResponse)
 async def suspend_business(
     business_id: uuid.UUID,
@@ -702,6 +705,16 @@ async def suspend_business(
     user: AuthUser = Depends(require_super_admin),
     db: AsyncSession = Depends(get_db),
 ):
+    # BUG-0208 review L-4: the two event reasons are reserved. The automatic
+    # end-of-event reason grants a post-event sync grace and is lifted by the
+    # reconcile job; the admin vendor reason is set and lifted only by the
+    # event routes. A free-text suspension must never impersonate either.
+    if body.reason.strip().upper() in _RESERVED_SUSPENSION_REASONS:
+        raise AppError(
+            "SUSPENSION_REASON_RESERVED",
+            "This suspension reason is reserved for event vendor access; use another reason",
+            422,
+        )
     biz = await db.get(Business, business_id)
     if not biz:
         raise NotFoundError("Business", str(business_id))

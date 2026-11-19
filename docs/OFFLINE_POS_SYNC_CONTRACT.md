@@ -99,7 +99,8 @@ was offline, the PWA must surface the failure to the user and not drop the queue
 `GET /v1/business/pos/offline-orders/flagged` (owner or manager only; the business comes from the JWT).
 
 Query: `reason` = `shortfall` | `variance` | `unattributed` | `late_till` | `capture_day_unpaid_at_sync` |
-`late_sync` | `cashier_differs_from_syncer` | `post_event_grace_sync` | `late_capture_approved` (omit for any flag), `include_acknowledged` (default false: orders an
+`late_sync` | `cashier_differs_from_syncer` | `post_event_grace_sync` | `late_capture_approved` |
+`post_event_grace_upload` (omit for any flag), `include_acknowledged` (default false: orders an
 owner has acknowledged are hidden), `since` (ISO datetime, filters on `offline_captured_at`), `limit` (1-200,
 default 50).
 Returns, newest capture first, a list of: `id, order_number, total_cents, payment_method,
@@ -141,6 +142,7 @@ that cash is in no cash-up, so handing it back inside today's session would show
 | 202 | `OFFLINE_CAPTURE_PENDING_REVIEW` | (success, not an error) too old for automatic acceptance, opted in, queued for review; body carries `review_id`, `review_status`, `idempotency_key` |
 | 409 | `OFFLINE_CAPTURE_REVIEW_REJECTED` | this key's late upload was rejected by a manager; final, do not retry |
 | 409 | `OFFLINE_CAPTURE_REVIEW_DECIDED` | this key's review was decided but its order no longer exists; final |
+| 409 | `OFFLINE_REVIEW_KEY_CONFLICT` | an online checkout reused a key that is queued for review |
 | 422 | `INSUFFICIENT_CASH_TENDERED`, `PAYMENT_TOTAL_MISMATCH` | server total differs from what the cash/split payment covers |
 | 404 / 422 | existing catalog errors | an item, option or variant was deleted or deactivated while offline |
 
@@ -212,15 +214,21 @@ Owner approval 2026-11-19. Code: `backend/app/events/trading.py` (`EVENT_SYNC_GR
 
 ### 10.2 The grace
 
-`EVENT_SYNC_GRACE = 72h` (owner may adjust), measured from the **end of the vendor's last paid event day**: the end
-of that local date in the event's timezone. "Last paid day" is the latest billable day covered by a PAID
-subscription. It is computed live from the database on every request (no cached flag, no new column). A business
-is in grace only when ALL of these hold:
+`EVENT_SYNC_GRACE = 72h` (owner may adjust), measured from the end of the **anchor day**: the later of the
+vendor's last paid TRADE day (latest billable day covered by a PAID subscription) and the event's last billable
+day, end of that local date in the event's timezone. It is computed live from the database on every request (no
+cached flag, no new column). A business is in grace only when ALL of these hold:
 
 1. it is suspended (`is_active = false`) with **exactly** `suspended_reason = EVENT_SUBSCRIPTION_ENDED`;
 2. it is on the EVENT plan;
-3. at an event that is not CANCELLED, where its vendor row is not CANCELLED, `end(last paid day) <= now <
-   end(last paid day) + 72h`.
+3. at an event that is not CANCELLED, where its vendor row is not CANCELLED and has at least one paid TRADE day,
+   `end(anchor) <= now < end(anchor) + 72h`.
+
+Why that anchor (review L-3): the reconcile job suspends only when access becomes NONE, and for a vendor with any
+paid day that happens after the event's **last** billable day (an unpaid day during the event is CONFIGURE, not a
+suspension). Anchoring on the last paid day alone gave a vendor who paid only early days little or no grace. No
+suspension timestamp is stored; the end of the event's last billable day is the earliest moment the automatic
+suspension can happen (the hourly job may run up to an hour later).
 
 An administrator's suspension (`EVENT_ADMIN_SUSPENDED`), a billing suspension, any other reason, a cancelled
 vendor or event, and every non-event business never get grace. After the window: `BUSINESS_SUSPENDED` as before.
@@ -242,10 +250,17 @@ Matched on HTTP method + the FastAPI route template (never a client string):
 | POST | `/business/pos/till/{session_id}/close` | cash-up: records the counted cash and computes expected cash from sales already recorded; it creates no sale and moves no money. Opening a till is **not** allowed. |
 | GET | `/business/orders`, `/business/orders/{order_id}` | read-only history |
 
-During grace a paid-day capture that passes the normal checks is accepted with the informational reason
-`post_event_grace_sync` (instead of `capture_day_unpaid_at_sync`, which would wrongly suggest backdating);
-`late_sync` still applies when the capture is >12h old. Like every reason it sets `offline_review_required`, so the
-sale appears in the flagged list (filter `post_event_grace_sync`) until an owner acknowledges it.
+**During grace every offline upload is held for review (review M-1, coordinator decision under the owner rule
+"suspicious offline transactions require explicit review rather than silently adjusting financial records").** A
+device clock can be backdated, so a capture that passes every hard check (timezone, not in the future, paid TRADE
+capture day, active cashier, within the age bound or opted in to the queue when older) is NOT posted: it is stored
+in the review queue (10.4) and answered `202 OFFLINE_CAPTURE_PENDING_REVIEW`, whether or not the client sent
+`offline_review_if_too_old`. Nothing reaches orders, stock, payments, the till or loyalty until an owner/manager
+approves it. The review carries `post_event_grace_upload` and `post_event_grace_sync` (never
+`capture_day_unpaid_at_sync`), plus `late_sync` / `cashier_differs_from_syncer` when they apply; on approval the
+order gets those plus `late_capture_approved`. A too-old capture in grace without the opt-in flag is still the old
+422. Note for clients released before this field: a 202 has no order id, so they must not treat it as an order
+(the current staff PWA shows "Sent to manager for review").
 
 ### 10.4 Late-upload review queue
 
@@ -277,8 +292,20 @@ Endpoints (owner or manager; business from the JWT; POS entitlement required):
   normal, till by capture instant (else `offline_unattributed`). It carries the review's idempotency key and the
   reasons judged at upload plus `late_capture_approved`, so it is in the flagged list and the organiser's
   flagged count. H-1: the discount limit uses the **original uploader's** role (its upload-time role, lowered to
-  its current role) and the cashier's; the approver never raises it, and `discount_approved_by_user_id` stays the
-  uploader. A failed re-validation leaves the review PENDING.
+  its current role; an uploader no longer active counts as STAFF, review L-1) and the cashier's; the approver
+  never raises it, and `discount_approved_by_user_id` stays the uploader. The cashier is the one validated at
+  upload (`captured_by_user_id`, same business and active then); it must still belong to the business but may
+  have been deactivated since, in which case its authority is STAFF (review L-2). A failed re-validation leaves
+  the review PENDING. A stored payload that no longer validates is `422 OFFLINE_REVIEW_PAYLOAD_INVALID`.
+* Price on approval: exactly like a normal offline sync, the order is priced at the **current** menu price when
+  it is recorded (approval time), never the device's. The device total (`offline_client_total_cents`) is kept and
+  any difference is recorded as `offline_price_variance_cents` with the sale flagged, so the manager sees it.
+* An ONLINE checkout whose `idempotency_key` is queued for review is refused with
+  `409 OFFLINE_REVIEW_KEY_CONFLICT` (same key lock as offline uploads), so a review is never stranded.
+* The organiser sees `pending_offline_reviews` per vendor on `GET /admin/events/{id}/vendors` (read-only), so
+  reviews left pending after the grace are visible.
+* The admin generic suspend (`POST /admin/businesses/{id}/suspend`) refuses the reserved reasons
+  `EVENT_SUBSCRIPTION_ENDED` and `EVENT_ADMIN_SUSPENDED` (422 `SUSPENSION_REASON_RESERVED`).
 * `POST /v1/business/pos/offline-reviews/{id}/reject` body `{"note": "..."}` records the decision; no financial
   effect.
 * Both lock the review row: two concurrent approvals make exactly one order; approving an approved review (or
