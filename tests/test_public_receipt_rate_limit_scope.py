@@ -212,6 +212,9 @@ _EXPECTED_FIXED_SCOPE_ROUTES: dict[str, str] = {
     # parameter — see routes_delivery_webhook.py's own module docstring for
     # the identical BUG-0077 rationale applied pre-emptively.
     "backend.app.api.v1.routes_delivery_webhook.delivery_webhook": "delivery_webhook",
+    # Souk public routes carry a {slug} path parameter, so they need a fixed scope too.
+    "backend.app.api.v1.routes_event_public.get_public_event": "public_event_info",
+    "backend.app.api.v1.routes_event_public.register_vendor": "public_event_register",
 }
 
 

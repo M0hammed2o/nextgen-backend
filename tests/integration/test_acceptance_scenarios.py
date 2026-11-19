@@ -132,6 +132,23 @@ class _Harness:
                 state_machine.set_context(sess, k, v)
             await db.commit()
 
+    async def staff_set_delivery_fee(self, fee_cents: int) -> None:
+        """The real staff action: POST /business/orders/{id}/delivery-fee
+        (routes_orders.set_delivery_fee), which stores the fee and the
+        VAT/discount total on the order, moves it to FEE_SENT and writes the
+        session context. Since H-3 the bot keeps the order's stored totals,
+        so writing only the context no longer simulates staff faithfully."""
+        from backend.app.api.v1.routes_orders import DeliveryFeeRequest, set_delivery_fee
+        from backend.app.core.rbac import AuthUser
+        [order] = await self.orders()
+        staff = AuthUser(user_id=uuid.uuid4(), business_id=self.business.id, role="STAFF", token_type="access")
+        with (
+            patch("backend.app.bot.whatsapp_sender.send_notification_message", new=AsyncMock(return_value=None)),
+            patch("backend.app.db.session.get_redis", new=AsyncMock(side_effect=RuntimeError("no redis"))),
+        ):
+            async with get_session_factory()() as db:
+                await set_delivery_fee(order.id, DeliveryFeeRequest(delivery_fee_cents=fee_cents), staff, db)
+
     async def orders(self) -> list[Order]:
         async with get_session_factory()() as db:
             rows = (await db.execute(
@@ -523,7 +540,7 @@ async def test_15b_delivery_flow_sets_order_mode_delivery_and_fee(test_business:
         await h.send("22 Kings Avenue")
         await h.send("skip")
         assert await h.state() == "WAITING_DELIVERY_FEE_APPROVAL"
-        await h.staff_set_context(delivery_fee_cents=3000, delivery_fee_status="FEE_SENT")
+        await h.staff_set_delivery_fee(3000)
         await h.send("Yes")
         assert await h.state() == "COLLECTING_PAYMENT"
         await h.send("Cash")

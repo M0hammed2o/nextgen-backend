@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import select
+from starlette.concurrency import run_in_threadpool
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.ratelimit import limiter
@@ -65,7 +66,7 @@ async def admin_login(
         from backend.app.core.errors import AppError
         raise AppError("ACCOUNT_LOCKED", "Account is locked", 423)
 
-    if not verify_password(body.password, admin.password_hash):
+    if not await run_in_threadpool(verify_password, body.password, admin.password_hash):
         admin.failed_login_attempts += 1
         if admin.failed_login_attempts >= settings.ACCOUNT_LOCKOUT_ATTEMPTS:
             admin.locked_until = datetime.now(timezone.utc) + timedelta(

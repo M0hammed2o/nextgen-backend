@@ -37,7 +37,7 @@ from backend.app.whatsapp.connect_state import (
     mint_connect_state,
 )
 from backend.app.whatsapp.graph_client import GraphAPIError, MetaGraphClient
-from shared.enums import AuditScope
+from shared.enums import EVENT_PLAN, AuditScope
 from shared.models.audit import AuditEvent
 from shared.models.business import Business
 from shared.models.whatsapp_connection import WhatsAppConnection
@@ -50,12 +50,28 @@ router = APIRouter(prefix="/business/whatsapp/connection", tags=["whatsapp-conne
 
 # ── Guard (mirrors _require_inventory_enabled in routes_inventory.py) ───────
 
-async def _require_whatsapp_module_enabled(db: AsyncSession, business_id: uuid.UUID) -> Business:
+async def _require_whatsapp_module_enabled(
+    db: AsyncSession, business_id: uuid.UUID, *, mutating: bool = False, disconnecting: bool = False,
+) -> Business:
     business = (
         await db.execute(select(Business).where(Business.id == business_id))
     ).scalar_one_or_none()
     if not business:
         raise NotFoundError("Business")
+    if business.plan == EVENT_PLAN:
+        # Souk WhatsApp gate (docs/EVENT_WHATSAPP.md). Bot orders now pass the
+        # event trading gate, but WhatsApp stays off for an event vendor until
+        # a SUPER_ADMIN switches is_whatsapp_enabled on for that vendor (the
+        # per-vendor kill switch from migration 0065).
+        if disconnecting:
+            # The owner can always remove their own number, even while off.
+            return business
+        if mutating and not business.is_whatsapp_enabled:
+            raise AppError(
+                "EVENT_WHATSAPP_NOT_AVAILABLE",
+                "WhatsApp for event vendors is pending platform approval and cannot be connected yet.",
+                403,
+            )
     if not business.is_whatsapp_enabled:
         raise AppError(
             "WHATSAPP_NOT_ENABLED",
@@ -232,7 +248,7 @@ async def start_connect(
     user: AuthUser = Depends(require_owner),
     db: AsyncSession = Depends(get_db),
 ):
-    business = await _require_whatsapp_module_enabled(db, user.business_id)
+    business = await _require_whatsapp_module_enabled(db, user.business_id, mutating=True)
 
     redis = await get_redis()
     try:
@@ -268,7 +284,7 @@ async def exchange_code(
     user: AuthUser = Depends(require_owner),
     db: AsyncSession = Depends(get_db),
 ):
-    business = await _require_whatsapp_module_enabled(db, user.business_id)
+    business = await _require_whatsapp_module_enabled(db, user.business_id, mutating=True)
 
     # ── Anti-CSRF/replay state check (gate hardening pass) ─────────────────
     # Must happen BEFORE run_exchange touches Meta/the DB at all — a request
@@ -364,7 +380,7 @@ async def run_health_check(
     user: AuthUser = Depends(require_owner_or_manager),
     db: AsyncSession = Depends(get_db),
 ):
-    business = await _require_whatsapp_module_enabled(db, user.business_id)
+    business = await _require_whatsapp_module_enabled(db, user.business_id, mutating=True)
     try:
         connection, result = await connection_service.health_check(db, business)
     except connection_service.ConnectionNotFound:
@@ -400,7 +416,7 @@ async def send_test_message(
     user: AuthUser = Depends(require_owner_or_manager),
     db: AsyncSession = Depends(get_db),
 ):
-    business = await _require_whatsapp_module_enabled(db, user.business_id)
+    business = await _require_whatsapp_module_enabled(db, user.business_id, mutating=True)
     connection = await connection_service.get_connection(db, business.id)
     if connection is None or connection.status != "CONNECTED":
         raise AppError(
@@ -463,7 +479,7 @@ async def disconnect_whatsapp(
     user: AuthUser = Depends(require_owner),
     db: AsyncSession = Depends(get_db),
 ):
-    business = await _require_whatsapp_module_enabled(db, user.business_id)
+    business = await _require_whatsapp_module_enabled(db, user.business_id, disconnecting=True)
     try:
         connection = await connection_service.disconnect(db, business)
     except connection_service.ConnectionNotFound:

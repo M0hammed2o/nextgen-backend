@@ -14,10 +14,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.app.core.crypto import decrypt_credential, encrypt_credential
 from backend.app.core.errors import AppError, NotFoundError
 from backend.app.core.ownership import require_owned
-from backend.app.core.rbac import AuthUser, require_owner_or_manager, require_staff_or_above
+from backend.app.core.rbac import (
+    AuthUser,
+    require_any_business_user,
+    require_owner_or_manager,
+    require_staff_or_above,
+)
 from backend.app.db.session import get_db
 from backend.app.payments.registry import get_provider
-from shared.enums import AuditScope
+from backend.app.events.service import business_access_decision
+from shared.enums import EVENT_PLAN, AuditScope
+from shared.models.event import Event, EventVendor
 from backend.app.api.v1.routes_assets import asset_public_url
 from shared.models.asset import Asset
 from shared.models.audit import AuditEvent
@@ -66,6 +73,14 @@ _OWNER_ONLY_MONEY_FIELDS = (
     "eft_account_number",
     "eft_branch_code",
 )
+
+# Till-permission limits that bind MANAGERs as well as STAFF (routes_pos.py:
+# only an OWNER is never limited), so a manager must not raise their own
+# limit. OWNER-only, audited with old and new values (not secrets).
+_OWNER_ONLY_LIMIT_FIELDS = (
+    "max_staff_discount_cents",
+)
+MAX_STAFF_DISCOUNT_CEILING_CENTS = 10_000_000  # R100 000: a typo guard, not a business rule
 
 
 # ── Schemas ──────────────────────────────────────────────────────────────────
@@ -200,6 +215,9 @@ class BusinessSettingsResponse(BaseModel):
     pos_direct_eft_enabled: bool = False
     pos_other_payment_enabled: bool = False
     pos_table_number_required: bool = False
+    # Largest POS discount a STAFF/MANAGER may give without the owner
+    # (0 = none). Enforced server-side in create_pos_order.
+    max_staff_discount_cents: int = 0
     # POS module entitlement (migration 0057_pos_entitlement) — same
     # platform-admin-writable / business-plane READ-ONLY pattern as
     # inventory_enabled/digital_receipts_enabled above. Gates every route
@@ -301,6 +319,7 @@ class BusinessSettingsResponse(BaseModel):
             pos_direct_eft_enabled=b.pos_direct_eft_enabled,
             pos_other_payment_enabled=b.pos_other_payment_enabled,
             pos_table_number_required=b.pos_table_number_required,
+            max_staff_discount_cents=b.max_staff_discount_cents,
             pos_enabled=b.pos_enabled,
         )
 
@@ -352,6 +371,8 @@ class BusinessSettingsUpdate(BaseModel):
     pos_direct_eft_enabled: bool | None = None
     pos_other_payment_enabled: bool | None = None
     pos_table_number_required: bool | None = None
+    # OWNER-only (_OWNER_ONLY_LIMIT_FIELDS): the staff/manager discount limit.
+    max_staff_discount_cents: int | None = Field(default=None, ge=0, le=MAX_STAFF_DISCOUNT_CEILING_CENTS)
     # VAT / receipt config (Ciao Pizza P0). inventory_enabled is deliberately
     # NOT settable here — enabling a paid module is a platform decision, made
     # through the admin plane, not something a tenant switches on themselves.
@@ -537,6 +558,13 @@ async def update_business_settings(
                     f"Only the business owner can change '{field}' — it controls where payments are routed",
                     403,
                 )
+        for field in _OWNER_ONLY_LIMIT_FIELDS:
+            if field in update_data:
+                raise AppError(
+                    "OWNER_ONLY_FIELD",
+                    f"Only the business owner can change '{field}' — it limits managers too",
+                    403,
+                )
 
     result = await db.execute(
         select(Business).where(Business.id == user.business_id)
@@ -549,6 +577,15 @@ async def update_business_settings(
     # they are handled separately so empty strings clear the stored value.
     _CREDENTIAL_FIELDS = {"payment_api_key", "payment_api_secret", "payment_webhook_secret"}
     changed_money_fields = [f for f in _OWNER_ONLY_MONEY_FIELDS if f in update_data]
+    limit_changes = {
+        f: {"from": getattr(business, f), "to": update_data[f]}
+        for f in _OWNER_ONLY_LIMIT_FIELDS
+        if f in update_data and update_data[f] is not None and update_data[f] != getattr(business, f)
+    }
+    # null would hit a NOT NULL column; treat an explicit null as "not sent".
+    for f in _OWNER_ONLY_LIMIT_FIELDS:
+        if update_data.get(f, 0) is None:
+            update_data.pop(f)
 
     for field in _ASSET_REFERENCE_FIELDS:
         value = update_data.get(field)
@@ -598,6 +635,17 @@ async def update_business_settings(
             target_type="business",
             target_id=business.id,
             diff_json={"fields_changed": changed_money_fields, "actor_role": user.role},
+        ))
+
+    if limit_changes:
+        db.add(AuditEvent(
+            scope=AuditScope.BUSINESS.value,
+            business_id=user.business_id,
+            actor_user_id=user.user_id,
+            action="business.pos_limits.changed",
+            target_type="business",
+            target_id=business.id,
+            diff_json={"changes": limit_changes, "actor_role": user.role},
         ))
 
     await db.commit()
@@ -688,6 +736,78 @@ class PaymentHealthResponse(BaseModel):
     provider: str
     checked_at: datetime
     detail: str | None = None
+
+
+@router.get("/event-access")
+async def get_event_access(
+    user: AuthUser = Depends(require_any_business_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    The calling business's own event-vendor access (souk). business_id comes
+    only from the JWT; only this business's event/vendor/subscription rows
+    are read. For a business that is not an event vendor, access_level and
+    reason are null (trading is not event-gated).
+    """
+    from sqlalchemy.orm import selectinload
+
+    plan = (await db.execute(select(Business.plan).where(Business.id == user.business_id))).scalar_one_or_none()
+    from backend.app.services.email_verification import verification_status
+
+    # Owner email verification (souk self-registration). required is false for
+    # every restaurant and admin-provisioned business.
+    email_verification = await verification_status(db, user.business_id)
+    if plan != EVENT_PLAN:
+        return {"is_event_vendor": False, "access_level": None, "reason": None, "events": [],
+                "email_verification": email_verification}
+    # BUG-0208: sync_only / sync_only_until come from get_current_user, which
+    # decided the post-event sync grace live. While sync_only is true the
+    # vendor may only upload queued offline sales and reconcile; access_level
+    # keeps its old meaning (NONE after the event) for older clients.
+    sync_only_until = user.sync_only_until
+    sync_fields = {"sync_only": sync_only_until is not None, "sync_only_until": sync_only_until}
+    decision = await business_access_decision(db, user.business_id)
+    vendors = (await db.execute(
+        select(EventVendor)
+        .where(EventVendor.business_id == user.business_id)
+        .options(selectinload(EventVendor.subscriptions), selectinload(EventVendor.event).selectinload(Event.days))
+    )).scalars().all()
+    events = []
+    for v in vendors:
+        days = [d.day for d in v.event.days if d.is_billable]
+        events.append({
+            "event_id": v.event.id, "event_name": v.event.name, "venue": v.event.venue,
+            "timezone": v.event.timezone, "event_status": v.event.status, "prep_days": v.event.prep_days,
+            "days": sorted(days), "first_day": min(days) if days else None, "last_day": max(days) if days else None,
+            "calendar_published": bool(days),
+            "stall_code": v.stall_code, "category": v.category, "vendor_status": v.status,
+            "subscriptions": [
+                {"starts_on": sub.starts_on, "ends_on": sub.ends_on, "billable_days": sub.billable_days,
+                 "amount_cents": sub.amount_cents, "status": sub.status, "paid_at": sub.paid_at}
+                for sub in sorted(v.subscriptions, key=lambda x: x.starts_on)
+            ],
+        })
+    # Souk WhatsApp gate: whether the till may offer the order-ready opt-in,
+    # and what the vendor still needs to go live (manager screen).
+    from backend.app.events.order_ready import (
+        SUGGESTED_TEMPLATE_BODY, SUGGESTED_TEMPLATE_CATEGORY, SUGGESTED_TEMPLATE_LANGUAGE,
+        SUGGESTED_TEMPLATE_NAME, ready_notify_status,
+    )
+    business = (await db.execute(select(Business).where(Business.id == user.business_id))).scalar_one()
+    ready = await ready_notify_status(db, business)
+    whatsapp = {
+        "state": ready.state, "whatsapp_enabled": ready.whatsapp_enabled,
+        "connection_status": ready.connection_status, "template_name": ready.template_name,
+        "template_language": ready.template_language, "template_approved": ready.template_approved,
+        "suggested_template": {
+            "name": SUGGESTED_TEMPLATE_NAME, "language": SUGGESTED_TEMPLATE_LANGUAGE,
+            "category": SUGGESTED_TEMPLATE_CATEGORY, "body": SUGGESTED_TEMPLATE_BODY,
+        },
+    }
+    return {"is_event_vendor": True, "access_level": decision.level, "reason": decision.reason, "events": events,
+            "email_verification": email_verification,
+            "ready_notify_available": ready.available, "whatsapp": whatsapp,
+            **sync_fields}
 
 
 @router.get("/payments/health", response_model=PaymentHealthResponse)

@@ -54,6 +54,7 @@ def create_access_token(
     role: str,
     extra_claims: dict | None = None,
     expires_minutes: int | None = None,
+    token_version: int = 0,
 ) -> str:
     """
     Create a JWT access token.
@@ -64,6 +65,7 @@ def create_access_token(
         role: user role
         exp: expiration
         iat: issued at
+        tv: the user's token_version at issue time; rbac rejects a mismatch
 
     expires_minutes overrides the default TTL (used for short-lived STAFF tokens).
     """
@@ -78,6 +80,8 @@ def create_access_token(
     }
     if extra_claims:
         payload.update(extra_claims)
+    # Set after extra_claims so a caller can never override it.
+    payload["tv"] = int(token_version or 0)
     return jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
 
 

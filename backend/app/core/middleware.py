@@ -154,6 +154,12 @@ _PII_ARG_KEYS = frozenset({
     "phone_number_e164",
     "customer_phone",
     "msisdn",
+    # Souk WhatsApp review H-2: Meta status webhooks log the recipient's
+    # number as `to=%s` (routes_webhook.py::_handle_status_update).
+    "to",
+    "recipient",
+    "recipient_id",
+    "recipient_wa_id",
 })
 
 # Defence-in-depth companion to the position-based masking below: catches the
@@ -164,7 +170,8 @@ _PII_ARG_KEYS = frozenset({
 # accidentally eat an unrelated token/UUID that merely follows one of these
 # key names, or swallow trailing punctuation/whitespace into the match.
 _PII_PARAM_PATTERN = re.compile(
-    r"\b(wa_id|customer_wa_id|phone_number_e164|phone_number|customer_phone|msisdn)="
+    r"\b(wa_id|customer_wa_id|phone_number_e164|phone_number|customer_phone|msisdn"
+    r"|to|recipient_wa_id|recipient_id|recipient)="
     r"([0-9+][0-9\-]{4,20})",
     re.IGNORECASE,
 )
@@ -315,6 +322,29 @@ class TokenMaskingFilter(logging.Filter):
         return True
 
 
+class ArqJobArgsFilter(logging.Filter):
+    """
+    Souk WhatsApp review L-5. arq logs every job start as
+    `'%6.2fs → %s(%s)%s'` with the job's positional arguments repr'd. For
+    process_whatsapp_message those are the customer's wa_id, the raw message
+    text and the raw webhook payload, as bare values that the key-based
+    TokenMaskingFilter cannot recognise. The argument string is replaced by
+    its length. Any other record passes through untouched.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if (
+            isinstance(record.msg, str)
+            and " → %s(%s)" in record.msg
+            and isinstance(record.args, tuple)
+            and len(record.args) >= 3
+        ):
+            args = list(record.args)
+            args[2] = f"<{len(str(args[2]))} chars of job arguments redacted>"
+            record.args = tuple(args)
+        return True
+
+
 class CorrelationIDMiddleware(BaseHTTPMiddleware):
     """
     Assigns a correlation ID to every request.
@@ -368,21 +398,45 @@ def get_correlation_id() -> str:
     return correlation_id_ctx.get()
 
 
+LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+
+
+def _add_mask_filter(target, mask_filter: "TokenMaskingFilter") -> None:
+    """Attach the masking filter once (setup_logging may run more than once)."""
+    if not any(isinstance(f, TokenMaskingFilter) for f in target.filters):
+        target.addFilter(mask_filter)
+
+
 def setup_logging(environment: str = "development") -> None:
     """
     Configure logging with token masking filter.
-    Call this during app startup.
+    Call this during app startup (main.py) AND worker startup (worker.py).
+
+    Souk WhatsApp review H-2: a filter attached to a LOGGER only runs for
+    records created on that exact logger, never for its children
+    (`nextgen.bot.pipeline` is not covered by a filter on `nextgen.bot`).
+    The filter is therefore attached to the root logger's HANDLERS, which
+    every propagating logger reaches. If the root logger has no handler yet
+    (the ARQ worker: arq only configures its own `arq` logger, so every
+    nextgen.* record fell through to logging.lastResort, unfiltered) one is
+    installed first. Idempotent.
     """
     mask_filter = TokenMaskingFilter()
 
-    # Apply to root logger so ALL log output is masked
+    # Apply to root logger's handlers so ALL propagating log output is masked
     root_logger = logging.getLogger()
+    if not root_logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter(LOG_FORMAT))
+        root_logger.addHandler(handler)
+        if root_logger.level == logging.WARNING:  # untouched default
+            root_logger.setLevel(logging.INFO)
     for handler in root_logger.handlers:
-        handler.addFilter(mask_filter)
+        _add_mask_filter(handler, mask_filter)
 
     # Also apply to our app loggers
     for name in ("nextgen", "nextgen.webhook", "nextgen.bot", "nextgen.outbox"):
-        logging.getLogger(name).addFilter(mask_filter)
+        _add_mask_filter(logging.getLogger(name), mask_filter)
 
     # BUG-0075: httpx logs every request as
     # `HTTP Request: GET <full url> "HTTP/1.1 200 OK"` at INFO, and the Meta
@@ -398,3 +452,16 @@ def setup_logging(environment: str = "development") -> None:
         # handlers, which a root-handler filter would never reach.
         for handler in logger_obj.handlers:
             handler.addFilter(mask_filter)
+
+    # Review L-5: the ARQ worker. arq.cli configures its own `arq` logger with
+    # its own handler (propagate left on), so its records reached both that
+    # unfiltered handler and the root handler (twice, once root has one).
+    # Mask on arq's handlers (job arguments redacted by ArqJobArgsFilter) and
+    # stop propagation so each arq line is printed once, by arq's handler.
+    arq_logger = logging.getLogger("arq")
+    if arq_logger.handlers:
+        for handler in arq_logger.handlers:
+            _add_mask_filter(handler, mask_filter)
+            if not any(isinstance(f, ArqJobArgsFilter) for f in handler.filters):
+                handler.addFilter(ArqJobArgsFilter())
+        arq_logger.propagate = False

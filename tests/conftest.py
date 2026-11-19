@@ -61,3 +61,20 @@ def session():
 @pytest.fixture
 def building_cart_session():
     return FakeSession(state="BUILDING_CART")
+
+
+@pytest.fixture(autouse=True)
+def _stub_event_trading_gate_in_mocked_unit_tests(request, monkeypatch):
+    """
+    The souk trading gate (backend/app/events/trading.py) issues a real query.
+    Unit tests drive route functions with scripted mock sessions whose
+    execute() call sequence is asserted, so the gate is stubbed to a no-op
+    there. Its real behaviour is covered against Postgres in
+    tests/integration/test_event_phase1_realdb.py, which does NOT use this stub.
+    """
+    if "integration" in request.node.nodeid.replace("\\", "/").split("/"):
+        return
+    from unittest.mock import AsyncMock
+
+    for mod in ("backend.app.api.v1.routes_pos", "backend.app.api.v1.routes_orders"):
+        monkeypatch.setattr(f"{mod}.assert_trading_allowed", AsyncMock(return_value=None), raising=True)

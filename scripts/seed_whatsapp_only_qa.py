@@ -26,21 +26,22 @@ import sys
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from scripts._seed_safety import fixture_credential, require_local_or_confirmed  # noqa: E402
 
 WA_OWNER_EMAIL = "owner@wa-only-qa.co.za"
-WA_OWNER_PASSWORD = "WaOnlyQA2026!Owner"
+WA_OWNER_PASSWORD = fixture_credential("NEXTGEN_SEED_WHATSAPP_ONLY_QA_WA_OWNER_PASSWORD", "WaOnlyQA2026!Owner")
 WA_MANAGER_EMAIL = "manager@wa-only-qa.co.za"
-WA_MANAGER_PASSWORD = "WaOnlyQA2026!Manager"
+WA_MANAGER_PASSWORD = fixture_credential("NEXTGEN_SEED_WHATSAPP_ONLY_QA_WA_MANAGER_PASSWORD", "WaOnlyQA2026!Manager")
 WA_STAFF_NAME = "WA QA Staff"
-WA_STAFF_PIN = "4321"
+WA_STAFF_PIN = fixture_credential("NEXTGEN_SEED_WHATSAPP_ONLY_QA_WA_STAFF_PIN", "4321")
 
 POS_OWNER_EMAIL = "owner@pos-regression-qa.co.za"
-POS_OWNER_PASSWORD = "PosRegQA2026!Owner"
+POS_OWNER_PASSWORD = fixture_credential("NEXTGEN_SEED_WHATSAPP_ONLY_QA_POS_OWNER_PASSWORD", "PosRegQA2026!Owner")
 POS_STAFF_NAME = "POS QA Staff"
-POS_STAFF_PIN = "1234"
+POS_STAFF_PIN = fixture_credential("NEXTGEN_SEED_WHATSAPP_ONLY_QA_POS_STAFF_PIN", "1234")
 
 SUPER_ADMIN_EMAIL = "superadmin@nextgen-qa.co.za"
-SUPER_ADMIN_PASSWORD = "SuperAdminQA2026!"
+SUPER_ADMIN_PASSWORD = fixture_credential("NEXTGEN_SEED_WHATSAPP_ONLY_QA_SUPER_ADMIN_PASSWORD", "SuperAdminQA2026!")
 
 
 async def seed() -> None:
@@ -59,6 +60,7 @@ async def seed() -> None:
     from shared.utils import generate_business_code
 
     settings = get_settings()
+    require_local_or_confirmed(settings.DATABASE_URL, "scripts/seed_whatsapp_only_qa.py")
     engine = create_async_engine(settings.DATABASE_URL)
     session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 

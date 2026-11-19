@@ -129,6 +129,9 @@ def _summary_payload(summary: ResolutionSummary) -> dict:
         "orders_total": len(summary.orders),
         "orders_ready": len(summary.importable),
         "duplicates": len(summary.duplicates),
+        # Subset of `duplicates`: orders the live provider connection already
+        # booked — skipped so one real sale is never recorded twice.
+        "live_api_duplicates": sum(1 for o in summary.duplicates if o.duplicate_source == "LIVE_API"),
         "cancelled": len(summary.cancelled),
         "blocked": len(summary.blocked),
         "unresolved_items": summary.unresolved_item_names,
@@ -144,6 +147,7 @@ def _summary_payload(summary: ResolutionSummary) -> dict:
                 "status": o.status,
                 "gross_cents": o.gross_cents,
                 "is_duplicate": o.is_duplicate,
+                "duplicate_source": o.duplicate_source,
                 "is_cancelled": o.is_cancelled,
                 "in_closed_period": o.in_closed_period,
                 "blocks_import": o.blocks_import,

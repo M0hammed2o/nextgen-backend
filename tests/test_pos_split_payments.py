@@ -197,6 +197,7 @@ async def _run(body, user, business=None, till=None, resolved_items=None, extra_
     results = []
     if body.idempotency_key:
         results.append(FakeResult(scalar=None))
+        results.append(FakeResult())  # BUG-0208 info-1: lock + no offline review queued for this key
     results.append(FakeResult(scalar=till))
     results.append(FakeResult(scalar=business))
     results.extend(extra_results)
@@ -233,6 +234,8 @@ def make_fake_order(user, **overrides):
         special_instructions=None, cancelled_reason=None, items=[],
         created_at=now, updated_at=now,
         loyalty_reward_id=None, refund_cash_cents=None,
+        # modelled for the M-1 offline-cash refund guard: an ordinary online sale
+        is_offline_capture=False, offline_unattributed=False, offline_late_to_closed_till=False,
     )
     defaults.update(overrides)
     return types.SimpleNamespace(**defaults)
@@ -496,6 +499,7 @@ async def test_split_pay_by_link_already_consumed_same_idempotency_key_replays()
     )
     db = FakeDB([
         FakeResult(scalar=None),  # early idempotency lookup — not yet visible to THIS request
+        FakeResult(),  # BUG-0208 info-1: lock + no offline review queued for this key
         FakeResult(scalar=make_till(user.business_id)),
         FakeResult(scalar=make_business()),
         FakeResult(scalar=intent),          # intent lock — already CONSUMED by the race winner
@@ -542,6 +546,7 @@ async def test_loyalty_redemption_discount_applies_before_split_sum_is_checked()
     business = make_business()
     db = FakeDB([
         FakeResult(scalar=None),      # idempotency lookup
+        FakeResult(),  # BUG-0208 info-1: lock + no offline review queued for this key
         FakeResult(scalar=till),
         FakeResult(scalar=business),
         FakeResult(scalar=program),   # loyalty program lookup

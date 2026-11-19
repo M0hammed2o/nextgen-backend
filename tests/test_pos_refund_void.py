@@ -508,6 +508,9 @@ async def test_pos_settings_reflects_business_config():
         # route reads the business row rather than falling through to the
         # schema default — same reasoning as the staff navigation flags.
         loyalty_enabled=True,
+        # Delivery marketplace module — opposite of the response default
+        # (False), same reasoning: proves the route reads the business row.
+        delivery_platforms_enabled=True,
         wastage_approval_threshold_cents=0,
         # Staff navigation flags. Set to the OPPOSITE of their model defaults
         # so the assertions below prove the route reads the business row
@@ -535,6 +538,7 @@ async def test_pos_settings_reflects_business_config():
     assert settings.inventory_enabled is True
     assert settings.digital_receipts_enabled is True
     assert settings.loyalty_enabled is True
+    assert settings.delivery_platforms_enabled is True
     assert settings.staff_live_orders_tab_enabled is False
     assert settings.staff_wastage_tab_enabled is False
     assert settings.staff_stocktake_tab_enabled is True

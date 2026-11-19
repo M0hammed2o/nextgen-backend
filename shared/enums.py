@@ -34,6 +34,56 @@ class PlanTier(str, enum.Enum):
     ENTERPRISE = "ENTERPRISE"
 
 
+# Set on businesses provisioned for a temporary event (souk, fair). Deliberately
+# NOT a PlanTier member, so an ONBOARDER (whose plan edits are validated against
+# PlanTier) cannot put a tenant on event billing. A SUPER_ADMIN's free-form plan
+# edit is not validated, so a super admin can; that is a trusted role.
+# backend/app/events/service.py only ever manages businesses on this plan.
+EVENT_PLAN = "EVENT"
+
+
+# ── Industries (DECISION-0060) ───────────────────────────────────────────────
+
+class Industry(str, enum.Enum):
+    RESTAURANT = "RESTAURANT"
+    CAFE = "CAFE"
+    TAKEAWAY = "TAKEAWAY"
+    BUTCHERY = "BUTCHERY"
+    BAKERY = "BAKERY"
+    CLOTHING_RETAIL = "CLOTHING_RETAIL"
+    GENERAL_RETAIL = "GENERAL_RETAIL"
+    EVENT_FOOD = "EVENT_FOOD"
+    EVENT_RETAIL = "EVENT_RETAIL"
+
+
+# ── Temporary events / souk (PRODUCT_ROADMAP.md §13, Wave 1) ────────────────
+
+class EventStatus(str, enum.Enum):
+    DRAFT = "DRAFT"
+    OPEN = "OPEN"
+    CLOSED = "CLOSED"
+    CANCELLED = "CANCELLED"
+
+
+class EventVendorCategory(str, enum.Enum):
+    FOOD = "FOOD"
+    CLOTHING = "CLOTHING"
+
+
+class EventVendorStatus(str, enum.Enum):
+    PENDING = "PENDING"      # registered; setting up before the event or before a paid day
+    ACTIVE = "ACTIVE"        # covered by a paid subscription (today or a future paid day)
+    UNPAID = "UNPAID"        # a billable event day with no paid cover, never paid
+    EXPIRED = "EXPIRED"      # paid cover existed and has ended
+    CANCELLED = "CANCELLED"  # removed by an administrator; never auto-reactivated
+
+
+class EventSubscriptionStatus(str, enum.Enum):
+    UNPAID = "UNPAID"
+    PAID = "PAID"
+    VOID = "VOID"
+
+
 # ── Orders ───────────────────────────────────────────────────────────────────
 
 class OrderStatus(str, enum.Enum):
@@ -98,7 +148,11 @@ class OrderSource(str, enum.Enum):
 
 
 #: Sources whose money the restaurant never handles, so they must never
-#: reach till cash-up. Used by backend/app/pos/till.py.
+#: reach till cash-up, be relabelled via PATCH .../payment, or be refunded
+#: through the restaurant's own payment provider. Used by
+#: backend/app/api/v1/routes_orders.py and routes_external_orders.py
+#: (NOT backend/app/pos/till.py, which is source-agnostic by construction —
+#: it sums by till_session_id, which these sources never have).
 EXTERNAL_ORDER_SOURCES: frozenset[str] = frozenset({
     OrderSource.UBER_EATS.value,
     OrderSource.MR_D.value,

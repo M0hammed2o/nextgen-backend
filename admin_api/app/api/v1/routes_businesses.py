@@ -27,18 +27,20 @@ from admin_api.app.core.deps import (
     require_super_admin,
 )
 from admin_api.app.services.onboarding import GoLiveResult, compute_go_live_checks
+from admin_api.app.services.provisioning import provision_business
 from backend.app.api.v1.routes_setup import SetupProgress, compute_setup_progress
 from backend.app.billing.trials import extend_trial, start_trial
 from backend.app.core.errors import AppError, DuplicateError, NotFoundError
 from backend.app.core.rbac import AuthUser
 from backend.app.core.security import hash_password
 from backend.app.db.session import get_db
-from shared.enums import AuditScope, PlanTier
+from shared.enums import EVENT_PLAN, AuditScope, PlanTier
 from shared.models.admin import AdminRole
 from shared.models.audit import AuditEvent
 from shared.models.business import Business
-from shared.models.user import BusinessUser, RefreshToken
-from shared.utils import generate_business_code, generate_temp_password
+from shared.auth_sessions import end_user_sessions
+from shared.models.user import BusinessUser
+from shared.utils import generate_temp_password
 
 logger = logging.getLogger("nextgen.admin")
 router = APIRouter(prefix="/admin/businesses", tags=["admin-businesses"])
@@ -161,6 +163,13 @@ class BusinessUpdate(BaseModel):
     # since it is a billing-tier concept.
     pos_enabled: bool | None = None
     whatsapp_order_allowance: int | None = Field(default=None, ge=0)
+    # Order-ready template (migration 0071, souk WhatsApp gate). SUPER_ADMIN
+    # only (deliberately NOT in ONBOARDER_PATCH_ALLOWED_FIELDS): `approved`
+    # records that a super admin confirmed the template is APPROVED in the
+    # business's own WhatsApp Manager. NextGen never creates templates.
+    whatsapp_ready_template_name: str | None = Field(default=None, max_length=512)
+    whatsapp_ready_template_language: str | None = Field(default=None, max_length=16)
+    whatsapp_ready_template_approved: bool | None = None
 
 
 class LimitsUpdate(BaseModel):
@@ -238,6 +247,9 @@ class BusinessAdminResponse(BaseModel):
     whatsapp_order_allowance: int | None = None
     onboarded_by_admin_id: uuid.UUID | None
     onboarding_completed_at: datetime | None
+    whatsapp_ready_template_name: str | None = None
+    whatsapp_ready_template_language: str | None = None
+    whatsapp_ready_template_approved: bool = False
     # Populated only by POST /admin/businesses when owner_email was provided —
     # shown once, never returned by GET/PATCH.
     owner_temporary_password: str | None = None
@@ -449,83 +461,34 @@ async def create_business(
                 "FIELD_NOT_ALLOWED", "ONBOARDER cannot set whatsapp_order_allowance", 403,
             )
 
-    # Auto-generate slug from name if not provided
-    import re as _re
-    slug = body.slug
-    if not slug:
-        slug = _re.sub(r"[^a-z0-9]+", "-", body.name.lower()).strip("-")
-        if not slug:
-            slug = "business"
-
-    # Ensure slug uniqueness — append suffix if needed
-    base_slug = slug
-    for suffix in range(20):
-        candidate = base_slug if suffix == 0 else f"{base_slug}-{suffix}"
-        existing = await db.execute(
-            select(Business.id).where(Business.slug == candidate)
-        )
-        if not existing.scalar_one_or_none():
-            slug = candidate
-            break
-    else:
-        raise AppError("SLUG_GENERATION_FAILED", "Could not generate unique slug", 500)
-    body_slug = slug
-
-    # If owner_email provided, check email uniqueness
-    if body.owner_email:
-        email_check = await db.execute(
-            select(BusinessUser.id).where(
-                BusinessUser.email == body.owner_email.lower().strip()
+    # An event-plan business starts with WhatsApp off and no number. A super
+    # admin may later enable it for one vendor; the number then only comes
+    # from the vendor's own Embedded Signup (docs/EVENT_WHATSAPP.md).
+    create_fields = body.model_dump(exclude={"owner_email", "owner_full_name", "slug", "start_trial"})
+    if body.plan == EVENT_PLAN:
+        if body.whatsapp_phone_number_id:
+            raise AppError(
+                "EVENT_PLAN_WHATSAPP_NOT_ALLOWED",
+                "An event-plan business cannot have a WhatsApp number", 422,
             )
-        )
-        if email_check.scalar_one_or_none():
-            raise DuplicateError("User", "email")
+        create_fields["is_whatsapp_enabled"] = False
 
-    # Generate unique business code
-    for _ in range(10):
-        code = generate_business_code()
-        check = await db.execute(
-            select(Business.id).where(Business.business_code == code)
-        )
-        if not check.scalar_one_or_none():
-            break
-    else:
-        raise AppError("CODE_GENERATION_FAILED", "Could not generate unique business code", 500)
-
-    # Create business
-    biz_data = body.model_dump(exclude={"owner_email", "owner_full_name", "slug", "start_trial"})
-    biz = Business(
-        business_code=code, slug=body_slug,
+    # Slug, business code, owner-email uniqueness, the business row and the
+    # owner login all come from the shared provisioning service, so bulk flows
+    # (souk vendors, branches) follow exactly the same rules.
+    provisioned = await provision_business(
+        db,
+        fields=create_fields,
+        requested_slug=body.slug,
+        owner_email=body.owner_email,
+        owner_full_name=body.owner_full_name,
+        trial=body.start_trial,
         onboarded_by_admin_id=user.user_id if user.role == AdminRole.ONBOARDER else None,
-        **biz_data,
+        # This route creates one specific business; its own WhatsApp number may be set here.
+        allow_external_identity=True,
     )
-    if body.start_trial:
-        start_trial(biz)
-    else:
-        # No trial period — e.g. a client already invoiced/paying from day
-        # one. Explicit ACTIVE rather than leaving the model's default
-        # billing_status="TRIAL" with no trial_ends_at set, which would
-        # otherwise read as an immediately-EXPIRED trial via
-        # compute_account_status (see backend/app/billing/account_status.py).
-        biz.billing_status = "ACTIVE"
-    db.add(biz)
-    await db.flush()  # Get biz.id before creating user
-
-    # Optionally create owner user in same transaction, with a generated
-    # temporary password — same policy as POST /admin/businesses/{id}/owner.
-    owner_temp_password: str | None = None
-    if body.owner_email:
-        owner_temp_password = generate_temp_password()
-        owner = BusinessUser(
-            business_id=biz.id,
-            role="OWNER",
-            email=body.owner_email.lower().strip(),
-            password_hash=hash_password(owner_temp_password),
-            staff_name=body.owner_full_name,
-            is_active=True,
-            must_change_password=True,
-        )
-        db.add(owner)
+    biz = provisioned.business
+    owner_temp_password = provisioned.owner_temporary_password
 
     db.add(AuditEvent(
         scope=AuditScope.PLATFORM.value,
@@ -635,6 +598,76 @@ async def update_business(
                 422,
             )
 
+    # Souk WhatsApp gate (replaces the interim L-4 block; docs/EVENT_WHATSAPP.md).
+    # Bot orders now pass the event trading gate, so a SUPER_ADMIN may switch
+    # WhatsApp on for ONE event vendor (is_whatsapp_enabled, the per-vendor
+    # kill switch from migration 0065). Nobody may type a WhatsApp number or
+    # WABA id for an event vendor: it only ever comes from the vendor's own
+    # Embedded Signup (so the vendor, not NextGen, is billed by Meta).
+    new_plan = changes.get("plan", biz.plan)
+    if new_plan == EVENT_PLAN:
+        if changes.get("is_whatsapp_enabled") is True and user.role != AdminRole.SUPER_ADMIN:
+            raise AppError(
+                "EVENT_PLAN_WHATSAPP_NOT_ALLOWED",
+                "Only a super admin can enable WhatsApp for an event vendor", 403,
+            )
+        for field in ("whatsapp_phone_number_id", "whatsapp_business_account_id"):
+            if changes.get(field) and changes[field] != getattr(biz, field):
+                raise AppError(
+                    "EVENT_PLAN_WHATSAPP_NOT_ALLOWED",
+                    "An event vendor's WhatsApp number comes only from its own Embedded Signup "
+                    "and cannot be set here", 422,
+                )
+        if biz.plan != EVENT_PLAN:
+            # Moving INTO the event plan: a number from the old plan (platform
+            # token) must be cleared in the same request, and WhatsApp starts
+            # off; enabling it is a separate, explicit super-admin request.
+            new_number = (
+                changes["whatsapp_phone_number_id"] if "whatsapp_phone_number_id" in changes
+                else biz.whatsapp_phone_number_id
+            )
+            if new_number:
+                raise AppError(
+                    "EVENT_PLAN_WHATSAPP_NOT_ALLOWED",
+                    "An event-plan business cannot keep a typed-in WhatsApp number; clear "
+                    "whatsapp_phone_number_id in the same request", 422,
+                )
+            changes["is_whatsapp_enabled"] = False
+
+    # Order-ready template: renaming it (or changing its language) clears the
+    # super-admin approval unless approval is re-confirmed in the same request;
+    # approval needs a template name.
+    template_fields = ("whatsapp_ready_template_name", "whatsapp_ready_template_language")
+    template_changed = any(f in changes and changes[f] != getattr(biz, f) for f in template_fields)
+    # A different WhatsApp number/WABA also needs the template re-confirmed.
+    template_changed = template_changed or any(
+        f in changes and changes[f] != getattr(biz, f)
+        for f in ("whatsapp_phone_number_id", "whatsapp_business_account_id")
+    )
+    if template_changed and "whatsapp_ready_template_approved" not in changes:
+        changes["whatsapp_ready_template_approved"] = False
+    if changes.get("whatsapp_ready_template_approved") is True:
+        if not changes.get("whatsapp_ready_template_name", biz.whatsapp_ready_template_name):
+            raise AppError(
+                "READY_TEMPLATE_NAME_REQUIRED",
+                "Set whatsapp_ready_template_name before marking the template approved", 422,
+            )
+    if changes.get("whatsapp_ready_template_approved") is None:
+        changes.pop("whatsapp_ready_template_approved", None)
+
+    # Fail-closed WhatsApp number handover (migration 0059): bump the
+    # routing generation BEFORE applying the new number, whenever it's
+    # actually changing (not on a no-op PATCH that happens to repeat the
+    # same value). A queued-but-not-yet-processed message snapshot this
+    # generation at webhook-accept time; bumping it here is what lets the
+    # worker detect "ownership moved on" and refuse to process a stale job
+    # under the new owner. See pipeline.py::_process / routes_webhook.py.
+    if (
+        "whatsapp_phone_number_id" in changes
+        and changes["whatsapp_phone_number_id"] != biz.whatsapp_phone_number_id
+    ):
+        biz.whatsapp_routing_generation += 1
+
     for field, value in changes.items():
         setattr(biz, field, value)
     db.add(AuditEvent(
@@ -662,6 +695,9 @@ async def update_business(
     return _business_response(biz, user.role)
 
 
+_RESERVED_SUSPENSION_REASONS = frozenset({"EVENT_SUBSCRIPTION_ENDED", "EVENT_ADMIN_SUSPENDED"})
+
+
 @router.post("/{business_id}/suspend", response_model=BusinessAdminResponse)
 async def suspend_business(
     business_id: uuid.UUID,
@@ -669,6 +705,16 @@ async def suspend_business(
     user: AuthUser = Depends(require_super_admin),
     db: AsyncSession = Depends(get_db),
 ):
+    # BUG-0208 review L-4: the two event reasons are reserved. The automatic
+    # end-of-event reason grants a post-event sync grace and is lifted by the
+    # reconcile job; the admin vendor reason is set and lifted only by the
+    # event routes. A free-text suspension must never impersonate either.
+    if body.reason.strip().upper() in _RESERVED_SUSPENSION_REASONS:
+        raise AppError(
+            "SUSPENSION_REASON_RESERVED",
+            "This suspension reason is reserved for event vendor access; use another reason",
+            422,
+        )
     biz = await db.get(Business, business_id)
     if not biz:
         raise NotFoundError("Business", str(business_id))
@@ -877,7 +923,6 @@ async def reset_business_user_password(
     complete — enforced by get_business_scoped below, same rule as every
     other onboarder-accessible route.
     """
-    from sqlalchemy import update as sa_update
 
     await get_business_scoped(business_id, user, db)
 
@@ -898,11 +943,9 @@ async def reset_business_user_password(
     target.failed_login_attempts = 0
     target.locked_until = None
 
-    await db.execute(
-        sa_update(RefreshToken)
-        .where(RefreshToken.user_id == target.id, RefreshToken.revoked_at.is_(None))
-        .values(revoked_at=datetime.now(timezone.utc))
-    )
+    # Ends every session: bumps token_version (old access tokens fail on their
+    # next request) and revokes all live refresh tokens (shared/auth_sessions.py).
+    await end_user_sessions(db, target)
     db.add(AuditEvent(
         scope=AuditScope.PLATFORM.value,
         business_id=business_id,
@@ -1088,7 +1131,6 @@ async def complete_onboarding(
     From the next request onward, get_business_scoped denies this
     ONBOARDER access to this business (404) — SUPER_ADMIN is unaffected.
     """
-    from sqlalchemy import update as sa_update
 
     biz = await get_business_scoped(business_id, user, db)
 
@@ -1120,11 +1162,7 @@ async def complete_onboarding(
     now = datetime.now(timezone.utc)
     for account in onboarding_accounts:
         account.is_active = False
-        await db.execute(
-            sa_update(RefreshToken)
-            .where(RefreshToken.user_id == account.id, RefreshToken.revoked_at.is_(None))
-            .values(revoked_at=now)
-        )
+        await end_user_sessions(db, account)
 
     biz.onboarding_completed_at = now
     db.add(AuditEvent(
@@ -1343,6 +1381,18 @@ async def send_whatsapp_test(
         raise AppError(
             "WHATSAPP_DISABLED",
             "WhatsApp is disabled for this business",
+            422,
+        )
+
+    if biz.plan == EVENT_PLAN:
+        # This endpoint always sends on the PLATFORM token. An event vendor
+        # must only ever send from its own WABA (token_resolver), so NextGen is
+        # never billed for it; use the vendor's own test message instead
+        # (POST /v1/business/whatsapp/connection/test-message).
+        raise AppError(
+            "EVENT_PLAN_PLATFORM_TOKEN_NOT_ALLOWED",
+            "Event vendors send only from their own WhatsApp number; use the vendor's own "
+            "connection test message instead of the platform test-send",
             422,
         )
 

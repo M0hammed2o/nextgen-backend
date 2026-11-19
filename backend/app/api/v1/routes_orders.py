@@ -6,7 +6,7 @@ Staff, Manager, and Owner can access. Status transitions are validated.
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import select, func, and_
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,6 +17,7 @@ from backend.app.core.ownership import require_owned
 from backend.app.core.pagination import CursorParams, PaginatedResponse, PaginationMeta, encode_cursor
 from backend.app.core.rbac import AuthUser, require_owner_or_manager, require_staff_or_above
 from backend.app.db.session import get_db
+from backend.app.events.trading import assert_trading_allowed
 from backend.app.pos.pricing import POSAddOnSelection, POSItemInput, resolve_pos_items
 from backend.app.receipts.whatsapp_receipt import (
     ReceiptDestinationUnavailable,
@@ -24,7 +25,14 @@ from backend.app.receipts.whatsapp_receipt import (
     send_digital_receipt,
 )
 from backend.app.utils.phone import normalize_sa_mobile
-from shared.enums import ORDER_STATUS_TRANSITIONS, AuditScope, OrderSource, OrderStatus
+from shared.enums import (
+    EVENT_PLAN,
+    EXTERNAL_ORDER_SOURCES,
+    ORDER_STATUS_TRANSITIONS,
+    AuditScope,
+    OrderSource,
+    OrderStatus,
+)
 from backend.app.payments.registry import get_provider
 from shared.models.audit import AuditEvent
 from shared.models.business import Business
@@ -56,6 +64,11 @@ class OrderItemResponse(BaseModel):
     # other line, which was resolved and priced server-side from the live
     # menu catalog (POS orders, and dashboard orders that set menu_item_id).
     is_ad_hoc_price: bool = False
+    # Product variants (migration 0066)
+    variant_id: uuid.UUID | None = None
+    variant_label_snapshot: str | None = None
+    sku_snapshot: str | None = None
+    returned_quantity: int | None = 0
     model_config = {"from_attributes": True}
 
 
@@ -132,6 +145,19 @@ class OrderResponse(BaseModel):
     completed_at: datetime | None
     special_instructions: str | None = None
     cancelled_reason: str | None
+    exchange_of_order_id: uuid.UUID | None = None
+    # Offline POS capture (migration 0067). Nullable bools: an unflushed Order
+    # built in Python reads back None for a column default.
+    is_offline_capture: bool | None = False
+    offline_captured_at: datetime | None = None
+    offline_synced_at: datetime | None = None
+    offline_synced_by_user_id: uuid.UUID | None = None
+    offline_unattributed: bool | None = False
+    offline_late_to_closed_till: bool | None = False
+    offline_stock_shortfall: bool | None = False
+    offline_client_total_cents: int | None = None
+    offline_price_variance_cents: int | None = None
+    offline_review_required: bool | None = False
     items: list[OrderItemResponse] = []
     payment_allocations: list[PaymentAllocationResponse] = []
     created_at: datetime
@@ -268,6 +294,9 @@ async def create_order(
     instead of always 0.
     """
     from sqlalchemy import update as sa_update
+
+    # Event vendors may only create real sales on a paid trading day.
+    await assert_trading_allowed(db, user.business_id)
 
     # ── Resolve every catalog-priced item against the live menu BEFORE any
     #    mutation — an invalid menu_item_id/option/add-on must never consume
@@ -538,12 +567,16 @@ async def get_order(
     return OrderResponse.model_validate(order)
 
 
+_COMPLETION_STATUSES = frozenset({OrderStatus.COLLECTED, OrderStatus.DELIVERED, OrderStatus.COMPLETED})
+
+
 @router.post("/{order_id}/status", response_model=OrderResponse)
 async def update_order_status(
     order_id: uuid.UUID,
     body: StatusUpdateRequest,
     user: AuthUser = Depends(require_staff_or_above),
     db: AsyncSession = Depends(get_db),
+    request: Request = None,
 ):
     """
     Update order status with transition validation.
@@ -575,6 +608,19 @@ async def update_order_status(
                 current.value, requested.value,
                 detail="Payment must be confirmed before the order can move to IN_PROGRESS."
             )
+
+    # ── Souk trading gate (security review M2) ──────────────────────────
+    # Completing an order that is not already PAID is the moment a
+    # cash-on-collection sale becomes final, so an event vendor needs a paid
+    # trading day for it. An already-PAID order (money was gated when taken)
+    # may always be moved through the kitchen statuses.
+    if requested in _COMPLETION_STATUSES and order.payment_status != "PAID":
+        await assert_trading_allowed(db, user.business_id)
+    # Souk WhatsApp gate: accepting an online-payment order creates a payment
+    # link below (money requested from the customer), so an event vendor needs
+    # a paid trading day for it. Checked before anything is changed.
+    if requested == OrderStatus.ACCEPTED and order.payment_required:
+        await assert_trading_allowed(db, user.business_id)
 
     old_status = order.status
     order.status = requested.value
@@ -671,17 +717,54 @@ async def update_order_status(
         import logging
         logging.getLogger("nextgen").warning("Failed to publish SSE event for order %s", order.id)
 
+    # ── Marketplace order: tell the provider (fire and forget) ────────────
+    # READY -> "ready for pickup", CANCELLED -> restaurant cancel, a
+    # hand-over status -> local FULFILLED. Queued, never awaited inline, so
+    # a slow/failing provider can never block or undo the kitchen's own
+    # status change; failures are recorded on the delivery order and raised
+    # to managers (backend/app/delivery/order_service.py::sync_delivery_order_status).
+    # business_id comes from the JWT, never the request body.
+    if order.source in EXTERNAL_ORDER_SOURCES:
+        try:
+            arq_pool = getattr(request.app.state, "arq_pool", None) if request is not None else None
+            if arq_pool is not None:
+                await arq_pool.enqueue_job(
+                    "sync_delivery_order_status",
+                    str(user.business_id), str(order.id), requested.value, body.reason,
+                )
+        except Exception:
+            import logging
+            logging.getLogger("nextgen").warning(
+                "Failed to enqueue marketplace status sync for order %s", order.id
+            )
+
     # ── Notify customer via WhatsApp (fire and forget) ────────────────────
     try:
-        if order.customer_id:
+        # Consent (souk review): a POS order's customer_phone is also captured
+        # for loyalty, so a linked customer is NOT consent to be messaged. A
+        # POS order gets exactly one customer message, READY, and only when the
+        # cashier recorded the customer's explicit notify_when_ready consent.
+        # WhatsApp/other sources keep their existing behaviour.
+        is_pos_order = order.source == OrderSource.POS.value
+        notify_allowed = (not is_pos_order) or (
+            requested == OrderStatus.READY and bool(order.notify_when_ready)
+        )
+        if notify_allowed and (order.customer_id or (is_pos_order and order.phone_number)):
             from shared.models.customer import Customer
             from backend.app.bot.whatsapp_sender import send_notification_message
             from backend.app.payments.messages import build_payment_message
 
-            cust_row = await db.execute(
-                select(Customer.wa_id).where(Customer.id == order.customer_id)
-            )
-            wa_id = cust_row.scalar_one_or_none()
+            wa_id = None
+            if order.customer_id:
+                cust_row = await db.execute(
+                    select(Customer.wa_id).where(Customer.id == order.customer_id)
+                )
+                wa_id = cust_row.scalar_one_or_none()
+            if not wa_id and is_pos_order and order.phone_number:
+                # Walk-up customer with no WhatsApp identity: use the consented number.
+                normalised = normalize_sa_mobile(order.phone_number)
+                if normalised:
+                    wa_id = normalised[1:] if normalised.startswith("+") else normalised
 
             biz_row = await db.execute(
                 select(Business).where(Business.id == order.business_id)
@@ -689,7 +772,13 @@ async def update_order_status(
             business_obj = biz_row.scalar_one_or_none()
             phone_number_id = business_obj.whatsapp_phone_number_id if business_obj else None
 
-            if wa_id and phone_number_id:
+            if is_pos_order and business_obj is not None and business_obj.plan == EVENT_PLAN:
+                # Souk event vendor (BUG-0210): READY goes through an approved
+                # template on the vendor's own WABA, opt-out checked, recorded
+                # on the order. Restaurants never take this branch.
+                from backend.app.events.order_ready import send_event_order_ready
+                await send_event_order_ready(db, business_obj, order, wa_id)
+            elif wa_id and phone_number_id:
                 # For online-payment-required orders accepted: send payment instructions
                 # instead of (or in addition to) the generic accepted message.
                 if requested == OrderStatus.ACCEPTED and order.payment_required and business_obj:
@@ -838,6 +927,10 @@ async def set_delivery_fee(
     if order.status != OrderStatus.PENDING_DELIVERY_FEE.value:
         from backend.app.core.errors import InvalidTransitionError
         raise InvalidTransitionError(order.status, "FEE_SENT")
+
+    # Souk WhatsApp gate: quoting a delivery fee asks the customer to commit
+    # to a sale, so an event vendor needs a paid trading day for it.
+    await assert_trading_allowed(db, user.business_id)
 
     biz_result = await db.execute(select(Business).where(Business.id == user.business_id))
     business = biz_result.scalar_one_or_none()
@@ -1017,6 +1110,15 @@ async def update_payment_status(
     if not order:
         raise NotFoundError("Order", str(order_id))
 
+    if order.source in EXTERNAL_ORDER_SOURCES:
+        raise AppError(
+            "EXTERNAL_ORDER_PAYMENT_LOCKED",
+            "This order's payment was collected by the delivery platform, not this "
+            "restaurant — its payment status/method can't be edited here. Contact "
+            "the platform (Uber Eats/Mr D) for payment disputes on marketplace orders.",
+            422,
+        )
+
     new_status = body.payment_status
     old_payment_status = order.payment_status
 
@@ -1035,6 +1137,11 @@ async def update_payment_status(
             "Moving a PAID order back to an unpaid status requires an owner or manager.",
             403,
         )
+
+    if new_status in ("PAID", "CASH_ON_COLLECTION") and old_payment_status != "PAID":
+        # Recording money received (or promised on collection): event vendors
+        # need a paid trading day (security review M2).
+        await assert_trading_allowed(db, user.business_id)
 
     was_unpaid = old_payment_status in ("UNPAID", "PENDING")
     payment_required = order.payment_required
@@ -1209,6 +1316,15 @@ async def refund_order_payment(
     order = result.scalar_one_or_none()
     if not order:
         raise NotFoundError("Order", str(order_id))
+
+    if order.source in EXTERNAL_ORDER_SOURCES:
+        raise AppError(
+            "EXTERNAL_ORDER_PAYMENT_LOCKED",
+            "This order's payment was collected by the delivery platform, not this "
+            "restaurant's own payment provider — it can't be refunded here. Refunds "
+            "on marketplace orders go through the platform (Uber Eats/Mr D) directly.",
+            422,
+        )
 
     if body.confirm_manual:
         if order.payment_status in ("REFUNDED", "PARTIALLY_REFUNDED"):

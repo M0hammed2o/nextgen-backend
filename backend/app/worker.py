@@ -32,11 +32,15 @@ from backend.app.bot.outbox_worker import _process_batch
 from backend.app.bot.pipeline import process_inbound_message
 from backend.app.bot.whatsapp_sender import send_notification_message
 from backend.app.core.config import WORKER_HEARTBEAT_REDIS_KEY, get_settings
+from backend.app.core.middleware import setup_logging
 from backend.app.db.session import DATABASE_URL
+from backend.app.delivery.retention import delivery_webhook_retention_sweep
 from backend.app.delivery.order_service import (
     delivery_accept_deadline_watchdog,
+    delivery_order_recovery_and_reminders,
     process_delivery_cancellation,
     process_delivery_order,
+    sync_delivery_order_status,
 )
 from shared.models.business import Business
 from shared.models.customer import Customer
@@ -67,6 +71,10 @@ async def startup(ctx: dict) -> None:
     The worker uses a small pool (5 connections) separate from the API's pool,
     preventing the outbox worker from competing with request-handling connections.
     """
+    # Souk WhatsApp review H-2: the bot pipeline runs HERE, not in the API
+    # process, so the PII/token masking filter must be installed here too
+    # (main.py's setup_logging call never runs in the worker).
+    setup_logging(get_settings().ENVIRONMENT)
     engine = create_async_engine(
         DATABASE_URL,
         pool_size=5,
@@ -111,6 +119,8 @@ async def process_whatsapp_message(
     msg_type: str,
     raw_payload: dict,
     contact_name: str | None = None,
+    expected_business_id: uuid.UUID | None = None,
+    expected_routing_generation: int | None = None,
 ) -> None:
     """
     Process one inbound WhatsApp message through the full bot pipeline.
@@ -123,11 +133,24 @@ async def process_whatsapp_message(
     Infrastructure failures (DB temporarily unavailable) will cause the job to
     fail; ARQ will retry up to max_tries times. The pipeline's wa_message_id
     deduplication check ensures retries are safe and never double-process.
+
+    `expected_business_id`/`expected_routing_generation` (migration 0059):
+    the webhook handler's snapshot of who owned `phone_number_id` at the
+    moment this job was enqueued. The pipeline re-verifies this snapshot
+    against the business's CURRENT generation before doing anything else —
+    see `pipeline.py::_process` — so a message queued before a WhatsApp
+    number handover can never be processed under the new owner just because
+    ARQ happened to run (or retry) the job after the handover completed.
+    Both default to `None` for any caller that hasn't been updated to pass
+    them, which falls back to the pre-0059 lookup-by-phone-number-only
+    behaviour unchanged.
     """
     logger.info(
-        "ARQ job start: wa_message_id=%s, phone_number_id=%s",
+        "ARQ job start: wa_message_id=%s, phone_number_id=%s, expected_business_id=%s, expected_routing_generation=%s",
         wa_message_id,
         phone_number_id,
+        expected_business_id,
+        expected_routing_generation,
     )
     async with ctx["session_factory"]() as db:
         await process_inbound_message(
@@ -139,6 +162,8 @@ async def process_whatsapp_message(
             msg_type=msg_type,
             raw_payload=raw_payload,
             contact_name=contact_name,
+            expected_business_id=expected_business_id,
+            expected_routing_generation=expected_routing_generation,
         )
     logger.info("ARQ job done: wa_message_id=%s", wa_message_id)
 
@@ -491,6 +516,44 @@ async def suspend_past_due_businesses(ctx: dict) -> None:
             logger.exception("Billing grace-period suspension job failed — rolled back.")
 
 
+async def reconcile_event_vendors(ctx: dict) -> None:
+    """
+    Hourly: activate and expire temporary-event (souk) vendors automatically,
+    from their PAID event subscriptions. See backend/app/events/service.py.
+    Only businesses on the event plan are touched, and only suspensions
+    carrying EVENT_SUBSCRIPTION_ENDED are ever lifted. Never deletes data.
+    """
+    from backend.app.events.service import reconcile_event_vendor_access
+
+    async with ctx["session_factory"]() as db:
+        try:
+            await reconcile_event_vendor_access(db, lock_events=True)
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            logger.exception("Event vendor access reconcile failed — rolled back.")
+
+
+async def close_abandoned_vendor_registrations(ctx: dict) -> None:
+    """
+    Hourly: soft-close souk self-registrations whose owner never verified
+    their email within 7 days and that have no PAID event subscription
+    (backend/app/services/email_verification.py). Owner and business are
+    deactivated, unpaid subscriptions voided, one audit row each. Never
+    deletes data; admin-provisioned and restaurant owners are never touched
+    (they never have email_verification_required).
+    """
+    from backend.app.services.email_verification import close_abandoned_registrations
+
+    async with ctx["session_factory"]() as db:
+        try:
+            await close_abandoned_registrations(db)
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            logger.exception("Abandoned vendor registration sweep failed — rolled back.")
+
+
 async def sweep_trial_and_invoice_expiry(ctx: dict) -> None:
     """
     Companion sweep to `suspend_past_due_businesses` above, run on the same
@@ -714,6 +777,7 @@ class WorkerSettings:
         process_whatsapp_message,
         process_delivery_order,
         process_delivery_cancellation,
+        sync_delivery_order_status,
     ]
     on_startup = startup
     on_shutdown = shutdown
@@ -746,6 +810,22 @@ class WorkerSettings:
             minute=0,
             second=0,
             run_at_startup=True,
+        ),
+        # Activate/expire temporary-event (souk) vendors from their paid
+        # event subscriptions — hourly, offset from the billing sweeps.
+        cron(
+            reconcile_event_vendors,
+            minute=5,
+            second=0,
+            run_at_startup=True,
+        ),
+        # Soft-close souk self-registrations left unverified for 7 days —
+        # hourly, offset from the event reconcile above.
+        cron(
+            close_abandoned_vendor_registrations,
+            minute=10,
+            second=0,
+            run_at_startup=False,
         ),
         # Suspend businesses whose trial expired past its grace period, and
         # mark overdue commercial invoices — hourly, same cadence as above
@@ -783,6 +863,14 @@ class WorkerSettings:
             second={0, 30},
             run_at_startup=True,
         ),
+        # BUG-0191: re-enqueue orders whose job was lost (Redis restart,
+        # worker crash) and remind staff about orders waiting on them.
+        # Offset from the watchdog so the two never share a tick.
+        cron(
+            delivery_order_recovery_and_reminders,
+            second={15, 45},
+            run_at_startup=True,
+        ),
         # WhatsApp order-usage threshold alerts (migration 0057_pos_entitlement)
         # — monitoring/reporting only, once daily, off-peak alongside the
         # stale-WhatsApp-connection sweep above.
@@ -790,6 +878,15 @@ class WorkerSettings:
             check_whatsapp_usage_alerts,
             hour=3,
             minute=30,
+            second=0,
+            run_at_startup=False,
+        ),
+        # Delivery webhook event retention (redact at 30 days, delete at
+        # 400) — once daily, off-peak. See backend/app/delivery/retention.py.
+        cron(
+            delivery_webhook_retention_sweep,
+            hour=3,
+            minute=45,
             second=0,
             run_at_startup=False,
         ),

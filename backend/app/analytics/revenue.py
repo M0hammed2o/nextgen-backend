@@ -82,7 +82,7 @@ imported Uber Eats/Mr D order: `import_resolved_orders()` never overrides
 `TimestampMixin`'s default, so `created_at` there is IMPORT time, which can
 be hours or days after the real sale. `external_placed_at` carries the
 platform's real order time for those rows and is NULL for every in-store
-order, so `COALESCE(external_placed_at, created_at)` gives the true sale
+order, so `COALESCE(external_placed_at, offline_captured_at, created_at)` gives the true sale
 moment uniformly across every source. Every date-range cutoff and every
 daily bucket in this module uses that coalesced timestamp, converted to the
 business's own local timezone for bucketing (BUG-0032's fix applied
@@ -144,7 +144,7 @@ IS_TRUE_CANCELLATION: ColumnElement = (Order.status == CANCELLED_STATUS) & (
 
 def sale_timestamp_expr() -> ColumnElement:
     """The timestamp analytics should treat as "when this sale happened"."""
-    return func.coalesce(Order.external_placed_at, Order.created_at)
+    return func.coalesce(Order.external_placed_at, Order.offline_captured_at, Order.created_at)
 
 
 def local_sale_date_expr(tz_name: str):

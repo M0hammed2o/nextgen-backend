@@ -59,6 +59,10 @@ class FakeDB:
         self.commits = 0
 
     async def execute(self, stmt):
+        self.executed = getattr(self, "executed", []) + [stmt]
+        # A bulk UPDATE (refresh-token revocation, BUG-0206) needs no queued result.
+        if getattr(stmt, "is_update", False):
+            return FakeResult(None)
         return self._results.pop(0)
 
     def add(self, obj):
@@ -80,6 +84,7 @@ def make_business(**overrides):
 
 def make_owner(password="Temp1234", **overrides):
     u = types.SimpleNamespace(
+        token_version=0,  # BusinessUser.token_version server default (migration 0061)
         id=uuid.uuid4(),
         business_id=uuid.uuid4(),
         role="OWNER",
@@ -169,6 +174,8 @@ async def test_set_password_success_updates_hash_and_clears_flag():
     assert not verify_password("Temp1234", user.password_hash)
     assert access and refresh
     assert db.commits == 1
+    # BUG-0206: changing the password revokes the user's other live sessions.
+    assert any(getattr(st, "is_update", False) and st.table.name == "refresh_tokens" for st in db.executed)
 
 
 async def test_set_password_unknown_email_is_generic_401():

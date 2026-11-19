@@ -16,27 +16,43 @@ rationale.
 """
 
 import uuid
+from decimal import ROUND_HALF_UP, Decimal
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Query
-from pydantic import BaseModel, Field, model_validator
-from sqlalchemy import func, select
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, ValidationError, model_validator
+from sqlalchemy import func, select, text
 from sqlalchemy import update as sa_update
 from sqlalchemy.exc import IntegrityError, MultipleResultsFound
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.app.events.trading import (
+    REASON_CASHIER_DIFFERS,
+    REASON_LATE_CAPTURE_APPROVED,
+    REASON_POST_EVENT_GRACE_UPLOAD,
+    assert_trading_allowed,
+    offline_capture_gate,
+)
 from backend.app.api.v1.routes_orders import OrderResponse
 from backend.app.core.config import get_settings
 from backend.app.core.errors import AppError, NotFoundError
 from backend.app.core.ownership import require_owned
 from backend.app.core.rbac import (
     AuthUser,
+    require_owner,
     require_owner_or_manager,
     require_pos_enabled,
     require_staff_or_above,
 )
 from backend.app.db.session import get_db
-from backend.app.inventory.ledger import post_sale_consumption, reverse_sale_consumption
+from backend.app.inventory.ledger import (
+    post_sale_consumption,
+    stock_on_hand,
+    restore_returned_variant_stock,
+    reverse_sale_consumption,
+)
+from backend.app.pos.offline import find_till_open_at
 from backend.app.pos.pricing import POSAddOnSelection, POSItemInput, resolve_pos_items
 from backend.app.pos.till import compute_expected_cash_cents, compute_variance_cents
 from backend.app.receipts.whatsapp_receipt import (
@@ -49,9 +65,16 @@ from shared.enums import AuditScope, OrderSource, OrderStatus, POSPaymentMethod
 from shared.pricing.engine import apply_vat_to_total
 from shared.models.audit import AuditEvent
 from shared.models.business import Business
+from shared.models.offline_review import (
+    OFFLINE_REVIEW_APPROVED,
+    OFFLINE_REVIEW_PENDING,
+    OFFLINE_REVIEW_REJECTED,
+    OfflineCaptureReview,
+)
 from shared.models.order import Order, OrderEvent, OrderItem
 from shared.models.pos_payment import POSPaymentAllocation, POSPaymentLinkIntent
 from shared.models.till import TillSession
+from shared.models.variant import ProductVariant
 from shared.models.user import BusinessUser
 from shared.utils import format_order_number
 
@@ -61,6 +84,9 @@ from shared.utils import format_order_number
 _POS_LINK_ELIGIBLE_PROVIDERS = ("YOCO", "PAYFAST")
 
 router = APIRouter(prefix="/business/pos", tags=["pos"])
+
+# Postgres INTEGER ceiling: an amount above it would be a 500 on insert, so it is a 422 here.
+INT32_MAX = 2_147_483_647
 settings = get_settings()
 
 
@@ -73,6 +99,9 @@ class POSAddOnSelectionRequest(BaseModel):
 
 class POSOrderItemRequest(BaseModel):
     menu_item_id: uuid.UUID
+    # Required when the item has active variants (422 VARIANT_REQUIRED
+    # otherwise); must be a variant of THIS item in the caller's business.
+    variant_id: uuid.UUID | None = None
     quantity: int = Field(ge=1, le=999)
     selected_option_ids: dict[str, str] = Field(default_factory=dict)
     add_on_selections: list[POSAddOnSelectionRequest] = Field(default_factory=list)
@@ -88,8 +117,8 @@ class POSPaymentAllocationRequest(BaseModel):
     the amount physically tendered (that's cash_tendered_cents, CASH only).
     """
     payment_method: str = Field(pattern=r"^(CASH|CARD|OTHER|PAY_BY_LINK)$")
-    amount_cents: int = Field(gt=0)
-    cash_tendered_cents: int | None = Field(default=None, ge=0)
+    amount_cents: int = Field(gt=0, le=INT32_MAX)
+    cash_tendered_cents: int | None = Field(default=None, ge=0, le=INT32_MAX)
     payment_reference: str | None = Field(default=None, max_length=255)
     payment_intent_id: uuid.UUID | None = Field(
         default=None, description="PAY_BY_LINK only — a PAID POSPaymentLinkIntent"
@@ -119,8 +148,15 @@ class POSOrderCreateRequest(BaseModel):
     table_number: str | None = Field(default=None, max_length=32)
     customer_name: str | None = Field(default=None, max_length=255)
     customer_phone: str | None = Field(default=None, max_length=32)
-    discount_cents: int = Field(default=0, ge=0)
+    # Explicit consent to a WhatsApp "your order is ready" message. A phone
+    # number alone (loyalty) is never consent. Requires customer_phone.
+    notify_when_ready: bool = False
+    discount_cents: int = Field(default=0, ge=0, le=INT32_MAX)
     discount_reason: str | None = Field(default=None, max_length=255)
+    # Exchange: this sale replaces goods returned on an already-refunded POS
+    # order of the same business (refund first via /orders/{id}/refund with
+    # return_items, then ring up the replacement with this link).
+    exchange_of_order_id: uuid.UUID | None = None
 
     # ── Loyalty redemption (POS checkout) ──────────────────────────────────
     # Deliberately no customer_id field — customer_phone is already the
@@ -148,13 +184,51 @@ class POSOrderCreateRequest(BaseModel):
     # an order). A single-entry array is processed by exactly the same
     # per-allocation code below as any larger one — nothing assumes N >= 2.
     payment_method: str | None = Field(default=None, pattern=r"^(CASH|CARD|OTHER)$")
-    cash_tendered_cents: int | None = Field(default=None, ge=0)
+    cash_tendered_cents: int | None = Field(default=None, ge=0, le=INT32_MAX)
     payment_reference: str | None = Field(default=None, max_length=255)
     payments: list[POSPaymentAllocationRequest] | None = Field(default=None, min_length=1)
 
     # A client-generated key; retrying the same checkout with the same key
     # returns the original order instead of ringing up a second sale.
     idempotency_key: str | None = Field(default=None, max_length=128)
+
+    # -- Offline capture (Phase 3b; docs/OFFLINE_POS_SYNC_CONTRACT.md) ------
+    # A sale queued on the device while offline and replayed on reconnect.
+    # The client NEVER sets a price: offline_client_total_cents is only the
+    # figure the device displayed, compared with the server's own total.
+    offline_captured_at: datetime | None = Field(
+        default=None, description="When the sale was rung up on the device (timezone-aware)")
+    is_offline_capture: bool | None = Field(
+        default=None, description="Optional; implied by offline_captured_at")
+    captured_by_user_id: uuid.UUID | None = Field(
+        default=None, description="Cashier who made the sale (default: the syncing caller)")
+    offline_client_total_cents: int | None = Field(default=None, ge=0, le=INT32_MAX)
+    # BUG-0208: opt in to the late-upload review queue. When true and the
+    # capture is refused ONLY because it is older than the automatic age bound
+    # (OFFLINE_CAPTURE_TOO_OLD), it is stored for owner/manager review and
+    # answered 202 OFFLINE_CAPTURE_PENDING_REVIEW instead of the 422. Without
+    # it (every client released before this field existed) behaviour is
+    # exactly the old 422.
+    offline_review_if_too_old: bool = False
+
+    @model_validator(mode="after")
+    def validate_offline_capture(self) -> "POSOrderCreateRequest":
+        if self.offline_captured_at is None:
+            if self.is_offline_capture:
+                raise ValueError("offline_captured_at is required when is_offline_capture is true")
+            if self.captured_by_user_id is not None or self.offline_client_total_cents is not None:
+                raise ValueError(
+                    "captured_by_user_id and offline_client_total_cents are only valid on an offline capture"
+                )
+            if self.offline_review_if_too_old:
+                raise ValueError("offline_review_if_too_old is only valid on an offline capture")
+        else:
+            if self.is_offline_capture is False:
+                raise ValueError("is_offline_capture is false but offline_captured_at was given")
+            if not self.idempotency_key:
+                raise ValueError("idempotency_key is required for an offline capture")
+            self.is_offline_capture = True
+        return self
 
     @model_validator(mode="after")
     def validate_payment_shape(self) -> "POSOrderCreateRequest":
@@ -178,6 +252,12 @@ class POSOrderCreateRequest(BaseModel):
         return self
 
     @model_validator(mode="after")
+    def validate_notify_consent(self) -> "POSOrderCreateRequest":
+        if self.notify_when_ready and not self.customer_phone:
+            raise ValueError("customer_phone is required when notify_when_ready is set")
+        return self
+
+    @model_validator(mode="after")
     def validate_loyalty_redemption(self) -> "POSOrderCreateRequest":
         if self.loyalty_reward_id is not None:
             if not self.customer_phone:
@@ -194,11 +274,11 @@ class POSOrderCreateRequest(BaseModel):
 
 
 class TillOpenRequest(BaseModel):
-    opening_float_cents: int = Field(ge=0)
+    opening_float_cents: int = Field(ge=0, le=INT32_MAX)
 
 
 class TillCloseRequest(BaseModel):
-    counted_cash_cents: int = Field(ge=0)
+    counted_cash_cents: int = Field(ge=0, le=INT32_MAX)
 
 
 class TillSessionResponse(BaseModel):
@@ -213,6 +293,11 @@ class TillSessionResponse(BaseModel):
     # from the linked orders, same as expected_cash_cents itself).
     cash_sales_cents: int | None = None
     cash_refunds_cents: int | None = None
+    # Also close-time only: offline sales captured since the previous session
+    # closed that no till session covered (Order.offline_unattributed). Their
+    # cash is NOT in expected_cash_cents; the manager must reconcile it.
+    offline_unattributed_count: int | None = None
+    offline_unattributed_cash_cents: int | None = None
     opened_at: datetime
     closed_at: datetime | None
     model_config = {"from_attributes": True}
@@ -236,8 +321,17 @@ class TillSessionHistoryEntry(BaseModel):
     closed_by_name: str | None = None
 
 
+class POSReturnLine(BaseModel):
+    order_item_id: uuid.UUID
+    quantity: int = Field(ge=1, le=999)
+
+
 class POSRefundRequest(BaseModel):
-    amount_cents: int | None = Field(default=None, ge=1, description="Defaults to a full refund of total_cents")
+    amount_cents: int | None = Field(default=None, ge=1, le=INT32_MAX, description="Defaults to a full refund of total_cents")
+    # Line-level return. When given, amount_cents defaults to the value of the
+    # returned units (pro-rated for any order discount/loyalty/VAT-exclusive
+    # adjustment) and may only be LOWER than that (e.g. a restocking fee).
+    return_items: list[POSReturnLine] | None = Field(default=None, min_length=1)
     reason: str | None = Field(default=None, max_length=255)
 
     # Money moving back to the customer does NOT imply food coming back to
@@ -276,7 +370,7 @@ class POSRefundRequest(BaseModel):
     # knows, not something this endpoint should guess — so it's required in
     # exactly that one case (see refund_pos_order's own comment).
     cash_refund_cents: int | None = Field(
-        default=None, ge=0,
+        default=None, ge=0, le=INT32_MAX,
         description="Required for a PARTIAL refund of a split order that mixes cash and "
                      "non-cash payment methods — how much of THIS refund is physical cash.",
     )
@@ -386,9 +480,16 @@ class POSSettingsResponse(BaseModel):
     # of discovering it only by having every other POS call come back 409.
     pos_enabled: bool = True
 
+    # Delivery marketplace module (Business.delivery_platforms_enabled) —
+    # read-only, same pattern as loyalty_enabled above: tells the Staff PWA
+    # whether to show the pending delivery-order queue on Live Orders
+    # (GET /business/delivery/queue), rather than discovering it by probing
+    # that route and interpreting a DELIVERY_NOT_ENABLED 409.
+    delivery_platforms_enabled: bool = False
+
 
 class POSPaymentIntentCreateRequest(BaseModel):
-    amount_cents: int = Field(gt=0)
+    amount_cents: int = Field(gt=0, le=INT32_MAX)
     customer_phone: str = Field(max_length=32)
 
 
@@ -749,6 +850,7 @@ async def get_pos_settings(
         print_kitchen_receipt=business.print_kitchen_receipt,
         inventory_enabled=business.inventory_enabled,
         loyalty_enabled=business.loyalty_enabled,
+        delivery_platforms_enabled=bool(getattr(business, "delivery_platforms_enabled", False)),
         staff_live_orders_tab_enabled=business.staff_live_orders_tab_enabled,
         staff_wastage_tab_enabled=business.staff_wastage_tab_enabled,
         # A stocktake tab is only useful if there is stock to count. Gating the
@@ -806,6 +908,7 @@ async def create_pos_payment_intent(
     allocation. Never returns the raw payment link — only a safe status the
     Staff app can poll (GET .../{id}).
     """
+    await assert_trading_allowed(db, user.business_id)
     biz_result = await db.execute(select(Business).where(Business.id == user.business_id))
     business = biz_result.scalar_one_or_none()
     if not business:
@@ -942,6 +1045,7 @@ async def resend_pos_payment_intent(
     db: AsyncSession = Depends(get_db),
 ):
     """Re-sends the SAME link for a still-PENDING intent — never creates a second payable link."""
+    await assert_trading_allowed(db, user.business_id)
     intent = await _load_pos_payment_intent(db, user.business_id, intent_id, for_update=True)
     if _maybe_expire(intent):
         await db.commit()
@@ -1002,11 +1106,209 @@ async def cancel_pos_payment_intent(
     return _intent_to_response(intent)
 
 
+def _require_owner_for_unreviewed_offline_cash(user: AuthUser, order: Order, cash_cents: int | None) -> None:
+    """
+    M-1: an offline sale that no till session covered, or that landed in an
+    already-closed session, has cash that is in no cash-up. Handing that cash
+    back inside today's session would show zero variance, so only an OWNER may.
+    """
+    if (
+        cash_cents
+        and user.role != "OWNER"
+        and order.is_offline_capture
+        and (order.offline_unattributed or order.offline_late_to_closed_till)
+    ):
+        raise AppError(
+            "OFFLINE_REFUND_REQUIRES_OWNER",
+            "Cash for this offline sale is not in any till cash-up; only an owner can refund or void it in cash",
+            403,
+        )
+
+
+_ROLE_RANK = {"STAFF": 1, "MANAGER": 2, "OWNER": 3}
+
+
+async def _resolve_offline_cashier(
+    db: AsyncSession, user: AuthUser, body: "POSOrderCreateRequest",
+) -> tuple[uuid.UUID, str, bool]:
+    """
+    (cashier_id, limit_role, cashier_differs) for an offline capture. The
+    cashier must be an active user of THIS business: one 404 for "no such
+    user", "another business's user" and "deactivated". H-1: limit_role is
+    the LOWER of the syncing caller's role and the cashier's role.
+    """
+    if body.captured_by_user_id is None or body.captured_by_user_id == user.user_id:
+        return user.user_id, user.role, False
+    cashier = (await db.execute(
+        select(BusinessUser.id, BusinessUser.role).where(
+            BusinessUser.id == body.captured_by_user_id,
+            BusinessUser.business_id == user.business_id,
+            BusinessUser.is_active.is_(True),
+        )
+    )).first()
+    if cashier is None:
+        raise NotFoundError("User", str(body.captured_by_user_id))
+    return cashier.id, _lower_role(user.role, cashier.role), True
+
+
+async def _resolve_approval_cashier(
+    db: AsyncSession, uploader: AuthUser, review: OfflineCaptureReview,
+) -> tuple[uuid.UUID, str, bool]:
+    """
+    Review L-2: on approval the cashier is the one validated AT UPLOAD
+    (review.captured_by_user_id was checked then: same business, active). It
+    must still be a user of this business, but may have been deactivated since
+    (temporary event staff). An inactive cashier's discount authority is STAFF,
+    the lowest; H-1 still takes the lower of uploader and cashier.
+    """
+    cid = review.captured_by_user_id
+    if cid == uploader.user_id:
+        return cid, uploader.role, False
+    row = (await db.execute(
+        select(BusinessUser.role, BusinessUser.is_active).where(
+            BusinessUser.id == cid, BusinessUser.business_id == uploader.business_id,
+        )
+    )).first()
+    if row is None:
+        raise NotFoundError("User", str(cid))
+    cashier_role = row.role if row.is_active else "STAFF"
+    return cid, _lower_role(uploader.role, cashier_role), True
+
+
+async def _lock_offline_capture_key(db: AsyncSession, business_id: uuid.UUID, key: str) -> None:
+    """
+    Transaction-scoped advisory lock on (business, idempotency key), held until
+    the caller's commit/rollback. Serialises concurrent uploads of one queued
+    sale so a key yields exactly one order OR one review (BUG-0208). The unique
+    indexes on orders and offline_capture_reviews remain the final guarantee.
+    """
+    await db.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:k, 0))"),
+        {"k": f"offline-capture:{business_id}:{key}"},
+    )
+
+
+async def _find_offline_review(
+    db: AsyncSession, business_id: uuid.UUID, key: str,
+) -> OfflineCaptureReview | None:
+    return (await db.execute(select(OfflineCaptureReview).where(
+        OfflineCaptureReview.business_id == business_id,
+        OfflineCaptureReview.idempotency_key == key,
+    ))).scalar_one_or_none()
+
+
+def _pending_review_response(review: OfflineCaptureReview) -> JSONResponse:
+    return JSONResponse(status_code=202, content={
+        "code": "OFFLINE_CAPTURE_PENDING_REVIEW",
+        "message": "This offline sale is older than the automatic upload limit and was sent to a manager for review.",
+        "review_id": str(review.id),
+        "review_status": review.status,
+        "idempotency_key": review.idempotency_key,
+    })
+
+
+async def _offline_review_replay(db: AsyncSession, business_id: uuid.UUID, review: OfflineCaptureReview):
+    """
+    Re-upload of a key that is already in the review queue: the same 202 while
+    pending; the order once approved (the same answer as an idempotent replay);
+    a final 409 once rejected. Releases the key lock before answering.
+    """
+    status_, review_id = review.status, review.id
+    if status_ == OFFLINE_REVIEW_PENDING:
+        response = _pending_review_response(review)
+        await db.rollback()
+        return response
+    if status_ == OFFLINE_REVIEW_APPROVED and review.order_id is not None:
+        order = (await db.execute(select(Order).where(
+            Order.id == review.order_id, Order.business_id == business_id,
+        ))).scalar_one_or_none()
+        if order is not None:
+            response = OrderResponse.model_validate(order)
+            await db.rollback()
+            return response
+    await db.rollback()
+    raise AppError(
+        "OFFLINE_CAPTURE_REVIEW_REJECTED" if status_ == OFFLINE_REVIEW_REJECTED else "OFFLINE_CAPTURE_REVIEW_DECIDED",
+        "A manager already decided this late offline sale; it will not be recorded from this upload.",
+        409,
+        details={"review_id": str(review_id), "review_status": status_},
+    )
+
+
+async def _queue_offline_capture_for_review(
+    db: AsyncSession, user: AuthUser, body: "POSOrderCreateRequest",
+) -> JSONResponse:
+    """
+    BUG-0208: store a capture refused ONLY by the automatic age bound for
+    owner/manager review. Everything else must still pass first (timezone,
+    not in the future, an event vendor's capture day a paid TRADE day, the
+    cashier an active user of this business): those stay hard refusals.
+    Nothing is posted to orders, stock, payments or the till. The caller holds
+    the key lock (_lock_offline_capture_key).
+    """
+    now = datetime.now(timezone.utc)
+    gate = await offline_capture_gate(
+        db, user.business_id, body.offline_captured_at, now,
+        in_sync_grace=user.sync_only_until is not None, enforce_max_age=False,
+    )
+    cashier_id, _, differs = await _resolve_offline_cashier(db, user, body)
+    reasons = list(gate.reasons) + ([REASON_CASHIER_DIFFERS] if differs else [])
+    if user.sync_only_until is not None:
+        reasons.append(REASON_POST_EVENT_GRACE_UPLOAD)
+    review = OfflineCaptureReview(
+        business_id=user.business_id,
+        idempotency_key=body.idempotency_key,
+        status=OFFLINE_REVIEW_PENDING,
+        captured_at=gate.captured_at,
+        payload=body.model_dump(mode="json"),
+        captured_by_user_id=cashier_id,
+        synced_by_user_id=user.user_id,
+        synced_by_role=user.role,
+        upload_review_reasons=list(dict.fromkeys(reasons)),
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(review)
+    try:
+        await db.flush()
+        db.add(AuditEvent(
+            scope=AuditScope.BUSINESS.value,
+            business_id=user.business_id,
+            actor_user_id=user.user_id,
+            action="order.pos.offline_review_queued",
+            target_type="offline_capture_review",
+            target_id=review.id,
+            diff_json={
+                "idempotency_key": body.idempotency_key,
+                "captured_at": gate.captured_at.isoformat(),
+                "captured_by_user_id": str(cashier_id),
+                "client_total_cents": body.offline_client_total_cents,
+                "review_reasons": review.upload_review_reasons,
+            },
+        ))
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        if not _is_unique_violation(exc, "uq_offline_capture_reviews_business_id_idempotency_key"):
+            raise
+        existing = await _find_offline_review(db, user.business_id, body.idempotency_key)
+        if existing is None:
+            raise
+        return await _offline_review_replay(db, user.business_id, existing)
+    return _pending_review_response(review)
+
+
+def _lower_role(a: str, b: str) -> str:
+    """The less privileged of two roles (an unknown role ranks below STAFF)."""
+    return a if _ROLE_RANK.get(a, 0) <= _ROLE_RANK.get(b, 0) else b
+
+
 # ── Order creation / checkout ─────────────────────────────────────────────────
 
 @router.post(
     "/orders", response_model=OrderResponse, status_code=201,
     dependencies=[Depends(require_pos_enabled)],
+    responses={202: {"description": "OFFLINE_CAPTURE_PENDING_REVIEW: a late offline upload was queued for review"}},
 )
 async def create_pos_order(
     body: POSOrderCreateRequest,
@@ -1023,6 +1325,64 @@ async def create_pos_order(
     (grab-and-go) — never NEW, since ringing it up at the till already IS
     the acceptance moment.
     """
+    # BUG-0208: an event vendor in its post-event sync grace may only upload
+    # queued offline sales. get_current_user's allowlist already refuses a
+    # body without offline_captured_at; this is the same rule on the parsed
+    # body (defence in depth). The trading gate would refuse it too.
+    if user.sync_only_until is not None and body.offline_captured_at is None:
+        raise AppError(
+            "EVENT_SYNC_ONLY",
+            "This event has ended. New sales are not allowed; only queued offline sales can be uploaded.",
+            403,
+        )
+    return await _create_pos_order_impl(body, user, db)
+
+
+class _ReviewApproval:
+    """An owner/manager approving a queued late upload (approve_offline_review)."""
+
+    def __init__(self, review: OfflineCaptureReview, approver: AuthUser, note: str):
+        self.review = review
+        self.approver = approver
+        self.note = note
+
+    def apply(self, db: AsyncSession, order: Order, now: datetime) -> None:
+        """Mark the review approved in the SAME transaction as the order it created."""
+        self.review.status = OFFLINE_REVIEW_APPROVED
+        self.review.decided_by_user_id = self.approver.user_id
+        self.review.decided_at = now
+        self.review.decision_note = self.note
+        self.review.order_id = order.id
+        db.add(AuditEvent(
+            scope=AuditScope.BUSINESS.value,
+            business_id=self.approver.business_id,
+            actor_user_id=self.approver.user_id,
+            action="order.pos.offline_review_approved",
+            target_type="offline_capture_review",
+            target_id=self.review.id,
+            diff_json={
+                "order_id": str(order.id),
+                "idempotency_key": self.review.idempotency_key,
+                "captured_at": self.review.captured_at.isoformat(),
+                "synced_by_user_id": str(self.review.synced_by_user_id),
+                "note": self.note,
+            },
+        ))
+
+
+async def _create_pos_order_impl(
+    body: POSOrderCreateRequest,
+    user: AuthUser,
+    db: AsyncSession,
+    approval: _ReviewApproval | None = None,
+):
+    """
+    The one POS order-creation path. `user` is the caller, or, when
+    `approval` is given, the ORIGINAL uploader of a queued late capture (its
+    upload-time role, lowered to its current one), so the approver never
+    raises the discount authority (H-1). With `approval` the capture is
+    re-validated exactly like a normal offline sync except the age bound.
+    """
     # ── Idempotency: a retried/double-tapped checkout must never create a
     #    second sale — return the original order unchanged instead. ───────
     if body.idempotency_key:
@@ -1034,10 +1394,128 @@ async def create_pos_order(
         )
         existing_order = existing.scalar_one_or_none()
         if existing_order:
+            if approval is not None:
+                raise AppError(
+                    "OFFLINE_REVIEW_KEY_CONFLICT",
+                    "An order with this upload's idempotency key already exists",
+                    409,
+                )
             return OrderResponse.model_validate(existing_order)
 
-    # ── Till must be open before any sale can be rung up ──────────────────
-    till_session = await _get_open_till(db, user.business_id)
+    is_offline = body.offline_captured_at is not None
+    if not is_offline and body.idempotency_key and approval is None:
+        # Review info-1: an ONLINE checkout must never reuse a key that is in
+        # the late-upload review queue (it would create an order and strand the
+        # review). Same key lock as offline uploads, plus the check, in one
+        # statement; the lock is held until this transaction ends.
+        queued_row = (await db.execute(
+            text(
+                "SELECT EXISTS (SELECT 1 FROM offline_capture_reviews "
+                "WHERE business_id = :b AND idempotency_key = :key) "
+                "FROM (SELECT pg_advisory_xact_lock(hashtextextended(:k, 0))) AS key_lock"
+            ).bindparams(
+                b=user.business_id, key=body.idempotency_key,
+                k=f"offline-capture:{user.business_id}:{body.idempotency_key}",
+            )
+        )).one_or_none()
+        if queued_row is not None and queued_row[0]:
+            raise AppError(
+                "OFFLINE_REVIEW_KEY_CONFLICT",
+                "This idempotency key belongs to an offline sale awaiting manager review",
+                409,
+            )
+    captured_utc: datetime | None = None
+    cashier_id = user.user_id
+    # H-1: the role every limit check uses is the LOWER of the syncing caller's
+    # role and the named cashier's role; naming a more senior colleague as the
+    # cashier can never raise the limit.
+    limit_role = user.role
+    offline_reasons: list[str] = []
+
+    # ── Event vendors may only trade on a paid trading day (souk gate) ─────
+    # An offline capture is judged on the day it was rung up (bounded to 72h),
+    # an online sale on today, exactly as before.
+    if is_offline:
+        if approval is None:
+            # BUG-0208: one idempotency key has exactly one outcome (an order,
+            # or a queued review), never both. Serialise every offline upload
+            # of this key, then look again: a concurrent upload may have
+            # committed an order or a review while we waited.
+            await _lock_offline_capture_key(db, user.business_id, body.idempotency_key)
+            existing_order = (await db.execute(select(Order).where(
+                Order.business_id == user.business_id, Order.idempotency_key == body.idempotency_key,
+            ))).scalar_one_or_none()
+            if existing_order is not None:
+                response = OrderResponse.model_validate(existing_order)
+                await db.rollback()  # releases the key lock
+                return response
+            queued = await _find_offline_review(db, user.business_id, body.idempotency_key)
+            if queued is not None:
+                return await _offline_review_replay(db, user.business_id, queued)
+            try:
+                gate = await offline_capture_gate(
+                    db, user.business_id, body.offline_captured_at,
+                    in_sync_grace=user.sync_only_until is not None,
+                )
+            except AppError as exc:
+                # ONLY the age bound may divert to review, and only on opt-in.
+                if exc.code == "OFFLINE_CAPTURE_TOO_OLD" and body.offline_review_if_too_old:
+                    return await _queue_offline_capture_for_review(db, user, body)
+                raise
+            if user.sync_only_until is not None:
+                # Review M-1: in the post-event sync-only grace EVERY upload that
+                # passed the hard checks is held for an owner/manager, whatever
+                # the opt-in flag says: a backdated device clock could otherwise
+                # keep posting real sales for 36h after the event.
+                return await _queue_offline_capture_for_review(db, user, body)
+        else:
+            # Approval: everything except the age bound is judged again (the
+            # capture day must still have been a paid TRADE day). The upload-
+            # time reasons are carried over; sync-time access is not
+            # re-judged at approval time.
+            gate = await offline_capture_gate(
+                db, user.business_id, body.offline_captured_at,
+                enforce_max_age=False, judge_sync_time=False,
+            )
+            offline_reasons.extend(approval.review.upload_review_reasons or [])
+        captured_utc = gate.captured_at
+        offline_reasons.extend(gate.reasons)
+        if approval is None:
+            cashier_id, limit_role, differs = await _resolve_offline_cashier(db, user, body)
+        else:
+            cashier_id, limit_role, differs = await _resolve_approval_cashier(db, user, approval.review)
+        if differs:
+            offline_reasons.append(REASON_CASHIER_DIFFERS)
+        if approval is not None:
+            offline_reasons.append(REASON_LATE_CAPTURE_APPROVED)
+        offline_reasons = list(dict.fromkeys(offline_reasons))
+        # Till: the session that covered the capture instant, NOT whatever is
+        # open at sync time. None = unattributed (flagged below), never wrong.
+        till_session = await find_till_open_at(db, user.business_id, captured_utc)
+    else:
+        await assert_trading_allowed(db, user.business_id)
+        # ── Till must be open before any sale can be rung up ──────────────
+        till_session = await _get_open_till(db, user.business_id)
+    till_session_id = till_session.id if till_session is not None else None
+
+    if body.exchange_of_order_id is not None:
+        original_result = await db.execute(
+            select(Order.payment_status, Order.source).where(
+                Order.id == body.exchange_of_order_id,
+                Order.business_id == user.business_id,
+            )
+        )
+        original = original_result.first()
+        if original is None:
+            raise NotFoundError("Order", str(body.exchange_of_order_id))
+        if original.source != OrderSource.POS.value or original.payment_status not in (
+            "REFUNDED", "PARTIALLY_REFUNDED",
+        ):
+            raise AppError(
+                "EXCHANGE_ORIGINAL_NOT_REFUNDED",
+                "An exchange must reference a POS order whose returned goods were already refunded",
+                422,
+            )
 
     biz_check_result = await db.execute(
         select(Business).where(Business.id == user.business_id)
@@ -1098,6 +1576,7 @@ async def create_pos_order(
             ],
             removed_ingredient_ids=item.removed_ingredient_ids,
             special_instructions=item.special_instructions,
+            variant_id=item.variant_id,
         )
         for item in body.items
     ]
@@ -1107,6 +1586,9 @@ async def create_pos_order(
     # number or leave a partial order behind.
     resolved_items = await resolve_pos_items(db, user.business_id, item_inputs)
     subtotal_cents = sum(r.breakdown.line_total_cents for r in resolved_items)
+    if subtotal_cents > INT32_MAX:
+        # Priced lines can still sum past the INTEGER column: a 422, not a 500.
+        raise AppError("ORDER_TOTAL_TOO_LARGE", "This order's total is too large to record", 422)
 
     if body.discount_cents > subtotal_cents:
         raise AppError(
@@ -1116,7 +1598,7 @@ async def create_pos_order(
         )
 
     max_staff_discount = business.max_staff_discount_cents or 0
-    if body.discount_cents > 0 and user.role != "OWNER" and body.discount_cents > max_staff_discount:
+    if body.discount_cents > 0 and limit_role != "OWNER" and body.discount_cents > max_staff_discount:
         raise AppError(
             "DISCOUNT_LIMIT_EXCEEDED",
             f"This discount requires owner approval (staff limit is {max_staff_discount} cents)",
@@ -1209,6 +1691,8 @@ async def create_pos_order(
     # allocation only ever needs to cover what's actually owed after
     # redemption.
     now = datetime.now(timezone.utc)
+    # When the sale happened: the device's capture time for an offline sale.
+    sale_at = captured_utc if is_offline else now
     change_due_cents = None
     pay_by_link_intents: list[POSPaymentLinkIntent] = []  # locked + validated; consumed below on success
 
@@ -1294,7 +1778,27 @@ async def create_pos_order(
     # it at the till already is the acceptance). A pure grab-and-go sale
     # (drinks, packaged snacks) completes immediately with no kitchen ticket.
     needs_kitchen = any(r.requires_preparation for r in resolved_items)
-    initial_status = OrderStatus.ACCEPTED if needs_kitchen else OrderStatus.COMPLETED
+    # An offline sale has already physically happened (the kitchen never saw a
+    # ticket during the outage), so a stale ACCEPTED ticket would only clutter
+    # the kitchen screen: it is recorded COMPLETED.
+    initial_status = (
+        OrderStatus.ACCEPTED if needs_kitchen and not is_offline else OrderStatus.COMPLETED
+    )
+
+    # -- Offline flags decided so far (stock shortfall is added after the
+    #    ledger is staged). Server price is authoritative: a client total that
+    #    differs is recorded as variance and flagged, never used. -----------
+    offline_unattributed = is_offline and till_session is None
+    offline_late_to_closed_till = bool(
+        is_offline and till_session is not None and till_session.status != "OPEN"
+    )
+    offline_price_variance: int | None = None
+    if (
+        is_offline
+        and body.offline_client_total_cents is not None
+        and body.offline_client_total_cents != total_cents
+    ):
+        offline_price_variance = body.offline_client_total_cents - total_cents
 
     # ── Atomic order-number increment (same pattern as the manual-order route) ─
     result = await db.execute(
@@ -1344,12 +1848,12 @@ async def create_pos_order(
         payment_required=False,
         payment_method=order_payment_method,
         payment_reference=(body.payment_reference if body.payments is None else None),
-        paid_at=now,
+        paid_at=sale_at,
         cash_tendered_cents=(body.cash_tendered_cents if body.payments is None else None),
         change_due_cents=(change_due_cents if body.payments is None else None),
-        till_session_id=till_session.id,
+        till_session_id=till_session_id,
         idempotency_key=body.idempotency_key,
-        created_by_user_id=user.user_id,
+        created_by_user_id=cashier_id,
         order_mode=body.order_mode,
         table_number=body.table_number if body.order_mode == "DINE_IN" else None,
         source=OrderSource.POS.value,
@@ -1358,6 +1862,7 @@ async def create_pos_order(
         discount_cents=body.discount_cents,
         tax_cents=tax_cents,
         discount_reason=body.discount_reason,
+        # H-1: the approver is always the authenticated caller, never a named cashier.
         discount_approved_by_user_id=user.user_id if body.discount_cents > 0 else None,
         loyalty_discount_cents=loyalty_discount_cents,
         loyalty_reward_id=reward.id if redemption else None,
@@ -1367,9 +1872,28 @@ async def create_pos_order(
         currency=currency,
         customer_name=body.customer_name,
         phone_number=body.customer_phone,
-        confirmed_at=now,
-        accepted_at=now if initial_status == OrderStatus.ACCEPTED else None,
-        completed_at=now if initial_status == OrderStatus.COMPLETED else None,
+        notify_when_ready=body.notify_when_ready,
+        # Consent provenance (migration 0071): the authenticated caller (JWT)
+        # recorded it at sale time.
+        notify_consent_at=sale_at if body.notify_when_ready else None,
+        notify_consent_by_user_id=user.user_id if body.notify_when_ready else None,
+        exchange_of_order_id=body.exchange_of_order_id,
+        confirmed_at=sale_at,
+        accepted_at=sale_at if initial_status == OrderStatus.ACCEPTED else None,
+        completed_at=sale_at if initial_status == OrderStatus.COMPLETED else None,
+        is_offline_capture=is_offline,
+        offline_captured_at=captured_utc,
+        offline_synced_at=(approval.review.created_at if approval is not None else now) if is_offline else None,
+        offline_synced_by_user_id=user.user_id if is_offline else None,
+        offline_unattributed=offline_unattributed,
+        offline_late_to_closed_till=offline_late_to_closed_till,
+        offline_client_total_cents=body.offline_client_total_cents if is_offline else None,
+        offline_price_variance_cents=offline_price_variance,
+        offline_review_reasons=list(offline_reasons),
+        offline_review_required=bool(
+            offline_unattributed or offline_late_to_closed_till or offline_price_variance
+            or offline_reasons
+        ),
     )
     db.add(order)
 
@@ -1402,6 +1926,10 @@ async def create_pos_order(
                 add_ons_snapshot=resolved.add_ons_snapshot or None,
                 removed_ingredients_snapshot=resolved.removed_ingredients_snapshot or None,
                 special_instructions=resolved.special_instructions,
+                variant_id=resolved.variant_id,
+                variant_label_snapshot=resolved.variant_label,
+                stock_ingredient_id_snapshot=resolved.variant_ingredient_id,
+                sku_snapshot=resolved.sku,
             ))
 
         db.add(OrderEvent(
@@ -1409,7 +1937,7 @@ async def create_pos_order(
             business_id=user.business_id,
             old_status=None,
             new_status=initial_status.value,
-            changed_by_user_id=user.user_id,
+            changed_by_user_id=cashier_id,
             reason=(
                 f"POS checkout — paid by SPLIT ({'+'.join(p.payment_method for p in body.payments)})"
                 if body.payments is not None
@@ -1436,11 +1964,11 @@ async def create_pos_order(
                 alloc = POSPaymentAllocation(
                     order_id=order.id,
                     business_id=user.business_id,
-                    till_session_id=till_session.id,
+                    till_session_id=till_session_id,
                     payment_method=p.payment_method,
                     amount_cents=p.amount_cents,
-                    created_by_user_id=user.user_id,
-                    created_at=now,
+                    created_by_user_id=cashier_id,
+                    created_at=sale_at,
                 )
                 if p.payment_method == "CASH":
                     alloc.cash_tendered_cents = p.cash_tendered_cents
@@ -1458,14 +1986,14 @@ async def create_pos_order(
             db.add(POSPaymentAllocation(
                 order_id=order.id,
                 business_id=user.business_id,
-                till_session_id=till_session.id,
+                till_session_id=till_session_id,
                 payment_method=body.payment_method,
                 amount_cents=total_cents,
                 cash_tendered_cents=(body.cash_tendered_cents if body.payment_method == "CASH" else None),
                 change_due_cents=(change_due_cents if body.payment_method == "CASH" else None),
                 payment_reference=body.payment_reference,
-                created_by_user_id=user.user_id,
-                created_at=now,
+                created_by_user_id=cashier_id,
+                created_at=sale_at,
             ))
 
         if body.discount_cents > 0:
@@ -1530,9 +2058,22 @@ async def create_pos_order(
                 business_id=user.business_id,
                 order_id=order.id,
                 resolved_items=resolved_items,
-                created_by_user_id=user.user_id,
-                occurred_at=now,
+                created_by_user_id=cashier_id,
+                occurred_at=sale_at,
             )
+            if is_offline and not consumption.is_empty:
+                # An offline sale has already happened, so it is NEVER refused
+                # for stock (the online path does not refuse either: the ledger
+                # is append-only). The truthful movements above are kept; if
+                # they leave any ingredient/variant below zero, say so. The
+                # read autoflushes the staged movements, so it includes them.
+                on_hand = await stock_on_hand(
+                    db, user.business_id,
+                    ingredient_ids=[line.ingredient_id for line in consumption.lines],
+                )
+                if any(int(on_hand.get(line.ingredient_id, 0)) < 0 for line in consumption.lines):
+                    order.offline_stock_shortfall = True
+                    order.offline_review_required = True
             if consumption.menu_items_without_recipe:
                 db.add(AuditEvent(
                     scope=AuditScope.BUSINESS.value,
@@ -1550,6 +2091,32 @@ async def create_pos_order(
                     },
                 ))
 
+        if is_offline:
+            db.add(AuditEvent(
+                scope=AuditScope.BUSINESS.value,
+                business_id=user.business_id,
+                actor_user_id=user.user_id,
+                action="order.pos.offline_synced",
+                target_type="order",
+                target_id=order.id,
+                diff_json={
+                    "offline_captured_at": captured_utc.isoformat(),
+                    "captured_by_user_id": str(cashier_id),
+                    "synced_by_user_id": str(user.user_id),
+                    "till_session_id": str(till_session_id) if till_session_id else None,
+                    "unattributed": offline_unattributed,
+                    "late_to_closed_till": offline_late_to_closed_till,
+                    "stock_shortfall": order.offline_stock_shortfall,
+                    "client_total_cents": body.offline_client_total_cents,
+                    "server_total_cents": total_cents,
+                    "price_variance_cents": offline_price_variance,
+                    "review_reasons": list(offline_reasons),
+                },
+            ))
+
+        if approval is not None:
+            approval.apply(db, order, now)
+
         await db.commit()
     except IntegrityError as exc:
         await db.rollback()
@@ -1558,6 +2125,12 @@ async def create_pos_order(
             attempted_total_cents=total_cents, attempted_item_count=len(resolved_items),
         )
         if replayed is not None:
+            if approval is not None:
+                raise AppError(
+                    "OFFLINE_REVIEW_KEY_CONFLICT",
+                    "An order with this upload's idempotency key already exists",
+                    409,
+                )
             return OrderResponse.model_validate(replayed)
         raise
 
@@ -1720,9 +2293,66 @@ async def refund_pos_order(
     order = await _load_pos_order_for_reversal(db, user.business_id, order_id)
     await _require_open_till_for_cash_reversal(db, user.business_id, order)
 
-    amount_cents = body.amount_cents or order.total_cents
+    # ── Line-level return (retail/variants): validated BEFORE any mutation ──
+    return_lines: list[tuple[OrderItem, int]] = []
+    if body.return_items:
+        items_by_id = {oi.id: oi for oi in order.items}
+        wanted: dict[uuid.UUID, int] = {}
+        for r in body.return_items:
+            wanted[r.order_item_id] = wanted.get(r.order_item_id, 0) + r.quantity
+        for oi_id, qty in wanted.items():
+            oi = items_by_id.get(oi_id)
+            if oi is None:
+                raise NotFoundError("Order item", str(oi_id))
+            if qty > oi.quantity - (oi.returned_quantity or 0):
+                raise AppError(
+                    "RETURN_EXCEEDS_SOLD",
+                    f"Cannot return {qty} of {oi.name_snapshot}: only "
+                    f"{oi.quantity - (oi.returned_quantity or 0)} left to return",
+                    422,
+                    details={"order_item_id": str(oi_id)},
+                )
+            return_lines.append((oi, qty))
+        # What the customer actually paid per unit: the order total (less any
+        # delivery fee) spread over the item subtotal, so order-level
+        # discounts, loyalty and exclusive VAT are shared out pro rata.
+        items_paid = max(0, order.total_cents - (order.delivery_fee_cents or 0))
+        all_returned = all(
+            (oi.returned_quantity or 0) + wanted.get(oi.id, 0) >= oi.quantity for oi in order.items
+        )
+        if all_returned:
+            computed_cents = items_paid
+        else:
+            ratio = (
+                Decimal(items_paid) / Decimal(order.subtotal_cents)
+                if order.subtotal_cents else Decimal(0)
+            )
+            computed_cents = sum(
+                int((Decimal(oi.unit_price_cents * qty) * ratio).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+                for oi, qty in return_lines
+            )
+        if computed_cents <= 0:
+            raise AppError("RETURN_AMOUNT_ZERO", "The returned goods have no refundable value", 422)
+        if body.amount_cents is not None and body.amount_cents > computed_cents:
+            raise AppError(
+                "REFUND_EXCEEDS_RETURNED_VALUE",
+                f"Refund cannot exceed the value of the returned goods ({computed_cents} cents)",
+                422,
+            )
+        amount_cents = body.amount_cents or computed_cents
+    else:
+        amount_cents = body.amount_cents or order.total_cents
     if amount_cents > order.total_cents:
         raise AppError("REFUND_EXCEEDS_TOTAL", "Refund amount cannot exceed the order total", 422)
+    if (
+        body.restore_stock and not return_lines and amount_cents < order.total_cents
+        and any(oi.variant_id is not None for oi in order.items)
+    ):
+        raise AppError(
+            "RETURN_ITEMS_REQUIRED",
+            "A partial refund that restores variant stock must say which units came back (return_items)",
+            422,
+        )
 
     is_full_refund = amount_cents == order.total_cents
 
@@ -1765,6 +2395,8 @@ async def refund_pos_order(
     else:
         cash_refund_cents = await _compute_cash_portion(db, order, amount_cents)
 
+    _require_owner_for_unreviewed_offline_cash(user, order, cash_refund_cents)
+
     order.payment_status = "REFUNDED" if is_full_refund else "PARTIALLY_REFUNDED"
     order.refund_amount_cents = amount_cents
     order.refund_cash_cents = cash_refund_cents
@@ -1786,13 +2418,49 @@ async def refund_pos_order(
         )
         business = business_result.scalar_one_or_none()
         if business and business.inventory_enabled:
-            reversed_lines = await reverse_sale_consumption(
-                db,
-                business_id=user.business_id,
-                order_id=order.id,
-                created_by_user_id=user.user_id,
-                notes=f"Refund with stock returned: {body.reason}",
-            )
+            if return_lines and not is_full_refund:
+                # Partial line-level return: restock only the returned
+                # variant units (recipe-based lines have no per-unit mirror).
+                variant_ids = {oi.variant_id for oi, _ in return_lines if oi.variant_id}
+                ing_by_variant = {}
+                if variant_ids:
+                    vrows = await db.execute(
+                        select(ProductVariant.id, ProductVariant.ingredient_id).where(
+                            ProductVariant.business_id == user.business_id,
+                            ProductVariant.id.in_(variant_ids),
+                        )
+                    )
+                    ing_by_variant = {r[0]: r[1] for r in vrows.all()}
+                reversed_lines = await restore_returned_variant_stock(
+                    db,
+                    business_id=user.business_id,
+                    order_id=order.id,
+                    # L-3: the ingredient the sale actually consumed (snapshot on
+                    # the line), not the variant's CURRENT link, which an admin may
+                    # have changed since. Pre-0068 lines fall back to the link.
+                    returns=[
+                        (oi.id, oi.returned_quantity or 0, ing_id, qty)
+                        for oi, qty in return_lines
+                        for ing_id in [
+                            oi.stock_ingredient_id_snapshot
+                            or (ing_by_variant.get(oi.variant_id) if oi.variant_id else None)
+                        ]
+                        if ing_id
+                    ],
+                    created_by_user_id=user.user_id,
+                    notes=f"Return with stock returned: {body.reason}",
+                )
+            else:
+                reversed_lines = await reverse_sale_consumption(
+                    db,
+                    business_id=user.business_id,
+                    order_id=order.id,
+                    created_by_user_id=user.user_id,
+                    notes=f"Refund with stock returned: {body.reason}",
+                )
+
+    for oi, qty in return_lines:
+        oi.returned_quantity = (oi.returned_quantity or 0) + qty
 
     # Points, unlike stock, default to coming back — see POSRefundRequest.
     # restore_loyalty_points' own docstring for why the default is flipped
@@ -1820,6 +2488,11 @@ async def refund_pos_order(
             "reason": body.reason,
             "restore_stock": body.restore_stock,
             "stock_lines_reversed": reversed_lines,
+            "returned_items": [
+                {"order_item_id": str(oi.id), "variant_id": str(oi.variant_id) if oi.variant_id else None,
+                 "quantity": qty}
+                for oi, qty in return_lines
+            ],
             "restore_loyalty_points": body.restore_loyalty_points,
             "loyalty_points_restored": loyalty_points_restored,
             "pay_by_link_allocations_pending_provider_refund": pay_by_link_flagged,
@@ -1854,6 +2527,7 @@ async def void_pos_order(
     # partial refund, there's no "which method's money is this" question
     # (see refund_pos_order's own comment).
     cash_refund_cents = await _compute_cash_portion(db, order, order.total_cents)
+    _require_owner_for_unreviewed_offline_cash(user, order, cash_refund_cents)
 
     order.payment_status = "VOIDED"
     order.refund_amount_cents = order.total_cents
@@ -2164,6 +2838,28 @@ async def close_till(
     )
     cash_refunds_cents = sum(cash_refund_result.scalars().all())
 
+    # Offline sales captured while NO till session was open are attached to
+    # none (Order.offline_unattributed), so their cash is not in the figures
+    # above. Report ALL of this business's unreviewed ones (M-1): not only
+    # those since the previous close, otherwise a sale captured before the
+    # last close would drop out of every later cash-up while still being
+    # refundable. An owner's acknowledgement is what removes one from here.
+    unattributed_filter = [
+        Order.business_id == user.business_id,
+        Order.offline_unattributed.is_(True),
+        Order.offline_acknowledged_at.is_(None),
+    ]
+    unattributed_count = (await db.execute(
+        select(func.count(Order.id)).where(*unattributed_filter)
+    )).scalar_one() or 0
+    unattributed_cash_cents = (await db.execute(
+        select(func.coalesce(func.sum(POSPaymentAllocation.amount_cents), 0)).where(
+            POSPaymentAllocation.business_id == user.business_id,
+            POSPaymentAllocation.payment_method == "CASH",
+            POSPaymentAllocation.order_id.in_(select(Order.id).where(*unattributed_filter)),
+        )
+    )).scalar_one() or 0
+
     expected = compute_expected_cash_cents(
         session.opening_float_cents, cash_sales_cents, cash_refunds_cents,
     )
@@ -2190,6 +2886,8 @@ async def close_till(
             "variance_cents": variance,
             "cash_sales_cents": cash_sales_cents,
             "cash_refunds_cents": cash_refunds_cents,
+            "offline_unattributed_count": unattributed_count,
+            "offline_unattributed_cash_cents": unattributed_cash_cents,
         },
     ))
 
@@ -2198,6 +2896,8 @@ async def close_till(
     response = TillSessionResponse.model_validate(session)
     response.cash_sales_cents = cash_sales_cents
     response.cash_refunds_cents = cash_refunds_cents
+    response.offline_unattributed_count = unattributed_count
+    response.offline_unattributed_cash_cents = unattributed_cash_cents
     return response
 
 
@@ -2267,3 +2967,411 @@ async def list_till_sessions(
         )
         for s in rows
     ]
+
+
+# -- Offline sync review (Phase 3b) -------------------------------------------
+
+class OfflineFlaggedOrder(BaseModel):
+    id: uuid.UUID
+    order_number: str
+    total_cents: int
+    payment_method: str | None = None
+    offline_captured_at: datetime | None = None
+    offline_synced_at: datetime | None = None
+    created_by_user_id: uuid.UUID | None = None
+    offline_synced_by_user_id: uuid.UUID | None = None
+    till_session_id: uuid.UUID | None = None
+    offline_unattributed: bool = False
+    offline_late_to_closed_till: bool = False
+    offline_stock_shortfall: bool = False
+    offline_client_total_cents: int | None = None
+    offline_price_variance_cents: int | None = None
+    # Every reason this sale is flagged (boolean flags + migration 0068 reasons).
+    review_reasons: list[str] = []
+    offline_acknowledged_at: datetime | None = None
+    offline_acknowledged_by_user_id: uuid.UUID | None = None
+    model_config = {"from_attributes": True}
+
+
+def _offline_flagged_out(o: Order) -> OfflineFlaggedOrder:
+    out = OfflineFlaggedOrder.model_validate(o)
+    reasons: list[str] = []
+    if o.offline_stock_shortfall:
+        reasons.append("shortfall")
+    if o.offline_price_variance_cents is not None:
+        reasons.append("variance")
+    if o.offline_unattributed:
+        reasons.append("unattributed")
+    if o.offline_late_to_closed_till:
+        reasons.append("late_till")
+    out.review_reasons = reasons + list(o.offline_review_reasons or [])
+    return out
+
+
+_OFFLINE_REASON_FILTERS = {
+    "shortfall": lambda: Order.offline_stock_shortfall.is_(True),
+    "variance": lambda: Order.offline_price_variance_cents.is_not(None),
+    "unattributed": lambda: Order.offline_unattributed.is_(True),
+    "late_till": lambda: Order.offline_late_to_closed_till.is_(True),
+    "capture_day_unpaid_at_sync": lambda: Order.offline_review_reasons.contains(["capture_day_unpaid_at_sync"]),
+    "late_sync": lambda: Order.offline_review_reasons.contains(["late_sync"]),
+    "cashier_differs_from_syncer": lambda: Order.offline_review_reasons.contains(["cashier_differs_from_syncer"]),
+    "post_event_grace_sync": lambda: Order.offline_review_reasons.contains(["post_event_grace_sync"]),
+    "late_capture_approved": lambda: Order.offline_review_reasons.contains(["late_capture_approved"]),
+    "post_event_grace_upload": lambda: Order.offline_review_reasons.contains(["post_event_grace_upload"]),
+}
+
+
+@router.get(
+    "/offline-orders/flagged", response_model=list[OfflineFlaggedOrder],
+    dependencies=[Depends(require_pos_enabled)],
+)
+async def list_flagged_offline_orders(
+    reason: str | None = Query(
+        None, pattern=r"^(shortfall|variance|unattributed|late_till|capture_day_unpaid_at_sync|late_sync|cashier_differs_from_syncer|post_event_grace_sync|late_capture_approved|post_event_grace_upload)$",
+        description="Only this kind of flag; omit for any flag",
+    ),
+    since: datetime | None = Query(None, description="Only sales captured at or after this instant"),
+    include_acknowledged: bool = Query(False, description="Also list sales an owner has already acknowledged"),
+    limit: int = Query(50, ge=1, le=200),
+    user: AuthUser = Depends(require_owner_or_manager),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Offline-synced sales that need a manager's eyes: stock went negative, the
+    device's total differed from the server's, no till session covered the sale,
+    or it landed in an already-closed till session. Newest capture first.
+    business_id comes from the JWT only.
+    """
+    conditions = [
+        Order.business_id == user.business_id,
+        Order.is_offline_capture.is_(True),
+        Order.offline_review_required.is_(True),
+    ]
+    if include_acknowledged is not True:  # also when called directly with the Query default
+        conditions.append(Order.offline_acknowledged_at.is_(None))
+    if reason is not None:
+        conditions.append(_OFFLINE_REASON_FILTERS[reason]())
+    if since is not None:
+        conditions.append(Order.offline_captured_at >= since)
+    rows = (await db.execute(
+        select(Order).where(*conditions).order_by(Order.offline_captured_at.desc(), Order.id).limit(limit)
+    )).scalars().all()
+    return [_offline_flagged_out(o) for o in rows]
+
+
+@router.post(
+    "/offline-orders/{order_id}/acknowledge", response_model=OfflineFlaggedOrder,
+    dependencies=[Depends(require_pos_enabled)],
+)
+async def acknowledge_offline_order(
+    order_id: uuid.UUID,
+    user: AuthUser = Depends(require_owner),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    OWNER only. Records that the owner reviewed this flagged offline sale
+    (reviewer and time) and removes it from the default flagged list and from
+    the till-close unattributed totals. It changes no money and no stock.
+    Idempotent: a second call keeps the first reviewer/time. business_id comes
+    from the JWT; another business's order is a 404.
+    """
+    order = (await db.execute(
+        select(Order).where(Order.id == order_id, Order.business_id == user.business_id).with_for_update()
+    )).scalar_one_or_none()
+    if order is None or not order.is_offline_capture or not order.offline_review_required:
+        raise NotFoundError("Offline order", str(order_id))
+    if order.offline_acknowledged_at is None:
+        order.offline_acknowledged_at = datetime.now(timezone.utc)
+        order.offline_acknowledged_by_user_id = user.user_id
+        db.add(AuditEvent(
+            scope=AuditScope.BUSINESS.value,
+            business_id=user.business_id,
+            actor_user_id=user.user_id,
+            action="order.pos.offline_acknowledged",
+            target_type="order",
+            target_id=order.id,
+            diff_json={
+                "reasons": _offline_flagged_out(order).review_reasons,
+                "unattributed": order.offline_unattributed,
+                "late_to_closed_till": order.offline_late_to_closed_till,
+                "total_cents": order.total_cents,
+            },
+        ))
+        await db.commit()
+        await db.refresh(order)
+    return _offline_flagged_out(order)
+
+
+# -- Late offline uploads awaiting review (BUG-0208, migration 0069) ----------
+
+class OfflineReviewDecisionRequest(BaseModel):
+    note: str = Field(min_length=1, max_length=1000)
+
+    @model_validator(mode="after")
+    def _note_not_blank(self) -> "OfflineReviewDecisionRequest":
+        self.note = self.note.strip()
+        if not self.note:
+            raise ValueError("note must not be blank")
+        return self
+
+
+class OfflineReviewLine(BaseModel):
+    menu_item_id: uuid.UUID
+    variant_id: uuid.UUID | None = None
+    quantity: int
+    name: str | None = None
+
+
+class OfflineReviewOut(BaseModel):
+    id: uuid.UUID
+    status: str
+    idempotency_key: str
+    captured_at: datetime
+    received_at: datetime
+    captured_by_user_id: uuid.UUID
+    captured_by_name: str | None = None
+    synced_by_user_id: uuid.UUID
+    synced_by_name: str | None = None
+    upload_review_reasons: list[str] = []
+    payment_method: str | None = None
+    client_total_cents: int | None = None
+    discount_cents: int = 0
+    lines: list[OfflineReviewLine] = []
+    decided_by_user_id: uuid.UUID | None = None
+    decided_by_name: str | None = None
+    decided_at: datetime | None = None
+    decision_note: str | None = None
+    order_id: uuid.UUID | None = None
+
+
+class OfflineReviewList(BaseModel):
+    items: list[OfflineReviewOut]
+    pending_count: int
+
+
+class OfflineReviewDecisionResponse(BaseModel):
+    review: OfflineReviewOut
+    order: OrderResponse | None = None
+
+
+async def _review_outs(
+    db: AsyncSession, business_id: uuid.UUID, reviews: list[OfflineCaptureReview],
+) -> list[OfflineReviewOut]:
+    """Serialize reviews with staff and item names, resolved within this business only."""
+    from shared.models.menu import MenuItem
+
+    user_ids = {u for r in reviews for u in (r.captured_by_user_id, r.synced_by_user_id, r.decided_by_user_id) if u}
+    item_ids: set[uuid.UUID] = set()
+    for r in reviews:
+        for line in (r.payload or {}).get("items") or []:
+            try:
+                item_ids.add(uuid.UUID(str(line.get("menu_item_id"))))
+            except (ValueError, TypeError, AttributeError):
+                continue
+    names: dict[uuid.UUID, str] = {}
+    if user_ids:
+        for uid, staff_name, email in (await db.execute(
+            select(BusinessUser.id, BusinessUser.staff_name, BusinessUser.email).where(
+                BusinessUser.id.in_(user_ids), BusinessUser.business_id == business_id,
+            )
+        )).all():
+            names[uid] = staff_name or email or ""
+    item_names: dict[uuid.UUID, str] = {}
+    if item_ids:
+        for iid, name in (await db.execute(
+            select(MenuItem.id, MenuItem.name).where(MenuItem.id.in_(item_ids), MenuItem.business_id == business_id)
+        )).all():
+            item_names[iid] = name
+    out: list[OfflineReviewOut] = []
+    for r in reviews:
+        payload = r.payload or {}
+        lines = []
+        for line in payload.get("items") or []:
+            try:
+                mid = uuid.UUID(str(line.get("menu_item_id")))
+            except (ValueError, TypeError, AttributeError):
+                continue
+            vid = line.get("variant_id")
+            lines.append(OfflineReviewLine(
+                menu_item_id=mid, variant_id=uuid.UUID(str(vid)) if vid else None,
+                quantity=int(line.get("quantity") or 0), name=item_names.get(mid),
+            ))
+        payment_method = payload.get("payment_method") or ("SPLIT" if payload.get("payments") else None)
+        out.append(OfflineReviewOut(
+            id=r.id, status=r.status, idempotency_key=r.idempotency_key, captured_at=r.captured_at,
+            received_at=r.created_at, captured_by_user_id=r.captured_by_user_id,
+            captured_by_name=names.get(r.captured_by_user_id), synced_by_user_id=r.synced_by_user_id,
+            synced_by_name=names.get(r.synced_by_user_id), upload_review_reasons=list(r.upload_review_reasons or []),
+            payment_method=payment_method, client_total_cents=payload.get("offline_client_total_cents"),
+            discount_cents=int(payload.get("discount_cents") or 0), lines=lines,
+            decided_by_user_id=r.decided_by_user_id,
+            decided_by_name=names.get(r.decided_by_user_id) if r.decided_by_user_id else None,
+            decided_at=r.decided_at, decision_note=r.decision_note, order_id=r.order_id,
+        ))
+    return out
+
+
+async def _load_review_locked(db: AsyncSession, business_id: uuid.UUID, review_id: uuid.UUID) -> OfflineCaptureReview:
+    """This business's review, locked FOR UPDATE (two managers deciding at once serialise here). 404 otherwise."""
+    review = (await db.execute(
+        select(OfflineCaptureReview)
+        .where(OfflineCaptureReview.id == review_id, OfflineCaptureReview.business_id == business_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    if review is None:
+        raise NotFoundError("Offline review", str(review_id))
+    return review
+
+
+async def _decided_response(db: AsyncSession, business_id: uuid.UUID, review: OfflineCaptureReview):
+    order = None
+    if review.order_id is not None:
+        row = (await db.execute(select(Order).where(
+            Order.id == review.order_id, Order.business_id == business_id,
+        ))).scalar_one_or_none()
+        order = OrderResponse.model_validate(row) if row is not None else None
+    [out] = await _review_outs(db, business_id, [review])
+    return OfflineReviewDecisionResponse(review=out, order=order)
+
+
+@router.get(
+    "/offline-reviews", response_model=OfflineReviewList,
+    dependencies=[Depends(require_pos_enabled)],
+)
+async def list_offline_reviews(
+    status: str = Query("PENDING", pattern=r"^(PENDING|APPROVED|REJECTED|ALL)$"),
+    limit: int = Query(50, ge=1, le=200),
+    user: AuthUser = Depends(require_owner_or_manager),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Late offline uploads (refused by the automatic age bound, queued on the
+    client's opt-in). Pending ones have no financial effect yet. Newest
+    upload first; `pending_count` is always the business's total pending.
+    business_id comes from the JWT only.
+    """
+    status = status if isinstance(status, str) else "PENDING"  # direct calls get the Query default
+    limit = limit if isinstance(limit, int) else 50
+    conditions = [OfflineCaptureReview.business_id == user.business_id]
+    if status != "ALL":
+        conditions.append(OfflineCaptureReview.status == status)
+    rows = (await db.execute(
+        select(OfflineCaptureReview).where(*conditions)
+        .order_by(OfflineCaptureReview.created_at.desc(), OfflineCaptureReview.id).limit(limit)
+    )).scalars().all()
+    pending = (await db.execute(select(func.count(OfflineCaptureReview.id)).where(
+        OfflineCaptureReview.business_id == user.business_id,
+        OfflineCaptureReview.status == OFFLINE_REVIEW_PENDING,
+    ))).scalar_one() or 0
+    return OfflineReviewList(items=await _review_outs(db, user.business_id, list(rows)), pending_count=pending)
+
+
+@router.post(
+    "/offline-reviews/{review_id}/approve", response_model=OfflineReviewDecisionResponse,
+    dependencies=[Depends(require_pos_enabled)],
+)
+async def approve_offline_review(
+    review_id: uuid.UUID,
+    body: OfflineReviewDecisionRequest,
+    user: AuthUser = Depends(require_owner_or_manager),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Approve a queued late upload (note required). The order is created now
+    through the same path as a normal offline sync, re-validating everything
+    except the age bound: an event vendor's capture day must still have been
+    a paid TRADE day, the price is the server's, variants and stock behave as
+    normal, and the till is the session open at the capture instant (else the
+    sale is flagged unattributed). The order carries reason
+    late_capture_approved, so it appears in the flagged list.
+
+    H-1: discounts are judged with the ORIGINAL uploader's role (its role at
+    upload, lowered to its current role) and the cashier's; the approver never
+    raises that authority. Idempotent and race-safe: the review row is locked,
+    so two approvals make exactly one order; approving an approved review
+    returns it unchanged. Another business's review is a 404.
+    """
+    review = await _load_review_locked(db, user.business_id, review_id)
+    if review.status == OFFLINE_REVIEW_APPROVED:
+        response = await _decided_response(db, user.business_id, review)
+        await db.rollback()
+        return response
+    if review.status != OFFLINE_REVIEW_PENDING:
+        decided = review.status.lower()
+        await db.rollback()
+        raise AppError("OFFLINE_REVIEW_ALREADY_DECIDED", f"This upload was already {decided}", 409)
+
+    try:
+        request_body = POSOrderCreateRequest.model_validate(review.payload)
+    except ValidationError:
+        # Review info-2: a stored payload that no longer validates is a 422 the
+        # manager can act on (reject it), never a 500.
+        await db.rollback()
+        raise AppError(
+            "OFFLINE_REVIEW_PAYLOAD_INVALID",
+            "This upload can no longer be recorded as it was sent; reject it and enter the sale by hand",
+            422,
+        )
+    uploader_role = review.synced_by_role
+    # Review L-1: an uploader who is no longer an ACTIVE user of this business
+    # keeps no authority beyond STAFF (the lowest).
+    current_role = (await db.execute(select(BusinessUser.role).where(
+        BusinessUser.id == review.synced_by_user_id, BusinessUser.business_id == user.business_id,
+        BusinessUser.is_active.is_(True),
+    ))).scalar_one_or_none()
+    uploader_role = _lower_role(uploader_role, current_role if current_role is not None else "STAFF")
+    uploader = AuthUser(
+        user_id=review.synced_by_user_id, business_id=user.business_id, role=uploader_role, token_type="access",
+    )
+    await _create_pos_order_impl(request_body, uploader, db, approval=_ReviewApproval(review, user, body.note))
+    review = (await db.execute(
+        select(OfflineCaptureReview).where(OfflineCaptureReview.id == review_id)
+        .execution_options(populate_existing=True)
+    )).scalar_one()
+    return await _decided_response(db, user.business_id, review)
+
+
+@router.post(
+    "/offline-reviews/{review_id}/reject", response_model=OfflineReviewDecisionResponse,
+    dependencies=[Depends(require_pos_enabled)],
+)
+async def reject_offline_review(
+    review_id: uuid.UUID,
+    body: OfflineReviewDecisionRequest,
+    user: AuthUser = Depends(require_owner_or_manager),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Reject a queued late upload (note required). No financial effect: no
+    order, stock, payment or till change. Idempotent (a second reject keeps
+    the first decision); rejecting an approved upload is a 409. Another
+    business's review is a 404.
+    """
+    review = await _load_review_locked(db, user.business_id, review_id)
+    if review.status == OFFLINE_REVIEW_REJECTED:
+        response = await _decided_response(db, user.business_id, review)
+        await db.rollback()
+        return response
+    if review.status != OFFLINE_REVIEW_PENDING:
+        decided = review.status.lower()
+        await db.rollback()
+        raise AppError("OFFLINE_REVIEW_ALREADY_DECIDED", f"This upload was already {decided}", 409)
+    now = datetime.now(timezone.utc)
+    review.status = OFFLINE_REVIEW_REJECTED
+    review.decided_by_user_id = user.user_id
+    review.decided_at = now
+    review.decision_note = body.note
+    db.add(AuditEvent(
+        scope=AuditScope.BUSINESS.value,
+        business_id=user.business_id,
+        actor_user_id=user.user_id,
+        action="order.pos.offline_review_rejected",
+        target_type="offline_capture_review",
+        target_id=review.id,
+        diff_json={"idempotency_key": review.idempotency_key, "captured_at": review.captured_at.isoformat(),
+                   "note": body.note},
+    ))
+    await db.commit()
+    return await _decided_response(db, user.business_id, review)

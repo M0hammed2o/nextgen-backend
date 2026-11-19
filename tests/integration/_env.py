@@ -34,8 +34,11 @@ suite (see KNOWN_BUGS.md BUG-0096).
 To run this tier:
 
     docker compose -f docker-compose.test.yml up -d
-    export TEST_DATABASE_URL="postgresql+asyncpg://nextgen_test:nextgen_test_only_do_not_use_in_prod@localhost:55677/nextgen_test"
-    export TEST_REDIS_URL="redis://localhost:55678/0"
+    # 127.0.0.1, not localhost: on Windows "localhost" tries ::1 first and every
+    # fresh connection waits ~2s for the refused IPv6 attempt, which fails the
+    # 2s ping in test_sse_redis_pool_leak.py (diagnosed 2026-11-08).
+    export TEST_DATABASE_URL="postgresql+asyncpg://nextgen_test:nextgen_test_only_do_not_use_in_prod@127.0.0.1:55677/nextgen_test"
+    export TEST_REDIS_URL="redis://127.0.0.1:55678/0"
     python -m alembic upgrade head
     python -m pytest tests/integration -q
 

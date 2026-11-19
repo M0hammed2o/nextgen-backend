@@ -13,6 +13,7 @@ Never accept business_id from the client unless caller is SUPER_ADMIN.
 
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 
 import jwt
 from fastapi import Depends, HTTPException, Request, status
@@ -26,6 +27,10 @@ from shared.models.user import BusinessUser
 
 bearer_scheme = HTTPBearer(auto_error=False)
 
+# Mirrors backend.app.events.service.EVENT_SUSPENSION_REASON (not imported at
+# module load to keep this core module free of the events package).
+_EVENT_SUSPENSION_REASON = "EVENT_SUBSCRIPTION_ENDED"
+
 
 @dataclass
 class AuthUser:
@@ -34,6 +39,11 @@ class AuthUser:
     business_id: uuid.UUID | None
     role: str
     token_type: str  # "access" or "admin_access"
+    # BUG-0208: set ONLY by get_current_user, when the business is an event
+    # vendor suspended at the end of its event and still inside its sync
+    # grace. Such a user passed the sync-only allowlist; routes that need a
+    # finer check (create_pos_order: offline uploads only) read it.
+    sync_only_until: datetime | None = None
 
 
 async def get_current_user(
@@ -106,6 +116,13 @@ async def get_current_user(
         role=payload["role"],
         token_type=payload.get("type", "access"),
     )
+    # Tokens issued before token_version existed carry no "tv" claim; they
+    # are treated as version 0, which is every user's starting value, so the
+    # deploy itself logs nobody out.
+    try:
+        token_version_claim = int(payload.get("tv", 0) or 0)
+    except (TypeError, ValueError):
+        raise _invalid
 
     # Instant cutoff for deactivated business users AND suspended businesses —
     # one indexed join, no extra round-trip. Business suspension was
@@ -117,7 +134,12 @@ async def get_current_user(
     if user.token_type == "access":
         from shared.models.business import Business
         result = await db.execute(
-            select(BusinessUser.is_active, Business.is_active, Business.suspended_reason)
+            select(
+                BusinessUser.is_active,
+                Business.is_active,
+                Business.suspended_reason,
+                BusinessUser.token_version,
+            )
             .join(Business, Business.id == BusinessUser.business_id)
             .where(BusinessUser.id == user.user_id)
         )
@@ -127,21 +149,45 @@ async def get_current_user(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail={"code": "ACCOUNT_DISABLED", "message": "This account has been disabled"},
             )
-        user_active, business_active, suspended_reason = row
+        user_active, business_active, suspended_reason, current_token_version = row
         if not user_active:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail={"code": "ACCOUNT_DISABLED", "message": "This account has been disabled"},
             )
-        if not business_active:
+        # Instant cut-off on credential change: shared/auth_sessions.py bumps
+        # token_version whenever a PIN/password is replaced or the account is
+        # deactivated, so an access token issued before that is refused here
+        # on its next request rather than when it expires.
+        if token_version_claim != (current_token_version or 0):
             raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail={
-                    "code": "BUSINESS_SUSPENDED",
-                    "message": "This business account has been suspended.",
-                    "details": {"reason": suspended_reason} if suspended_reason else None,
-                },
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail={"code": "SESSION_REVOKED", "message": "This session has ended. Please sign in again."},
             )
+        if not business_active:
+            # BUG-0208 post-event sync grace: the ONE exception. Only an
+            # EVENT-plan business suspended with exactly the automatic
+            # end-of-event reason can qualify (an admin suspension,
+            # cancellation or any other reason is refused right here, before
+            # any further query), and event_sync_grace_until re-checks all of
+            # that live and computes the window from paid subscription data.
+            # Even then only the explicit sync-only allowlist is reachable.
+            grace_until = None
+            if suspended_reason == _EVENT_SUSPENSION_REASON and user.business_id is not None:
+                from backend.app.events.trading import event_sync_grace_until
+                grace_until = await event_sync_grace_until(db, user.business_id)
+            if grace_until is None:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail={
+                        "code": "BUSINESS_SUSPENDED",
+                        "message": "This business account has been suspended.",
+                        "details": {"reason": suspended_reason} if suspended_reason else None,
+                    },
+                )
+            from backend.app.events.sync_grace import assert_sync_only_request_allowed
+            await assert_sync_only_request_allowed(request)
+            user.sync_only_until = grace_until
 
     return user
 

@@ -47,7 +47,13 @@ class FakeDB:
 
     async def execute(self, stmt):
         self.executed.append(stmt)
+        # A bulk UPDATE (refresh-token revocation) needs no queued result.
+        if getattr(stmt, "is_update", False) and not self._results:
+            return FakeResult(None)
         return self._results.pop(0)
+
+    def revoked_refresh_tokens(self) -> bool:
+        return any(getattr(s, "is_update", False) and getattr(s.table, "name", "") == "refresh_tokens" for s in self.executed)
 
     async def commit(self):
         self.commits += 1
@@ -69,6 +75,7 @@ def make_staff(role: str, business_id, staff_id=None, is_active=True):
     from datetime import datetime, timezone
 
     return types.SimpleNamespace(
+        token_version=0,  # BusinessUser.token_version server default (migration 0061)
         id=staff_id or uuid.uuid4(),
         business_id=business_id,
         role=role,
@@ -168,6 +175,8 @@ async def test_manager_can_rotate_pin_of_staff():
 
     result = await rotate_pin(staff_id=target.id, body=PinRotation(new_pin="1234"), user=manager, db=db)
     assert result.pin == "1234"
+    # BUG-0184 follow-up: rotating a PIN revokes the target's live sessions.
+    assert db.revoked_refresh_tokens()
 
 
 async def test_auto_rotate_pin_blocks_targeting_owner():

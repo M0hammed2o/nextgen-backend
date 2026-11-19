@@ -15,9 +15,12 @@ by `Business.advanced_analytics_enabled` via `require_advanced_analytics_enabled
 (returns 409 ADVANCED_ANALYTICS_NOT_ENABLED for a non-entitled tenant). The
 delivery-channel breakdown, the other Advanced Analytics report, lives in
 routes_external_orders.py's `/business/external-orders/channels` and is gated
-the same way.
+the same way. `/sales-wallets`, `/best-sellers` and
+`/products/{id}/performance` are Core Analytics (every plan): the
+restaurant's own sales split by channel and by product.
 """
 
+import uuid
 from collections import defaultdict
 from decimal import ROUND_HALF_UP, Decimal
 
@@ -41,6 +44,8 @@ from backend.app.analytics.revenue import (
     voided_cents_expr,
     voided_count_expr,
 )
+from backend.app.analytics import product_rankings, sales_wallets, variant_report
+from backend.app.core.errors import AppError
 from backend.app.core.rbac import AuthUser, require_owner_or_manager
 from backend.app.db.session import get_db
 from shared.models.analytics import DailyUsage
@@ -593,3 +598,126 @@ async def get_payment_method_breakdown(
         total_refunds_cents=sum(m.refunds_cents for m in methods),
         total_net_cents=sum(m.net_cents for m in methods),
     )
+
+
+# ── Sales Wallets ────────────────────────────────────────────────────────────
+# Sales per channel group (Mr D, Uber Eats, General) and their total. These are
+# reporting views, not stored money; see backend/app/analytics/sales_wallets.py.
+# Core Analytics, available on every plan (owner decision 2026-11-11,
+# DECISION-0058 as amended): they show the restaurant's own sales, the same
+# figures /summary already shows ungated, split by channel. The /channels
+# report stays Advanced Analytics.
+
+_RANGE_PATTERN = r"^(today|yesterday|7d|month|custom)$"
+
+
+async def _report_business(db: AsyncSession, business_id) -> "Business":
+    from shared.models.business import Business
+
+    business = await db.get(Business, business_id)
+    if business is None:
+        raise AppError("NOT_FOUND", "Business not found.", 404)
+    return business
+
+
+@router.get("/sales-wallets")
+async def get_sales_wallets(
+    range_: str = Query(default="today", alias="range", pattern=_RANGE_PATTERN),
+    start: date | None = Query(default=None),
+    end: date | None = Query(default=None),
+    user: AuthUser = Depends(require_owner_or_manager),
+    db: AsyncSession = Depends(get_db),
+):
+    business = await _report_business(db, user.business_id)
+    rng = sales_wallets.resolve_range(range_, start, end, business.timezone or "Africa/Johannesburg")
+    wallets, total = await sales_wallets.wallet_totals(db, user.business_id, rng)
+    return {
+        "range": rng.range, "start_date": rng.start_date.isoformat(), "end_date": rng.end_date.isoformat(),
+        "timezone": rng.timezone, "currency": business.currency, "wallets": wallets, "total": total,
+    }
+
+
+@router.get("/sales-wallets/{wallet}/orders")
+async def get_sales_wallet_orders(
+    wallet: str,
+    range_: str = Query(default="today", alias="range", pattern=_RANGE_PATTERN),
+    start: date | None = Query(default=None),
+    end: date | None = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=25, ge=1, le=100),
+    user: AuthUser = Depends(require_owner_or_manager),
+    db: AsyncSession = Depends(get_db),
+):
+    if wallet not in (*sales_wallets.WALLET_KEYS, sales_wallets.TOTAL):
+        raise AppError("UNKNOWN_WALLET", f"Unknown wallet {wallet!r}.", 404)
+    business = await _report_business(db, user.business_id)
+    rng = sales_wallets.resolve_range(range_, start, end, business.timezone or "Africa/Johannesburg")
+    wallets, total = await sales_wallets.wallet_totals(db, user.business_id, rng)
+    summary = total if wallet == sales_wallets.TOTAL else next(w for w in wallets if w["key"] == wallet)
+    detail = await sales_wallets.wallet_orders(db, user.business_id, rng, wallet, page=page, page_size=page_size)
+    return {
+        "wallet": wallet, "label": sales_wallets.WALLET_LABELS[wallet],
+        "start_date": rng.start_date.isoformat(), "end_date": rng.end_date.isoformat(),
+        "timezone": rng.timezone, "currency": business.currency, "summary": summary, **detail,
+    }
+
+
+# ── Best-selling products ───────────────────────────────────────────────────
+# Top 3 per channel and one product across channels. Core Analytics, like
+# /top-items, which these extend with channels and stable product ids; see
+# backend/app/analytics/product_rankings.py.
+
+
+@router.get("/best-sellers")
+async def get_best_sellers(
+    range_: str = Query(default="today", alias="range", pattern=_RANGE_PATTERN),
+    start: date | None = Query(default=None),
+    end: date | None = Query(default=None),
+    rank_by: str = Query(default="quantity", pattern=r"^(quantity|revenue)$"),
+    user: AuthUser = Depends(require_owner_or_manager),
+    db: AsyncSession = Depends(get_db),
+):
+    business = await _report_business(db, user.business_id)
+    rng = sales_wallets.resolve_range(range_, start, end, business.timezone or "Africa/Johannesburg")
+    result = await product_rankings.best_sellers(db, user.business_id, rng, rank_by=rank_by)
+    return {
+        "range": rng.range, "start_date": rng.start_date.isoformat(), "end_date": rng.end_date.isoformat(),
+        "timezone": rng.timezone, "currency": business.currency, **result,
+    }
+
+
+@router.get("/products/{menu_item_id}/performance")
+async def get_product_performance(
+    menu_item_id: uuid.UUID,
+    range_: str = Query(default="7d", alias="range", pattern=_RANGE_PATTERN),
+    start: date | None = Query(default=None),
+    end: date | None = Query(default=None),
+    user: AuthUser = Depends(require_owner_or_manager),
+    db: AsyncSession = Depends(get_db),
+):
+    business = await _report_business(db, user.business_id)
+    rng = sales_wallets.resolve_range(range_, start, end, business.timezone or "Africa/Johannesburg")
+    result = await product_rankings.product_performance(db, user.business_id, rng, menu_item_id)
+    return {
+        "range": rng.range, "start_date": rng.start_date.isoformat(), "end_date": rng.end_date.isoformat(),
+        "timezone": rng.timezone, "currency": business.currency, **result,
+    }
+
+
+@router.get("/variants")
+async def get_variant_sales(
+    range_: str = Query(default="7d", alias="range", pattern=_RANGE_PATTERN),
+    start: date | None = Query(default=None),
+    end: date | None = Query(default=None),
+    menu_item_id: uuid.UUID | None = Query(default=None),
+    user: AuthUser = Depends(require_owner_or_manager),
+    db: AsyncSession = Depends(get_db),
+):
+    """Sales, returns and net by product variant (size/colour/SKU)."""
+    business = await _report_business(db, user.business_id)
+    rng = sales_wallets.resolve_range(range_, start, end, business.timezone or "Africa/Johannesburg")
+    result = await variant_report.variant_sales(db, user.business_id, rng, menu_item_id=menu_item_id)
+    return {
+        "range": rng.range, "start_date": rng.start_date.isoformat(), "end_date": rng.end_date.isoformat(),
+        "timezone": rng.timezone, "currency": business.currency, **result,
+    }

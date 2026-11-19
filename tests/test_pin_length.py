@@ -74,6 +74,10 @@ class FakeDB:
         self.commits = 0
 
     async def execute(self, stmt):
+        self.executed = getattr(self, "executed", []) + [stmt]
+        # A bulk UPDATE (refresh-token revocation) needs no queued result.
+        if getattr(stmt, "is_update", False) and not self._results:
+            return FakeResult(None)
         return self._results.pop(0)
 
     def add(self, obj):
@@ -126,6 +130,7 @@ async def test_auto_rotate_pin_returns_4_digits():
     business_id = uuid.uuid4()
     caller = make_owner_user(business_id)
     staff = types.SimpleNamespace(
+        token_version=0,  # BusinessUser.token_version server default (migration 0061)
         id=uuid.uuid4(), business_id=business_id, role="STAFF",
         pin_hash=None, pin_updated_at=None,
         failed_login_attempts=3, locked_until="something",
@@ -138,3 +143,5 @@ async def test_auto_rotate_pin_returns_4_digits():
     assert res.pin.isdigit()
     assert staff.failed_login_attempts == 0
     assert staff.locked_until is None
+    # BUG-0184 follow-up: the auto-rotation also revokes live sessions.
+    assert any(getattr(st, "is_update", False) and st.table.name == "refresh_tokens" for st in db.executed)

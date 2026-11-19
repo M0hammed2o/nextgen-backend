@@ -6,8 +6,8 @@ Includes order items (snapshots at time of order) and audit events.
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from shared.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
@@ -23,6 +23,14 @@ class Order(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     __table_args__ = (
         UniqueConstraint(
             "business_id", "order_number", name="uq_orders_business_id_order_number"
+        ),
+        CheckConstraint(
+            "NOT is_offline_capture OR offline_captured_at IS NOT NULL",
+            name="offline_capture_has_time",
+        ),
+        Index(
+            "ix_orders_business_id_offline_flagged", "business_id", "offline_captured_at",
+            postgresql_where=text("offline_review_required"),
         ),
     )
 
@@ -47,7 +55,7 @@ class Order(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     )
     payment_status: Mapped[str] = mapped_column(
         String(32), default="PENDING", nullable=False,
-        comment="PENDING / PAID / CASH_ON_COLLECTION"
+        comment="UNPAID / PENDING / PAID / FAILED / REFUNDED / PARTIALLY_REFUNDED / VOIDED / CASH_ON_COLLECTION"
     )
 
     # ── Order Details ────────────────────────────────────────────────────
@@ -57,7 +65,7 @@ class Order(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     )
     source: Mapped[str] = mapped_column(
         String(32), default="WHATSAPP", nullable=False,
-        comment="WHATSAPP / MANUAL / ADMIN"
+        comment="WHATSAPP / MANUAL / ADMIN / POS / UBER_EATS / MR_D / OTHER_EXTERNAL — see shared.enums.OrderSource"
     )
 
     # ── Money (cents) ────────────────────────────────────────────────────
@@ -69,6 +77,22 @@ class Order(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     # ── Customer Info (snapshot) ─────────────────────────────────────────
     customer_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     phone_number: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    notify_when_ready: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false",
+        comment="POS only: the customer consented to a WhatsApp message when the order is READY. "
+                "A phone number alone (e.g. captured for loyalty) is never consent."
+    )
+    # Consent provenance (migration 0071): when, and which business user
+    # recorded the notify_when_ready consent at the till. Not FK-enforced,
+    # same pattern as cancelled_by_user_id.
+    notify_consent_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+        comment="When the cashier recorded notify_when_ready consent (POS)."
+    )
+    notify_consent_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True,
+        comment="Business user (JWT) who recorded notify_when_ready consent; not FK-enforced."
+    )
     delivery_address: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # ── Timestamps ───────────────────────────────────────────────────────
@@ -241,6 +265,46 @@ class Order(Base, UUIDPrimaryKeyMixin, TimestampMixin):
                  "cash. NULL means nothing has been refunded, or the "
                  "refund involved no cash at all."
     )
+    # Exchange link (migration 0066): this sale replaces goods returned on
+    # the referenced order (which must already be refunded).
+    exchange_of_order_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("orders.id", ondelete="SET NULL"),
+        nullable=True, index=True,
+    )
+
+    # ── Offline POS capture (migration 0067) ──────────────────────────────
+    # A sale rung up on a device while offline and replayed on reconnect.
+    # created_by_user_id is the cashier who made the sale; the user whose
+    # session synced it is offline_synced_by_user_id. Price is always the
+    # server's; offline_client_total_cents is only what the device showed.
+    is_offline_capture: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False)
+    offline_captured_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    offline_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    offline_synced_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True, comment="business_users.id, not FK-enforced")
+    offline_unattributed: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False,
+        comment="No till session covered offline_captured_at; till_session_id is NULL")
+    offline_late_to_closed_till: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False,
+        comment="Attributed to a till session already closed when the sale synced")
+    offline_stock_shortfall: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False,
+        comment="The sale took an ingredient/variant stock below zero")
+    offline_client_total_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    offline_price_variance_cents: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, comment="client total minus server total, only when they differ")
+    offline_review_required: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False)
+    # Migration 0068 (souk security review). Reasons NOT already carried by a
+    # boolean above: capture_day_unpaid_at_sync, late_sync,
+    # cashier_differs_from_syncer. Empty for every pre-0068 row.
+    offline_review_reasons: Mapped[list[str]] = mapped_column(
+        ARRAY(Text), default=list, server_default=text("'{}'::text[]"), nullable=False)
+    offline_acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    offline_acknowledged_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True, comment="business_users.id (OWNER), not FK-enforced")
 
     # ── Relationships ────────────────────────────────────────────────────
     items = relationship("OrderItem", back_populates="order", lazy="selectin")
@@ -317,6 +381,24 @@ class OrderItem(Base, UUIDPrimaryKeyMixin):
                  "at order time, immutable like the other snapshot columns"
     )
     special_instructions: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Product variants (migration 0066). variant_id is SET NULL on delete so
+    # history survives; the snapshots below are what receipts/reports read.
+    variant_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("product_variants.id", ondelete="SET NULL"),
+        nullable=True, index=True,
+    )
+    variant_label_snapshot: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    sku_snapshot: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    stock_ingredient_id_snapshot: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True,
+        comment="Ingredient the sale actually consumed for this variant line (migration 0068); "
+                "a later re-link of the variant must not redirect a return's restock",
+    )
+    returned_quantity: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0",
+        comment="Units returned through a line-level POS refund (exchange/return)",
+    )
 
     # BUG-0016 fix (migration 0038): True only for a dashboard-typed
     # name+price_cents line with no menu_item_id — a caller-asserted price

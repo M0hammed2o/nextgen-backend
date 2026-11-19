@@ -30,6 +30,7 @@ os.environ.setdefault("RATE_LIMIT_ENABLED", "false")
 sys.path.insert(0, os.path.abspath("."))
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine  # noqa: E402
+from scripts._seed_safety import require_local_or_confirmed  # noqa: E402
 
 from backend.app.api.v1 import routes_import, routes_inventory, routes_setup  # noqa: E402
 from backend.app.core.rbac import AuthUser  # noqa: E402
@@ -110,6 +111,7 @@ Margherita,Large Pizza Box,1,box,size-large
 
 
 async def main():
+    require_local_or_confirmed(os.environ["DATABASE_URL"], "scripts/verify_self_service_e2e.py")
     engine = create_async_engine(os.environ["DATABASE_URL"], echo=False)
     Session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 

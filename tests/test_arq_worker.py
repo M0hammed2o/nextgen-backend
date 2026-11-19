@@ -88,6 +88,10 @@ class TestProcessWhatsappMessage:
             msg_type="text",
             raw_payload={"id": "wamid.test_abc", "type": "text"},
             contact_name="Test Customer",
+            # migration 0059 — always forwarded; None here since this call
+            # didn't pass either, matching the pre-0059 fallback behaviour.
+            expected_business_id=None,
+            expected_routing_generation=None,
         )
 
     async def test_session_comes_from_factory_not_fastapi(self):
@@ -385,12 +389,24 @@ class TestWorkerSettings:
         package) the WhatsApp order-usage threshold-alert sweep,
         check_whatsapp_usage_alerts (monitoring/reporting only — reads
         orders/businesses, writes only its own new usage_alerts table,
-        never touches the bot pipeline) — cron jobs must be registered.
-        Count was 6, then 7, then 8, now 9; bumped deliberately each time,
-        not a weakened assertion (this test still enumerates every job by
-        name below).
+        never touches the bot pipeline) — and (added 2026-10-26, marketplace
+        completion pass) the delivery webhook-event retention sweep,
+        delivery_webhook_retention_sweep (redacts raw payloads at 30 days,
+        deletes at 400 — backend/app/delivery/retention.py) — and (added
+        2026-11-11, BUG-0191) delivery_order_recovery_and_reminders
+        (re-enqueues lost delivery-order jobs, reminds staff; never accepts
+        or denies) — and (added 2026-11-18, souk foundation, migration
+        0062) reconcile_event_vendors (activates/expires event-plan vendors
+        from their paid event subscriptions; only lifts its own
+        EVENT_SUBSCRIPTION_ENDED suspensions) — and (added 2026-11-19, souk
+        email verification, migration 0070) close_abandoned_vendor_registrations
+        (soft-closes self-registrations unverified after 7 days with no paid
+        subscription) — cron jobs must be registered.
+        Count was 6, then 7, then 8, then 9, then 10, then 11, then 12, now 13; bumped deliberately each
+        time, not a weakened assertion (this test still enumerates every job
+        by name below).
         """
-        assert len(WorkerSettings.cron_jobs) == 9
+        assert len(WorkerSettings.cron_jobs) == 13
         names = {c.name for c in WorkerSettings.cron_jobs}
         assert "cron:run_outbox_batch" in names
         assert "cron:cancel_stale_delivery_fee_orders" in names
@@ -401,6 +417,10 @@ class TestWorkerSettings:
         assert "cron:log_stale_whatsapp_connections" in names
         assert "cron:delivery_accept_deadline_watchdog" in names
         assert "cron:check_whatsapp_usage_alerts" in names
+        assert "cron:delivery_webhook_retention_sweep" in names
+        assert "cron:delivery_order_recovery_and_reminders" in names
+        assert "cron:reconcile_event_vendors" in names
+        assert "cron:close_abandoned_vendor_registrations" in names
 
     def test_max_tries_is_positive(self):
         """max_tries must be > 0 so infrastructure failures can be retried."""

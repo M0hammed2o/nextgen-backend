@@ -84,6 +84,7 @@ def make_business_user(password="OldTemp123", **overrides):
         locked_until="something",
         last_login_at=None,
         created_at=datetime.now(timezone.utc),
+        token_version=0,  # BusinessUser.token_version server default (migration 0061)
     )
     for k, v in overrides.items():
         setattr(u, k, v)
@@ -133,6 +134,7 @@ async def test_reset_password_generates_new_temp_password_and_flags_reset():
     # New password actually replaces the old hash
     assert verify_password(res.temporary_password, target.password_hash)
     assert not verify_password("OldTemp123", target.password_hash)
+    assert target.token_version == 1  # access tokens issued before the reset now fail rbac
     assert db.commits == 1
 
 

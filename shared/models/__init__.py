@@ -26,8 +26,10 @@ from shared.models.inventory import (
 from shared.models.loyalty import LoyaltyProgram, LoyaltyReward, LoyaltyTransaction
 from shared.models.menu import MenuAddOn, MenuCategory, MenuItem
 from shared.models.menu_image import BusinessMenuImage
+from shared.models.event import Event, EventDay, EventVendor, EventVendorSubscription
 from shared.models.message import Message
 from shared.models.order import Order, OrderEvent, OrderItem
+from shared.models.offline_review import OfflineCaptureReview
 from shared.models.pos_payment import POSPaymentAllocation, POSPaymentLinkIntent
 from shared.models.push_subscription import PushSubscription
 from shared.models.recipe import Recipe, RecipeItem
@@ -35,12 +37,14 @@ from shared.models.specials import Special
 from shared.models.stocktake import StocktakeLine, StocktakeSession
 from shared.models.till import TillSession
 from shared.models.usage_alert import UsageAlert
-from shared.models.user import AdminRefreshToken, BusinessUser, RefreshToken
+from shared.models.variant import ProductVariant
+from shared.models.user import AdminRefreshToken, BusinessUser, EmailVerificationToken, RefreshToken
 from shared.models.wastage import WastageEntry
 from shared.models.whatsapp_connection import WhatsAppConnection
 
 __all__ = [
     "Base",
+    "ProductVariant",
     "AdminUser",
     "AdminRefreshToken",
     "AiEmailCaseStudy",
@@ -51,7 +55,12 @@ __all__ = [
     "BillingInvoice",
     "Business",
     "BusinessMenuImage",
+    "Event",
+    "EventDay",
+    "EventVendor",
+    "EventVendorSubscription",
     "BusinessUser",
+    "EmailVerificationToken",
     "CommercialInvoice",
     "CommercialInvoiceLine",
     "ConversationSession",
@@ -70,6 +79,7 @@ __all__ = [
     "LoyaltyReward",
     "LoyaltyTransaction",
     "MenuAddOn",
+    "OfflineCaptureReview",
     "MenuCategory",
     "MenuItem",
     "Message",

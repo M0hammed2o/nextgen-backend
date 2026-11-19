@@ -40,6 +40,7 @@ import httpx  # noqa: E402
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine  # noqa: E402
 
 from backend.app.core.security import hash_password, hash_pin  # noqa: E402
+from scripts._seed_safety import require_local_or_confirmed  # noqa: E402
 from backend.app.inventory.units import to_milli  # noqa: E402
 from shared.enums import CanonicalUnit  # noqa: E402
 from shared.models.business import Business  # noqa: E402
@@ -157,6 +158,7 @@ async def pin_login(client: httpx.AsyncClient, code: str, staff_id, pin: str) ->
 
 
 async def main() -> int:
+    require_local_or_confirmed(os.environ["DATABASE_URL"], "scripts/verify_pilot_till_stocktake_e2e.py")
     engine = create_async_engine(os.environ["DATABASE_URL"], echo=False)
     Session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     async with Session() as db:

@@ -72,6 +72,9 @@ class LineItemSpec:
     selected_option_ids: dict = field(default_factory=dict)  # {group_id: option_id}
     add_on_selections: tuple[AddOnSelectionSpec, ...] = ()
     removed_ref_ids: tuple[str, ...] = ()
+    # Product variants: the stock ingredient of the variant sold on this line.
+    # One unit sold consumes exactly 1 each (1000 milli) of it.
+    variant_ingredient_id: uuid.UUID | None = None
 
 
 @dataclass(frozen=True)
@@ -143,6 +146,10 @@ def resolve_line_item(
     selected_option_ids = set(str(v) for v in (item.selected_option_ids or {}).values() if v)
     removed = set(str(r) for r in (item.removed_ref_ids or ()))
 
+    # -- Variant stock: one each per unit sold --------------------------------
+    if item.variant_ingredient_id is not None:
+        add(item.variant_ingredient_id, 1000 * int(item.quantity))
+
     # -- Base recipe ------------------------------------------------------
     if item_recipe is not None:
         for line in item_recipe.lines:
@@ -197,7 +204,11 @@ def resolve_order(
 
     for item in items:
         recipe = item_recipes.get(item.menu_item_id)
-        if recipe is None and item.menu_item_id not in missing:
+        if (
+            recipe is None
+            and item.variant_ingredient_id is None
+            and item.menu_item_id not in missing
+        ):
             missing.append(item.menu_item_id)
 
         for consumption in resolve_line_item(item, recipe, add_on_recipes):

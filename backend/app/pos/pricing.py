@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.errors import AppError, NotFoundError
 from shared.models.menu import MenuAddOn, MenuItem
+from shared.models.variant import ProductVariant, variant_label
 from shared.pricing.engine import (
     LineItemBreakdown,
     SelectedAddOn,
@@ -36,6 +37,7 @@ class POSItemInput:
     add_on_selections: list = field(default_factory=list)    # list[POSAddOnSelection]
     removed_ingredient_ids: list = field(default_factory=list)  # list[str]
     special_instructions: str | None = None
+    variant_id: uuid.UUID | None = None
 
 
 @dataclass
@@ -48,6 +50,12 @@ class ResolvedPOSItem:
     removed_ingredients_snapshot: list
     special_instructions: str | None
     requires_preparation: bool
+    # Product variants (migration 0066). variant_ingredient_id is the stock
+    # ingredient the sale of this line deducts from (None = untracked).
+    variant_id: uuid.UUID | None = None
+    variant_label: str | None = None
+    sku: str | None = None
+    variant_ingredient_id: uuid.UUID | None = None
 
 
 def _resolve_selected_options(menu_item: MenuItem, selected_option_ids: dict) -> list[SelectedOption]:
@@ -207,6 +215,42 @@ async def resolve_pos_items(
     )
     menu_items_by_id = {m.id: m for m in result.scalars().all()}
 
+    # Existence/active checks first: an unknown or inactive item is refused
+    # before any variant lookup is made.
+    for item in items:
+        menu_item = menu_items_by_id.get(item.menu_item_id)
+        if not menu_item:
+            raise NotFoundError("Menu item", str(item.menu_item_id))
+        if not menu_item.is_active:
+            raise AppError(
+                "MENU_ITEM_INACTIVE",
+                f"{menu_item.name} is not currently available",
+                422,
+                details={"menu_item_id": str(menu_item.id)},
+            )
+
+    # Variants: ONE business-scoped query for every variant this request
+    # touches (the requested ids) and for every item's active variants (so an
+    # item that has variants cannot be sold without choosing one).
+    requested_variant_ids = {i.variant_id for i in items if i.variant_id is not None}
+    variants_by_id: dict[uuid.UUID, ProductVariant] = {}
+    if requested_variant_ids:
+        vres = await db.execute(
+            select(ProductVariant).where(
+                ProductVariant.id.in_(requested_variant_ids),
+                ProductVariant.business_id == business_id,
+            )
+        )
+        variants_by_id = {v.id: v for v in vres.scalars().all()}
+    items_with_variants_res = await db.execute(
+        select(ProductVariant.menu_item_id).where(
+            ProductVariant.business_id == business_id,
+            ProductVariant.menu_item_id.in_(menu_item_ids),
+            ProductVariant.is_active.is_(True),
+        ).distinct()
+    )
+    items_with_variants = {r[0] for r in items_with_variants_res.all()}
+
     resolved_items: list[ResolvedPOSItem] = []
     for item in items:
         menu_item = menu_items_by_id.get(item.menu_item_id)
@@ -220,12 +264,37 @@ async def resolve_pos_items(
                 details={"menu_item_id": str(menu_item.id)},
             )
 
+        variant: ProductVariant | None = None
+        if item.variant_id is not None:
+            variant = variants_by_id.get(item.variant_id)
+            # Same 404 for "no such variant", "another business's variant" and
+            # "a variant of a different item" - never reveals which.
+            if variant is None or variant.menu_item_id != menu_item.id:
+                raise NotFoundError("Variant", str(item.variant_id))
+            if not variant.is_active:
+                raise AppError(
+                    "VARIANT_INACTIVE",
+                    f"{menu_item.name} ({variant_label(variant.attributes)}) is not currently available",
+                    422,
+                    details={"variant_id": str(variant.id)},
+                )
+        elif menu_item.id in items_with_variants:
+            raise AppError(
+                "VARIANT_REQUIRED",
+                f"{menu_item.name} must be sold as one of its variants (choose a size/colour)",
+                422,
+                details={"menu_item_id": str(menu_item.id)},
+            )
+
         selected_options = _resolve_selected_options(menu_item, item.selected_option_ids)
         selected_add_ons = await _resolve_add_ons(db, business_id, menu_item, item.add_on_selections)
         removed_ingredients = _resolve_removed_ingredients(menu_item, item.removed_ingredient_ids)
 
         breakdown = calculate_line_item(
-            base_price_cents=menu_item.price_cents,
+            base_price_cents=(
+                variant.price_cents if variant is not None and variant.price_cents is not None
+                else menu_item.price_cents
+            ),
             selected_options=selected_options,
             add_ons=selected_add_ons,
             quantity=item.quantity,
@@ -257,6 +326,10 @@ async def resolve_pos_items(
             removed_ingredients_snapshot=removed_ingredients,
             special_instructions=item.special_instructions,
             requires_preparation=menu_item.requires_preparation,
+            variant_id=variant.id if variant else None,
+            variant_label=variant_label(variant.attributes) if variant else None,
+            sku=variant.sku if variant else None,
+            variant_ingredient_id=variant.ingredient_id if variant else None,
         ))
 
     return resolved_items

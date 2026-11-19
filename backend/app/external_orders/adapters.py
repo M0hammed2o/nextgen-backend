@@ -120,8 +120,12 @@ COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
     ),
     "price": (
         "price", "gross", "total", "amount", "item total", "line total",
-        "gross sales", "item price", "sale amount", "order total",
+        "gross sales", "item price", "sale amount",
     ),
+    # An ORDER-level total repeated on every line of a line-per-row export.
+    # Kept apart from `price` (it used to be one of its aliases): summed per
+    # line, a R300 three-line order would have been booked as R900.
+    "order_total": ("order total", "order amount", "order value", "total order value"),
     "status": ("status", "order status", "state", "order state"),
 }
 
@@ -332,6 +336,7 @@ def adapt_rows(
         return row.get(heading) if heading else None
 
     grouped: dict[str, CanonicalExternalOrder] = {}
+    order_totals: dict[str, int] = {}
 
     for index, row in enumerate(rows, start=2):  # row 1 is the header
         order_id = str(value(row, "external_order_id") or "").strip()
@@ -369,6 +374,7 @@ def adapt_rows(
 
         status_text = value(row, "status")
         status = str(status_text).strip() if status_text else None
+        order_total = parse_money_cents(value(row, "order_total")) if "order_total" in resolved else None
 
         line = ExternalOrderLine(
             external_item_text=item_text,
@@ -387,6 +393,8 @@ def adapt_rows(
                 status=status,
                 gross_cents=line.gross_cents,
             )
+            if order_total is not None:
+                order_totals[order_id] = order_total
         else:
             existing.lines.append(line)
             if existing.status is None and status:
@@ -397,6 +405,13 @@ def adapt_rows(
                 existing.placed_at = placed_at
             if line.gross_cents is not None:
                 existing.gross_cents = (existing.gross_cents or 0) + line.gross_cents
+            if order_total is not None and order_id not in order_totals:
+                order_totals[order_id] = order_total
+
+    # An explicit order-level total is the order's value, taken once — never
+    # summed across its lines (the lines still carry their own prices).
+    for order_id, total in order_totals.items():
+        grouped[order_id].gross_cents = total
 
     result.orders = list(grouped.values())
     return result

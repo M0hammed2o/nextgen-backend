@@ -18,6 +18,32 @@ logger = logging.getLogger("nextgen.billing.lifecycle")
 # "Retry. Notify. Grace period. Suspend account." — this is the grace period.
 GRACE_PERIOD_DAYS = 7
 
+# The exact suspended_reason values the billing code itself writes. A payment
+# may lift ONLY these; any other reason (an EVENT_* souk suspension, a manual
+# SUPER_ADMIN suspension, or an unknown value) is never cleared by billing.
+# Security review M1. Keep in step with every writer of suspended_reason:
+#   suspend_for_nonpayment (below), stripe_webhooks._handle_subscription_updated
+#   ("unpaid") and _handle_subscription_deleted, and worker.py (TRIAL_EXPIRED).
+SUSPENDED_GRACE_ELAPSED = "Subscription payment overdue — grace period elapsed"
+SUSPENDED_STRIPE_UNPAID = "Subscription unpaid"
+SUSPENDED_STRIPE_CANCELLED = "Subscription cancelled"
+SUSPENDED_TRIAL_EXPIRED = "TRIAL_EXPIRED"
+BILLING_SUSPENSION_REASONS = frozenset({
+    SUSPENDED_GRACE_ELAPSED, SUSPENDED_STRIPE_UNPAID, SUSPENDED_STRIPE_CANCELLED, SUSPENDED_TRIAL_EXPIRED,
+})
+
+
+def lift_billing_suspension(business: Business) -> bool:
+    """
+    Reactivate ``business`` only if it is suspended for a billing-owned reason.
+    Returns True if it lifted. Never touches any other suspension.
+    """
+    if not business.is_active and business.suspended_reason in BILLING_SUSPENSION_REASONS:
+        business.is_active = True
+        business.suspended_reason = None
+        return True
+    return False
+
 
 def mark_invoice_paid(
     business: Business, db=None, amount_cents: int | None = None,
@@ -30,8 +56,7 @@ def mark_invoice_paid(
     """
     was_past_due = business.billing_status == "PAST_DUE"
     business.billing_status = "ACTIVE"
-    business.is_active = True
-    business.suspended_reason = None
+    lift_billing_suspension(business)
     business.billing_period_started_at = datetime.now(timezone.utc)
     if was_past_due:
         logger.info("Business %s reactivated after payment", business.id)
@@ -100,5 +125,5 @@ def suspend_for_nonpayment(business: Business) -> None:
     """Suspend a business whose grace period has elapsed. Never deletes any data."""
     business.billing_status = "SUSPENDED"
     business.is_active = False
-    business.suspended_reason = "Subscription payment overdue — grace period elapsed"
+    business.suspended_reason = SUSPENDED_GRACE_ELAPSED
     logger.warning("Business %s suspended for non-payment (grace period elapsed)", business.id)

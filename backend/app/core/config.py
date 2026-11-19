@@ -389,6 +389,31 @@ class Settings(BaseSettings):
     # backend/app/receipts/token.py) — this is defence in depth, not the
     # only protection.
     RECEIPT_PUBLIC_RATE_LIMIT_PER_MINUTE: int = 30
+    # Souk public event page and vendor self-registration (unauthenticated, per client IP).
+    EVENT_PUBLIC_RATE_LIMIT_PER_MINUTE: int = 30
+    EVENT_REGISTER_RATE_LIMIT_PER_MINUTE: int = 5
+    EVENT_REGISTER_RATE_LIMIT_PER_HOUR: int = 20
+    # Souk review M-2: registrations accepted for one event per hour, across all IPs
+    EVENT_REGISTER_RATE_LIMIT_PER_EVENT_PER_HOUR: int = 30
+    # Souk vendor email verification (docs/VENDOR_EMAIL_VERIFICATION.md).
+    # Per client IP on the public verify/resend routes. Per-email limits on
+    # resend (cooldown, hourly cap) are enforced silently in the service.
+    EMAIL_VERIFY_RATE_LIMIT_PER_MINUTE: int = 10
+    EMAIL_RESEND_RATE_LIMIT_PER_MINUTE: int = 3
+    EMAIL_RESEND_RATE_LIMIT_PER_HOUR: int = 20
+
+    # ── Outbound email ───────────────────────────────────────────────────
+    # NO real provider is wired: production email delivery is not approved.
+    # "console" logs a redacted line (recipient domain, subject; never the
+    # body or any token), "memory" keeps messages in-process (tests), "file"
+    # writes .eml files to EMAIL_FILE_DIR for local manual testing and is
+    # refused outside development/test.
+    EMAIL_BACKEND: str = "console"
+    EMAIL_FROM_ADDRESS: str = "no-reply@nextgenintelligence.co.za"
+    EMAIL_FILE_DIR: str = ""
+    # Where the verification link points (the manager dashboard's
+    # /verify-email route). The raw token goes in the URL fragment.
+    EMAIL_VERIFICATION_LINK_BASE_URL: str = "https://app.nextgenintelligence.co.za"
 
     # ── Delivery marketplace integrations (Uber Eats live API) ────────────
     # Platform-wide app credentials (Uber issues ONE client_id/secret per
@@ -397,27 +422,64 @@ class Settings(BaseSettings):
     # a per-merchant authorization_code-grant token wiped after activation.
     UBER_EATS_CLIENT_ID: str = ""
     UBER_EATS_CLIENT_SECRET: str = ""
-    # Sandbox hosts, confirmed from Uber's docs: test-api.uber.com /
-    # sandbox-auth.uber.com. BUG-0094 (KNOWN_BUGS.md): UBER_EATS_ENVIRONMENT
-    # is NOT actually wired to these defaults — grep-confirmed it is read by
-    # nothing anywhere in this codebase. A staging/sandbox deployment MUST
-    # set these two URLs explicitly; leaving only UBER_EATS_ENVIRONMENT set
-    # to "sandbox" silently keeps talking to PRODUCTION Uber.
+    # PRODUCTION hosts. A DeliveryConnection with environment="production"
+    # always uses these and the credentials above.
     UBER_EATS_API_BASE_URL: str = "https://api.uber.com"
     UBER_EATS_AUTH_BASE_URL: str = "https://auth.uber.com"
-    # production | sandbox. NOT itself read by the webhook's environment
-    # gate (BUG-0094) — the REAL gate is `_find_misconfiguration()` in
-    # order_service.py, which compares the inbound webhook's own reported
-    # `X-Environment` header against `DeliveryConnection.environment` (a
-    # per-connection DB value, not this global setting) and — also per
-    # BUG-0094 — currently passes when that header is absent rather than
-    # failing closed. That specific change was evaluated and NOT made in
-    # the 2026-09-23 remediation pass: Uber's own docs do not confirm this
-    # header is reliably sent on every delivery, so flipping it to fail-
-    # closed risks silently denying every genuine production order instead
-    # of closing a narrow gap — a materially worse outcome. Revisit only
-    # once the header's real-world presence is confirmed against live
-    # traffic or Uber's own webhook reference.
+    # PRODUCTION dashboard "Basic HMAC" webhook signing keys (BUG-0190),
+    # mirroring the sandbox pair below. The authentic sandbox events were
+    # signed with the dashboard signing key, not the client secret; if
+    # production behaves the same, production needs these or every real
+    # order fails signature verification. Once set, the client secret is no
+    # longer accepted for production webhooks. Optional until Uber confirms
+    # which key production signs with: when empty, the client secret is
+    # tried and a startup warning is logged.
+    UBER_EATS_WEBHOOK_SIGNING_KEY: str = ""
+    UBER_EATS_WEBHOOK_SECONDARY_SIGNING_KEY: str = ""
+    # SANDBOX app — Uber issues a separate test application (its own client
+    # id/secret) for sandbox work. A DeliveryConnection with
+    # environment="sandbox" always uses these, never the production ones, so
+    # one deployment can hold both without a test order ever touching the
+    # production app (and vice versa). Hosts per Uber's Sandbox guide
+    # (developer.uber.com/docs/eats/guides/sandbox, read 2026-10-26):
+    # "sandbox-login.uber.com -> test-api.uber.com ... Mixing domains will
+    # cause authentication failures." Uber's Getting Started page still says
+    # sandbox-auth.uber.com; the Sandbox guide is the one with a worked
+    # example, so it wins here — override this if Uber's integration team
+    # says otherwise.
+    UBER_EATS_SANDBOX_CLIENT_ID: str = ""
+    UBER_EATS_SANDBOX_CLIENT_SECRET: str = ""
+    UBER_EATS_SANDBOX_API_BASE_URL: str = "https://test-api.uber.com"
+    UBER_EATS_SANDBOX_AUTH_BASE_URL: str = "https://sandbox-login.uber.com"
+    # Dashboard "Basic HMAC" webhook signing keys for the sandbox app. Uber
+    # signs X-Uber-Signature with the primary key and, during a rotation,
+    # X-Uber-Signature-New with the secondary one. Optional: when empty, the
+    # sandbox client secret (the key the Eats guide documents) is still tried.
+    # See backend/app/delivery/uber/environments.py.
+    UBER_EATS_SANDBOX_WEBHOOK_SIGNING_KEY: str = ""
+    UBER_EATS_SANDBOX_WEBHOOK_SECONDARY_SIGNING_KEY: str = ""
+    # Comma-separated business UUIDs allowed to turn SANDBOX orders into real
+    # NextGen Orders (stock, reports). A sandbox order is a test, so it may
+    # only ever land in a dedicated test tenant — never a live restaurant's
+    # books. Empty (the default) means every sandbox order is actively
+    # denied exactly as before, which keeps the old behaviour for every
+    # existing deployment.
+    UBER_EATS_SANDBOX_ORDER_BUSINESS_IDS: str = ""
+    # Explicit opt-in for a deployment that carries ONLY the sandbox app (e.g.
+    # sandbox testing on the one production deployment before Uber issues
+    # production credentials). Without it, enabling webhooks in a non-dev
+    # environment requires the production pair — otherwise every genuine
+    # production order would fail signature verification and be 200-acked as
+    # BAD_SIGNATURE (the BUG-0089 silent-drop pattern). While it is on, no
+    # connection may be promoted to CONNECTED.
+    UBER_EATS_SANDBOX_ONLY_DEPLOYMENT: bool = False
+    # DEPRECATED, read by nothing (BUG-0094). Kept only so an existing
+    # deployment that still sets it does not fail validation. Environment is
+    # per connection (`DeliveryConnection.environment`), and an inbound
+    # webhook's environment is now proven by WHICH app secret verified its
+    # signature (backend/app/delivery/uber/adapter.py), not by the
+    # unauthenticated `X-Environment` header — see
+    # order_service._find_misconfiguration.
     UBER_EATS_ENVIRONMENT: str = "production"
     # Platform-wide kill switch, independent of any tenant's own
     # uber_eats_enabled entitlement — lets ops pull the plug on ALL Uber
@@ -439,7 +501,12 @@ class Settings(BaseSettings):
     # routes_delivery_webhook.py's module docstring. Generous relative to
     # the auth-endpoint limits above since this is provider-server traffic,
     # not end-user traffic, but still bounded.
-    DELIVERY_WEBHOOK_RATE_LIMIT_PER_MINUTE: int = 120
+    # BUG-0170: raised from 120. Every tenant's Uber webhooks come from Uber's
+    # small sender pool and share one bucket per sender IP, so the old value
+    # was reachable with a few dozen busy stores. Over the limit, this route
+    # answers 503 + Retry-After (main.py::_rate_limit_handler), never 429,
+    # because Uber does not retry a 429.
+    DELIVERY_WEBHOOK_RATE_LIMIT_PER_MINUTE: int = 600
 
     # How long staff have to accept/deny a delivery order before the
     # watchdog cron auto-denies it. Deliberately UNDER Uber's real 11.5-
@@ -451,7 +518,12 @@ class Settings(BaseSettings):
     # so a delivery order that's genuinely mid-processing (worker briefly
     # slow, not stuck) isn't denied on the very first cron tick after its
     # deadline technically passed.
-    DELIVERY_DEADLINE_GRACE_SECONDS: int = 90
+    #
+    # Was 90. 600 + 90 = 690s is EXACTLY Uber's 11.5-minute auto-cancel, and
+    # the 30s cron tick only fires at or after that — so the watchdog's
+    # "honest deny" always arrived after Uber had already auto-cancelled the
+    # order. 600 + 30 + one 30s tick <= 660s stays clear of 690s.
+    DELIVERY_DEADLINE_GRACE_SECONDS: int = 30
 
     # Retention (design doc §3 — the first table on this platform with a
     # defined retention policy): delivery_webhook_events.raw_payload_json is
