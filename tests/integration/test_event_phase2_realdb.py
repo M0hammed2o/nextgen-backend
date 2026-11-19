@@ -37,12 +37,14 @@ from admin_api.app.api.v1.routes_events import (
 )
 from backend.app.api.v1 import routes_event_public as pub
 from backend.app.api.v1 import routes_event_vendor as ven
+from backend.app.api.v1 import routes_email_verification as ver
 from backend.app.api.v1.routes_business import get_event_access
 from backend.app.core.errors import AppError
 from backend.app.core.rbac import AuthUser, require_owner_or_manager
 from backend.app.core.ratelimit import limiter
 from backend.app.core.security import verify_password
 from backend.app.events.trading import assert_trading_allowed
+from backend.app.services import email_verification as ev_email
 from backend.app.services.auth_service import AuthService
 from shared.enums import EVENT_PLAN
 from shared.models.audit import AuditEvent
@@ -106,13 +108,28 @@ def _body(bag, code, category="FOOD", **kw) -> pub.RegisterRequest:
     return pub.RegisterRequest(**base)
 
 
-async def _register(db, bag, ev, category="FOOD", **kw) -> dict:
-    """Self-register a vendor; returns the response plus the owner's AuthUser and email."""
+async def _register(db, bag, ev, category="FOOD", verify=True, **kw) -> dict:
+    """
+    Self-register a vendor; returns the response plus the owner's AuthUser and email.
+
+    Since email verification (migration 0070) the register response no longer
+    carries the business code, so the business is found by the owner's email.
+    ``verify=True`` (the default) completes verification through the real
+    POST /public/auth/verify-email route with a freshly issued token, so tests
+    about subscriptions and trading keep exercising a legitimate, verified
+    vendor. Pass verify=False to keep the account unverified.
+    """
     body = _body(bag, ev["code"], category, **kw)
     res = await _REGISTER(ev["slug"], body, None, db)
-    biz = (await db.execute(select(Business).where(Business.business_code == res["business_code"]))).scalar_one()
-    user = (await db.execute(select(BusinessUser).where(BusinessUser.business_id == biz.id))).scalar_one()
-    return {**res, "business_id": biz.id, "user": _owner(biz.id), "email": str(body.owner_email), "owner_id": user.id}
+    email = str(body.owner_email).lower()
+    user = (await db.execute(select(BusinessUser).where(BusinessUser.email == email))).scalar_one()
+    biz = (await db.execute(select(Business).where(Business.id == user.business_id))).scalar_one()
+    if verify:
+        raw = await ev_email.issue_token(db, user.id)
+        await db.commit()
+        await ver.verify_email.__wrapped__(ver.VerifyEmailRequest(token=raw), None, db)
+    return {**res, "response": res, "business_code": biz.business_code, "business_id": biz.id,
+            "user": _owner(biz.id), "email": str(body.owner_email), "owner_id": user.id}
 
 
 async def _refused(coro) -> AppError:
@@ -207,8 +224,10 @@ async def test_code_is_case_and_hyphen_insensitive(db, bag):
 async def test_registration_creates_an_isolated_event_business_with_the_vendors_own_password(db, bag):
     ev = await _open_event(db, bag)
     v = await _register(db, bag, ev, "CLOTHING")
-    assert v["next"] == "login" and set(v) >= {"business_code", "next"}
-    assert not {"access_token", "refresh_token", "token"} & set(v)
+    # Changed with email verification (owner request): the response says
+    # "check your email" and carries no account data (no business code).
+    assert v["response"]["next"] == "check_email" and "business_code" not in v["response"]
+    assert not {"access_token", "refresh_token", "token"} & set(v["response"])
     biz = (await db.execute(select(Business).where(Business.id == v["business_id"]))).scalar_one()
     assert biz.plan == EVENT_PLAN and biz.industry == "EVENT_RETAIL" and biz.pos_enabled and biz.inventory_enabled
     assert biz.whatsapp_phone_number_id is None and biz.whatsapp_business_account_id is None
@@ -231,23 +250,26 @@ async def test_registration_creates_an_isolated_event_business_with_the_vendors_
 
 async def test_registration_audit_row_holds_no_pii(db, bag):
     ev = await _open_event(db, bag)
-    v = await _register(db, bag, ev)
+    v = await _register(db, bag, ev, verify=False)
     rows = (await db.execute(select(AuditEvent).where(AuditEvent.business_id == v["business_id"]))).scalars().all()
-    assert [r.action for r in rows] == ["event.vendor_self_registered"]
-    blob = repr(rows[0].diff_json) + repr(rows[0].target_type)
+    # Email verification added a second row (the verification email was sent).
+    assert sorted(r.action for r in rows) == ["auth.email_verification_sent", "event.vendor_self_registered"]
+    blob = "".join(repr(r.diff_json) + repr(r.target_type) for r in rows)
     assert v["email"] not in blob and PASSWORD not in blob and ev["code"] not in blob
-    assert rows[0].actor_user_id == v["owner_id"]
+    assert {r.actor_user_id for r in rows} == {v["owner_id"]}
 
 
-async def test_duplicate_email_gets_a_generic_error_and_creates_nothing(db, bag):
+async def test_duplicate_email_gets_the_same_answer_as_a_new_registration_and_creates_nothing(db, bag):
+    # Changed with email verification (owner request: no email enumeration).
+    # Was: 409 REGISTRATION_FAILED. Now the duplicate gets the exact body a
+    # new registration gets, and still creates nothing.
     ev = await _open_event(db, bag)
     first = await _register(db, bag, ev)
     body = _body(bag, ev["code"], owner_email=first["email"].upper())
     bag["emails"].append(first["email"])
     before = (await db.execute(select(func.count()).select_from(Business))).scalar()
-    err = await _refused(_REGISTER(ev["slug"], body, None, db))
-    assert err.code == "REGISTRATION_FAILED" and err.status_code == 409
-    assert "exist" not in err.message.lower() and "email" not in err.message.lower()
+    res = await _REGISTER(ev["slug"], body, None, db)
+    assert res == first["response"]
     assert (await db.execute(select(func.count()).select_from(Business))).scalar() == before
 
 

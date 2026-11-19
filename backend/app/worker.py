@@ -529,6 +529,26 @@ async def reconcile_event_vendors(ctx: dict) -> None:
             logger.exception("Event vendor access reconcile failed — rolled back.")
 
 
+async def close_abandoned_vendor_registrations(ctx: dict) -> None:
+    """
+    Hourly: soft-close souk self-registrations whose owner never verified
+    their email within 7 days and that have no PAID event subscription
+    (backend/app/services/email_verification.py). Owner and business are
+    deactivated, unpaid subscriptions voided, one audit row each. Never
+    deletes data; admin-provisioned and restaurant owners are never touched
+    (they never have email_verification_required).
+    """
+    from backend.app.services.email_verification import close_abandoned_registrations
+
+    async with ctx["session_factory"]() as db:
+        try:
+            await close_abandoned_registrations(db)
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            logger.exception("Abandoned vendor registration sweep failed — rolled back.")
+
+
 async def sweep_trial_and_invoice_expiry(ctx: dict) -> None:
     """
     Companion sweep to `suspend_past_due_businesses` above, run on the same
@@ -793,6 +813,14 @@ class WorkerSettings:
             minute=5,
             second=0,
             run_at_startup=True,
+        ),
+        # Soft-close souk self-registrations left unverified for 7 days —
+        # hourly, offset from the event reconcile above.
+        cron(
+            close_abandoned_vendor_registrations,
+            minute=10,
+            second=0,
+            run_at_startup=False,
         ),
         # Suspend businesses whose trial expired past its grace period, and
         # mark overdue commercial invoices — hourly, same cadence as above

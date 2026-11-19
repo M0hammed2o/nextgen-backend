@@ -711,8 +711,14 @@ async def get_event_access(
     from sqlalchemy.orm import selectinload
 
     plan = (await db.execute(select(Business.plan).where(Business.id == user.business_id))).scalar_one_or_none()
+    from backend.app.services.email_verification import verification_status
+
+    # Owner email verification (souk self-registration). required is false for
+    # every restaurant and admin-provisioned business.
+    email_verification = await verification_status(db, user.business_id)
     if plan != EVENT_PLAN:
-        return {"is_event_vendor": False, "access_level": None, "reason": None, "events": []}
+        return {"is_event_vendor": False, "access_level": None, "reason": None, "events": [],
+                "email_verification": email_verification}
     decision = await business_access_decision(db, user.business_id)
     vendors = (await db.execute(
         select(EventVendor)
@@ -734,7 +740,8 @@ async def get_event_access(
                 for sub in sorted(v.subscriptions, key=lambda x: x.starts_on)
             ],
         })
-    return {"is_event_vendor": True, "access_level": decision.level, "reason": decision.reason, "events": events}
+    return {"is_event_vendor": True, "access_level": decision.level, "reason": decision.reason, "events": events,
+            "email_verification": email_verification}
 
 
 @router.get("/payments/health", response_model=PaymentHealthResponse)

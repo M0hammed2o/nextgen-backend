@@ -443,6 +443,7 @@ from backend.app.api.v1.routes_receipts import digital_receipts_usage_router, ro
 from backend.app.api.v1.routes_receipt_public import router as receipt_public_router
 from backend.app.api.v1.routes_event_public import router as event_public_router
 from backend.app.api.v1.routes_event_vendor import router as event_vendor_router
+from backend.app.api.v1.routes_email_verification import router as email_verification_router
 from backend.app.api.v1.routes_stocktake import router as stocktake_router
 from backend.app.api.v1.routes_wastage import router as wastage_router
 from backend.app.api.v1.routes_billing import router as billing_settings_router
@@ -500,6 +501,9 @@ app.include_router(receipt_public_router, prefix=PREFIX)
 # (JWT business_id, OWNER/MANAGER).
 app.include_router(event_public_router, prefix=PREFIX)
 app.include_router(event_vendor_router, prefix=PREFIX)
+# Souk vendor email verification: public verify-email / resend-verification
+# (unauthenticated, per-IP rate limited, enumeration-safe responses).
+app.include_router(email_verification_router, prefix=PREFIX)
 app.include_router(billing_settings_router, prefix=PREFIX)
 app.include_router(loyalty_router, prefix=PREFIX)
 app.include_router(specials_router, prefix=PREFIX)

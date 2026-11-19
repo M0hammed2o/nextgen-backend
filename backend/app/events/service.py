@@ -47,13 +47,16 @@ from sqlalchemy.orm import selectinload
 from sqlalchemy.orm.attributes import set_committed_value
 
 from backend.app.events.rules import (
+    CONFIGURE,
     NONE,
+    TRADE,
     AccessDecision,
     PaidRange,
     best_decision,
     evaluate_access,
     vendor_status,
 )
+from backend.app.services.email_verification import EMAIL_NOT_VERIFIED, owner_email_unverified
 from shared.enums import EVENT_PLAN
 from shared.models.business import Business
 from shared.models.event import Event, EventVendor
@@ -265,4 +268,15 @@ async def business_access_decision(db: AsyncSession, business_id: uuid.UUID,
         paid = [PaidRange(s.starts_on, s.ends_on) for s in vendor.subscriptions if s.status == "PAID"]
         cancelled = vendor.status == "CANCELLED" or event.status == "CANCELLED"
         decisions.append(evaluate_access(local_day, billable, paid, event.prep_days, cancelled=cancelled))
-    return best_decision(decisions)
+    decision = best_decision(decisions)
+    if decision.level == TRADE:
+        # Souk email verification: a self-registered vendor whose owner has not
+        # verified their email may configure but never trade. Computed live like
+        # everything above, so it flows through assert_trading_allowed (POS,
+        # orders, payment intents, offline sync) with no caller changes. NONE
+        # and other CONFIGURE reasons are left as they are (they are the more
+        # fundamental answer; GET /business/event-access reports verification
+        # separately).
+        if await owner_email_unverified(db, business_id):
+            return AccessDecision(CONFIGURE, EMAIL_NOT_VERIFIED)
+    return decision

@@ -15,18 +15,25 @@ Enumeration and error design
 - Registration returns ONE error ("REGISTRATION_REJECTED") for: unknown slug,
   event not open, registration closed, no code set, wrong code. A bcrypt
   check always runs so these also take the same time.
-- A duplicate owner email returns a generic "could not register with these
-  details" (REGISTRATION_FAILED). Trade-off: only a caller who already holds
-  the valid code can reach this branch, so it is not an open account-exists
-  oracle, but the generic message also means a legitimate vendor who already
-  has a NextGen login is not told why; the organiser resolves that
-  (existing_business_id flow). A dummy bcrypt hash runs on this branch so
-  timing matches a successful registration.
+- Every registration that passes the code check gets the SAME 202 body
+  ("check your email"), whether the email is new or already belongs to an
+  account. A duplicate creates nothing and the existing address gets a
+  throttled "someone tried to register" notice instead (mock email). The
+  password is bcrypt-hashed on both paths so timing matches. The business
+  code is no longer in the response: it is in the verification email (and
+  returned by POST /public/auth/verify-email). Owner login is email+password
+  and never needed it.
+- Re-registration over an abandoned, never-verified self-registration
+  releases the old address in the same transaction
+  (services/email_verification.py). A verified or admin-provisioned account
+  is never taken over.
 - Access for the new business is decided for THAT business only
   (reconcile_single_business_access); a public request never writes other tenants' rows.
   A per-event hourly ceiling (EVENT_REGISTER_RATE_LIMIT_PER_EVENT_PER_HOUR) is spent only
   after the registration code is accepted.
-- LAUNCH ITEM (not implemented): the owner email is not verified at registration.
+- The owner email must be verified (docs/VENDOR_EMAIL_VERIFICATION.md): until
+  then the vendor may log in and configure, but the access decision caps it
+  at CONFIGURE (EMAIL_NOT_VERIFIED) and a payment claim is refused.
 - Vendors are created with NO external identity (no WhatsApp number, no
   payment credentials): provision_business(allow_external_identity=False).
 """
@@ -49,7 +56,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from starlette.concurrency import run_in_threadpool
 
-from admin_api.app.services.provisioning import ensure_owner_email_free, provision_business
+from admin_api.app.services.provisioning import provision_business
 from backend.app.core.config import get_settings
 from backend.app.core.errors import AppError, DuplicateError
 from backend.app.core.ratelimit import limiter
@@ -57,10 +64,13 @@ from backend.app.core.security import hash_password
 from backend.app.db.session import get_db
 from backend.app.events import registration as reg
 from backend.app.events.rules import evaluate_access
+from backend.app.email.sender import send_safely
 from backend.app.events.service import reconcile_single_business_access
+from backend.app.services import email_verification as ev_email
 from shared.enums import EVENT_PLAN, AuditScope
 from shared.models.audit import AuditEvent
 from shared.models.event import Event, EventVendor
+from shared.models.user import BusinessUser
 
 router = APIRouter(prefix="/public/events", tags=["public-events"])
 settings = get_settings()
@@ -157,7 +167,31 @@ def _failed() -> AppError:
     return AppError("REGISTRATION_FAILED", "We could not register with these details", 409)
 
 
-@router.post("/{slug}/register", status_code=201)
+def _accepted(tz_name: str, billable: set, prep_days: int) -> dict:
+    """
+    The ONE answer for every registration that passed the code check: new
+    account, existing email, or re-registration over an abandoned one. Only
+    event facts (public anyway) are included; nothing about the account.
+    """
+    local_day = datetime.now(timezone.utc).astimezone(ZoneInfo(tz_name)).date()
+    decision = evaluate_access(local_day, billable, [], prep_days)
+    return {
+        "status": "verification_pending",
+        "next": "check_email",
+        "message": ("Check your email to continue. If this address can be used, we have sent a link to "
+                    "confirm it."),
+        # Informational: a vendor registering long before the event cannot log in yet.
+        "access_level": decision.level,
+        "login_opens_on": (min(billable) - timedelta(days=prep_days)) if billable else None,
+    }
+
+
+async def _email_taken(db: AsyncSession, email: str) -> bool:
+    found = (await db.execute(select(BusinessUser.id).where(BusinessUser.email == email))).scalar_one_or_none()
+    return found is not None
+
+
+@router.post("/{slug}/register", status_code=202)
 @limiter.shared_limit(
     f"{settings.EVENT_REGISTER_RATE_LIMIT_PER_MINUTE}/minute;{settings.EVENT_REGISTER_RATE_LIMIT_PER_HOUR}/hour",
     scope=REGISTER_SCOPE,
@@ -165,8 +199,10 @@ def _failed() -> AppError:
 async def register_vendor(slug: str, body: RegisterRequest, request: Request, db: AsyncSession = Depends(get_db)):
     """
     Create an isolated event-plan business, its owner login (with the vendor's
-    own password) and a PENDING EventVendor. Returns no tokens: the vendor logs
-    in through the normal auth route.
+    own password, email verification required) and a PENDING EventVendor, and
+    email a verification link. Returns no tokens and no account data: the same
+    202 body is returned when the email already belongs to an account (that
+    account gets a notice email instead and nothing is created).
     """
     event = (await db.execute(
         select(Event).where(Event.slug == slug).options(selectinload(Event.days))
@@ -181,16 +217,31 @@ async def register_vendor(slug: str, body: RegisterRequest, request: Request, db
     tz_name, prep_days = event.timezone, event.prep_days
     billable = {d.day for d in event.days if d.is_billable}
     event_id = event.id
+    accepted = _accepted(tz_name, billable, prep_days)
 
     email = str(body.owner_email).lower().strip()
-    try:
-        await ensure_owner_email_free(db, email)
-    except DuplicateError:
-        await run_in_threadpool(hash_password, body.password)  # match the success path's timing
-        raise _failed()
-
+    # Hashed on every path (new, duplicate, takeover) so their timing matches.
     password_hash = await run_in_threadpool(hash_password, body.password)
+
+    existing = (await db.execute(
+        select(BusinessUser).where(BusinessUser.email == email).with_for_update()
+    )).scalar_one_or_none()
+    if existing is not None and not ev_email.releasable_abandoned_owner(existing):
+        # Enumeration: same 202 as a new registration. Nothing is created; the
+        # address's real owner is told (throttled) that someone tried.
+        notice = await ev_email.record_duplicate_attempt(db, existing)
+        await db.commit()
+        if notice is not None:
+            await send_safely(notice)
+        return accepted
+
     try:
+        if existing is not None:
+            # The only account with this email is an abandoned, never-verified
+            # self-registration: release its address in THIS transaction. The
+            # new verification proves ownership of the mailbox; the old rows
+            # stay deactivated and are never reused.
+            await ev_email.release_abandoned_email(db, existing)
         provisioned = await provision_business(
             db,
             fields={"name": body.business_name, "plan": EVENT_PLAN, "industry": _CATEGORY_INDUSTRY[body.category],
@@ -204,30 +255,30 @@ async def register_vendor(slug: str, body: RegisterRequest, request: Request, db
             allow_external_identity=False,
         )
         biz = provisioned.business
-        business_code = biz.business_code
+        owner = provisioned.owner
+        owner.email_verification_required = True
         vendor = EventVendor(event_id=event_id, business_id=biz.id, category=body.category, status="PENDING")
         db.add(vendor)
         await db.flush()
         db.add(AuditEvent(scope=AuditScope.BUSINESS.value, business_id=biz.id,
-                          actor_user_id=provisioned.owner.id, action="event.vendor_self_registered",
+                          actor_user_id=owner.id, action="event.vendor_self_registered",
                           target_type="event_vendor", target_id=vendor.id,
                           diff_json={"event_id": str(event_id), "category": body.category}))
         await db.flush()
+        message = await ev_email.send_verification(db, owner, biz.business_code)
         # M-2: decide ONLY the business created here. The global reconcile
         # wrote other events' vendors and other tenants' businesses from a
         # public, unauthenticated request.
         await reconcile_single_business_access(db, biz.id)
         await db.commit()
-    except IntegrityError:
+    except (IntegrityError, DuplicateError):
+        # A concurrent registration took the same email between our check and
+        # the insert: answer exactly like the duplicate path. Any other
+        # integrity failure (e.g. a slug race) stays a generic 409.
         await db.rollback()
+        if await _email_taken(db, email):
+            return accepted
         raise _failed()
 
-    local_day = datetime.now(timezone.utc).astimezone(ZoneInfo(tz_name)).date()
-    decision = evaluate_access(local_day, billable, [], prep_days)
-    return {
-        "business_code": business_code,
-        "next": "login",
-        # Informational: a vendor registering long before the event cannot log in yet.
-        "access_level": decision.level,
-        "login_opens_on": (min(billable) - timedelta(days=prep_days)) if billable else None,
-    }
+    await send_safely(message)
+    return accepted
