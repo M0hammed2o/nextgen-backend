@@ -16,7 +16,6 @@ R100/day food and R50/day clothing, VAT-inclusive, per billable event day.
 """
 from __future__ import annotations
 
-import asyncio
 import csv
 import io
 import logging
@@ -31,13 +30,11 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
-from starlette.concurrency import run_in_threadpool
 
 from admin_api.app.core.deps import require_super_admin
-from admin_api.app.services.provisioning import ensure_owner_email_free, provision_business
+from admin_api.app.services.provisioning import provision_business, submit_password_hashes
 from backend.app.core.errors import AppError, NotFoundError
 from backend.app.core.rbac import AuthUser
-from backend.app.core.security import hash_password
 from backend.app.db.session import get_db
 from backend.app.events import registration as reg
 from backend.app.events.rules import DEFAULT_PREP_DAYS, PaidRange, evaluate_access, quote
@@ -56,14 +53,16 @@ from shared.enums import EVENT_PLAN, AuditScope
 from shared.models.audit import AuditEvent
 from shared.models.business import Business
 from shared.models.event import Event, EventDay, EventVendor, EventVendorSubscription
+from shared.models.user import BusinessUser
 from shared.models.order import Order
 from shared.utils import generate_temp_password
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin/events", tags=["admin-events"])
 
-# Each new vendor costs one bcrypt hash (~1 s of CPU). Hashes are computed concurrently in the
-# threadpool (see bulk_onboard_vendors); 100 keeps one request under gateway timeouts.
+# Each new vendor costs one bcrypt hash (~1 s of CPU). Hashes are computed a few at a time on a
+# dedicated bounded pool (provisioning.submit_password_hashes); 100 keeps one request under
+# gateway timeouts.
 # Larger lists are imported in several batches.
 MAX_BULK_VENDORS = 100
 _CATEGORY_INDUSTRY = {"FOOD": "EVENT_FOOD", "CLOTHING": "EVENT_RETAIL"}
@@ -431,6 +430,13 @@ async def _validate_rows(db: AsyncSession, event: Event, rows: list[VendorRow]) 
     taken_stalls = set((await db.execute(
         select(EventVendor.stall_code).where(EventVendor.event_id == event.id, EventVendor.stall_code.in_(stalls))
     )).scalars()) if stalls else set()
+    # One query for every new owner's email instead of one per row (100 rows = 100 round trips).
+    # Same rule as provisioning.ensure_owner_email_free (lower-cased, trimmed, exact match), which
+    # still re-checks each row inside the insert loop.
+    wanted_emails = sorted({e.strip() for e in emails})
+    taken_emails = set((await db.execute(
+        select(BusinessUser.email).where(BusinessUser.email.in_(wanted_emails))
+    )).scalars()) if wanted_emails else set()
     for i, row in enumerate(rows):
         errs: list[str] = []
         if row.stall_code and (row.stall_code in dup_stalls or row.stall_code in taken_stalls):
@@ -451,11 +457,8 @@ async def _validate_rows(db: AsyncSession, event: Event, rows: list[VendorRow]) 
             email = str(row.owner_email).lower()
             if email in dup_emails:
                 errs.append("owner_email appears more than once in this import")
-            else:
-                try:
-                    await ensure_owner_email_free(db, email)
-                except AppError:
-                    errs.append("owner_email already has a NextGen login (use existing_business_id for a returning vendor)")
+            elif email.strip() in taken_emails:
+                errs.append("owner_email already has a NextGen login (use existing_business_id for a returning vendor)")
         if row.starts_on:
             try:
                 quote(row.category, event.food_day_rate_cents, event.clothing_day_rate_cents,
@@ -491,14 +494,17 @@ async def bulk_onboard_vendors(event_id: uuid.UUID, body: BulkVendorRequest,
     if body.dry_run:
         return {"dry_run": True, "vendors": preview}
 
-    # bcrypt is ~1 s of CPU per hash. Hash every new owner's temporary password
-    # concurrently in the threadpool BEFORE the (serial) database loop: 60 vendors
-    # took ~95 s when each hash was awaited in turn. Passwords are returned once in
-    # the response and never logged or stored in plaintext.
+    # bcrypt is ~1 s of CPU per hash. Every new owner's temporary password starts
+    # hashing now, a few at a time on provisioning's small dedicated pool, and the
+    # (serial) database loop below awaits each row's hash only when it reaches that
+    # row, so hashing overlaps the inserts. (60 vendors took ~95 s when each hash was
+    # awaited in turn; all 100 at once on the shared threadpool starved every other
+    # request.) Passwords are returned once in the response and never logged or
+    # stored in plaintext.
     new_rows = [r for r in body.vendors if not r.existing_business_id]
     temps = [generate_temp_password() for _ in new_rows]
-    hashes = await asyncio.gather(*(run_in_threadpool(hash_password, t) for t in temps))
-    credentials = {id(r): (t, h) for r, t, h in zip(new_rows, temps, hashes)}
+    pending_hashes = submit_password_hashes(temps)
+    credentials = {id(r): (t, f) for r, t, f in zip(new_rows, temps, pending_hashes)}
 
     created: list[dict] = []
     try:
@@ -516,7 +522,7 @@ async def bulk_onboard_vendors(event_id: uuid.UUID, body: BulkVendorRequest,
                             "is_whatsapp_enabled": False},
                     owner_email=str(row.owner_email),
                     owner_full_name=row.owner_full_name,
-                    owner_temp_credentials=credentials[id(row)],
+                    owner_temp_credentials=(credentials[id(row)][0], await credentials[id(row)][1]),
                 )
                 biz, temp_password = provisioned.business, provisioned.owner_temporary_password
             vendor = EventVendor(event_id=event.id, business_id=biz.id, category=row.category,
@@ -544,6 +550,11 @@ async def bulk_onboard_vendors(event_id: uuid.UUID, body: BulkVendorRequest,
         # temporary password is returned for rows that do not exist.
         await db.rollback()
         raise AppError("BULK_CONFLICT", "another change took a stall, email or vendor slot; nothing was created", 409)
+    finally:
+        # On any failure, hashes still queued for rows that will never exist are dropped
+        # (no-op for finished ones).
+        for fut in pending_hashes:
+            fut.cancel()
     return {"dry_run": False, "vendors": created}
 
 
