@@ -74,6 +74,14 @@ _OWNER_ONLY_MONEY_FIELDS = (
     "eft_branch_code",
 )
 
+# Till-permission limits that bind MANAGERs as well as STAFF (routes_pos.py:
+# only an OWNER is never limited), so a manager must not raise their own
+# limit. OWNER-only, audited with old and new values (not secrets).
+_OWNER_ONLY_LIMIT_FIELDS = (
+    "max_staff_discount_cents",
+)
+MAX_STAFF_DISCOUNT_CEILING_CENTS = 10_000_000  # R100 000: a typo guard, not a business rule
+
 
 # ── Schemas ──────────────────────────────────────────────────────────────────
 
@@ -207,6 +215,9 @@ class BusinessSettingsResponse(BaseModel):
     pos_direct_eft_enabled: bool = False
     pos_other_payment_enabled: bool = False
     pos_table_number_required: bool = False
+    # Largest POS discount a STAFF/MANAGER may give without the owner
+    # (0 = none). Enforced server-side in create_pos_order.
+    max_staff_discount_cents: int = 0
     # POS module entitlement (migration 0057_pos_entitlement) — same
     # platform-admin-writable / business-plane READ-ONLY pattern as
     # inventory_enabled/digital_receipts_enabled above. Gates every route
@@ -308,6 +319,7 @@ class BusinessSettingsResponse(BaseModel):
             pos_direct_eft_enabled=b.pos_direct_eft_enabled,
             pos_other_payment_enabled=b.pos_other_payment_enabled,
             pos_table_number_required=b.pos_table_number_required,
+            max_staff_discount_cents=b.max_staff_discount_cents,
             pos_enabled=b.pos_enabled,
         )
 
@@ -359,6 +371,8 @@ class BusinessSettingsUpdate(BaseModel):
     pos_direct_eft_enabled: bool | None = None
     pos_other_payment_enabled: bool | None = None
     pos_table_number_required: bool | None = None
+    # OWNER-only (_OWNER_ONLY_LIMIT_FIELDS): the staff/manager discount limit.
+    max_staff_discount_cents: int | None = Field(default=None, ge=0, le=MAX_STAFF_DISCOUNT_CEILING_CENTS)
     # VAT / receipt config (Ciao Pizza P0). inventory_enabled is deliberately
     # NOT settable here — enabling a paid module is a platform decision, made
     # through the admin plane, not something a tenant switches on themselves.
@@ -544,6 +558,13 @@ async def update_business_settings(
                     f"Only the business owner can change '{field}' — it controls where payments are routed",
                     403,
                 )
+        for field in _OWNER_ONLY_LIMIT_FIELDS:
+            if field in update_data:
+                raise AppError(
+                    "OWNER_ONLY_FIELD",
+                    f"Only the business owner can change '{field}' — it limits managers too",
+                    403,
+                )
 
     result = await db.execute(
         select(Business).where(Business.id == user.business_id)
@@ -556,6 +577,15 @@ async def update_business_settings(
     # they are handled separately so empty strings clear the stored value.
     _CREDENTIAL_FIELDS = {"payment_api_key", "payment_api_secret", "payment_webhook_secret"}
     changed_money_fields = [f for f in _OWNER_ONLY_MONEY_FIELDS if f in update_data]
+    limit_changes = {
+        f: {"from": getattr(business, f), "to": update_data[f]}
+        for f in _OWNER_ONLY_LIMIT_FIELDS
+        if f in update_data and update_data[f] is not None and update_data[f] != getattr(business, f)
+    }
+    # null would hit a NOT NULL column; treat an explicit null as "not sent".
+    for f in _OWNER_ONLY_LIMIT_FIELDS:
+        if update_data.get(f, 0) is None:
+            update_data.pop(f)
 
     for field in _ASSET_REFERENCE_FIELDS:
         value = update_data.get(field)
@@ -605,6 +635,17 @@ async def update_business_settings(
             target_type="business",
             target_id=business.id,
             diff_json={"fields_changed": changed_money_fields, "actor_role": user.role},
+        ))
+
+    if limit_changes:
+        db.add(AuditEvent(
+            scope=AuditScope.BUSINESS.value,
+            business_id=user.business_id,
+            actor_user_id=user.user_id,
+            action="business.pos_limits.changed",
+            target_type="business",
+            target_id=business.id,
+            diff_json={"changes": limit_changes, "actor_role": user.role},
         ))
 
     await db.commit()
