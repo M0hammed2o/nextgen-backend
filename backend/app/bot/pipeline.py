@@ -44,7 +44,7 @@ from backend.app.bot import (
     usage_tracker,
     whatsapp_sender,
 )
-from backend.app.core.errors import DailyLimitError
+from backend.app.core.errors import AppError, DailyLimitError
 from backend.app.events.trading import bot_event_context, bot_trade_refusal
 from shared.enums import EVENT_PLAN, ConversationState, MessageIntent, OrderStatus
 from shared.models.business import Business
@@ -6128,6 +6128,7 @@ async def _event_refusal_cleanup(db: AsyncSession, business: Business, session) 
     forgets superseded_order_id. Never raises (SAVEPOINT-isolated).
     """
     pending_order_id = _parse_uuid(state_machine.get_context(session, "pending_order_id"))
+    cancelled_from = None
     if pending_order_id is not None:
         try:
             async with db.begin_nested():
@@ -6163,12 +6164,32 @@ async def _event_refusal_cleanup(db: AsyncSession, business: Business, session) 
                             order_id=pending_order_id,
                             previous_status=previous_status,
                         )
+                        cancelled_from = previous_status
                     await db.flush()
         except Exception:
+            cancelled_from = None
             logger.exception(
                 "EVENT_GATE_PENDING_CANCEL_FAILED: business_id=%s, order_id=%s",
                 business.id, pending_order_id,
             )
+    if cancelled_from is not None:
+        # Same live-dashboard event as _cancel_superseded_order (review L-7).
+        try:
+            from backend.app.db.session import get_redis
+            import json as _json
+            redis = await get_redis()
+            await redis.publish(
+                f"orders:{business.id}",
+                _json.dumps({
+                    "type": "order_status_changed",
+                    "order_id": str(pending_order_id),
+                    "old_status": cancelled_from,
+                    "new_status": "CANCELLED",
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }),
+            )
+        except Exception:
+            pass
     state_machine.clear_cart(session)
     state_machine.transition_state(session, ConversationState.IDLE.value)
 
@@ -6184,9 +6205,16 @@ async def _event_trade_gate(
     refusal = await bot_trade_refusal(db, business)
     if refusal is None:
         return None
+    return await _event_refusal_reply(db, business, session, refusal)
+
+
+async def _event_refusal_reply(
+    db: AsyncSession, business: Business, session, reason: str,
+) -> tuple[str, bool, int | None, int | None, str | None]:
+    """Clean up after a refusal and return the customer notice as the reply."""
     logger.warning(
         "EVENT_BOT_ORDER_REFUSED: business_id=%s, reason=%s, session_id=%s",
-        business.id, refusal, session.id,
+        business.id, reason, session.id,
     )
     await _event_refusal_cleanup(db, business, session)
     ctx = await bot_event_context(db, business.id)
@@ -6431,10 +6459,17 @@ async def _handle_order_confirmation(
                     session.id,
                 )
 
-            order = await order_creator.create_order_from_cart(
-                db, business, customer, session,
-                initial_status="PENDING_DELIVERY_FEE",
-            )
+            try:
+                order = await order_creator.create_order_from_cart(
+                    db, business, customer, session,
+                    initial_status="PENDING_DELIVERY_FEE",
+                )
+            except AppError as _exc:
+                # Event-vendor backstop refused (the trading day ended after the
+                # gate above passed): reply normally instead of rolling back.
+                if _exc.code != "EVENT_TRADING_NOT_ALLOWED":
+                    raise
+                return await _event_refusal_reply(db, business, session, "BACKSTOP")
             await _cancel_prior_live_orders(db, business, customer, exclude_order_id=order.id)
             # Clear cart now — items are persisted in the order's items_json.
             # An empty cart prevents the ORDER_CONFIRM gate from hijacking any
@@ -6484,7 +6519,13 @@ async def _handle_order_confirmation(
             session.id,
         )
 
-    order = await order_creator.create_order_from_cart(db, business, customer, session)
+    try:
+        order = await order_creator.create_order_from_cart(db, business, customer, session)
+    except AppError as _exc:
+        # Event-vendor backstop refused (see the delivery branch above).
+        if _exc.code != "EVENT_TRADING_NOT_ALLOWED":
+            raise
+        return await _event_refusal_reply(db, business, session, "BACKSTOP")
     await _cancel_prior_live_orders(db, business, customer, exclude_order_id=order.id)
 
     summary = state_machine.cart_summary_text(session, business.currency)
@@ -6857,12 +6898,26 @@ async def _finalize_pending_delivery_order(
             )
             row = result.one_or_none()
             if row is None:
-                # Expired or cancelled meanwhile: nothing was placed.
+                # No longer awaiting the fee. Re-read why (H-3 follow-up): it
+                # may have been cancelled (expired), or it may already be live
+                # (staff moved it on, or a concurrent "yes" finalised it).
+                current = (await db.execute(
+                    select(_Order.status, _Order.order_number).where(
+                        _Order.id == _parse_uuid(pending_order_id),
+                        _Order.business_id == business.id,
+                    )
+                )).one_or_none()
                 logger.warning(
-                    "DELIVERY_FINALISE_NOT_PENDING: order_id=%s no longer awaiting fee approval, "
-                    "session_id=%s", pending_order_id, session.id,
+                    "DELIVERY_FINALISE_NOT_PENDING: order_id=%s status=%s, session_id=%s",
+                    pending_order_id, current.status if current else None, session.id,
                 )
                 state_machine.clear_cart(session)
+                if current is not None and current.status != OrderStatus.CANCELLED.value:
+                    state_machine.transition_state(session, ConversationState.ORDER_PLACED.value)
+                    return (
+                        responses.delivery_order_already_placed_response(current.order_number),
+                        False, None, None, None,
+                    )
                 state_machine.transition_state(session, ConversationState.IDLE.value)
                 return responses.delivery_order_expired_response(), False, None, None, None
             order_number = row.order_number

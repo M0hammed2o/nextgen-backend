@@ -461,8 +461,9 @@ async def create_business(
                 "FIELD_NOT_ALLOWED", "ONBOARDER cannot set whatsapp_order_allowance", 403,
             )
 
-    # L-4: an event-plan business never has WhatsApp (bot orders bypass the
-    # event trading gate): no number at creation, and it is switched off.
+    # An event-plan business starts with WhatsApp off and no number. A super
+    # admin may later enable it for one vendor; the number then only comes
+    # from the vendor's own Embedded Signup (docs/EVENT_WHATSAPP.md).
     create_fields = body.model_dump(exclude={"owner_email", "owner_full_name", "slug", "start_trial"})
     if body.plan == EVENT_PLAN:
         if body.whatsapp_phone_number_id:
@@ -638,6 +639,11 @@ async def update_business(
     # approval needs a template name.
     template_fields = ("whatsapp_ready_template_name", "whatsapp_ready_template_language")
     template_changed = any(f in changes and changes[f] != getattr(biz, f) for f in template_fields)
+    # A different WhatsApp number/WABA also needs the template re-confirmed.
+    template_changed = template_changed or any(
+        f in changes and changes[f] != getattr(biz, f)
+        for f in ("whatsapp_phone_number_id", "whatsapp_business_account_id")
+    )
     if template_changed and "whatsapp_ready_template_approved" not in changes:
         changes["whatsapp_ready_template_approved"] = False
     if changes.get("whatsapp_ready_template_approved") is True:
@@ -1362,6 +1368,18 @@ async def send_whatsapp_test(
         raise AppError(
             "WHATSAPP_DISABLED",
             "WhatsApp is disabled for this business",
+            422,
+        )
+
+    if biz.plan == EVENT_PLAN:
+        # This endpoint always sends on the PLATFORM token. An event vendor
+        # must only ever send from its own WABA (token_resolver), so NextGen is
+        # never billed for it; use the vendor's own test message instead
+        # (POST /v1/business/whatsapp/connection/test-message).
+        raise AppError(
+            "EVENT_PLAN_PLATFORM_TOKEN_NOT_ALLOWED",
+            "Event vendors send only from their own WhatsApp number; use the vendor's own "
+            "connection test message instead of the platform test-send",
             422,
         )
 

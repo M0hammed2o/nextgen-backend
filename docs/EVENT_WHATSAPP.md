@@ -13,10 +13,11 @@ WhatsApp Business account (WABA) or template was created or changed.
 | WhatsApp is off for an event vendor until a **super admin** switches it on for that one vendor (`is_whatsapp_enabled`, the per-vendor kill switch). While off, inbound messages are recorded but nothing is processed or sent. | admin PATCH `/admin/businesses/{id}`; pipeline soft gate |
 | An event vendor messages customers only from **its own** WhatsApp Business number (Embedded Signup). It never gets NextGen's platform token, so Meta bills the vendor, not NextGen. | `whatsapp/token_resolver.py` |
 | Nobody can type a WhatsApp number or WABA id for an event vendor. The number only comes from the vendor's own Embedded Signup. | admin PATCH (422 `EVENT_PLAN_WHATSAPP_NOT_ALLOWED`) |
-| The vendor can always disconnect its own number, even while WhatsApp is switched off. | `DELETE /v1/business/whatsapp/connection` |
+| The vendor can always disconnect its own number, even while WhatsApp is switched off. Disconnecting, connecting a different number/WABA, or an admin number change clears the order-ready template approval. | `DELETE /v1/business/whatsapp/connection`, `connection_service`, admin PATCH |
+| The admin platform-token test-send is refused for event vendors (it would send on NextGen's token). | admin `POST /admin/businesses/{id}/whatsapp/test-send` |
 | Accepting an online-payment order (which creates a payment link) and quoting a delivery fee need a paid trading day. | `routes_orders.update_order_status`, `set_delivery_fee` |
 | A provider payment that arrives on a non-trading day is still recorded (the money has moved) and flagged for the organiser: an order event plus audit event `event.payment.outside_trading_day`. | `routes_payments._mark_order_paid` |
-| Restaurants are unaffected: every check returns on the business plan the code already has, before any database query. | tests prove it (see §6) |
+| Restaurants are unaffected in behaviour. The bot pipeline adds **no** query for a restaurant (its checks use the business plan already loaded; a real-DB test captures every statement). The two staff routes, `set_delivery_fee` and accepting an order with `payment_required`, call `assert_trading_allowed`, which costs a restaurant one `SELECT businesses.plan` before returning (same as the existing completion gate). | tests prove it (see §6) |
 
 ## 2. How an event vendor goes live on WhatsApp
 

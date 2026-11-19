@@ -345,3 +345,88 @@ async def test_pos_consent_provenance_recorded(db, stalls):
         out[consent] = await _fresh(db, Order, o.id)
     assert out[True].notify_consent_by_user_id == owner.user_id and out[True].notify_consent_at is not None
     assert out[False].notify_consent_by_user_id is None and out[False].notify_consent_at is None
+
+
+async def test_ready_send_path_raising_still_returns_the_ready_order(db, stalls):
+    """Review L-3: a failure inside the ready send must not roll back/expire the
+    committed status change; the route still returns the READY order."""
+    st = await _ready_vendor(db, stalls)
+    order = await _order(db, st.business_id, status="IN_PROGRESS", payment_status="PAID", notify_when_ready=True,
+                         phone_number="0821234544")
+    with _no_redis(), patch("backend.app.bot.whatsapp_sender.send_template_message",
+                            new=AsyncMock(side_effect=RuntimeError("boom"))):
+        out = await update_order_status(order.id, StatusUpdateRequest(status="READY"),
+                                        _user(st.business_id, "STAFF"), db)
+    assert out.status == "READY" and out.id == order.id
+    reasons = (await db.execute(select(OrderEvent.reason).where(OrderEvent.order_id == order.id))).scalars().all()
+    assert order_ready.REASON_SEND_FAILED in reasons
+    assert (await _fresh(db, Order, order.id)).status == "READY"
+
+
+# -- review L-4: template approval is per WABA/number ---------------------------------------
+
+async def test_disconnect_clears_template_approval(db, stalls):
+    st = await _ready_vendor(db, stalls)
+    with patch("backend.app.whatsapp.graph_client.MetaGraphClient.unsubscribe_app", new=AsyncMock()):
+        await wa_connect.disconnect_whatsapp(_user(st.business_id), db)
+    assert (await _fresh(db, Business, st.business_id)).whatsapp_ready_template_approved is False
+
+
+@pytest.mark.parametrize("same", [True, False])
+async def test_claiming_a_different_number_clears_template_approval(db, stalls, same):
+    from backend.app.whatsapp import connection_service
+    st = await _ready_vendor(db, stalls)
+    biz = await _fresh(db, Business, st.business_id)
+    conn = (await db.execute(select(WhatsAppConnection).where(
+        WhatsAppConnection.business_id == st.business_id))).scalar_one()
+    await db.execute(update(Business).where(Business.id == st.business_id).values(
+        whatsapp_business_account_id=conn.waba_id))
+    await db.commit()
+    biz = await _fresh(db, Business, st.business_id)
+    if not same:
+        conn.phone_number_id = f"8{uuid.uuid4().int % 10**12:012d}"
+        conn.waba_id = f"w-new-{uuid.uuid4().hex[:6]}"
+    outcome = await connection_service._claim_routing_number(db, biz, conn, None)
+    assert outcome.success
+    assert (await _fresh(db, Business, st.business_id)).whatsapp_ready_template_approved is same
+
+
+async def test_admin_number_change_clears_template_approval(db, stalls):
+    st = await _ready_vendor(db, stalls, plan="STARTER", connection=None)
+    out = await update_business(st.business_id, BusinessUpdate(
+        whatsapp_phone_number_id=f"7{uuid.uuid4().int % 10**12:012d}"), ADMIN, db)
+    assert out.whatsapp_ready_template_approved is False
+
+
+# -- review L-8 ------------------------------------------------------------------------------
+
+async def test_onboarder_cannot_enable_whatsapp_for_an_event_business(db, stalls):
+    from sqlalchemy import delete as sa_delete
+    from shared.models.admin import AdminUser
+    admin_row = AdminUser(email=f"onb-{uuid.uuid4().hex[:8]}@example.com", password_hash="x",
+                          display_name="Onboarder", role="ONBOARDER")
+    db.add(admin_row)
+    await db.commit()
+    try:
+        st = await stalls.make(wa_enabled=False, connection=None, cart=False)
+        await db.execute(update(Business).where(Business.id == st.business_id).values(
+            onboarded_by_admin_id=admin_row.id))
+        await db.commit()
+        onb = AuthUser(user_id=admin_row.id, business_id=None, role="ONBOARDER", token_type="admin_access")
+        assert await _err(update_business(st.business_id, BusinessUpdate(is_whatsapp_enabled=True), onb, db)) \
+            == (403, "EVENT_PLAN_WHATSAPP_NOT_ALLOWED")
+        assert (await _fresh(db, Business, st.business_id)).is_whatsapp_enabled is False
+    finally:
+        await db.execute(update(Business).where(Business.onboarded_by_admin_id == admin_row.id).values(
+            onboarded_by_admin_id=None))
+        await db.execute(sa_delete(AdminUser).where(AdminUser.id == admin_row.id))
+        await db.commit()
+
+
+async def test_admin_platform_test_send_refuses_an_event_business(db, stalls):
+    from admin_api.app.api.v1.routes_businesses import WhatsAppTestSendRequest, send_whatsapp_test
+    st = await stalls.make(cart=False)
+    with patch("backend.app.bot.whatsapp_sender._send_via_meta_api_with_detail", new=AsyncMock()) as send:
+        assert await _err(send_whatsapp_test(st.business_id, WhatsAppTestSendRequest(to="27821234567", text="hi"),
+                                             ADMIN, db)) == (422, "EVENT_PLAN_PLATFORM_TOKEN_NOT_ALLOWED")
+    send.assert_not_awaited()

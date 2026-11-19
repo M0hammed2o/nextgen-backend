@@ -15,6 +15,7 @@ timezone is controlled exactly.
 from __future__ import annotations
 
 import contextlib
+import json
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -299,6 +300,10 @@ async def test_fee_approved_after_midnight_unpaid_cancels_order_and_reverses_sto
     assert ("FEE_SENT", "CANCELLED") in [(e.old_status, e.new_status) for e in snap.events]
     assert snap.state == ConversationState.IDLE.value and "pending_order_id" not in snap.ctx
     assert NOTICE in _sent_texts(w)[0]
+    # Review L-7: the staff dashboard is told, like any other cancellation.
+    events = [json.loads(c.args[1]) for c in w.redis.publish.await_args_list]
+    assert {"type": "order_status_changed", "order_id": str(snap.orders[0].id), "old_status": "FEE_SENT",
+            "new_status": "CANCELLED"}.items() <= events[0].items()
 
 
 async def test_cash_choice_after_midnight_hits_finalise_gate(stalls):
@@ -490,3 +495,44 @@ async def test_h3_finalise_keeps_vat_total_set_by_set_delivery_fee(stalls):
     o = snap.orders[0]
     assert (o.status, o.total_cents, o.tax_cents, o.delivery_fee_cents) == ("NEW", 5750, 750, 2000)
     assert "R57.50" in _sent_texts(w)[0]
+
+
+async def test_h3_repeat_yes_for_an_already_live_order_says_placed_not_expired(stalls):
+    """Review L-1: the order went FEE_SENT -> NEW elsewhere (staff, or a concurrent "yes")."""
+    st = await stalls.make(plan="STARTER", connection=None, delivery=True)
+    with outside_world():
+        await _send(st)
+    async with get_session_factory()() as db:
+        order = (await db.execute(select(Order).where(Order.business_id == st.business_id))).scalar_one()
+        order.status = "NEW"
+        sess = (await db.execute(select(ConversationSession).where(
+            ConversationSession.id == st.session_id))).scalar_one()
+        sess.state = ConversationState.COLLECTING_PAYMENT.value
+        sess.context_json = {**sess.context_json, "pending_order_id": str(order.id), "delivery_fee_cents": 2000,
+                             "delivery_fee_status": "APPROVED"}
+        await db.commit()
+        number = order.order_number
+    with outside_world() as w:
+        await _send(st, "cash")
+    snap = await _snapshot(st)
+    assert [o.status for o in snap.orders] == ["NEW"]
+    text = _sent_texts(w)[0]
+    assert "already been placed" in text and number in text and "expired" not in text
+    assert snap.state == ConversationState.ORDER_PLACED.value
+
+
+@pytest.mark.parametrize("delivery", [False, True])
+async def test_backstop_refusal_in_midnight_race_replies_and_commits(stalls, delivery):
+    """Review L-2: soft gate and gate (a) see 23:59:5x (TRADE); the backstop in
+    create_order_from_cart sees 00:00:01 (unpaid). The customer gets the notice,
+    the inbound message is committed, nothing is ordered."""
+    st = await stalls.make(delivery=delivery)
+    with event_clock(_local(PAID_DAY, 23, 59, 58), _local(PAID_DAY, 23, 59, 59), _local(UNPAID_DAY, 0, 0, 1)), \
+            outside_world() as w:
+        await _send(st)
+    snap = await _snapshot(st)
+    assert snap.orders == [] and snap.stock == 0
+    assert snap.inbound == 1  # not rolled back
+    assert snap.state == ConversationState.IDLE.value and snap.ctx.get("cart") == []
+    assert NOTICE in _sent_texts(w)[0]
+    w.redis.publish.assert_not_awaited()

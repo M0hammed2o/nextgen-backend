@@ -137,70 +137,88 @@ async def send_event_order_ready(db: AsyncSession, business: Business, order: Or
     consented POS order. Returns the OrderEvent reason recorded. Commits its
     own OrderEvent (the caller's status change is already committed). Never
     raises: a messaging problem must not fail the status change.
+
+    The work runs inside a SAVEPOINT, so a failure only undoes this module's
+    own writes and never rolls back (and expires) the caller's committed
+    order, which the route still serialises afterwards (review L-3).
     """
-    from backend.app.bot.whatsapp_sender import send_notification_message, send_template_message
-
     try:
-        already = (await db.execute(
-            select(OrderEvent.id).where(
-                OrderEvent.order_id == order.id, OrderEvent.business_id == order.business_id,
-                OrderEvent.reason.in_(_SENT_REASONS),
-            ).limit(1)
-        )).scalar_one_or_none()
-        if already is not None:
-            return "already sent"
-
-        customer = None
-        if order.customer_id:
-            customer = (await db.execute(select(Customer).where(
-                Customer.id == order.customer_id, Customer.business_id == order.business_id))).scalar_one_or_none()
-        if customer is None and wa_id:
-            customer = (await db.execute(select(Customer).where(
-                Customer.business_id == order.business_id, Customer.wa_id == wa_id))).scalar_one_or_none()
-        if customer is not None and customer.opted_out:
-            reason = REASON_NOT_SENT_OPTED_OUT
-        elif not wa_id:
-            reason = REASON_NOT_SENT_NO_NUMBER
-        else:
-            status = await ready_notify_status(db, business)
-            if status.state in (STATE_AWAITING_ADMIN, STATE_NOT_CONNECTED):
-                reason = REASON_NOT_SENT_UNAVAILABLE
-            elif status.template_approved:
-                vendor = business.brand_display_name or business.name
-                components = [{"type": "body", "parameters": [
-                    {"type": "text", "text": order.order_number},
-                    {"type": "text", "text": vendor},
-                    {"type": "text", "text": await _stall_label(db, business.id)},
-                ]}]
-                wamid, _err = await send_template_message(
-                    phone_number_id=business.whatsapp_phone_number_id, recipient_wa_id=wa_id,
-                    template_name=status.template_name, language_code=status.template_language or "en_US",
-                    components=components, db=db, business=business,
-                    customer_id=getattr(customer, "id", None), intent="ORDER_READY",
-                )
-                reason = REASON_SENT_TEMPLATE if wamid else REASON_SEND_FAILED
-            else:
-                last = getattr(customer, "last_message_at", None)
-                if last is not None and last.tzinfo is None:
-                    last = last.replace(tzinfo=timezone.utc)
-                if last is not None and datetime.now(timezone.utc) - last <= CUSTOMER_SERVICE_WINDOW:
-                    wamid = await send_notification_message(
-                        phone_number_id=business.whatsapp_phone_number_id, recipient_wa_id=wa_id,
-                        text=f"🎉 Your order *{order.order_number}* is ready for collection!",
-                        db=db, business=business,
-                        order_id=order.id, business_id=order.business_id, order_status=order.status,
-                    )
-                    reason = REASON_SENT_FREE_TEXT if wamid else REASON_SEND_FAILED
-                else:
-                    reason = REASON_NOT_SENT_NO_TEMPLATE
-        _record(db, order, reason)
-        await db.commit()
-        logger.info("EVENT_ORDER_READY: order_id=%s outcome=%s", order.id, reason)
-        return reason
+        async with db.begin_nested():
+            reason = await _decide_and_send(db, business, order, wa_id)
+            if reason != "already sent":
+                _record(db, order, reason)
     except Exception:  # noqa: BLE001
         logger.exception("EVENT_ORDER_READY_FAILED: order_id=%s", getattr(order, "id", None))
+        reason = REASON_SEND_FAILED
         try:
-            await db.rollback()
+            async with db.begin_nested():
+                _record(db, order, reason)
         except Exception:  # noqa: BLE001
-            pass
-        return REASON_SEND_FAILED
+            logger.exception("EVENT_ORDER_READY_RECORD_FAILED: order_id=%s", getattr(order, "id", None))
+    try:
+        await db.commit()
+    except Exception:  # noqa: BLE001
+        logger.exception("EVENT_ORDER_READY_COMMIT_FAILED: order_id=%s", getattr(order, "id", None))
+        await db.rollback()
+        await db.refresh(order)  # the caller's committed order stays loaded
+    logger.info("EVENT_ORDER_READY: order_id=%s outcome=%s", getattr(order, "id", None), reason)
+    return reason
+
+
+async def _decide_and_send(db: AsyncSession, business: Business, order: Order, wa_id: str | None) -> str:
+    """Decide, send if allowed, and return the outcome reason (may raise)."""
+    from backend.app.bot.whatsapp_sender import send_notification_message, send_template_message
+
+    already = (await db.execute(
+        select(OrderEvent.id).where(
+            OrderEvent.order_id == order.id, OrderEvent.business_id == order.business_id,
+            OrderEvent.reason.in_(_SENT_REASONS),
+        ).limit(1)
+    )).scalar_one_or_none()
+    if already is not None:
+        return "already sent"
+
+    customer = None
+    if order.customer_id:
+        customer = (await db.execute(select(Customer).where(
+            Customer.id == order.customer_id, Customer.business_id == order.business_id))).scalar_one_or_none()
+    if customer is None and wa_id:
+        customer = (await db.execute(select(Customer).where(
+            Customer.business_id == order.business_id, Customer.wa_id == wa_id))).scalar_one_or_none()
+    if customer is not None and customer.opted_out:
+        reason = REASON_NOT_SENT_OPTED_OUT
+    elif not wa_id:
+        reason = REASON_NOT_SENT_NO_NUMBER
+    else:
+        status = await ready_notify_status(db, business)
+        if status.state in (STATE_AWAITING_ADMIN, STATE_NOT_CONNECTED):
+            reason = REASON_NOT_SENT_UNAVAILABLE
+        elif status.template_approved:
+            vendor = business.brand_display_name or business.name
+            components = [{"type": "body", "parameters": [
+                {"type": "text", "text": order.order_number},
+                {"type": "text", "text": vendor},
+                {"type": "text", "text": await _stall_label(db, business.id)},
+            ]}]
+            wamid, _err = await send_template_message(
+                phone_number_id=business.whatsapp_phone_number_id, recipient_wa_id=wa_id,
+                template_name=status.template_name, language_code=status.template_language or "en_US",
+                components=components, db=db, business=business,
+                customer_id=getattr(customer, "id", None), intent="ORDER_READY",
+            )
+            reason = REASON_SENT_TEMPLATE if wamid else REASON_SEND_FAILED
+        else:
+            last = getattr(customer, "last_message_at", None)
+            if last is not None and last.tzinfo is None:
+                last = last.replace(tzinfo=timezone.utc)
+            if last is not None and datetime.now(timezone.utc) - last <= CUSTOMER_SERVICE_WINDOW:
+                wamid = await send_notification_message(
+                    phone_number_id=business.whatsapp_phone_number_id, recipient_wa_id=wa_id,
+                    text=f"🎉 Your order *{order.order_number}* is ready for collection!",
+                    db=db, business=business,
+                    order_id=order.id, business_id=order.business_id, order_status=order.status,
+                )
+                reason = REASON_SENT_FREE_TEXT if wamid else REASON_SEND_FAILED
+            else:
+                reason = REASON_NOT_SENT_NO_TEMPLATE
+    return reason
