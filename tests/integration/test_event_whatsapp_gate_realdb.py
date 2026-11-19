@@ -514,3 +514,20 @@ async def test_h3_repeat_yes_for_an_already_live_order_says_placed_not_expired(s
     text = _sent_texts(w)[0]
     assert "already been placed" in text and number in text and "expired" not in text
     assert snap.state == ConversationState.ORDER_PLACED.value
+
+
+@pytest.mark.parametrize("delivery", [False, True])
+async def test_backstop_refusal_in_midnight_race_replies_and_commits(stalls, delivery):
+    """Review L-2: soft gate and gate (a) see 23:59:5x (TRADE); the backstop in
+    create_order_from_cart sees 00:00:01 (unpaid). The customer gets the notice,
+    the inbound message is committed, nothing is ordered."""
+    st = await stalls.make(delivery=delivery)
+    with event_clock(_local(PAID_DAY, 23, 59, 58), _local(PAID_DAY, 23, 59, 59), _local(UNPAID_DAY, 0, 0, 1)), \
+            outside_world() as w:
+        await _send(st)
+    snap = await _snapshot(st)
+    assert snap.orders == [] and snap.stock == 0
+    assert snap.inbound == 1  # not rolled back
+    assert snap.state == ConversationState.IDLE.value and snap.ctx.get("cart") == []
+    assert NOTICE in _sent_texts(w)[0]
+    w.redis.publish.assert_not_awaited()

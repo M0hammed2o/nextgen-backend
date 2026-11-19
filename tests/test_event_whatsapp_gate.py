@@ -428,3 +428,46 @@ async def test_process_restaurant_never_calls_soft_gate():
          patch.object(pipeline.usage_tracker, "check_daily_limit", AsyncMock(side_effect=pipeline.DailyLimitError("messages", 1))):
         await pipeline._process(db=db, phone_number_id="pnid-1", wa_message_id="wamid.2", wa_id="2782",
                                 msg_text="hi", msg_type="text", raw_payload={}, contact_name=None)
+
+
+@pytest.mark.parametrize("delivery", [False, True])
+async def test_backstop_refusal_after_gate_passed_replies_instead_of_rolling_back(delivery):
+    """Review L-2: gate (a) passes, then the trading day ends before order creation."""
+    biz = _biz(delivery_enabled=delivery)
+    ctx = {"cart": _cart(), "order_mode": "DELIVERY" if delivery else "PICKUP", "order_notes_asked": True}
+    if delivery:
+        ctx["delivery_address"] = "1 Main Rd"
+    session = Session(ctx=ctx)
+    refusal = AppError("EVENT_TRADING_NOT_ALLOWED", "no", 403)
+    with patch.object(pipeline, "bot_trade_refusal", AsyncMock(return_value=None)), \
+         patch.object(pipeline, "bot_event_context", AsyncMock(return_value=_ctx())), \
+         patch.object(pipeline.order_creator, "create_order_from_cart", AsyncMock(side_effect=refusal)), \
+         patch.object(pipeline, "_cancel_superseded_order", AsyncMock()), \
+         patch.object(pipeline, "_cancel_prior_live_orders", AsyncMock()) as prior, \
+         patch.object(pipeline.usage_tracker, "check_daily_limit", AsyncMock()), \
+         patch.object(pipeline.usage_tracker, "increment_usage", AsyncMock()) as usage:
+        text, *_ = await pipeline._handle_order_confirmation(FakeDB(), biz, MagicMock(), session)
+    assert text.startswith(NOTICE_START)
+    prior.assert_not_awaited()
+    usage.assert_not_awaited()
+    assert state_machine.get_cart(session) == [] and session.state == ConversationState.IDLE.value
+
+
+async def test_other_app_errors_from_order_creation_still_propagate():
+    biz = _biz()
+    session = Session(ctx={"cart": _cart(), "order_mode": "PICKUP", "order_notes_asked": True})
+    with patch.object(pipeline, "bot_trade_refusal", AsyncMock(return_value=None)), \
+         patch.object(pipeline.order_creator, "create_order_from_cart", AsyncMock(side_effect=AppError("X", "y", 500))), \
+         patch.object(pipeline, "_cancel_superseded_order", AsyncMock()), \
+         patch.object(pipeline.usage_tracker, "check_daily_limit", AsyncMock()):
+        with pytest.raises(AppError):
+            await pipeline._handle_order_confirmation(FakeDB(), biz, MagicMock(), session)
+
+
+async def test_backstop_check_failure_refuses_inside_a_savepoint():
+    db = FakeDB()
+    with patch.object(trading, "business_access_decision", AsyncMock(side_effect=RuntimeError("db"))):
+        with pytest.raises(AppError) as exc:
+            await trading.assert_bot_order_allowed(db, _biz())
+    assert exc.value.details["reason"] == trading.BOT_ACCESS_CHECK_FAILED
+    assert db.nested == 1

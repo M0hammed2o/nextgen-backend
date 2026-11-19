@@ -216,7 +216,23 @@ async def assert_bot_order_allowed(db: AsyncSession, business: Business, now: da
     """
     if getattr(business, "plan", None) != EVENT_PLAN:
         return
-    await _require_trade_at(db, business.id, now)
+    # SAVEPOINT: a failed check must not abort the caller's transaction
+    # (the bot catches the refusal and still replies). Fails closed.
+    try:
+        async with db.begin_nested():
+            decision = await business_access_decision(db, business.id, now)
+    except Exception:  # noqa: BLE001
+        logger.exception("EVENT_BOT_BACKSTOP_CHECK_FAILED: business_id=%s - refusing", business.id)
+        decision = None
+    if decision is not None and decision.level == TRADE:
+        return
+    reason = decision.reason if decision is not None else BOT_ACCESS_CHECK_FAILED
+    raise AppError(
+        "EVENT_TRADING_NOT_ALLOWED",
+        _MESSAGES.get(reason, "Trading is not allowed for this event vendor right now."),
+        403,
+        details={"reason": reason, "access_level": decision.level if decision is not None else None},
+    )
 
 
 @dataclass(frozen=True)

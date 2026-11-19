@@ -44,7 +44,7 @@ from backend.app.bot import (
     usage_tracker,
     whatsapp_sender,
 )
-from backend.app.core.errors import DailyLimitError
+from backend.app.core.errors import AppError, DailyLimitError
 from backend.app.events.trading import bot_event_context, bot_trade_refusal
 from shared.enums import EVENT_PLAN, ConversationState, MessageIntent, OrderStatus
 from shared.models.business import Business
@@ -6184,9 +6184,16 @@ async def _event_trade_gate(
     refusal = await bot_trade_refusal(db, business)
     if refusal is None:
         return None
+    return await _event_refusal_reply(db, business, session, refusal)
+
+
+async def _event_refusal_reply(
+    db: AsyncSession, business: Business, session, reason: str,
+) -> tuple[str, bool, int | None, int | None, str | None]:
+    """Clean up after a refusal and return the customer notice as the reply."""
     logger.warning(
         "EVENT_BOT_ORDER_REFUSED: business_id=%s, reason=%s, session_id=%s",
-        business.id, refusal, session.id,
+        business.id, reason, session.id,
     )
     await _event_refusal_cleanup(db, business, session)
     ctx = await bot_event_context(db, business.id)
@@ -6431,10 +6438,17 @@ async def _handle_order_confirmation(
                     session.id,
                 )
 
-            order = await order_creator.create_order_from_cart(
-                db, business, customer, session,
-                initial_status="PENDING_DELIVERY_FEE",
-            )
+            try:
+                order = await order_creator.create_order_from_cart(
+                    db, business, customer, session,
+                    initial_status="PENDING_DELIVERY_FEE",
+                )
+            except AppError as _exc:
+                # Event-vendor backstop refused (the trading day ended after the
+                # gate above passed): reply normally instead of rolling back.
+                if _exc.code != "EVENT_TRADING_NOT_ALLOWED":
+                    raise
+                return await _event_refusal_reply(db, business, session, "BACKSTOP")
             await _cancel_prior_live_orders(db, business, customer, exclude_order_id=order.id)
             # Clear cart now — items are persisted in the order's items_json.
             # An empty cart prevents the ORDER_CONFIRM gate from hijacking any
@@ -6484,7 +6498,13 @@ async def _handle_order_confirmation(
             session.id,
         )
 
-    order = await order_creator.create_order_from_cart(db, business, customer, session)
+    try:
+        order = await order_creator.create_order_from_cart(db, business, customer, session)
+    except AppError as _exc:
+        # Event-vendor backstop refused (see the delivery branch above).
+        if _exc.code != "EVENT_TRADING_NOT_ALLOWED":
+            raise
+        return await _event_refusal_reply(db, business, session, "BACKSTOP")
     await _cancel_prior_live_orders(db, business, customer, exclude_order_id=order.id)
 
     summary = state_machine.cart_summary_text(session, business.currency)
