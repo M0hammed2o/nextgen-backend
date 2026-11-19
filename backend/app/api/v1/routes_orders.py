@@ -615,6 +615,11 @@ async def update_order_status(
     # may always be moved through the kitchen statuses.
     if requested in _COMPLETION_STATUSES and order.payment_status != "PAID":
         await assert_trading_allowed(db, user.business_id)
+    # Souk WhatsApp gate: accepting an online-payment order creates a payment
+    # link below (money requested from the customer), so an event vendor needs
+    # a paid trading day for it. Checked before anything is changed.
+    if requested == OrderStatus.ACCEPTED and order.payment_required:
+        await assert_trading_allowed(db, user.business_id)
 
     old_status = order.status
     order.status = requested.value
@@ -915,6 +920,10 @@ async def set_delivery_fee(
     if order.status != OrderStatus.PENDING_DELIVERY_FEE.value:
         from backend.app.core.errors import InvalidTransitionError
         raise InvalidTransitionError(order.status, "FEE_SENT")
+
+    # Souk WhatsApp gate: quoting a delivery fee asks the customer to commit
+    # to a sale, so an event vendor needs a paid trading day for it.
+    await assert_trading_allowed(db, user.business_id)
 
     biz_result = await db.execute(select(Business).where(Business.id == user.business_id))
     business = biz_result.scalar_one_or_none()
