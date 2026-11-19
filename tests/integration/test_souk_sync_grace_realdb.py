@@ -683,7 +683,8 @@ async def test_cashier_deactivated_after_upload_can_still_be_approved_at_staff_a
     # Review L-2: validated at upload; deactivation afterwards (temp event staff) does not block approval.
     biz, _, owner, item = await _restaurant(db, bag, max_staff_discount_cents=100)
     biz_id = biz.id
-    cashier = await _staff_row(db, biz_id, role="MANAGER")
+    # an OWNER cashier: only OWNER is exempt from the staff discount limit, so the STAFF downgrade decides
+    cashier = await _staff_row(db, biz_id, role="OWNER")
     captured = _now() - timedelta(hours=80)
     _, ok_rid = await _queued(db, owner, item, captured, discount_cents=50, captured_by_user_id=cashier.id)
     _, big_rid = await _queued(db, owner, item, captured, discount_cents=1000, captured_by_user_id=cashier.id)
@@ -693,7 +694,7 @@ async def test_cashier_deactivated_after_upload_can_still_be_approved_at_staff_a
     row = (await db.execute(select(Order).where(Order.id == out.order.id))).scalar_one()
     assert row.created_by_user_id == cashier.id
     assert "cashier_differs_from_syncer" in row.offline_review_reasons
-    # an inactive MANAGER cashier counts as STAFF: above the staff limit is refused
+    # an inactive OWNER cashier counts as STAFF: above the staff limit is refused
     assert await _err(approve_offline_review(big_rid, _note(), owner, db)) == (403, "DISCOUNT_LIMIT_EXCEEDED")
 
 
