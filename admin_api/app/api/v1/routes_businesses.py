@@ -34,7 +34,7 @@ from backend.app.core.errors import AppError, DuplicateError, NotFoundError
 from backend.app.core.rbac import AuthUser
 from backend.app.core.security import hash_password
 from backend.app.db.session import get_db
-from shared.enums import AuditScope, PlanTier
+from shared.enums import EVENT_PLAN, AuditScope, PlanTier
 from shared.models.admin import AdminRole
 from shared.models.audit import AuditEvent
 from shared.models.business import Business
@@ -451,12 +451,23 @@ async def create_business(
                 "FIELD_NOT_ALLOWED", "ONBOARDER cannot set whatsapp_order_allowance", 403,
             )
 
+    # L-4: an event-plan business never has WhatsApp (bot orders bypass the
+    # event trading gate): no number at creation, and it is switched off.
+    create_fields = body.model_dump(exclude={"owner_email", "owner_full_name", "slug", "start_trial"})
+    if body.plan == EVENT_PLAN:
+        if body.whatsapp_phone_number_id:
+            raise AppError(
+                "EVENT_PLAN_WHATSAPP_NOT_ALLOWED",
+                "An event-plan business cannot have a WhatsApp number", 422,
+            )
+        create_fields["is_whatsapp_enabled"] = False
+
     # Slug, business code, owner-email uniqueness, the business row and the
     # owner login all come from the shared provisioning service, so bulk flows
     # (souk vendors, branches) follow exactly the same rules.
     provisioned = await provision_business(
         db,
-        fields=body.model_dump(exclude={"owner_email", "owner_full_name", "slug", "start_trial"}),
+        fields=create_fields,
         requested_slug=body.slug,
         owner_email=body.owner_email,
         owner_full_name=body.owner_full_name,
@@ -575,6 +586,25 @@ async def update_business(
                 f"plan must be one of: {', '.join(t.value for t in PlanTier)}",
                 422,
             )
+
+    # L-4: an event-plan business must never end up WhatsApp-enabled or with a
+    # WhatsApp number (the bot path is not behind the event trading gate).
+    new_plan = changes.get("plan", biz.plan)
+    if new_plan == EVENT_PLAN:
+        if changes.get("is_whatsapp_enabled") is True:
+            raise AppError(
+                "EVENT_PLAN_WHATSAPP_NOT_ALLOWED",
+                "An event-plan business cannot have WhatsApp enabled", 422,
+            )
+        new_number = changes["whatsapp_phone_number_id"] if "whatsapp_phone_number_id" in changes             else biz.whatsapp_phone_number_id
+        if new_number:
+            raise AppError(
+                "EVENT_PLAN_WHATSAPP_NOT_ALLOWED",
+                "An event-plan business cannot have a WhatsApp number; clear whatsapp_phone_number_id "
+                "in the same request", 422,
+            )
+        if biz.plan != EVENT_PLAN or "is_whatsapp_enabled" in changes:
+            changes["is_whatsapp_enabled"] = False
 
     # Fail-closed WhatsApp number handover (migration 0059): bump the
     # routing generation BEFORE applying the new number, whenever it's
