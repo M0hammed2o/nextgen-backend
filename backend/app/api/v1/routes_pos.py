@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, ValidationError, model_validator
 from sqlalchemy import func, select, text
 from sqlalchemy import update as sa_update
 from sqlalchemy.exc import IntegrityError, MultipleResultsFound
@@ -30,6 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.app.events.trading import (
     REASON_CASHIER_DIFFERS,
     REASON_LATE_CAPTURE_APPROVED,
+    REASON_POST_EVENT_GRACE_UPLOAD,
     assert_trading_allowed,
     offline_capture_gate,
 )
@@ -1150,6 +1151,30 @@ async def _resolve_offline_cashier(
     return cashier.id, _lower_role(user.role, cashier.role), True
 
 
+async def _resolve_approval_cashier(
+    db: AsyncSession, uploader: AuthUser, review: OfflineCaptureReview,
+) -> tuple[uuid.UUID, str, bool]:
+    """
+    Review L-2: on approval the cashier is the one validated AT UPLOAD
+    (review.captured_by_user_id was checked then: same business, active). It
+    must still be a user of this business, but may have been deactivated since
+    (temporary event staff). An inactive cashier's discount authority is STAFF,
+    the lowest; H-1 still takes the lower of uploader and cashier.
+    """
+    cid = review.captured_by_user_id
+    if cid == uploader.user_id:
+        return cid, uploader.role, False
+    row = (await db.execute(
+        select(BusinessUser.role, BusinessUser.is_active).where(
+            BusinessUser.id == cid, BusinessUser.business_id == uploader.business_id,
+        )
+    )).first()
+    if row is None:
+        raise NotFoundError("User", str(cid))
+    cashier_role = row.role if row.is_active else "STAFF"
+    return cid, _lower_role(uploader.role, cashier_role), True
+
+
 async def _lock_offline_capture_key(db: AsyncSession, business_id: uuid.UUID, key: str) -> None:
     """
     Transaction-scoped advisory lock on (business, idempotency key), held until
@@ -1228,6 +1253,8 @@ async def _queue_offline_capture_for_review(
     )
     cashier_id, _, differs = await _resolve_offline_cashier(db, user, body)
     reasons = list(gate.reasons) + ([REASON_CASHIER_DIFFERS] if differs else [])
+    if user.sync_only_until is not None:
+        reasons.append(REASON_POST_EVENT_GRACE_UPLOAD)
     review = OfflineCaptureReview(
         business_id=user.business_id,
         idempotency_key=body.idempotency_key,
@@ -1376,6 +1403,27 @@ async def _create_pos_order_impl(
             return OrderResponse.model_validate(existing_order)
 
     is_offline = body.offline_captured_at is not None
+    if not is_offline and body.idempotency_key and approval is None:
+        # Review info-1: an ONLINE checkout must never reuse a key that is in
+        # the late-upload review queue (it would create an order and strand the
+        # review). Same key lock as offline uploads, plus the check, in one
+        # statement; the lock is held until this transaction ends.
+        queued_row = (await db.execute(
+            text(
+                "SELECT EXISTS (SELECT 1 FROM offline_capture_reviews "
+                "WHERE business_id = :b AND idempotency_key = :key) "
+                "FROM (SELECT pg_advisory_xact_lock(hashtextextended(:k, 0))) AS key_lock"
+            ).bindparams(
+                b=user.business_id, key=body.idempotency_key,
+                k=f"offline-capture:{user.business_id}:{body.idempotency_key}",
+            )
+        )).one_or_none()
+        if queued_row is not None and queued_row[0]:
+            raise AppError(
+                "OFFLINE_REVIEW_KEY_CONFLICT",
+                "This idempotency key belongs to an offline sale awaiting manager review",
+                409,
+            )
     captured_utc: datetime | None = None
     cashier_id = user.user_id
     # H-1: the role every limit check uses is the LOWER of the syncing caller's
@@ -1414,6 +1462,12 @@ async def _create_pos_order_impl(
                 if exc.code == "OFFLINE_CAPTURE_TOO_OLD" and body.offline_review_if_too_old:
                     return await _queue_offline_capture_for_review(db, user, body)
                 raise
+            if user.sync_only_until is not None:
+                # Review M-1: in the post-event sync-only grace EVERY upload that
+                # passed the hard checks is held for an owner/manager, whatever
+                # the opt-in flag says: a backdated device clock could otherwise
+                # keep posting real sales for 36h after the event.
+                return await _queue_offline_capture_for_review(db, user, body)
         else:
             # Approval: everything except the age bound is judged again (the
             # capture day must still have been a paid TRADE day). The upload-
@@ -1426,7 +1480,10 @@ async def _create_pos_order_impl(
             offline_reasons.extend(approval.review.upload_review_reasons or [])
         captured_utc = gate.captured_at
         offline_reasons.extend(gate.reasons)
-        cashier_id, limit_role, differs = await _resolve_offline_cashier(db, user, body)
+        if approval is None:
+            cashier_id, limit_role, differs = await _resolve_offline_cashier(db, user, body)
+        else:
+            cashier_id, limit_role, differs = await _resolve_approval_cashier(db, user, approval.review)
         if differs:
             offline_reasons.append(REASON_CASHIER_DIFFERS)
         if approval is not None:
@@ -2957,6 +3014,7 @@ _OFFLINE_REASON_FILTERS = {
     "cashier_differs_from_syncer": lambda: Order.offline_review_reasons.contains(["cashier_differs_from_syncer"]),
     "post_event_grace_sync": lambda: Order.offline_review_reasons.contains(["post_event_grace_sync"]),
     "late_capture_approved": lambda: Order.offline_review_reasons.contains(["late_capture_approved"]),
+    "post_event_grace_upload": lambda: Order.offline_review_reasons.contains(["post_event_grace_upload"]),
 }
 
 
@@ -2966,7 +3024,7 @@ _OFFLINE_REASON_FILTERS = {
 )
 async def list_flagged_offline_orders(
     reason: str | None = Query(
-        None, pattern=r"^(shortfall|variance|unattributed|late_till|capture_day_unpaid_at_sync|late_sync|cashier_differs_from_syncer|post_event_grace_sync|late_capture_approved)$",
+        None, pattern=r"^(shortfall|variance|unattributed|late_till|capture_day_unpaid_at_sync|late_sync|cashier_differs_from_syncer|post_event_grace_sync|late_capture_approved|post_event_grace_upload)$",
         description="Only this kind of flag; omit for any flag",
     ),
     since: datetime | None = Query(None, description="Only sales captured at or after this instant"),
@@ -3241,13 +3299,25 @@ async def approve_offline_review(
         await db.rollback()
         raise AppError("OFFLINE_REVIEW_ALREADY_DECIDED", f"This upload was already {decided}", 409)
 
-    request_body = POSOrderCreateRequest.model_validate(review.payload)
+    try:
+        request_body = POSOrderCreateRequest.model_validate(review.payload)
+    except ValidationError:
+        # Review info-2: a stored payload that no longer validates is a 422 the
+        # manager can act on (reject it), never a 500.
+        await db.rollback()
+        raise AppError(
+            "OFFLINE_REVIEW_PAYLOAD_INVALID",
+            "This upload can no longer be recorded as it was sent; reject it and enter the sale by hand",
+            422,
+        )
     uploader_role = review.synced_by_role
+    # Review L-1: an uploader who is no longer an ACTIVE user of this business
+    # keeps no authority beyond STAFF (the lowest).
     current_role = (await db.execute(select(BusinessUser.role).where(
         BusinessUser.id == review.synced_by_user_id, BusinessUser.business_id == user.business_id,
+        BusinessUser.is_active.is_(True),
     ))).scalar_one_or_none()
-    if current_role is not None:
-        uploader_role = _lower_role(uploader_role, current_role)
+    uploader_role = _lower_role(uploader_role, current_role if current_role is not None else "STAFF")
     uploader = AuthUser(
         user_id=review.synced_by_user_id, business_id=user.business_id, role=uploader_role, token_type="access",
     )
