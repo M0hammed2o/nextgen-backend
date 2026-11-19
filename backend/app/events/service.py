@@ -147,36 +147,91 @@ async def reconcile_event_vendor_access(
         if business.id in excluded:
             continue
         should_have_access = best_decision(decisions_by_business[business.id]).level != NONE
-        old_active, old_reason = business.is_active, business.suspended_reason
-        if should_have_access and not old_active and old_reason == EVENT_SUSPENSION_REASON:
-            new_active, new_reason, bucket = True, None, result.businesses_reactivated
-        elif not should_have_access and old_active:
-            new_active, new_reason, bucket = False, EVENT_SUSPENSION_REASON, result.businesses_suspended
-        else:
-            # Every other combination is left alone, deliberately: a business
-            # suspended for another reason stays suspended, and an active one
-            # with access stays active.
-            continue
-        changed = await db.execute(
-            update(Business)
-            .where(
-                Business.id == business.id,
-                Business.is_active == old_active,
-                Business.suspended_reason.is_not_distinct_from(old_reason),
-            )
-            .values(is_active=new_active, suspended_reason=new_reason)
-            .execution_options(synchronize_session=False)
-        )
-        if changed.rowcount == 1:
-            set_committed_value(business, "is_active", new_active)
-            set_committed_value(business, "suspended_reason", new_reason)
-            bucket.append(business.id)
+        await _apply_business_access(db, business, should_have_access, result)
 
     if result.businesses_suspended or result.businesses_reactivated or result.vendor_status_changes:
         logger.info(
             "Event access reconcile: %d vendor status change(s), %d suspended, %d reactivated",
             result.vendor_status_changes, len(result.businesses_suspended), len(result.businesses_reactivated),
         )
+    return result
+
+
+async def _apply_business_access(
+    db: AsyncSession, business: Business, should_have_access: bool, result: ReconcileResult,
+) -> None:
+    """Compare-and-set the business's active flag from the access decision (shared by both reconcilers)."""
+    old_active, old_reason = business.is_active, business.suspended_reason
+    if should_have_access and not old_active and old_reason == EVENT_SUSPENSION_REASON:
+        new_active, new_reason, bucket = True, None, result.businesses_reactivated
+    elif not should_have_access and old_active:
+        new_active, new_reason, bucket = False, EVENT_SUSPENSION_REASON, result.businesses_suspended
+    else:
+        # Every other combination is left alone, deliberately: a business
+        # suspended for another reason stays suspended, and an active one
+        # with access stays active.
+        return
+    changed = await db.execute(
+        update(Business)
+        .where(
+            Business.id == business.id,
+            Business.is_active == old_active,
+            Business.suspended_reason.is_not_distinct_from(old_reason),
+        )
+        .values(is_active=new_active, suspended_reason=new_reason)
+        .execution_options(synchronize_session=False)
+    )
+    if changed.rowcount == 1:
+        set_committed_value(business, "is_active", new_active)
+        set_committed_value(business, "suspended_reason", new_reason)
+        bucket.append(business.id)
+
+
+async def reconcile_single_business_access(
+    db: AsyncSession, business_id: uuid.UUID, now: datetime | None = None,
+) -> ReconcileResult:
+    """
+    The same decision and compare-and-set writes as reconcile_event_vendor_access,
+    but for ONE business: only that business's own EventVendor rows and its own
+    Business row can be written (souk security review M-2: a public request must
+    never write other tenants' rows). business_id is chosen by the caller from
+    state it just created, never from client input. Caller commits.
+    """
+    now = now or datetime.now(timezone.utc)
+    result = ReconcileResult()
+    vendors = (await db.execute(
+        select(EventVendor)
+        .join(Event, Event.id == EventVendor.event_id)
+        .where(EventVendor.business_id == business_id, Event.status.in_(_MANAGED_EVENT_STATUSES))
+        .options(selectinload(EventVendor.subscriptions), selectinload(EventVendor.event).selectinload(Event.days))
+    )).scalars().all()
+    if not vendors:
+        return result
+    decisions: list[AccessDecision] = []
+    for vendor in vendors:
+        event = vendor.event
+        local_day = now.astimezone(ZoneInfo(event.timezone)).date()
+        billable = {d.day for d in event.days if d.is_billable}
+        paid = [PaidRange(s.starts_on, s.ends_on) for s in vendor.subscriptions if s.status == "PAID"]
+        cancelled = vendor.status == "CANCELLED" or event.status == "CANCELLED"
+        new_status = vendor_status(local_day, billable, paid, cancelled=cancelled, prep_days=event.prep_days)
+        if new_status != vendor.status:
+            changed = await db.execute(
+                update(EventVendor)
+                .where(EventVendor.id == vendor.id, EventVendor.status == vendor.status)
+                .values(status=new_status, status_changed_at=now)
+                .execution_options(synchronize_session=False)
+            )
+            if changed.rowcount == 1:
+                set_committed_value(vendor, "status", new_status)
+                set_committed_value(vendor, "status_changed_at", now)
+                result.vendor_status_changes += 1
+        decisions.append(evaluate_access(local_day, billable, paid, event.prep_days, cancelled=cancelled))
+    business = (await db.execute(
+        select(Business).where(Business.id == business_id, Business.plan == EVENT_PLAN)
+    )).scalar_one_or_none()
+    if business is not None:
+        await _apply_business_access(db, business, best_decision(decisions).level != NONE, result)
     return result
 
 

@@ -26,13 +26,18 @@ from sqlalchemy import update as sa_update
 from sqlalchemy.exc import IntegrityError, MultipleResultsFound
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.app.events.trading import assert_trading_allowed, validate_capture_window
+from backend.app.events.trading import (
+    REASON_CASHIER_DIFFERS,
+    assert_trading_allowed,
+    offline_capture_gate,
+)
 from backend.app.api.v1.routes_orders import OrderResponse
 from backend.app.core.config import get_settings
 from backend.app.core.errors import AppError, NotFoundError
 from backend.app.core.ownership import require_owned
 from backend.app.core.rbac import (
     AuthUser,
+    require_owner,
     require_owner_or_manager,
     require_pos_enabled,
     require_staff_or_above,
@@ -70,6 +75,9 @@ from shared.utils import format_order_number
 _POS_LINK_ELIGIBLE_PROVIDERS = ("YOCO", "PAYFAST")
 
 router = APIRouter(prefix="/business/pos", tags=["pos"])
+
+# Postgres INTEGER ceiling: an amount above it would be a 500 on insert, so it is a 422 here.
+INT32_MAX = 2_147_483_647
 settings = get_settings()
 
 
@@ -100,8 +108,8 @@ class POSPaymentAllocationRequest(BaseModel):
     the amount physically tendered (that's cash_tendered_cents, CASH only).
     """
     payment_method: str = Field(pattern=r"^(CASH|CARD|OTHER|PAY_BY_LINK)$")
-    amount_cents: int = Field(gt=0)
-    cash_tendered_cents: int | None = Field(default=None, ge=0)
+    amount_cents: int = Field(gt=0, le=INT32_MAX)
+    cash_tendered_cents: int | None = Field(default=None, ge=0, le=INT32_MAX)
     payment_reference: str | None = Field(default=None, max_length=255)
     payment_intent_id: uuid.UUID | None = Field(
         default=None, description="PAY_BY_LINK only — a PAID POSPaymentLinkIntent"
@@ -134,7 +142,7 @@ class POSOrderCreateRequest(BaseModel):
     # Explicit consent to a WhatsApp "your order is ready" message. A phone
     # number alone (loyalty) is never consent. Requires customer_phone.
     notify_when_ready: bool = False
-    discount_cents: int = Field(default=0, ge=0)
+    discount_cents: int = Field(default=0, ge=0, le=INT32_MAX)
     discount_reason: str | None = Field(default=None, max_length=255)
     # Exchange: this sale replaces goods returned on an already-refunded POS
     # order of the same business (refund first via /orders/{id}/refund with
@@ -167,7 +175,7 @@ class POSOrderCreateRequest(BaseModel):
     # an order). A single-entry array is processed by exactly the same
     # per-allocation code below as any larger one — nothing assumes N >= 2.
     payment_method: str | None = Field(default=None, pattern=r"^(CASH|CARD|OTHER)$")
-    cash_tendered_cents: int | None = Field(default=None, ge=0)
+    cash_tendered_cents: int | None = Field(default=None, ge=0, le=INT32_MAX)
     payment_reference: str | None = Field(default=None, max_length=255)
     payments: list[POSPaymentAllocationRequest] | None = Field(default=None, min_length=1)
 
@@ -185,7 +193,7 @@ class POSOrderCreateRequest(BaseModel):
         default=None, description="Optional; implied by offline_captured_at")
     captured_by_user_id: uuid.UUID | None = Field(
         default=None, description="Cashier who made the sale (default: the syncing caller)")
-    offline_client_total_cents: int | None = Field(default=None, ge=0)
+    offline_client_total_cents: int | None = Field(default=None, ge=0, le=INT32_MAX)
 
     @model_validator(mode="after")
     def validate_offline_capture(self) -> "POSOrderCreateRequest":
@@ -248,11 +256,11 @@ class POSOrderCreateRequest(BaseModel):
 
 
 class TillOpenRequest(BaseModel):
-    opening_float_cents: int = Field(ge=0)
+    opening_float_cents: int = Field(ge=0, le=INT32_MAX)
 
 
 class TillCloseRequest(BaseModel):
-    counted_cash_cents: int = Field(ge=0)
+    counted_cash_cents: int = Field(ge=0, le=INT32_MAX)
 
 
 class TillSessionResponse(BaseModel):
@@ -301,7 +309,7 @@ class POSReturnLine(BaseModel):
 
 
 class POSRefundRequest(BaseModel):
-    amount_cents: int | None = Field(default=None, ge=1, description="Defaults to a full refund of total_cents")
+    amount_cents: int | None = Field(default=None, ge=1, le=INT32_MAX, description="Defaults to a full refund of total_cents")
     # Line-level return. When given, amount_cents defaults to the value of the
     # returned units (pro-rated for any order discount/loyalty/VAT-exclusive
     # adjustment) and may only be LOWER than that (e.g. a restocking fee).
@@ -344,7 +352,7 @@ class POSRefundRequest(BaseModel):
     # knows, not something this endpoint should guess — so it's required in
     # exactly that one case (see refund_pos_order's own comment).
     cash_refund_cents: int | None = Field(
-        default=None, ge=0,
+        default=None, ge=0, le=INT32_MAX,
         description="Required for a PARTIAL refund of a split order that mixes cash and "
                      "non-cash payment methods — how much of THIS refund is physical cash.",
     )
@@ -463,7 +471,7 @@ class POSSettingsResponse(BaseModel):
 
 
 class POSPaymentIntentCreateRequest(BaseModel):
-    amount_cents: int = Field(gt=0)
+    amount_cents: int = Field(gt=0, le=INT32_MAX)
     customer_phone: str = Field(max_length=32)
 
 
@@ -1080,6 +1088,33 @@ async def cancel_pos_payment_intent(
     return _intent_to_response(intent)
 
 
+def _require_owner_for_unreviewed_offline_cash(user: AuthUser, order: Order, cash_cents: int | None) -> None:
+    """
+    M-1: an offline sale that no till session covered, or that landed in an
+    already-closed session, has cash that is in no cash-up. Handing that cash
+    back inside today's session would show zero variance, so only an OWNER may.
+    """
+    if (
+        cash_cents
+        and user.role != "OWNER"
+        and order.is_offline_capture
+        and (order.offline_unattributed or order.offline_late_to_closed_till)
+    ):
+        raise AppError(
+            "OFFLINE_REFUND_REQUIRES_OWNER",
+            "Cash for this offline sale is not in any till cash-up; only an owner can refund or void it in cash",
+            403,
+        )
+
+
+_ROLE_RANK = {"STAFF": 1, "MANAGER": 2, "OWNER": 3}
+
+
+def _lower_role(a: str, b: str) -> str:
+    """The less privileged of two roles (an unknown role ranks below STAFF)."""
+    return a if _ROLE_RANK.get(a, 0) <= _ROLE_RANK.get(b, 0) else b
+
+
 # ── Order creation / checkout ─────────────────────────────────────────────────
 
 @router.post(
@@ -1116,14 +1151,20 @@ async def create_pos_order(
 
     is_offline = body.offline_captured_at is not None
     captured_utc: datetime | None = None
-    cashier_id, cashier_role = user.user_id, user.role
+    cashier_id = user.user_id
+    # H-1: the role every limit check uses is the LOWER of the syncing caller's
+    # role and the named cashier's role; naming a more senior colleague as the
+    # cashier can never raise the limit.
+    limit_role = user.role
+    offline_reasons: list[str] = []
 
     # ── Event vendors may only trade on a paid trading day (souk gate) ─────
     # An offline capture is judged on the day it was rung up (bounded to 72h),
     # an online sale on today, exactly as before.
     if is_offline:
-        captured_utc = validate_capture_window(body.offline_captured_at)
-        await assert_trading_allowed(db, user.business_id, captured_at=captured_utc)
+        gate = await offline_capture_gate(db, user.business_id, body.offline_captured_at)
+        captured_utc = gate.captured_at
+        offline_reasons.extend(gate.reasons)
         # The cashier must be an active user of THIS business. One 404 for
         # "no such user", "another business's user" and "deactivated".
         if body.captured_by_user_id is not None and body.captured_by_user_id != user.user_id:
@@ -1136,7 +1177,9 @@ async def create_pos_order(
             )).first()
             if cashier is None:
                 raise NotFoundError("User", str(body.captured_by_user_id))
-            cashier_id, cashier_role = cashier.id, cashier.role
+            cashier_id = cashier.id
+            limit_role = _lower_role(user.role, cashier.role)
+            offline_reasons.append(REASON_CASHIER_DIFFERS)
         # Till: the session that covered the capture instant, NOT whatever is
         # open at sync time. None = unattributed (flagged below), never wrong.
         till_session = await find_till_open_at(db, user.business_id, captured_utc)
@@ -1234,6 +1277,9 @@ async def create_pos_order(
     # number or leave a partial order behind.
     resolved_items = await resolve_pos_items(db, user.business_id, item_inputs)
     subtotal_cents = sum(r.breakdown.line_total_cents for r in resolved_items)
+    if subtotal_cents > INT32_MAX:
+        # Priced lines can still sum past the INTEGER column: a 422, not a 500.
+        raise AppError("ORDER_TOTAL_TOO_LARGE", "This order's total is too large to record", 422)
 
     if body.discount_cents > subtotal_cents:
         raise AppError(
@@ -1243,7 +1289,7 @@ async def create_pos_order(
         )
 
     max_staff_discount = business.max_staff_discount_cents or 0
-    if body.discount_cents > 0 and cashier_role != "OWNER" and body.discount_cents > max_staff_discount:
+    if body.discount_cents > 0 and limit_role != "OWNER" and body.discount_cents > max_staff_discount:
         raise AppError(
             "DISCOUNT_LIMIT_EXCEEDED",
             f"This discount requires owner approval (staff limit is {max_staff_discount} cents)",
@@ -1507,7 +1553,8 @@ async def create_pos_order(
         discount_cents=body.discount_cents,
         tax_cents=tax_cents,
         discount_reason=body.discount_reason,
-        discount_approved_by_user_id=cashier_id if body.discount_cents > 0 else None,
+        # H-1: the approver is always the authenticated caller, never a named cashier.
+        discount_approved_by_user_id=user.user_id if body.discount_cents > 0 else None,
         loyalty_discount_cents=loyalty_discount_cents,
         loyalty_reward_id=reward.id if redemption else None,
         loyalty_points_redeemed=redemption.points_cost if redemption else 0,
@@ -1529,8 +1576,10 @@ async def create_pos_order(
         offline_late_to_closed_till=offline_late_to_closed_till,
         offline_client_total_cents=body.offline_client_total_cents if is_offline else None,
         offline_price_variance_cents=offline_price_variance,
+        offline_review_reasons=list(offline_reasons),
         offline_review_required=bool(
             offline_unattributed or offline_late_to_closed_till or offline_price_variance
+            or offline_reasons
         ),
     )
     db.add(order)
@@ -1566,6 +1615,7 @@ async def create_pos_order(
                 special_instructions=resolved.special_instructions,
                 variant_id=resolved.variant_id,
                 variant_label_snapshot=resolved.variant_label,
+                stock_ingredient_id_snapshot=resolved.variant_ingredient_id,
                 sku_snapshot=resolved.sku,
             ))
 
@@ -1747,6 +1797,7 @@ async def create_pos_order(
                     "client_total_cents": body.offline_client_total_cents,
                     "server_total_cents": total_cents,
                     "price_variance_cents": offline_price_variance,
+                    "review_reasons": list(offline_reasons),
                 },
             ))
 
@@ -2022,6 +2073,8 @@ async def refund_pos_order(
     else:
         cash_refund_cents = await _compute_cash_portion(db, order, amount_cents)
 
+    _require_owner_for_unreviewed_offline_cash(user, order, cash_refund_cents)
+
     order.payment_status = "REFUNDED" if is_full_refund else "PARTIALLY_REFUNDED"
     order.refund_amount_cents = amount_cents
     order.refund_cash_cents = cash_refund_cents
@@ -2060,10 +2113,17 @@ async def refund_pos_order(
                     db,
                     business_id=user.business_id,
                     order_id=order.id,
+                    # L-3: the ingredient the sale actually consumed (snapshot on
+                    # the line), not the variant's CURRENT link, which an admin may
+                    # have changed since. Pre-0068 lines fall back to the link.
                     returns=[
-                        (oi.id, oi.returned_quantity or 0, ing_by_variant[oi.variant_id], qty)
+                        (oi.id, oi.returned_quantity or 0, ing_id, qty)
                         for oi, qty in return_lines
-                        if oi.variant_id is not None and ing_by_variant.get(oi.variant_id)
+                        for ing_id in [
+                            oi.stock_ingredient_id_snapshot
+                            or (ing_by_variant.get(oi.variant_id) if oi.variant_id else None)
+                        ]
+                        if ing_id
                     ],
                     created_by_user_id=user.user_id,
                     notes=f"Return with stock returned: {body.reason}",
@@ -2145,6 +2205,7 @@ async def void_pos_order(
     # partial refund, there's no "which method's money is this" question
     # (see refund_pos_order's own comment).
     cash_refund_cents = await _compute_cash_portion(db, order, order.total_cents)
+    _require_owner_for_unreviewed_offline_cash(user, order, cash_refund_cents)
 
     order.payment_status = "VOIDED"
     order.refund_amount_cents = order.total_cents
@@ -2457,21 +2518,15 @@ async def close_till(
 
     # Offline sales captured while NO till session was open are attached to
     # none (Order.offline_unattributed), so their cash is not in the figures
-    # above. Report them here, from the previous session's close onwards, so
-    # the cash-up shows them instead of silently omitting them.
-    prev_closed_at = (await db.execute(
-        select(func.max(TillSession.closed_at)).where(
-            TillSession.business_id == user.business_id,
-            TillSession.id != session.id,
-            TillSession.closed_at <= session.opened_at,
-        )
-    )).scalar_one_or_none()
+    # above. Report ALL of this business's unreviewed ones (M-1): not only
+    # those since the previous close, otherwise a sale captured before the
+    # last close would drop out of every later cash-up while still being
+    # refundable. An owner's acknowledgement is what removes one from here.
     unattributed_filter = [
         Order.business_id == user.business_id,
         Order.offline_unattributed.is_(True),
+        Order.offline_acknowledged_at.is_(None),
     ]
-    if prev_closed_at is not None:
-        unattributed_filter.append(Order.offline_captured_at >= prev_closed_at)
     unattributed_count = (await db.execute(
         select(func.count(Order.id)).where(*unattributed_filter)
     )).scalar_one() or 0
@@ -2609,7 +2664,26 @@ class OfflineFlaggedOrder(BaseModel):
     offline_stock_shortfall: bool = False
     offline_client_total_cents: int | None = None
     offline_price_variance_cents: int | None = None
+    # Every reason this sale is flagged (boolean flags + migration 0068 reasons).
+    review_reasons: list[str] = []
+    offline_acknowledged_at: datetime | None = None
+    offline_acknowledged_by_user_id: uuid.UUID | None = None
     model_config = {"from_attributes": True}
+
+
+def _offline_flagged_out(o: Order) -> OfflineFlaggedOrder:
+    out = OfflineFlaggedOrder.model_validate(o)
+    reasons: list[str] = []
+    if o.offline_stock_shortfall:
+        reasons.append("shortfall")
+    if o.offline_price_variance_cents is not None:
+        reasons.append("variance")
+    if o.offline_unattributed:
+        reasons.append("unattributed")
+    if o.offline_late_to_closed_till:
+        reasons.append("late_till")
+    out.review_reasons = reasons + list(o.offline_review_reasons or [])
+    return out
 
 
 _OFFLINE_REASON_FILTERS = {
@@ -2617,6 +2691,9 @@ _OFFLINE_REASON_FILTERS = {
     "variance": lambda: Order.offline_price_variance_cents.is_not(None),
     "unattributed": lambda: Order.offline_unattributed.is_(True),
     "late_till": lambda: Order.offline_late_to_closed_till.is_(True),
+    "capture_day_unpaid_at_sync": lambda: Order.offline_review_reasons.contains(["capture_day_unpaid_at_sync"]),
+    "late_sync": lambda: Order.offline_review_reasons.contains(["late_sync"]),
+    "cashier_differs_from_syncer": lambda: Order.offline_review_reasons.contains(["cashier_differs_from_syncer"]),
 }
 
 
@@ -2626,10 +2703,11 @@ _OFFLINE_REASON_FILTERS = {
 )
 async def list_flagged_offline_orders(
     reason: str | None = Query(
-        None, pattern=r"^(shortfall|variance|unattributed|late_till)$",
+        None, pattern=r"^(shortfall|variance|unattributed|late_till|capture_day_unpaid_at_sync|late_sync|cashier_differs_from_syncer)$",
         description="Only this kind of flag; omit for any flag",
     ),
     since: datetime | None = Query(None, description="Only sales captured at or after this instant"),
+    include_acknowledged: bool = Query(False, description="Also list sales an owner has already acknowledged"),
     limit: int = Query(50, ge=1, le=200),
     user: AuthUser = Depends(require_owner_or_manager),
     db: AsyncSession = Depends(get_db),
@@ -2645,6 +2723,8 @@ async def list_flagged_offline_orders(
         Order.is_offline_capture.is_(True),
         Order.offline_review_required.is_(True),
     ]
+    if include_acknowledged is not True:  # also when called directly with the Query default
+        conditions.append(Order.offline_acknowledged_at.is_(None))
     if reason is not None:
         conditions.append(_OFFLINE_REASON_FILTERS[reason]())
     if since is not None:
@@ -2652,4 +2732,47 @@ async def list_flagged_offline_orders(
     rows = (await db.execute(
         select(Order).where(*conditions).order_by(Order.offline_captured_at.desc(), Order.id).limit(limit)
     )).scalars().all()
-    return [OfflineFlaggedOrder.model_validate(o) for o in rows]
+    return [_offline_flagged_out(o) for o in rows]
+
+
+@router.post(
+    "/offline-orders/{order_id}/acknowledge", response_model=OfflineFlaggedOrder,
+    dependencies=[Depends(require_pos_enabled)],
+)
+async def acknowledge_offline_order(
+    order_id: uuid.UUID,
+    user: AuthUser = Depends(require_owner),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    OWNER only. Records that the owner reviewed this flagged offline sale
+    (reviewer and time) and removes it from the default flagged list and from
+    the till-close unattributed totals. It changes no money and no stock.
+    Idempotent: a second call keeps the first reviewer/time. business_id comes
+    from the JWT; another business's order is a 404.
+    """
+    order = (await db.execute(
+        select(Order).where(Order.id == order_id, Order.business_id == user.business_id).with_for_update()
+    )).scalar_one_or_none()
+    if order is None or not order.is_offline_capture or not order.offline_review_required:
+        raise NotFoundError("Offline order", str(order_id))
+    if order.offline_acknowledged_at is None:
+        order.offline_acknowledged_at = datetime.now(timezone.utc)
+        order.offline_acknowledged_by_user_id = user.user_id
+        db.add(AuditEvent(
+            scope=AuditScope.BUSINESS.value,
+            business_id=user.business_id,
+            actor_user_id=user.user_id,
+            action="order.pos.offline_acknowledged",
+            target_type="order",
+            target_id=order.id,
+            diff_json={
+                "reasons": _offline_flagged_out(order).review_reasons,
+                "unattributed": order.offline_unattributed,
+                "late_to_closed_till": order.offline_late_to_closed_till,
+                "total_cents": order.total_cents,
+            },
+        ))
+        await db.commit()
+        await db.refresh(order)
+    return _offline_flagged_out(order)

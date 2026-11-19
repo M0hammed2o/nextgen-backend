@@ -233,6 +233,8 @@ def make_fake_order(user, **overrides):
         special_instructions=None, cancelled_reason=None, items=[],
         created_at=now, updated_at=now,
         loyalty_reward_id=None, refund_cash_cents=None,
+        # modelled for the M-1 offline-cash refund guard: an ordinary online sale
+        is_offline_capture=False, offline_unattributed=False, offline_late_to_closed_till=False,
     )
     defaults.update(overrides)
     return types.SimpleNamespace(**defaults)

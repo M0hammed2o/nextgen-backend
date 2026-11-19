@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from shared.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
@@ -286,6 +286,14 @@ class Order(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         Integer, nullable=True, comment="client total minus server total, only when they differ")
     offline_review_required: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default="false", nullable=False)
+    # Migration 0068 (souk security review). Reasons NOT already carried by a
+    # boolean above: capture_day_unpaid_at_sync, late_sync,
+    # cashier_differs_from_syncer. Empty for every pre-0068 row.
+    offline_review_reasons: Mapped[list[str]] = mapped_column(
+        ARRAY(Text), default=list, server_default=text("'{}'::text[]"), nullable=False)
+    offline_acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    offline_acknowledged_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True, comment="business_users.id (OWNER), not FK-enforced")
 
     # ── Relationships ────────────────────────────────────────────────────
     items = relationship("OrderItem", back_populates="order", lazy="selectin")
@@ -371,6 +379,11 @@ class OrderItem(Base, UUIDPrimaryKeyMixin):
     )
     variant_label_snapshot: Mapped[str | None] = mapped_column(String(255), nullable=True)
     sku_snapshot: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    stock_ingredient_id_snapshot: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True,
+        comment="Ingredient the sale actually consumed for this variant line (migration 0068); "
+                "a later re-link of the variant must not redirect a return's restock",
+    )
     returned_quantity: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0",
         comment="Units returned through a line-level POS refund (exchange/return)",

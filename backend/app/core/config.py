@@ -393,6 +393,8 @@ class Settings(BaseSettings):
     EVENT_PUBLIC_RATE_LIMIT_PER_MINUTE: int = 30
     EVENT_REGISTER_RATE_LIMIT_PER_MINUTE: int = 5
     EVENT_REGISTER_RATE_LIMIT_PER_HOUR: int = 20
+    # Souk review M-2: registrations accepted for one event per hour, across all IPs
+    EVENT_REGISTER_RATE_LIMIT_PER_EVENT_PER_HOUR: int = 30
 
     # ── Delivery marketplace integrations (Uber Eats live API) ────────────
     # Platform-wide app credentials (Uber issues ONE client_id/secret per

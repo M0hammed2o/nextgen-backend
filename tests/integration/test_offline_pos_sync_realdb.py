@@ -406,12 +406,16 @@ async def test_gate_capture_on_a_paid_day_synced_after_the_event_ended_is_accept
     assert await _gate(db, v["business_id"], morning_after, _sast(DAYS[2], 21)) == "TRADE"
 
 
-async def test_gate_capture_on_a_paid_day_but_older_than_72h_is_refused(db, bag):
+async def test_gate_capture_on_a_paid_day_but_older_than_the_event_window_is_refused(db, bag):
+    # Souk review H-2: an EVENT-plan business's window is 36h (was 72h); other plans keep 72h
+    # (test_gate_capture_never_affects_a_non_event_business).
     ev = await _event(db, bag)
     [v] = await _vendors(db, ev, bag, [_row(bag, starts=DAYS[0], ends=DAYS[0])])
     await _pay(db, ev, v)
     captured = _sast(DAYS[0], 10)
-    assert await _gate(db, v["business_id"], captured + timedelta(hours=71), captured) == "TRADE"
+    assert await _gate(db, v["business_id"], captured + timedelta(hours=35), captured) == "TRADE"
+    assert await _gate(db, v["business_id"], captured + timedelta(hours=37), captured) == (
+        422, "OFFLINE_CAPTURE_TOO_OLD", None)
     assert await _gate(db, v["business_id"], captured + timedelta(hours=73), captured) == (
         422, "OFFLINE_CAPTURE_TOO_OLD", None)
     assert await _gate(db, v["business_id"], captured - timedelta(minutes=10), captured) == (

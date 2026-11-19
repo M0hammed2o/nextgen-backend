@@ -50,3 +50,12 @@ Order items return `variant_id`, `variant_label_snapshot`, `sku_snapshot`, `retu
 - Exchange = refund with `return_items` (+ `restore_stock`) then a new `POST /business/pos/orders` with
   `exchange_of_order_id` (must be a refunded POS order of the same business, else 422 `EXCHANGE_ORIGINAL_NOT_REFUNDED` /
   404). Two calls, not one transaction. An order can be refunded once (existing rule: only `PAID` orders).
+
+## Bounds and restock source (souk review L-1, L-3)
+- `price_cents`, `cost_cents`, `sort_order` (create, update, matrix) are capped at 2147483647 (the INTEGER ceiling);
+  `opening_stock x cost_cents` must also stay below it (it is the opening movement's rand value). Out of range is a
+  422. A POS order whose priced lines sum past the ceiling is a 422 `ORDER_TOTAL_TOO_LARGE`.
+- Each variant order line snapshots the ingredient it consumed (`order_items.stock_ingredient_id_snapshot`, migration
+  0068). A partial-return restock posts to that ingredient, not to the variant's current link, so re-linking a variant
+  after a sale cannot redirect returned stock. Lines created before 0068 fall back to the current link.
+

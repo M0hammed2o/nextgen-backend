@@ -48,6 +48,16 @@ MAX_MATRIX = 200
 
 # -- Schemas -------------------------------------------------------------------
 
+# Postgres INTEGER ceiling; anything above is a 422 here instead of a 500 on insert.
+INT32_MAX = 2_147_483_647
+
+
+def _check_opening_value(opening_stock: int | None, cost_cents: int | None) -> None:
+    """The opening movement's rand value (units x unit cost) is an INTEGER column."""
+    if opening_stock and cost_cents and opening_stock * cost_cents > INT32_MAX:
+        raise ValueError("opening_stock x cost_cents is too large")
+
+
 def _clean(value: str, field: str, max_len: int) -> str:
     v = (value or "").strip()
     if not v:
@@ -72,9 +82,9 @@ class VariantCreate(BaseModel):
     sku: str
     barcode: str | None = None
     attributes: dict[str, str]
-    price_cents: int | None = Field(default=None, ge=0, description="Override; omit = item base price")
-    cost_cents: int | None = Field(default=None, ge=0, description="Unit cost, for stock valuation")
-    sort_order: int = 0
+    price_cents: int | None = Field(default=None, ge=0, le=INT32_MAX, description="Override; omit = item base price")
+    cost_cents: int | None = Field(default=None, ge=0, le=INT32_MAX, description="Unit cost, for stock valuation")
+    sort_order: int = Field(default=0, ge=-INT32_MAX, le=INT32_MAX)
     track_stock: bool = True
     opening_stock: int | None = Field(default=None, ge=0, le=1_000_000, description="Units on hand now")
 
@@ -97,6 +107,7 @@ class VariantCreate(BaseModel):
     def _stock(self):
         if self.opening_stock and not self.track_stock:
             raise ValueError("opening_stock requires track_stock")
+        _check_opening_value(self.opening_stock, self.cost_cents)
         return self
 
 
@@ -104,9 +115,9 @@ class VariantUpdate(BaseModel):
     sku: str | None = None
     barcode: str | None = None  # explicit null clears it
     attributes: dict[str, str] | None = None
-    price_cents: int | None = Field(default=None, ge=0)  # explicit null = use item base price
-    cost_cents: int | None = Field(default=None, ge=0)
-    sort_order: int | None = None
+    price_cents: int | None = Field(default=None, ge=0, le=INT32_MAX)  # explicit null = use item base price
+    cost_cents: int | None = Field(default=None, ge=0, le=INT32_MAX)
+    sort_order: int | None = Field(default=None, ge=-INT32_MAX, le=INT32_MAX)
     is_active: bool | None = None
 
     @field_validator("sku")
@@ -129,8 +140,8 @@ class MatrixCreate(BaseModel):
     sku_prefix: str
     sizes: list[str] = Field(default_factory=list)
     colours: list[str] = Field(default_factory=list)
-    price_cents: int | None = Field(default=None, ge=0)
-    cost_cents: int | None = Field(default=None, ge=0)
+    price_cents: int | None = Field(default=None, ge=0, le=INT32_MAX)
+    cost_cents: int | None = Field(default=None, ge=0, le=INT32_MAX)
     track_stock: bool = True
     opening_stock: int | None = Field(default=None, ge=0, le=1_000_000, description="Per variant")
 
@@ -155,6 +166,7 @@ class MatrixCreate(BaseModel):
             raise ValueError(f"at most {MAX_MATRIX} variants per call")
         if self.opening_stock and not self.track_stock:
             raise ValueError("opening_stock requires track_stock")
+        _check_opening_value(self.opening_stock, self.cost_cents)
         return self
 
 

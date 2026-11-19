@@ -372,6 +372,10 @@ _cors_kwargs = {
     "allow_credentials": True,
     "allow_methods": ["*"],
     "allow_headers": ["*"],
+    # The staff PWA reads the server Date header to warn about a wrong device
+    # clock (offline sales are stamped with the device time). Date is not a
+    # CORS-safelisted response header, so it must be exposed explicitly.
+    "expose_headers": ["Date"],
 }
 if settings.ENVIRONMENT == "development":
     _cors_kwargs["allow_origin_regex"] = r"http://localhost:\d+"

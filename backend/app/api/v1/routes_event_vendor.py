@@ -165,9 +165,13 @@ async def claim_payment(subscription_id: uuid.UUID, body: PaymentClaim,
         raise AppError("PAYMENT_REFERENCE_USED", "this payment reference is already used on a paid subscription", 409)
     if sub.payment_claim_reference == body.reference:
         return {**_sub_out(sub), "already_claimed": True}
+    previous_reference = sub.payment_claim_reference
     sub.payment_claim_reference = body.reference
     sub.payment_claimed_at = datetime.now(timezone.utc)
-    db.add(_audit(user, "event.subscription_payment_claimed", sub, {}))
+    db.add(_audit(user, "event.subscription_payment_claimed", sub, {
+        "payment_claim_reference": body.reference,
+        "previous_reference": previous_reference,
+    }))
     await db.flush()
     out = {**_sub_out(sub), "already_claimed": False}
     await db.commit()

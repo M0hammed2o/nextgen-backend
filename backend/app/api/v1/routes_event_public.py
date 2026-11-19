@@ -22,6 +22,11 @@ Enumeration and error design
   has a NextGen login is not told why; the organiser resolves that
   (existing_business_id flow). A dummy bcrypt hash runs on this branch so
   timing matches a successful registration.
+- Access for the new business is decided for THAT business only
+  (reconcile_single_business_access); a public request never writes other tenants' rows.
+  A per-event hourly ceiling (EVENT_REGISTER_RATE_LIMIT_PER_EVENT_PER_HOUR) is spent only
+  after the registration code is accepted.
+- LAUNCH ITEM (not implemented): the owner email is not verified at registration.
 - Vendors are created with NO external identity (no WhatsApp number, no
   payment credentials): provision_business(allow_external_identity=False).
 """
@@ -33,6 +38,7 @@ from typing import Literal
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, Request
+from limits import parse as parse_limit
 from pydantic import BaseModel, EmailStr, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -48,7 +54,7 @@ from backend.app.core.security import hash_password
 from backend.app.db.session import get_db
 from backend.app.events import registration as reg
 from backend.app.events.rules import evaluate_access
-from backend.app.events.service import reconcile_event_vendor_access
+from backend.app.events.service import reconcile_single_business_access
 from shared.enums import EVENT_PLAN, AuditScope
 from shared.models.audit import AuditEvent
 from shared.models.event import Event, EventVendor
@@ -59,6 +65,12 @@ logger = logging.getLogger("nextgen.events.public")
 
 INFO_SCOPE = "public_event_info"
 REGISTER_SCOPE = "public_event_register"
+EVENT_REGISTER_EVENT_SCOPE = "public_event_register_event"
+# M-2: a ceiling on businesses created for ONE event per hour, whichever IPs they
+# come from (the per-IP limit alone is beaten by a botnet or a few proxies). It
+# is only spent by a request that already holds the valid registration code,
+# so junk traffic cannot use it to lock real vendors out.
+EVENT_REGISTER_PER_EVENT_LIMIT = parse_limit(f"{settings.EVENT_REGISTER_RATE_LIMIT_PER_EVENT_PER_HOUR}/hour")
 _CATEGORY_INDUSTRY = {"FOOD": "EVENT_FOOD", "CLOTHING": "EVENT_RETAIL"}
 PUBLIC_STATUSES = ("OPEN", "CLOSED")
 
@@ -119,6 +131,21 @@ async def get_public_event(slug: str, request: Request, db: AsyncSession = Depen
     }
 
 
+def event_register_budget_key(slug: str) -> str:
+    """Rate-limit key for the per-event registration budget."""
+    return slug.strip().lower()
+
+
+def _spend_event_register_budget(slug: str) -> None:
+    """Raise 429 once this event has had its hourly registration allowance. No-op when limiting is disabled."""
+    if not limiter.enabled:
+        return
+    if not limiter.limiter.hit(EVENT_REGISTER_PER_EVENT_LIMIT, EVENT_REGISTER_EVENT_SCOPE,
+                               event_register_budget_key(slug)):
+        raise AppError("EVENT_REGISTRATION_RATE_LIMITED",
+                       "Too many registrations for this event right now; please try again later", 429)
+
+
 def _rejected() -> AppError:
     return AppError("REGISTRATION_REJECTED", "Registration is not available with these details", 403)
 
@@ -145,6 +172,7 @@ async def register_vendor(slug: str, body: RegisterRequest, request: Request, db
     code_ok = await reg.verify_code(body.registration_code, event.registration_code_hash if event else None)
     if not (usable and code_ok):
         raise _rejected()
+    _spend_event_register_budget(slug)
 
     # Plain values captured now: nothing is lazily loaded after the commit.
     tz_name, prep_days = event.timezone, event.prep_days
@@ -182,7 +210,10 @@ async def register_vendor(slug: str, body: RegisterRequest, request: Request, db
                           target_type="event_vendor", target_id=vendor.id,
                           diff_json={"event_id": str(event_id), "category": body.category}))
         await db.flush()
-        await reconcile_event_vendor_access(db)
+        # M-2: decide ONLY the business created here. The global reconcile
+        # wrote other events' vendors and other tenants' businesses from a
+        # public, unauthenticated request.
+        await reconcile_single_business_access(db, biz.id)
         await db.commit()
     except IntegrityError:
         await db.rollback()
