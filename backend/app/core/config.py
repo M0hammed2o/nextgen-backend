@@ -395,6 +395,25 @@ class Settings(BaseSettings):
     EVENT_REGISTER_RATE_LIMIT_PER_HOUR: int = 20
     # Souk review M-2: registrations accepted for one event per hour, across all IPs
     EVENT_REGISTER_RATE_LIMIT_PER_EVENT_PER_HOUR: int = 30
+    # Souk vendor email verification (docs/VENDOR_EMAIL_VERIFICATION.md).
+    # Per client IP on the public verify/resend routes. Per-email limits on
+    # resend (cooldown, hourly cap) are enforced silently in the service.
+    EMAIL_VERIFY_RATE_LIMIT_PER_MINUTE: int = 10
+    EMAIL_RESEND_RATE_LIMIT_PER_MINUTE: int = 3
+    EMAIL_RESEND_RATE_LIMIT_PER_HOUR: int = 20
+
+    # ── Outbound email ───────────────────────────────────────────────────
+    # NO real provider is wired: production email delivery is not approved.
+    # "console" logs a redacted line (recipient domain, subject; never the
+    # body or any token), "memory" keeps messages in-process (tests), "file"
+    # writes .eml files to EMAIL_FILE_DIR for local manual testing and is
+    # refused outside development/test.
+    EMAIL_BACKEND: str = "console"
+    EMAIL_FROM_ADDRESS: str = "no-reply@nextgenintelligence.co.za"
+    EMAIL_FILE_DIR: str = ""
+    # Where the verification link points (the manager dashboard's
+    # /verify-email route). The raw token goes in the URL fragment.
+    EMAIL_VERIFICATION_LINK_BASE_URL: str = "https://app.nextgenintelligence.co.za"
 
     # ── Delivery marketplace integrations (Uber Eats live API) ────────────
     # Platform-wide app credentials (Uber issues ONE client_id/secret per
