@@ -7,6 +7,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
+from starlette.concurrency import run_in_threadpool
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.config import get_settings
@@ -53,7 +54,7 @@ class AuthService:
         # Check lockout
         self._check_lockout(user)
 
-        if not user.password_hash or not verify_password(password, user.password_hash):
+        if not user.password_hash or not await run_in_threadpool(verify_password, password, user.password_hash):
             await self._record_failed_login(user)
             # Commit explicitly — get_db never commits, so without this the
             # failed-attempt counter is lost when the 401 propagates.
@@ -106,7 +107,7 @@ class AuthService:
 
         self._check_lockout(user)
 
-        if not user.password_hash or not verify_password(current_password, user.password_hash):
+        if not user.password_hash or not await run_in_threadpool(verify_password, current_password, user.password_hash):
             await self._record_failed_login(user)
             await self.db.commit()
             raise AppError("INVALID_CREDENTIALS", "Invalid email or password", 401)
@@ -210,7 +211,7 @@ class AuthService:
 
         self._check_lockout(user)
 
-        if not verify_pin(pin, user.pin_hash):
+        if not await run_in_threadpool(verify_pin, pin, user.pin_hash):
             await self._record_failed_login(user)
             # Commit explicitly — get_db never commits, so without this the
             # failed-attempt counter is lost when the 401 propagates.
