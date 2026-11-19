@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.app.events.trading import assert_bot_order_allowed
 from backend.app.inventory.ledger import build_line_specs_from_bot_cart, post_sale_consumption
 from shared.enums import AuditScope
 from shared.models.audit import AuditEvent
@@ -40,7 +41,12 @@ async def create_order_from_cart(
     4. Publish to Redis for SSE
     
     Raises ValueError if cart is empty.
+    Raises AppError 403 EVENT_TRADING_NOT_ALLOWED for a souk event vendor on a
+    non-trading day: a backstop behind the pipeline's own gates, so a future
+    caller cannot create an order (or publish SSE/push) on an unpaid day.
+    Restaurants: returns before any query (plan read from the loaded row).
     """
+    await assert_bot_order_allowed(db, business)
     ctx = session.context_json or {}
 
     # Always prefer the live cart — it is updated by every add/remove/replace

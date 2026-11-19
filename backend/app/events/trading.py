@@ -9,19 +9,20 @@ own timezone.
 
 Non-event businesses (any plan other than EVENT_PLAN) are never affected.
 
-NOT applied to WhatsApp-originated orders: the protected bot pipeline files
-(pipeline.py, order_creator.py, ...) are out of scope for the change that added
-this gate, so a bot order is NOT checked here. The earlier assumption that
-event vendors "have no WhatsApp number, so that channel is unreachable" was
-false (security review H1): an event vendor's owner could connect their own
-number through Embedded Signup. The interim mitigation is therefore:
-  - every /business/whatsapp/connection mutation is refused for event-plan
-    businesses (403 EVENT_WHATSAPP_NOT_AVAILABLE);
-  - event vendors are provisioned with is_whatsapp_enabled = false, and
-    migration 0065 switched it off for existing event-plan businesses.
-OWNER APPROVAL NEEDED: gate bot order creation for event vendors (call
-assert_trading_allowed from the bot's order-creation path, which means editing
-the protected files). Until then WhatsApp must stay off for event vendors.
+WhatsApp-originated orders ARE gated (souk WhatsApp gate, owner-approved
+change to the protected bot files; docs/EVENT_WHATSAPP.md):
+  - bot_trade_refusal() is checked early in pipeline._process (no LLM, no cart
+    on a non-trading day; the customer gets a neutral notice once per
+    event-local day), again at the top of _handle_order_confirmation and
+    _finalize_pending_delivery_order (hard gates), and
+    assert_bot_order_allowed() is a raising backstop inside
+    order_creator.create_order_from_cart, before any row or SSE event;
+  - for a restaurant (plan != EVENT_PLAN) both return before any SQL, using
+    the Business row the pipeline has already loaded.
+WhatsApp for an event vendor additionally requires: a SUPER_ADMIN setting
+is_whatsapp_enabled (the per-vendor kill switch from migration 0065), and the
+vendor's OWN Embedded-Signup connection (token_resolver never gives an event
+vendor the platform token, so Meta bills the vendor, not NextGen).
 """
 from __future__ import annotations
 
@@ -29,14 +30,21 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
+import logging
+from zoneinfo import ZoneInfo
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from backend.app.core.errors import AppError
 from backend.app.events.rules import TRADE
 from backend.app.events.service import business_access_decision
 from shared.enums import EVENT_PLAN
 from shared.models.business import Business
+from shared.models.event import Event, EventVendor
+
+logger = logging.getLogger("nextgen.events.trading")
 
 # Offline POS sync (Phase 3b). A queued sale carries the time it was rung up;
 # it is only believable inside this window. The 72h bound is what limits
@@ -166,3 +174,91 @@ async def _require_trade_at(db: AsyncSession, business_id: uuid.UUID, at: dateti
         403,
         details={"reason": decision.reason, "access_level": decision.level},
     )
+
+
+# -- WhatsApp bot (souk WhatsApp gate) ----------------------------------------
+
+# Returned by bot_trade_refusal when the access check itself failed: the bot
+# fails closed (no order), but never raises into the pipeline.
+BOT_ACCESS_CHECK_FAILED = "ACCESS_CHECK_FAILED"
+
+
+async def bot_trade_refusal(db: AsyncSession, business: Business, now: datetime | None = None) -> str | None:
+    """
+    None when the WhatsApp bot may take a real order for `business` right now,
+    else the refusal reason (never shown to the customer).
+
+    Uses the Business row the pipeline already loaded: a non-event business
+    returns None before any SQL. An event-plan business gets a live
+    business_access_decision (event timezone) inside a SAVEPOINT, so a failed
+    check cannot abort the pipeline's transaction (the inbound message row and
+    the notice reply survive). Never raises; fails closed.
+    """
+    if getattr(business, "plan", None) != EVENT_PLAN:
+        return None
+    try:
+        async with db.begin_nested():
+            decision = await business_access_decision(db, business.id, now)
+    except Exception:  # noqa: BLE001 - must never escape into the bot pipeline
+        logger.exception("EVENT_BOT_ACCESS_CHECK_FAILED: business_id=%s - refusing (fail closed)", business.id)
+        return BOT_ACCESS_CHECK_FAILED
+    if decision.level == TRADE:
+        return None
+    return decision.reason or decision.level
+
+
+async def assert_bot_order_allowed(db: AsyncSession, business: Business, now: datetime | None = None) -> None:
+    """
+    Backstop for order_creator.create_order_from_cart: raise 403
+    EVENT_TRADING_NOT_ALLOWED for an event-plan business that may not trade
+    now. Non-event businesses return before any SQL. Called before any order
+    row, stock movement or SSE/push event is produced.
+    """
+    if getattr(business, "plan", None) != EVENT_PLAN:
+        return
+    await _require_trade_at(db, business.id, now)
+
+
+@dataclass(frozen=True)
+class BotEventContext:
+    """What the customer notice names, and the event-local day for "once per day"."""
+    event_name: str | None
+    local_day: str  # ISO date in the chosen event's timezone (UTC when there is no event)
+
+
+_EVENT_STATUS_PREFERENCE = {"OPEN": 0, "DRAFT": 1, "CLOSED": 2}
+
+
+async def bot_event_context(db: AsyncSession, business_id: uuid.UUID, now: datetime | None = None) -> BotEventContext:
+    """
+    The event to name in the bot's notice: of this business's own (non-
+    cancelled) vendor rows, an OPEN event first, then DRAFT, then CLOSED;
+    oldest first on a tie. Only this business's rows are read. Never raises.
+    """
+    now = now or datetime.now(timezone.utc)
+    try:
+        async with db.begin_nested():
+            vendors = (await db.execute(
+                select(EventVendor)
+                .where(EventVendor.business_id == business_id)
+                .options(selectinload(EventVendor.event))
+            )).scalars().all()
+    except Exception:  # noqa: BLE001
+        logger.exception("EVENT_BOT_CONTEXT_FAILED: business_id=%s", business_id)
+        vendors = []
+    candidates = [
+        v.event for v in vendors
+        if v.status != "CANCELLED" and v.event is not None and v.event.status != "CANCELLED"
+    ]
+    if not candidates:
+        return BotEventContext(event_name=None, local_day=now.astimezone(timezone.utc).date().isoformat())
+    event = sorted(
+        candidates,
+        key=lambda e: (_EVENT_STATUS_PREFERENCE.get(e.status, 9), e.created_at or now),
+    )[0]
+    try:
+        local_day = now.astimezone(ZoneInfo(event.timezone)).date().isoformat()
+    except Exception:  # noqa: BLE001 - a bad zone name must not break the notice
+        local_day = now.astimezone(timezone.utc).date().isoformat()
+    label = event.name if not event.venue else f"{event.name} ({event.venue})"
+    return BotEventContext(event_name=label, local_day=local_day)
