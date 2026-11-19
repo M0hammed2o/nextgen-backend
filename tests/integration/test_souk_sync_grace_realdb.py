@@ -209,10 +209,21 @@ async def test_grace_runs_72h_from_the_end_of_the_last_paid_local_day(db, bag):
     assert await event_sync_grace_until(db, bid, end_of_last_day - timedelta(seconds=1)) is None  # not before
 
 
-async def test_grace_counts_only_paid_trade_days(db, bag):
-    # three-day event, vendor paid only the first day: grace runs from the end of THAT day
+async def test_grace_is_anchored_to_the_end_of_the_event_when_only_early_days_were_paid(db, bag):
+    # Review L-3: three-day event, vendor paid only the first day. It is suspended only after the
+    # event's last day, so the grace runs from the end of that day, not from the end of the paid one.
     _, v, _, _, _, grace = await _ended_vendor(db, bag, [_day(-3), _day(-2), _day(-1)], paid=[_day(-3)])
-    assert grace == datetime.combine(_day(-2), time(0), tzinfo=SAST).astimezone(timezone.utc) + EVENT_SYNC_GRACE
+    assert grace == datetime.combine(TODAY, time(0), tzinfo=SAST).astimezone(timezone.utc) + EVENT_SYNC_GRACE
+
+
+async def test_a_vendor_that_never_paid_a_trading_day_gets_no_grace(db, bag):
+    ev = await _event(db, bag, days=[_day(-1)])
+    [v] = await _vendors(db, ev, bag, [_row(bag, starts=_day(-1), ends=_day(-1))])  # never marked paid
+    await reconcile_single_business_access(db, v["business_id"])
+    await db.commit()
+    biz = await _biz(db, v["business_id"])
+    assert not biz.is_active and biz.suspended_reason == EVENT_SUSPENSION_REASON
+    assert await event_sync_grace_until(db, v["business_id"]) is None
 
 
 async def test_expired_grace_leaves_the_vendor_suspended(db, bag):
@@ -316,8 +327,9 @@ async def test_allowlist_over_http_during_grace(db, bag):
         offline = {**online, "offline_captured_at": _sast(_day(-1), 21).isoformat(),
                    "idempotency_key": f"http-{uuid.uuid4().hex}"}
         r = await c.post("/v1/business/pos/orders", json=offline, headers=h)
-        assert r.status_code == 201, r.text
-        assert r.json()["is_offline_capture"] is True
+        # Review M-1: in grace it is held for review even without the opt-in flag
+        assert r.status_code == 202, r.text
+        assert r.json()["code"] == "OFFLINE_CAPTURE_PENDING_REVIEW"
 
 
 async def test_staff_pin_login_works_in_grace_but_not_after_admin_suspension(db, bag):
@@ -332,22 +344,36 @@ async def test_staff_pin_login_works_in_grace_but_not_after_admin_suspension(db,
 
 # == offline sync during grace ================================================
 
-async def test_final_day_sale_synced_in_grace_is_accepted_and_replays(db, bag):
+async def test_final_day_sale_uploaded_in_grace_is_held_for_review_then_approved(db, bag):
+    # Review M-1: a last-paid-day capture within 36h, uploaded in grace, posts NOTHING until approved.
     _, v, _, owner, item, grace = await _ended_vendor(db, bag, [_day(-1)])
     key = f"final-{uuid.uuid4().hex}"
     captured = _sast(_day(-1), 22)
-    first = await create_pos_order(_req(item.id, captured, key), owner, db)
-    again = await create_pos_order(_req(item.id, captured, key), owner, db)
-    assert first.id == again.id and await _orders(db, v["business_id"], key) == 1
-    row = (await db.execute(select(Order).where(Order.id == first.id))).scalar_one()
-    assert "post_event_grace_sync" in row.offline_review_reasons
-    assert "capture_day_unpaid_at_sync" not in row.offline_review_reasons
+    first = await create_pos_order(_req(item.id, captured, key), owner, db)  # no opt-in flag at all
+    again = await create_pos_order(_req(item.id, captured, key, offline_review_if_too_old=True), owner, db)
+    assert first.status_code == again.status_code == 202
+    assert _json(first)["review_id"] == _json(again)["review_id"]
+    assert await _orders(db, v["business_id"]) == 0
+    allocs = (await db.execute(select(func.count(POSPaymentAllocation.id)).where(
+        POSPaymentAllocation.business_id == v["business_id"]))).scalar_one()
+    assert allocs == 0
+    [review] = await _reviews(db, v["business_id"])
+    assert {"post_event_grace_upload", "post_event_grace_sync"} <= set(review.upload_review_reasons)
+    assert "capture_day_unpaid_at_sync" not in review.upload_review_reasons
+
+    out = await approve_offline_review(review.id, _note(), owner, db)
+    row = (await db.execute(select(Order).where(Order.id == out.order.id))).scalar_one()
+    assert {"post_event_grace_upload", "post_event_grace_sync", "late_capture_approved"} <= set(
+        row.offline_review_reasons)
+    assert row.idempotency_key == key and row.offline_captured_at == captured
+    replay = await create_pos_order(_req(item.id, captured, key), owner, db)
+    assert replay.id == out.order.id and await _orders(db, v["business_id"], key) == 1
     flagged = await list_flagged_offline_orders(reason="post_event_grace_sync", since=None,
                                                 include_acknowledged=False, limit=50, user=owner, db=db)
-    assert [f.id for f in flagged] == [first.id]
+    assert [f.id for f in flagged] == [out.order.id]
 
 
-async def test_concurrent_duplicate_syncs_in_grace_make_one_order(db, bag):
+async def test_concurrent_duplicate_uploads_in_grace_make_one_review_and_no_order(db, bag):
     _, v, _, owner, item, _ = await _ended_vendor(db, bag, [_day(-1)])
     key = f"cc-{uuid.uuid4().hex}"
     captured = _sast(_day(-1), 20)
@@ -357,8 +383,26 @@ async def test_concurrent_duplicate_syncs_in_grace_make_one_order(db, bag):
             return await create_pos_order(_req(item.id, captured, key), owner, s)
 
     results = await asyncio.gather(*(sync() for _ in range(3)))
-    assert len({r.id for r in results}) == 1
-    assert await _orders(db, v["business_id"], key) == 1
+    assert {r.status_code for r in results} == {202}
+    assert len({_json(r)["review_id"] for r in results}) == 1
+    assert len(await _reviews(db, v["business_id"])) == 1 and await _orders(db, v["business_id"]) == 0
+
+
+async def test_outside_grace_a_paid_day_offline_sync_still_posts_directly(db, bag):
+    # Normal trading (business active, today is a paid day): unchanged, an order at once, no review.
+    ev = await _event(db, bag, days=[TODAY])
+    [v] = await _vendors(db, ev, bag, [_row(bag, starts=TODAY, ends=TODAY)])
+    await _pay(db, ev, v)
+    await db.execute(update(Business).where(Business.id == v["business_id"]).values(pos_enabled=True))
+    await db.commit()
+    assert (await _biz(db, v["business_id"])).is_active
+    owner = _auth(await _owner_row(db, v["business_id"]))
+    assert owner.sync_only_until is None and await event_sync_grace_until(db, v["business_id"]) is None
+    item = await _item(db, owner)
+    captured = max(_sast(TODAY, 0, 1), _now() - timedelta(minutes=30))
+    out = await create_pos_order(_req(item.id, captured, offline_review_if_too_old=True), owner, db)
+    assert out.is_offline_capture and out.payment_status == "PAID"
+    assert await _reviews(db, v["business_id"]) == []
 
 
 async def test_unpaid_day_capture_is_still_refused_in_grace_even_with_review_opt_in(db, bag):
@@ -618,3 +662,86 @@ async def test_unknown_cashier_is_refused_and_not_queued(db, bag):
 def test_note_is_required():
     with pytest.raises(ValidationError):
         OfflineReviewDecisionRequest(note=" ")
+
+
+# == reviewer follow-ups (L-1, L-2, L-3 admin count, info-1, info-2) ==========
+
+async def test_inactive_uploader_keeps_only_staff_discount_authority(db, bag):
+    # Review L-1: an OWNER who uploaded and has since been deactivated approves nothing above STAFF limits.
+    biz, _, owner, item = await _restaurant(db, bag, max_staff_discount_cents=100)
+    biz_id = biz.id
+    second_owner_row = await _staff_row(db, biz_id, role="OWNER")
+    key, rid = await _queued(db, _auth(second_owner_row), item, _now() - timedelta(hours=80), discount_cents=1000)
+    await db.execute(update(BusinessUser).where(BusinessUser.id == second_owner_row.id).values(is_active=False))
+    await db.commit()
+    assert await _err(approve_offline_review(rid, _note(), owner, db)) == (403, "DISCOUNT_LIMIT_EXCEEDED")
+    await db.rollback()
+    assert {r.status for r in await _reviews(db, biz_id)} == {"PENDING"}
+
+
+async def test_cashier_deactivated_after_upload_can_still_be_approved_at_staff_authority(db, bag):
+    # Review L-2: validated at upload; deactivation afterwards (temp event staff) does not block approval.
+    biz, _, owner, item = await _restaurant(db, bag, max_staff_discount_cents=100)
+    biz_id = biz.id
+    cashier = await _staff_row(db, biz_id, role="MANAGER")
+    captured = _now() - timedelta(hours=80)
+    _, ok_rid = await _queued(db, owner, item, captured, discount_cents=50, captured_by_user_id=cashier.id)
+    _, big_rid = await _queued(db, owner, item, captured, discount_cents=1000, captured_by_user_id=cashier.id)
+    await db.execute(update(BusinessUser).where(BusinessUser.id == cashier.id).values(is_active=False))
+    await db.commit()
+    out = await approve_offline_review(ok_rid, _note(), owner, db)
+    row = (await db.execute(select(Order).where(Order.id == out.order.id))).scalar_one()
+    assert row.created_by_user_id == cashier.id
+    assert "cashier_differs_from_syncer" in row.offline_review_reasons
+    # an inactive MANAGER cashier counts as STAFF: above the staff limit is refused
+    assert await _err(approve_offline_review(big_rid, _note(), owner, db)) == (403, "DISCOUNT_LIMIT_EXCEEDED")
+
+
+async def test_approval_prices_at_the_current_menu_price_and_flags_the_variance(db, bag):
+    # Same as a normal offline sync: server price at the time it is recorded; the device total
+    # is kept and the difference flagged.
+    biz, _, owner, item = await _restaurant(db, bag)
+    key, rid = await _queued(db, owner, item, _now() - timedelta(hours=80), offline_client_total_cents=PRICE)
+    from shared.models.menu import MenuItem
+    await db.execute(update(MenuItem).where(MenuItem.id == item.id).values(price_cents=PRICE + 700))
+    await db.commit()
+    out = await approve_offline_review(rid, _note(), owner, db)
+    row = (await db.execute(select(Order).where(Order.id == out.order.id))).scalar_one()
+    assert row.total_cents == PRICE + 700
+    assert row.offline_price_variance_cents == -700 and row.offline_review_required
+
+
+async def test_admin_vendor_list_shows_pending_late_uploads(db, bag):
+    # Review L-3: the organiser sees reviews still pending (e.g. stranded after the grace).
+    from admin_api.app.api.v1.routes_events import list_vendors
+    ev, v, _, owner, item, _ = await _ended_vendor(db, bag, [_day(-2)])
+    await _queued(db, owner, item, _sast(_day(-2), 9))
+    items = (await list_vendors(ev["id"], ADMIN, db))["items"]
+    [mine] = [i for i in items if i["vendor_id"] == v["vendor_id"]]
+    assert mine["pending_offline_reviews"] == 1
+
+
+async def test_online_checkout_cannot_reuse_a_key_awaiting_review(db, bag):
+    # Review info-1: an online sale with a queued review's key is refused, the review is not stranded.
+    biz, _, owner, item = await _restaurant(db, bag)
+    await open_till(body=TillOpenRequest(opening_float_cents=0), user=owner, db=db)
+    key, rid = await _queued(db, owner, item, _now() - timedelta(hours=80))
+    online = POSOrderCreateRequest(items=[POSOrderItemRequest(menu_item_id=item.id, quantity=1)],
+                                   payment_method="CASH", cash_tendered_cents=10_000, idempotency_key=key)
+    assert await _err(create_pos_order(online, owner, db)) == (409, "OFFLINE_REVIEW_KEY_CONFLICT")
+    await db.rollback()
+    assert await _orders(db, owner.business_id) == 0
+    # an unrelated online key still works
+    fresh = online.model_copy(update={"idempotency_key": f"online-{uuid.uuid4().hex}"})
+    assert (await create_pos_order(fresh, owner, db)).payment_status == "PAID"
+
+
+async def test_a_payload_that_no_longer_validates_is_a_422_not_a_500(db, bag):
+    # Review info-2
+    biz, _, owner, item = await _restaurant(db, bag)
+    key, rid = await _queued(db, owner, item, _now() - timedelta(hours=80))
+    await db.execute(update(OfflineCaptureReview).where(OfflineCaptureReview.id == rid).values(payload={"items": []}))
+    await db.commit()
+    assert await _err(approve_offline_review(rid, _note(), owner, db)) == (422, "OFFLINE_REVIEW_PAYLOAD_INVALID")
+    [review] = await _reviews(db, owner.business_id)
+    assert review.status == "PENDING"

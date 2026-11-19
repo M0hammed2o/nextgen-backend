@@ -182,6 +182,7 @@ async def test_concurrent_checkout_loser_replays_winners_order_instead_of_500():
     exc = make_integrity_error("uq_orders_business_idempotency_key")
     results = [
         FakeResult(scalar=None),          # early idempotency lookup: not found yet
+        FakeResult(),  # BUG-0208 info-1: lock + no offline review queued for this key
         FakeResult(scalar=till),          # _get_open_till
         FakeResult(scalar=business),      # business lookup
         FakeResult(row=(1, "ZAR")),       # atomic order-number increment
@@ -210,6 +211,7 @@ async def test_unrelated_integrity_error_during_checkout_is_not_swallowed():
     exc = make_integrity_error("some_unrelated_constraint")
     results = [
         FakeResult(scalar=None),
+        FakeResult(),  # BUG-0208 info-1: lock + no offline review queued for this key
         FakeResult(scalar=till),
         FakeResult(scalar=business),
         FakeResult(row=(1, "ZAR")),

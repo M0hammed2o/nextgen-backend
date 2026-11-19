@@ -288,3 +288,34 @@ async def test_create_pos_order_refuses_an_online_sale_for_a_sync_only_user():
     with pytest.raises(AppError) as exc:
         await create_pos_order(body, user, db)
     assert (exc.value.status_code, exc.value.code) == (403, "EVENT_SYNC_ONLY")
+
+
+# -- review L-4: reserved suspension reasons ----------------------------------
+
+@pytest.mark.parametrize("reason", ["EVENT_SUBSCRIPTION_ENDED", "EVENT_ADMIN_SUSPENDED", " event_subscription_ended "])
+async def test_admin_generic_suspend_refuses_the_reserved_event_reasons(reason):
+    from admin_api.app.api.v1.routes_businesses import SuspendRequest, suspend_business
+    from backend.app.core.errors import AppError
+    from backend.app.core.rbac import AuthUser
+    db = MagicMock()
+    db.get = AsyncMock(side_effect=AssertionError("must refuse before loading the business"))
+    admin = AuthUser(user_id=uuid.uuid4(), business_id=None, role="SUPER_ADMIN", token_type="admin_access")
+    with pytest.raises(AppError) as exc:
+        await suspend_business(business_id=uuid.uuid4(), body=SuspendRequest(reason=reason), user=admin, db=db)
+    assert (exc.value.status_code, exc.value.code) == (422, "SUSPENSION_REASON_RESERVED")
+
+
+async def test_admin_generic_suspend_still_accepts_ordinary_reasons():
+    from types import SimpleNamespace
+    from admin_api.app.api.v1 import routes_businesses as rb
+    from backend.app.core.rbac import AuthUser
+    biz = SimpleNamespace(id=uuid.uuid4(), is_active=True, suspended_reason=None)
+    db = MagicMock()
+    db.get = AsyncMock(return_value=biz)
+    db.commit = AsyncMock()
+    db.refresh = AsyncMock()
+    admin = AuthUser(user_id=uuid.uuid4(), business_id=None, role="SUPER_ADMIN", token_type="admin_access")
+    with patch.object(rb.BusinessAdminResponse, "model_validate", lambda obj: obj):
+        out = await rb.suspend_business(business_id=biz.id, body=rb.SuspendRequest(reason="Payment overdue"),
+                                        user=admin, db=db)
+    assert out.is_active is False and out.suspended_reason == "Payment overdue"
