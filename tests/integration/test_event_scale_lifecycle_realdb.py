@@ -101,6 +101,7 @@ from backend.app.api.v1.routes_variants import (
 from backend.app.core.errors import AppError, NotFoundError
 from backend.app.core.security import verify_password
 from backend.app.events import service as event_service
+from backend.app.events.order_ready import REASON_NOT_SENT_UNAVAILABLE
 from backend.app.events.rules import CONFIGURE, NONE, TRADE
 from backend.app.events.service import (
     EVENT_ADMIN_SUSPENSION_REASON,
@@ -817,10 +818,15 @@ async def test_food_vendor_menu_to_pos_sale_with_consent_to_kitchen_to_completed
             assert await _refused(update_order_status(order.id, StatusUpdateRequest(status="READY"), staff, db),
                                   status=422) == "INVALID_STATUS_TRANSITION"
             await db.rollback()
-        trail = (await db.execute(select(OrderEvent.order_id, OrderEvent.new_status).where(
+        trail = (await db.execute(select(OrderEvent.order_id, OrderEvent.old_status, OrderEvent.new_status,
+                                         OrderEvent.reason).where(
             OrderEvent.order_id.in_([with_consent.id, without.id])).order_by(OrderEvent.created_at))).all()
         for oid in (with_consent.id, without.id):
-            assert [s for o, s in trail if o == oid] == ["ACCEPTED", "IN_PROGRESS", "READY", "COMPLETED"]
+            # status transitions only; the order-ready audit row is READY -> READY
+            assert [n for o, old, n, _r in trail if o == oid and old != n] == ["ACCEPTED", "IN_PROGRESS", "READY", "COMPLETED"]
+        # Order-ready audit (WhatsApp gate): exactly one "not sent" record for the consented order,
+        # none for the order without consent.
+        assert [(o, r) for o, old, n, r in trail if old == n] == [(with_consent.id, REASON_NOT_SENT_UNAVAILABLE)]
         # No message for the order without consent. For the consented one, an event vendor has no
         # whatsapp_phone_number_id (WhatsApp is off for event vendors, security review H1), so the
         # notification path has no sender identity either: nothing is sent, and nothing real could be.
