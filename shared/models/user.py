@@ -46,6 +46,20 @@ class BusinessUser(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     last_login_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # ── Email verification (souk vendor self-registration, migration 0070) ──
+    # Only a self-registered vendor owner has email_verification_required=True.
+    # Restaurants, admin-provisioned and bulk-onboarded owners keep the default
+    # False and are never affected (docs/VENDOR_EMAIL_VERIFICATION.md).
+    email_verification_required: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False,
+    )
+    email_verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    registration_abandoned_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+        comment="Set when a self-registration was closed unverified after 7 days (never a hard delete)",
+    )
     token_version: Mapped[int] = mapped_column(
         Integer, default=0, server_default="0", nullable=False,
         comment="Bumped on every credential change or deactivation; access tokens carry it "
@@ -99,6 +113,30 @@ class AdminRefreshToken(Base, UUIDPrimaryKeyMixin):
         DateTime(timezone=True), nullable=True
     )
     ip_address: Mapped[str | None] = mapped_column(String(45), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: __import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+        nullable=False,
+    )
+
+
+class EmailVerificationToken(Base, UUIDPrimaryKeyMixin):
+    """
+    One email-verification link for a business user (souk vendor
+    self-registration). Only the SHA-256 of the raw token is stored. A token
+    is usable once: ``used_at`` is set by a single conditional UPDATE, and a
+    resend sets ``invalidated_at`` on every earlier unused token of the user.
+    """
+    __tablename__ = "email_verification_tokens"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("business_users.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    invalidated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: __import__("datetime").datetime.now(__import__("datetime").timezone.utc),
