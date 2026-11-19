@@ -566,7 +566,10 @@ async def test_event_access_endpoint_for_a_non_event_business(db, bag):
     await db.commit()
     bag["extra_biz"].append(biz.id)
     out = await get_event_access(_user(biz.id), db)
-    assert out == {"is_event_vendor": False, "access_level": None, "reason": None, "events": []}
+    # email_verification was added by the vendor email-verification work; a
+    # restaurant never needs verification. The original keys are unchanged.
+    assert out == {"is_event_vendor": False, "access_level": None, "reason": None, "events": [],
+                   "email_verification": {"required": False, "verified": True}}
 
 
 async def test_returning_vendor_at_a_cancelled_event_is_none(db, bag):
