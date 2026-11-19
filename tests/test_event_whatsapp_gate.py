@@ -471,3 +471,31 @@ async def test_backstop_check_failure_refuses_inside_a_savepoint():
             await trading.assert_bot_order_allowed(db, _biz())
     assert exc.value.details["reason"] == trading.BOT_ACCESS_CHECK_FAILED
     assert db.nested == 1
+
+
+async def test_gate_cancellation_publishes_the_dashboard_event():
+    """Review L-7: same order_status_changed event as a superseded cancellation."""
+    import json
+    biz = _biz()
+    order_id = uuid.uuid4()
+    session = Session(state=ConversationState.COLLECTING_PAYMENT.value, ctx={"pending_order_id": str(order_id)})
+    db = FakeDB([_result(scalar="PENDING_DELIVERY_FEE"), _result(scalar=order_id)])
+    redis = MagicMock()
+    redis.publish = AsyncMock()
+    with refused(), patch("backend.app.inventory.cancellation.reverse_consumption_on_cancel", AsyncMock()), \
+         patch("backend.app.db.session.get_redis", AsyncMock(return_value=redis)):
+        await pipeline._finalize_pending_delivery_order(db, biz, MagicMock(), session)
+    channel, payload = redis.publish.await_args.args
+    assert channel == f"orders:{biz.id}"
+    body = json.loads(payload)
+    assert (body["type"], body["order_id"], body["old_status"], body["new_status"]) == (
+        "order_status_changed", str(order_id), "PENDING_DELIVERY_FEE", "CANCELLED")
+
+
+async def test_no_dashboard_event_when_nothing_was_cancelled():
+    biz = _biz()
+    session = Session(state=ConversationState.COLLECTING_PAYMENT.value, ctx={"pending_order_id": str(uuid.uuid4())})
+    db = FakeDB([_result(scalar="ACCEPTED")])
+    with refused(), patch("backend.app.db.session.get_redis", AsyncMock()) as get_redis:
+        await pipeline._finalize_pending_delivery_order(db, biz, MagicMock(), session)
+    get_redis.assert_not_awaited()

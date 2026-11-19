@@ -6128,6 +6128,7 @@ async def _event_refusal_cleanup(db: AsyncSession, business: Business, session) 
     forgets superseded_order_id. Never raises (SAVEPOINT-isolated).
     """
     pending_order_id = _parse_uuid(state_machine.get_context(session, "pending_order_id"))
+    cancelled_from = None
     if pending_order_id is not None:
         try:
             async with db.begin_nested():
@@ -6163,12 +6164,32 @@ async def _event_refusal_cleanup(db: AsyncSession, business: Business, session) 
                             order_id=pending_order_id,
                             previous_status=previous_status,
                         )
+                        cancelled_from = previous_status
                     await db.flush()
         except Exception:
+            cancelled_from = None
             logger.exception(
                 "EVENT_GATE_PENDING_CANCEL_FAILED: business_id=%s, order_id=%s",
                 business.id, pending_order_id,
             )
+    if cancelled_from is not None:
+        # Same live-dashboard event as _cancel_superseded_order (review L-7).
+        try:
+            from backend.app.db.session import get_redis
+            import json as _json
+            redis = await get_redis()
+            await redis.publish(
+                f"orders:{business.id}",
+                _json.dumps({
+                    "type": "order_status_changed",
+                    "order_id": str(pending_order_id),
+                    "old_status": cancelled_from,
+                    "new_status": "CANCELLED",
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }),
+            )
+        except Exception:
+            pass
     state_machine.clear_cart(session)
     state_machine.transition_state(session, ConversationState.IDLE.value)
 

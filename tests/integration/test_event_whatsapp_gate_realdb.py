@@ -15,6 +15,7 @@ timezone is controlled exactly.
 from __future__ import annotations
 
 import contextlib
+import json
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -299,6 +300,10 @@ async def test_fee_approved_after_midnight_unpaid_cancels_order_and_reverses_sto
     assert ("FEE_SENT", "CANCELLED") in [(e.old_status, e.new_status) for e in snap.events]
     assert snap.state == ConversationState.IDLE.value and "pending_order_id" not in snap.ctx
     assert NOTICE in _sent_texts(w)[0]
+    # Review L-7: the staff dashboard is told, like any other cancellation.
+    events = [json.loads(c.args[1]) for c in w.redis.publish.await_args_list]
+    assert {"type": "order_status_changed", "order_id": str(snap.orders[0].id), "old_status": "FEE_SENT",
+            "new_status": "CANCELLED"}.items() <= events[0].items()
 
 
 async def test_cash_choice_after_midnight_hits_finalise_gate(stalls):
