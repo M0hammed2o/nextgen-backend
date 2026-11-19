@@ -30,7 +30,10 @@ Enumeration and error design
 - Vendors are created with NO external identity (no WhatsApp number, no
   payment credentials): provision_business(allow_external_identity=False).
 """
-from __future__ import annotations
+# No `from __future__ import annotations` here: the slowapi decorator wraps these
+# routes, and FastAPI would then resolve string annotations against slowapi's
+# globals, leaving RegisterRequest an unresolved ForwardRef that it treats as a
+# required query parameter (every POST /register got 422; found by the HTTP E2E).
 
 import logging
 from datetime import datetime, timedelta, timezone
