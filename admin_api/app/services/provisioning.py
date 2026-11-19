@@ -17,8 +17,11 @@ all-or-nothing and the caller writes its own audit event.
 """
 from __future__ import annotations
 
+import asyncio
+import os
 import re
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
@@ -32,6 +35,29 @@ from backend.app.core.security import hash_password
 from shared.models.business import Business
 from shared.models.user import BusinessUser
 from shared.utils import generate_business_code, generate_temp_password
+
+# Bulk onboarding hashes one bcrypt password per new owner (~0.6-1 s of CPU each).
+# Those hashes run on this small dedicated pool, never on Starlette/anyio's shared
+# threadpool: 100 hashes submitted there at once held all of its (default 40)
+# tokens for the whole hashing phase, so every other request in the process that
+# needed a thread (sync endpoints/dependencies, file responses, run_in_threadpool)
+# queued behind the import, and 40 CPU-bound threads crowded the event loop off the
+# CPU. min(4, cpus) keeps most of the parallel speed-up while leaving CPU for the
+# rest of the API. The pool is process-wide, so two concurrent imports share it
+# rather than doubling the load. Threads are created lazily, on first use.
+BCRYPT_MAX_CONCURRENCY = max(1, min(4, os.cpu_count() or 1))
+_BCRYPT_POOL = ThreadPoolExecutor(max_workers=BCRYPT_MAX_CONCURRENCY, thread_name_prefix="bcrypt")
+
+
+def submit_password_hashes(passwords: list[str]) -> list["asyncio.Future[str]"]:
+    """
+    Start bcrypt-hashing many passwords on the bounded pool and return one future per
+    password, in order, without waiting. At most BCRYPT_MAX_CONCURRENCY run at once; the
+    rest queue in submission order. A caller that gives up early should ``cancel()`` the
+    futures so queued hashes never run.
+    """
+    loop = asyncio.get_running_loop()
+    return [loop.run_in_executor(_BCRYPT_POOL, hash_password, p) for p in passwords]
 
 # Fields a caller may never set through provisioning: identities that belong
 # to exactly one real business and must be connected by that business itself.
