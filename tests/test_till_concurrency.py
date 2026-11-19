@@ -64,6 +64,9 @@ class FakeResult:
             raise self._scalar_exc
         return self._scalar
 
+    def scalar_one(self):
+        return self._scalar
+
     def scalars(self):
         return FakeScalars(self._items or [])
 
@@ -189,6 +192,9 @@ async def test_close_till_locks_the_session_row():
         FakeResult(scalar=0),  # allocation-based cash sum (none — legacy order, no allocation rows)
         FakeResult(items=[]),
         FakeResult(items=[]),
+        FakeResult(scalar=None),  # previous session's closed_at (new: offline-unattributed window)
+        FakeResult(scalar=0),     # offline-unattributed order count (none)
+        FakeResult(scalar=0),     # offline-unattributed cash cents (none)
     ])
 
     await close_till(

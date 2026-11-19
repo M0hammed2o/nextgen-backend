@@ -65,6 +65,9 @@ class FakeResult:
     def scalar_one_or_none(self):
         return self._scalar
 
+    def scalar_one(self):
+        return self._scalar
+
     def scalars(self):
         return FakeScalars(self._items or [])
 
@@ -200,6 +203,9 @@ async def test_close_till_computes_variance_and_writes_audit_event():
         FakeResult(scalar=0),                 # allocation-based cash sum (none — legacy orders, no allocation rows)
         FakeResult(items=[5000, 3000]),       # Order.total_cents for CASH-paid orders in this session
         FakeResult(items=[]),                 # Order.refund_cash_cents for refunds/voids in this session
+        FakeResult(scalar=None),  # previous session's closed_at (new: offline-unattributed window)
+        FakeResult(scalar=0),     # offline-unattributed order count (none)
+        FakeResult(scalar=0),     # offline-unattributed cash cents (none)
     ])
 
     result = await close_till(
@@ -240,6 +246,9 @@ async def test_close_till_sums_total_cents_which_is_already_net_of_any_loyalty_r
         FakeResult(scalar=0),      # allocation-based cash sum (none — legacy order, no allocation rows)
         FakeResult(items=[8000]),  # a R100 sale with a R20 reward already netted into total_cents
         FakeResult(items=[]),
+        FakeResult(scalar=None),  # previous session's closed_at (new: offline-unattributed window)
+        FakeResult(scalar=0),     # offline-unattributed order count (none)
+        FakeResult(scalar=0),     # offline-unattributed cash cents (none)
     ])
 
     result = await close_till(
@@ -268,6 +277,9 @@ async def test_close_till_cash_query_still_filters_by_payment_status():
         FakeResult(scalar=0),  # allocation-based cash sum (none — legacy order, no allocation rows)
         FakeResult(items=[5000]),
         FakeResult(items=[]),
+        FakeResult(scalar=None),  # previous session's closed_at (new: offline-unattributed window)
+        FakeResult(scalar=0),     # offline-unattributed order count (none)
+        FakeResult(scalar=0),     # offline-unattributed cash cents (none)
     ])
 
     await close_till(
@@ -294,6 +306,9 @@ async def test_close_till_cash_refund_reduces_expected_cash():
         FakeResult(scalar=0),          # allocation-based cash sum (none — legacy orders, no allocation rows)
         FakeResult(items=[5000]),      # one CASH sale of R50
         FakeResult(items=[2000]),      # one CASH refund of R20 in the same session
+        FakeResult(scalar=None),  # previous session's closed_at (new: offline-unattributed window)
+        FakeResult(scalar=0),     # offline-unattributed order count (none)
+        FakeResult(scalar=0),     # offline-unattributed cash cents (none)
     ])
 
     result = await close_till(
@@ -323,6 +338,9 @@ async def test_close_till_cash_sales_query_links_via_till_session_id():
         FakeResult(scalar=0),  # allocation-based cash sum (none — legacy order, no allocation rows)
         FakeResult(items=[]),
         FakeResult(items=[]),
+        FakeResult(scalar=None),  # previous session's closed_at (new: offline-unattributed window)
+        FakeResult(scalar=0),     # offline-unattributed order count (none)
+        FakeResult(scalar=0),     # offline-unattributed cash cents (none)
     ])
 
     await close_till(
@@ -354,6 +372,9 @@ async def test_close_till_refund_query_uses_refunded_at_not_till_session_id():
         FakeResult(scalar=0),  # allocation-based cash sum (none — legacy order, no allocation rows)
         FakeResult(items=[]),
         FakeResult(items=[]),
+        FakeResult(scalar=None),  # previous session's closed_at (new: offline-unattributed window)
+        FakeResult(scalar=0),     # offline-unattributed order count (none)
+        FakeResult(scalar=0),     # offline-unattributed cash cents (none)
     ])
 
     await close_till(
@@ -385,6 +406,9 @@ async def test_close_till_same_session_refund_is_not_double_counted():
         FakeResult(scalar=0),        # allocation-based cash sum (none — legacy orders, no allocation rows)
         FakeResult(items=[8000]),    # order B's original sale still counted (payment_status filter now includes REFUNDED)
         FakeResult(items=[8000]),    # order B's refund_cash_cents, scoped by refunded_at
+        FakeResult(scalar=None),  # previous session's closed_at (new: offline-unattributed window)
+        FakeResult(scalar=0),     # offline-unattributed order count (none)
+        FakeResult(scalar=0),     # offline-unattributed cash cents (none)
     ])
 
     result = await close_till(
@@ -412,6 +436,9 @@ async def test_close_till_two_cash_sales_one_refunded_nets_correctly():
         FakeResult(scalar=0),            # allocation-based cash sum (none — legacy orders, no allocation rows)
         FakeResult(items=[8000, 8000]),  # A (kept) + B (later refunded) — both counted as sales
         FakeResult(items=[8000]),        # B's refund
+        FakeResult(scalar=None),  # previous session's closed_at (new: offline-unattributed window)
+        FakeResult(scalar=0),     # offline-unattributed order count (none)
+        FakeResult(scalar=0),     # offline-unattributed cash cents (none)
     ])
 
     result = await close_till(
