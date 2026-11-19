@@ -280,8 +280,8 @@ async def _process(
     norm_text = _normalize_msg(msg_text)
     if norm_text != msg_text:
         logger.info(
-            "MSG_NORMALIZED: original=%r normalized=%r",
-            msg_text[:80], norm_text[:80],
+            "MSG_NORMALIZED: original_len=%d normalized_len=%d",
+            len(msg_text), len(norm_text),
         )
 
     # ── 6b. Detect opt-out intent early ──────────────────────────────────
@@ -424,12 +424,12 @@ async def _process(
 
     # ── 11. Process based on intent + state ──────────────────────────────
     logger.warning(
-        "PIPELINE_HANDLE_START: business_id=%s, wa_id=%s, intent=%s, session_state=%s, msg_text=%r",
+        "PIPELINE_HANDLE_START: business_id=%s, wa_id=%s, intent=%s, session_state=%s, msg_len=%d",
         business.id,
         wa_id,
         intent.value if intent else "None",
         session.state,
-        msg_text[:80],
+        len(msg_text),
     )
 
     response_text, is_llm, llm_tokens, llm_cost, llm_provider = await _handle_message(
@@ -446,13 +446,12 @@ async def _process(
     if response_text:
         logger.warning(
             "PIPELINE_SENDING_REPLY: business_id=%s, wa_id=%s, intent=%s, "
-            "is_llm=%s, text_len=%d, text_preview=%r",
+            "is_llm=%s, text_len=%d",
             business.id,
             wa_id,
             intent.value if intent else "UNKNOWN",
             is_llm,
             len(response_text),
-            response_text[:80],
         )
         await _send_response(
             db=db,
@@ -684,7 +683,7 @@ def _never_empty_reply(fn):
             return result
         logger.warning(
             "EMPTY_RESPONSE_GUARD: handler returned blank text, substituting a prompt. "
-            "state=%s, session_id=%s, msg=%r", session.state, session.id, msg_text[:80],
+            "state=%s, session_id=%s, msg_len=%d", session.state, session.id, len(msg_text),
         )
         fallback = None
         pend = state_machine.get_context(session, "pending_options")
@@ -731,10 +730,10 @@ async def _handle_message(
     """
     current_state = session.state
     logger.warning(
-        "HANDLE_MSG: intent=%s, state=%s, msg=%r",
+        "HANDLE_MSG: intent=%s, state=%s, msg_len=%d",
         intent.value if intent else "None",
         current_state,
-        msg_text[:80],
+        len(msg_text),
     )
 
     # ── Outstanding named-variant-family allocation (BUG-0172) ──────────
@@ -793,8 +792,8 @@ async def _handle_message(
         }
         if current_state in _CONFIRM_YIELD_STATES and intent_router.is_confirmation(norm_text):
             logger.warning(
-                "HANDLE_BRANCH: GREETING → yielding to %s confirmation handler, msg=%r",
-                current_state, msg_text[:40],
+                "HANDLE_BRANCH: GREETING → yielding to %s confirmation handler, msg_len=%d",
+                current_state, len(msg_text),
             )
             # Fall through: do NOT return — let CONFIRMING_ORDER / WAITING_DELIVERY_FEE_APPROVAL
             # handlers below run for this message.
@@ -1335,8 +1334,8 @@ async def _handle_message(
             state_machine.clear_cart(session)
             state_machine.transition_state(session, ConversationState.BUILDING_CART.value)
             logger.warning(
-                "CART_CORRECTION: cleared cart, transitioning to BUILDING_CART, rebuilding via LLM. session_id=%s, msg=%r",
-                session.id, msg_text[:80],
+                "CART_CORRECTION: cleared cart, transitioning to BUILDING_CART, rebuilding via LLM. session_id=%s, msg_len=%d",
+                session.id, len(msg_text),
             )
             return await _handle_with_llm(
                 db, business, customer, session, msg_text, intent=MessageIntent.ORDER_START,
@@ -1375,7 +1374,7 @@ async def _handle_message(
                 state_machine.transition_state(session, ConversationState.BUILDING_CART.value)
                 logger.warning(
                     "ONLY_WANT_REPLACEMENT: cleared cart, rebuilding via DET/LLM. "
-                    "session_id=%s, msg=%r", session.id, msg_text[:80],
+                    "session_id=%s, msg_len=%d", session.id, len(msg_text),
                 )
                 return await _handle_with_llm(
                     db, business, customer, session,
@@ -1709,8 +1708,8 @@ async def _handle_message(
         or intent_router.is_confirmation(norm_text)
     ):
         logger.warning(
-            "REC_ACCEPT: acceptance detected, %d stored item(s), session_id=%s, msg=%r",
-            len(_recommended), session.id, msg_text[:60],
+            "REC_ACCEPT: acceptance detected, %d stored item(s), session_id=%s, msg_len=%d",
+            len(_recommended), session.id, len(msg_text),
         )
         return await _handle_recommendation_acceptance(db, business, customer, session, _recommended)
 
@@ -5029,7 +5028,7 @@ async def _handle_with_llm(
         # Sub-case C: real cart item removal — fall through to LLM
         logger.warning(
             "DET_REMOVE_FALLTHROUGH: no ingredient match, forwarding to LLM. "
-            "session_id=%s, msg=%r", session.id, msg_text[:80],
+            "session_id=%s, msg_len=%d", session.id, len(msg_text),
         )
 
     # ── Deterministic modifier reversal ("actually leave the tomato") ────────
@@ -5877,17 +5876,17 @@ async def _handle_with_llm(
         if _cart_is_empty and not _has_menu_items:
             logger.warning(
                 "ORDER_MUTATION_GUARD_SKIPPED: empty cart + no items in msg, letting LLM response through. "
-                "intent=%s action=%s msg=%r",
-                intent.value if intent else "None", parsed.action, msg_text[:80],
+                "intent=%s action=%s msg_len=%d",
+                intent.value if intent else "None", parsed.action, len(msg_text),
             )
             # Fall through to catch-all below — LLM's chitchat response is returned
         else:
             logger.warning(
-                "ORDER_MUTATION_MISSED: intent=%s parsed_action=%s state=%s msg=%r",
+                "ORDER_MUTATION_MISSED: intent=%s parsed_action=%s state=%s msg_len=%d",
                 intent.value if intent else "None",
                 parsed.action,
                 session.state,
-                msg_text[:80],
+                len(msg_text),
             )
             if intent == MessageIntent.ORDER_REMOVE:
                 retry_msg = "Sorry, I didn't catch which item to remove. Could you tell me the name of the item you'd like taken off? 😊"
@@ -6290,8 +6289,8 @@ async def _handle_order_confirmation(
             state_machine.set_context(session, "pending_order_id", str(order.id))
             state_machine.transition_state(session, ConversationState.WAITING_DELIVERY_FEE_APPROVAL.value)
             logger.warning(
-                "DELIVERY_FEE_PENDING: order_id=%s, address=%r, session_id=%s",
-                order.id, delivery_address, session.id,
+                "DELIVERY_FEE_PENDING: order_id=%s, address_len=%d, session_id=%s",
+                order.id, len(str(delivery_address)), session.id,
             )
             return (
                 "Got it! 📍 Your delivery address has been noted.\n\n"
