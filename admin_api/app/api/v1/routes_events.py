@@ -16,6 +16,7 @@ R100/day food and R50/day clothing, VAT-inclusive, per billable event day.
 """
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import logging
@@ -30,11 +31,13 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from starlette.concurrency import run_in_threadpool
 
 from admin_api.app.core.deps import require_super_admin
 from admin_api.app.services.provisioning import ensure_owner_email_free, provision_business
 from backend.app.core.errors import AppError, NotFoundError
 from backend.app.core.rbac import AuthUser
+from backend.app.core.security import hash_password
 from backend.app.db.session import get_db
 from backend.app.events import registration as reg
 from backend.app.events.rules import DEFAULT_PREP_DAYS, PaidRange, evaluate_access, quote
@@ -53,12 +56,14 @@ from shared.enums import EVENT_PLAN, AuditScope
 from shared.models.audit import AuditEvent
 from shared.models.business import Business
 from shared.models.event import Event, EventDay, EventVendor, EventVendorSubscription
+from shared.utils import generate_temp_password
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin/events", tags=["admin-events"])
 
-# Each new vendor costs one bcrypt hash (~0.8 s); 100 keeps one request well under
-# gateway timeouts. Larger lists are imported in several batches.
+# Each new vendor costs one bcrypt hash (~1 s of CPU). Hashes are computed concurrently in the
+# threadpool (see bulk_onboard_vendors); 100 keeps one request under gateway timeouts.
+# Larger lists are imported in several batches.
 MAX_BULK_VENDORS = 100
 _CATEGORY_INDUSTRY = {"FOOD": "EVENT_FOOD", "CLOTHING": "EVENT_RETAIL"}
 
@@ -485,6 +490,15 @@ async def bulk_onboard_vendors(event_id: uuid.UUID, body: BulkVendorRequest,
     if body.dry_run:
         return {"dry_run": True, "vendors": preview}
 
+    # bcrypt is ~1 s of CPU per hash. Hash every new owner's temporary password
+    # concurrently in the threadpool BEFORE the (serial) database loop: 60 vendors
+    # took ~95 s when each hash was awaited in turn. Passwords are returned once in
+    # the response and never logged or stored in plaintext.
+    new_rows = [r for r in body.vendors if not r.existing_business_id]
+    temps = [generate_temp_password() for _ in new_rows]
+    hashes = await asyncio.gather(*(run_in_threadpool(hash_password, t) for t in temps))
+    credentials = {id(r): (t, h) for r, t, h in zip(new_rows, temps, hashes)}
+
     created: list[dict] = []
     try:
         for row, pv in zip(body.vendors, preview):
@@ -501,6 +515,7 @@ async def bulk_onboard_vendors(event_id: uuid.UUID, body: BulkVendorRequest,
                             "is_whatsapp_enabled": False},
                     owner_email=str(row.owner_email),
                     owner_full_name=row.owner_full_name,
+                    owner_temp_credentials=credentials[id(row)],
                 )
                 biz, temp_password = provisioned.business, provisioned.owner_temporary_password
             vendor = EventVendor(event_id=event.id, business_id=biz.id, category=row.category,

@@ -60,6 +60,12 @@ async def unique_slug(db: AsyncSession, name: str, requested: str | None = None)
         candidate = slug if suffix == 0 else f"{slug}-{suffix}"
         if not (await db.execute(select(Business.id).where(Business.slug == candidate))).scalar_one_or_none():
             return candidate
+    # More than 20 businesses with the same name (a souk with many "Burgers" stalls):
+    # fall back to a random suffix instead of failing the whole import with a 500.
+    for _ in range(5):
+        candidate = f"{slug}-{uuid.uuid4().hex[:6]}"
+        if not (await db.execute(select(Business.id).where(Business.slug == candidate))).scalar_one_or_none():
+            return candidate
     raise AppError("SLUG_GENERATION_FAILED", "Could not generate unique slug", 500)
 
 
@@ -88,6 +94,7 @@ async def provision_business(
     onboarded_by_admin_id: uuid.UUID | None = None,
     allow_external_identity: bool = False,
     owner_password_hash: str | None = None,
+    owner_temp_credentials: tuple[str, str] | None = None,
 ) -> ProvisionedBusiness:
     """
     Create a business (and optionally its owner) in the caller's transaction.
@@ -104,6 +111,12 @@ async def provision_business(
     password the owner chose. No temporary password is generated and
     ``must_change_password`` is False. Admin flows leave it None and are
     unchanged.
+
+    ``owner_temp_credentials`` (bulk onboarding): a ``(temporary_password, bcrypt_hash)``
+    pair the caller already generated, so many owners' bcrypt hashes can be computed
+    concurrently in the threadpool instead of one after another inside the import loop
+    (60 vendors took ~95 s serially). Behaves exactly like the generated-temporary-password
+    path: the owner must change the password at first login.
     """
     if not allow_external_identity:
         forbidden = {k for k in FORBIDDEN_FIELDS & set(fields) if fields[k] is not None}
@@ -127,7 +140,9 @@ async def provision_business(
     owner = None
     temp_password = None
     if owner_email:
-        if owner_password_hash is None:
+        if owner_temp_credentials is not None:
+            temp_password, password_hash = owner_temp_credentials
+        elif owner_password_hash is None:
             temp_password = generate_temp_password()
             password_hash = await run_in_threadpool(hash_password, temp_password)
         else:
