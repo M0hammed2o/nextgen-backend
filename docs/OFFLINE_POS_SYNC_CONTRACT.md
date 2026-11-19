@@ -18,6 +18,7 @@ Everything else on the body is unchanged (items, payment_method / payments, disc
 | `is_offline_capture` | bool, optional | Implied `true` by `offline_captured_at`. `true` without it, or `false` with it, is a 422. |
 | `captured_by_user_id` | uuid, optional | The cashier who made the sale. Must be an active user of the caller's business. Default: the syncing caller. |
 | `offline_client_total_cents` | int >= 0, optional | The total the device displayed. Informational only (see section 4). |
+| `offline_review_if_too_old` | bool, default false | BUG-0208 (migration 0069). Opt in to the late-upload review queue: a capture refused **only** because it is older than the automatic age bound is stored for owner/manager review and answered `202 OFFLINE_CAPTURE_PENDING_REVIEW` instead of the 422. Only valid with `offline_captured_at` (422 otherwise). See section 10. |
 
 `captured_by_user_id` and `offline_client_total_cents` without `offline_captured_at` are a 422 (pydantic).
 Do not send a `business_id` or a till session id. The business comes from the JWT. The till session is chosen by the server.
@@ -30,6 +31,10 @@ Send the queued sale's original `items`, `payment_method` / `payments`, `discoun
 1. **Idempotent replay first.** If `(business, idempotency_key)` already exists, the original order is returned
    unchanged (HTTP 201 with the same body). Nothing is created, deducted or re-validated, so a retry after the
    72h window still succeeds. Concurrent identical requests are safe: exactly one order and one stock deduction.
+   If the key is instead in the late-upload review queue (section 10), the answer is the review's: `202` while
+   pending, the order once approved, `409 OFFLINE_CAPTURE_REVIEW_REJECTED` once rejected. Every offline upload of
+   one key is serialised (a transaction-scoped advisory lock on business + key), so a key can never produce both
+   an order and a review.
 2. **Capture window.** `offline_captured_at` must be within `[now - 72h, now + 5min]`. For a business on the
    EVENT plan the lower bound is **36h** (`EVENT_OFFLINE_CAPTURE_MAX_AGE`), not 72h (`details.max_age_hours`
    reports the bound that applied). **Owner may adjust** this and the two thresholds in section 8.
@@ -94,7 +99,7 @@ was offline, the PWA must surface the failure to the user and not drop the queue
 `GET /v1/business/pos/offline-orders/flagged` (owner or manager only; the business comes from the JWT).
 
 Query: `reason` = `shortfall` | `variance` | `unattributed` | `late_till` | `capture_day_unpaid_at_sync` |
-`late_sync` | `cashier_differs_from_syncer` (omit for any flag), `include_acknowledged` (default false: orders an
+`late_sync` | `cashier_differs_from_syncer` | `post_event_grace_sync` | `late_capture_approved` (omit for any flag), `include_acknowledged` (default false: orders an
 owner has acknowledged are hidden), `since` (ISO datetime, filters on `offline_captured_at`), `limit` (1-200,
 default 50).
 Returns, newest capture first, a list of: `id, order_number, total_cents, payment_method,
@@ -131,21 +136,26 @@ that cash is in no cash-up, so handing it back inside today's session would show
 | 403 | `OFFLINE_REFUND_REQUIRES_OWNER` | cash refund/void of an unattributed or late-to-closed-till offline sale by a non-owner |
 | 422 | `ORDER_TOTAL_TOO_LARGE` | priced lines sum past the INTEGER column (all amount fields are bounded at 2147483647, a 422 not a 500) |
 | 403 | `EVENT_TRADING_NOT_ALLOWED` | event vendor: the capture date was not a paid trading day (`details.reason`) |
-| 403 | `BUSINESS_SUSPENDED` | the business is suspended at sync time (auth layer, see section 7) |
+| 403 | `BUSINESS_SUSPENDED` | the business is suspended at sync time and has no post-event sync grace (auth layer, section 10) |
+| 403 | `EVENT_SYNC_ONLY` | event vendor inside its post-event sync grace: the request is not on the sync-only allowlist, or it is a `POST /pos/orders` without `offline_captured_at` (an online sale) |
+| 202 | `OFFLINE_CAPTURE_PENDING_REVIEW` | (success, not an error) too old for automatic acceptance, opted in, queued for review; body carries `review_id`, `review_status`, `idempotency_key` |
+| 409 | `OFFLINE_CAPTURE_REVIEW_REJECTED` | this key's late upload was rejected by a manager; final, do not retry |
+| 409 | `OFFLINE_CAPTURE_REVIEW_DECIDED` | this key's review was decided but its order no longer exists; final |
 | 422 | `INSUFFICIENT_CASH_TENDERED`, `PAYMENT_TOTAL_MISMATCH` | server total differs from what the cash/split payment covers |
 | 404 / 422 | existing catalog errors | an item, option or variant was deleted or deactivated while offline |
 
 Never mapped to a retry-forever loop: `OFFLINE_CAPTURE_*`, 404 and 403 will not succeed on retry.
 Retry only on network errors and 5xx, with the same `idempotency_key`.
-`OFFLINE_CAPTURE_TOO_OLD` is permanent: the sale needs a manager to enter it manually.
+`OFFLINE_CAPTURE_TOO_OLD` is permanent: the sale needs a manager to enter it manually. A client that sends
+`offline_review_if_too_old: true` gets `202 OFFLINE_CAPTURE_PENDING_REVIEW` instead and must treat the sale as
+final on the device ("sent to manager for review"), never as an error and never as a retry.
 
 ## 7. Known limitations (owner decisions)
 
-* **Suspended after the event.** The hourly event reconcile job suspends an event-plan business once the
-  event ends (`EVENT_SUBSCRIPTION_ENDED`). The auth layer then refuses every request with
-  `BUSINESS_SUSPENDED` before the trading gate runs. A sale made on the last paid day and synced after the
-  suspension is therefore refused, even though the gate itself would accept it. Fixing it needs a grace window
-  in `get_current_user` (a security-relevant change), which this phase deliberately did not make.
+* **Suspended after the event (BUG-0208, resolved by section 10).** The hourly event reconcile job suspends an
+  event-plan business once the event ends (`EVENT_SUBSCRIPTION_ENDED`). Before section 10 the auth layer then
+  refused every request with `BUSINESS_SUSPENDED`, so a last-day sale still queued on a device could never
+  upload. It now gets a sync-only grace (section 10); after the grace it is refused exactly as before.
 * **Device clock skew.** The capture instant is the device's clock. If the till session was opened a few
   seconds "after" the device clock says the sale was made, the sale is `offline_unattributed` and shown to
   the manager rather than put in the wrong session.
@@ -184,3 +194,98 @@ Reasons not already a boolean are stored in `orders.offline_review_reasons text[
   `whatsapp_phone_number_id` for an EVENT-plan business (422 `EVENT_PLAN_WHATSAPP_NOT_ALLOWED`); moving a
   business to EVENT forces `is_whatsapp_enabled=false`, and requires the number to be cleared in the same request.
 
+
+## 10. Post-event sync grace and the late-upload review queue (BUG-0208, migration 0069)
+
+Owner approval 2026-11-19. Code: `backend/app/events/trading.py` (`EVENT_SYNC_GRACE`,
+`event_sync_grace_until`), `backend/app/events/sync_grace.py` (allowlist), `backend/app/core/rbac.py`
+(`get_current_user`), `backend/app/services/auth_service.py` (sign-in), `backend/app/api/v1/routes_pos.py`
+(review queue), `shared/models/offline_review.py`.
+
+### 10.1 What did not change
+
+* Automatic acceptance: EVENT plan 36h from capture, other plans 72h; an event capture day must be a paid TRADE
+  day; 5 min future skew; every existing reason and flag. The age bound is **not** extended by the grace.
+* Online trading after the vendor's paid days stays refused (the trading gate, and now also the allowlist).
+* Clients that do not send `offline_review_if_too_old` get exactly the old behaviour (the old 422).
+* Admin plane (`admin_api`) authentication is untouched.
+
+### 10.2 The grace
+
+`EVENT_SYNC_GRACE = 72h` (owner may adjust), measured from the **end of the vendor's last paid event day**: the end
+of that local date in the event's timezone. "Last paid day" is the latest billable day covered by a PAID
+subscription. It is computed live from the database on every request (no cached flag, no new column). A business
+is in grace only when ALL of these hold:
+
+1. it is suspended (`is_active = false`) with **exactly** `suspended_reason = EVENT_SUBSCRIPTION_ENDED`;
+2. it is on the EVENT plan;
+3. at an event that is not CANCELLED, where its vendor row is not CANCELLED, `end(last paid day) <= now <
+   end(last paid day) + 72h`.
+
+An administrator's suspension (`EVENT_ADMIN_SUSPENDED`), a billing suspension, any other reason, a cancelled
+vendor or event, and every non-event business never get grace. After the window: `BUSINESS_SUSPENDED` as before.
+
+### 10.3 The sync-only allowlist (403 `EVENT_SYNC_ONLY` for everything else)
+
+Matched on HTTP method + the FastAPI route template (never a client string):
+
+| Method | Path (under `/v1`) | Why |
+|---|---|---|
+| GET | `/auth/me` | stay signed in (login, PIN login, staff directory, set-password, refresh and logout also work in grace; refresh/logout never checked suspension) |
+| GET | `/business/event-access` | adds `sync_only: true` and `sync_only_until` (ISO UTC); `access_level` keeps its old value (`NONE`) |
+| POST | `/business/pos/orders` | **only** when the JSON body has a non-null `offline_captured_at`; refused again in the route on the parsed body |
+| GET | `/business/pos/offline-orders/flagged` | reconciliation status |
+| POST | `/business/pos/offline-orders/{order_id}/acknowledge` | owner review marker (no money) |
+| GET | `/business/pos/offline-reviews` | late-upload queue |
+| POST | `/business/pos/offline-reviews/{review_id}/approve`, `/reject` | decide a late upload |
+| GET | `/business/pos/till/current` | the session the offline sales belong to |
+| POST | `/business/pos/till/{session_id}/close` | cash-up: records the counted cash and computes expected cash from sales already recorded; it creates no sale and moves no money. Opening a till is **not** allowed. |
+| GET | `/business/orders`, `/business/orders/{order_id}` | read-only history |
+
+During grace a paid-day capture that passes the normal checks is accepted with the informational reason
+`post_event_grace_sync` (instead of `capture_day_unpaid_at_sync`, which would wrongly suggest backdating);
+`late_sync` still applies when the capture is >12h old. Like every reason it sets `offline_review_required`, so the
+sale appears in the flagged list (filter `post_event_grace_sync`) until an owner acknowledges it.
+
+### 10.4 Late-upload review queue
+
+When `offline_review_if_too_old: true` and the capture is refused **only** because of the age bound, the server
+first re-runs every other check (timezone, not in the future, an event capture day must be a paid TRADE day, the
+cashier is an active user of this business). Any of those failing is the usual hard refusal and nothing is
+queued. Otherwise it stores the validated request body in `offline_capture_reviews` (tenant-scoped, unique on
+`(business_id, idempotency_key)`) and answers:
+
+```
+202 {"code": "OFFLINE_CAPTURE_PENDING_REVIEW", "review_id": "...", "review_status": "PENDING",
+     "idempotency_key": "...", "message": "..."}
+```
+
+A pending review posts **nothing** to orders, stock, payments or the till. Restaurants (non-event plans) get the
+same queue for >72h captures when their client opts in: approval re-validates everything except the age bound,
+so the only effect is that a manager, not a timer, decides an old sale.
+
+Endpoints (owner or manager; business from the JWT; POS entitlement required):
+
+* `GET /v1/business/pos/offline-reviews?status=PENDING|APPROVED|REJECTED|ALL&limit=1..200` (default PENDING, 50)
+  returns `{items: [...], pending_count}`. Each item: `id, status, idempotency_key, captured_at, received_at,
+  captured_by_user_id/_name, synced_by_user_id/_name, upload_review_reasons, payment_method, client_total_cents,
+  discount_cents, lines [{menu_item_id, variant_id, quantity, name}], decided_by_user_id/_name, decided_at,
+  decision_note, order_id`. `pending_count` is the business's total pending, whatever the filter.
+* `POST /v1/business/pos/offline-reviews/{id}/approve` body `{"note": "..."}` (1-1000 chars, required) returns
+  `{review, order}`. The order is created through the **same** code path as a normal offline sync, re-validating
+  everything except the age bound: event capture day still a paid TRADE day, server price, variants and stock as
+  normal, till by capture instant (else `offline_unattributed`). It carries the review's idempotency key and the
+  reasons judged at upload plus `late_capture_approved`, so it is in the flagged list and the organiser's
+  flagged count. H-1: the discount limit uses the **original uploader's** role (its upload-time role, lowered to
+  its current role) and the cashier's; the approver never raises it, and `discount_approved_by_user_id` stays the
+  uploader. A failed re-validation leaves the review PENDING.
+* `POST /v1/business/pos/offline-reviews/{id}/reject` body `{"note": "..."}` records the decision; no financial
+  effect.
+* Both lock the review row: two concurrent approvals make exactly one order; approving an approved review (or
+  rejecting a rejected one) returns it unchanged; approve-after-reject or reject-after-approve is
+  `409 OFFLINE_REVIEW_ALREADY_DECIDED`. Another business's review id is `404 OFFLINE_REVIEW_NOT_FOUND`.
+* Audit events: `order.pos.offline_review_queued`, `order.pos.offline_review_approved`,
+  `order.pos.offline_review_rejected`.
+
+Not bounded: a restaurant can queue a capture of any age (the manager decides); an event vendor's queue is bounded
+in practice by its paid TRADE days. If that proves noisy, add a hard maximum age for queueing.
