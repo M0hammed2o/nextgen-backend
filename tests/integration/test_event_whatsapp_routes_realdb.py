@@ -396,3 +396,37 @@ async def test_admin_number_change_clears_template_approval(db, stalls):
     out = await update_business(st.business_id, BusinessUpdate(
         whatsapp_phone_number_id=f"7{uuid.uuid4().int % 10**12:012d}"), ADMIN, db)
     assert out.whatsapp_ready_template_approved is False
+
+
+# -- review L-8 ------------------------------------------------------------------------------
+
+async def test_onboarder_cannot_enable_whatsapp_for_an_event_business(db, stalls):
+    from sqlalchemy import delete as sa_delete
+    from shared.models.admin import AdminUser
+    admin_row = AdminUser(email=f"onb-{uuid.uuid4().hex[:8]}@example.com", password_hash="x",
+                          display_name="Onboarder", role="ONBOARDER")
+    db.add(admin_row)
+    await db.commit()
+    try:
+        st = await stalls.make(wa_enabled=False, connection=None, cart=False)
+        await db.execute(update(Business).where(Business.id == st.business_id).values(
+            onboarded_by_admin_id=admin_row.id))
+        await db.commit()
+        onb = AuthUser(user_id=admin_row.id, business_id=None, role="ONBOARDER", token_type="admin_access")
+        assert await _err(update_business(st.business_id, BusinessUpdate(is_whatsapp_enabled=True), onb, db)) \
+            == (403, "EVENT_PLAN_WHATSAPP_NOT_ALLOWED")
+        assert (await _fresh(db, Business, st.business_id)).is_whatsapp_enabled is False
+    finally:
+        await db.execute(update(Business).where(Business.onboarded_by_admin_id == admin_row.id).values(
+            onboarded_by_admin_id=None))
+        await db.execute(sa_delete(AdminUser).where(AdminUser.id == admin_row.id))
+        await db.commit()
+
+
+async def test_admin_platform_test_send_refuses_an_event_business(db, stalls):
+    from admin_api.app.api.v1.routes_businesses import WhatsAppTestSendRequest, send_whatsapp_test
+    st = await stalls.make(cart=False)
+    with patch("backend.app.bot.whatsapp_sender._send_via_meta_api_with_detail", new=AsyncMock()) as send:
+        assert await _err(send_whatsapp_test(st.business_id, WhatsAppTestSendRequest(to="27821234567", text="hi"),
+                                             ADMIN, db)) == (422, "EVENT_PLAN_PLATFORM_TOKEN_NOT_ALLOWED")
+    send.assert_not_awaited()

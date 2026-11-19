@@ -196,7 +196,7 @@ async def register_vendor(slug: str, body: RegisterRequest, request: Request, db
             fields={"name": body.business_name, "plan": EVENT_PLAN, "industry": _CATEGORY_INDUSTRY[body.category],
                     "pos_enabled": True, "inventory_enabled": True, "currency": "ZAR",
                     "timezone": tz_name,
-                    # H1: WhatsApp orders bypass the trading gate; off until approved.
+                    # WhatsApp starts off; a super admin enables it per vendor.
                     "is_whatsapp_enabled": False},
             owner_email=email,
             owner_full_name=body.owner_full_name,

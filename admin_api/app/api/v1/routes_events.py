@@ -512,7 +512,7 @@ async def bulk_onboard_vendors(event_id: uuid.UUID, body: BulkVendorRequest,
                     fields={"name": row.business_name, "plan": EVENT_PLAN, "industry": _CATEGORY_INDUSTRY[row.category],
                             "pos_enabled": True, "inventory_enabled": True, "currency": "ZAR",
                             "timezone": event.timezone,
-                            # H1: WhatsApp orders bypass the trading gate; off until approved.
+                            # WhatsApp starts off; a super admin enables it per vendor.
                             "is_whatsapp_enabled": False},
                     owner_email=str(row.owner_email),
                     owner_full_name=row.owner_full_name,
