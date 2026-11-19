@@ -162,3 +162,13 @@ def vendor_status(d: date, billable_days: set[date], paid: list[PaidRange], canc
         return "EXPIRED" if paid and not any(p.starts_on > d for p in paid) else "UNPAID"
     # NONE after the event
     return "EXPIRED" if paid else "UNPAID"
+
+
+def last_paid_trade_day(billable_days: set[date], paid: list[PaidRange]) -> date | None:
+    """
+    The vendor's last paid TRADE day at one event: the latest billable day
+    covered by a PAID range, or None. A paid range over non-billable days
+    grants nothing (those days were never TRADE days).
+    """
+    covered = [d for d in billable_days if any(p.covers(d) for p in paid)]
+    return max(covered) if covered else None

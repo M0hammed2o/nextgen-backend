@@ -66,7 +66,7 @@ class AuthService:
 
         # Load business
         business = await self._load_business(user.business_id)
-        self._check_business_active(business)
+        await self._check_business_active_or_sync_grace(business)
 
         # Success — reset failed attempts & update last_login
         user.failed_login_attempts = 0
@@ -123,7 +123,7 @@ class AuthService:
             )
 
         business = await self._load_business(user.business_id)
-        self._check_business_active(business)
+        await self._check_business_active_or_sync_grace(business)
 
         user.password_hash = hash_password(new_password)
         user.must_change_password = False
@@ -158,7 +158,7 @@ class AuthService:
         if not business:
             raise AppError("INVALID_CREDENTIALS", "Invalid business code or PIN", 401)
 
-        self._check_business_active(business)
+        await self._check_business_active_or_sync_grace(business)
 
         stmt = (
             select(BusinessUser)
@@ -195,7 +195,7 @@ class AuthService:
         if not business:
             raise AppError("INVALID_CREDENTIALS", "Invalid business code or PIN", 401)
 
-        self._check_business_active(business)
+        await self._check_business_active_or_sync_grace(business)
 
         stmt = select(BusinessUser).where(
             BusinessUser.id == staff_id,
@@ -337,6 +337,28 @@ class AuthService:
         if not business.is_active:
             from backend.app.core.errors import BusinessSuspendedError
             raise BusinessSuspendedError(business.suspended_reason)
+
+    async def _check_business_active_or_sync_grace(self, business: Business) -> None:
+        """
+        As _check_business_active, except an event vendor inside its post-event
+        sync grace (BUG-0208) may still sign in. Its tokens are ordinary, but
+        every request they make is held to the sync-only allowlist by
+        get_current_user, which re-decides the grace live on each request, so
+        signing in grants nothing beyond uploading queued offline sales and
+        reconciliation. Any other suspension (admin, cancellation, billing,
+        ...) is refused exactly as before.
+        """
+        from backend.app.core.errors import BusinessSuspendedError
+        try:
+            self._check_business_active(business)
+            return
+        except BusinessSuspendedError:
+            from backend.app.events.service import EVENT_SUSPENSION_REASON
+            if business.suspended_reason == EVENT_SUSPENSION_REASON:
+                from backend.app.events.trading import event_sync_grace_until
+                if await event_sync_grace_until(self.db, business.id) is not None:
+                    return
+            raise
 
     def _check_lockout(self, user: BusinessUser) -> None:
         if user.locked_until and user.locked_until > datetime.now(timezone.utc):

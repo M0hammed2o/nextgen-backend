@@ -719,6 +719,12 @@ async def get_event_access(
     if plan != EVENT_PLAN:
         return {"is_event_vendor": False, "access_level": None, "reason": None, "events": [],
                 "email_verification": email_verification}
+    # BUG-0208: sync_only / sync_only_until come from get_current_user, which
+    # decided the post-event sync grace live. While sync_only is true the
+    # vendor may only upload queued offline sales and reconcile; access_level
+    # keeps its old meaning (NONE after the event) for older clients.
+    sync_only_until = user.sync_only_until
+    sync_fields = {"sync_only": sync_only_until is not None, "sync_only_until": sync_only_until}
     decision = await business_access_decision(db, user.business_id)
     vendors = (await db.execute(
         select(EventVendor)
@@ -759,7 +765,8 @@ async def get_event_access(
     }
     return {"is_event_vendor": True, "access_level": decision.level, "reason": decision.reason, "events": events,
             "email_verification": email_verification,
-            "ready_notify_available": ready.available, "whatsapp": whatsapp}
+            "ready_notify_available": ready.available, "whatsapp": whatsapp,
+            **sync_fields}
 
 
 @router.get("/payments/health", response_model=PaymentHealthResponse)

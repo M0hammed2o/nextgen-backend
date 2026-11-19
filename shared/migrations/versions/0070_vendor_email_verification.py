@@ -1,12 +1,11 @@
 """Souk vendor email verification: per-owner verification marker and single-use tokens
 
 Revision ID: 0070_vendor_email_verification
-Revises: 0068_offline_review_hardening
+Revises: 0069_offline_capture_review
 Create Date: 2026-11-19
 
-NOTE FOR MERGE: 0069_offline_capture_review is being added on a parallel
-branch. This file is numbered 0070 but points at 0068 so the branch runs on
-its own; re-point down_revision at 0069 when both branches merge.
+Chained after 0069_offline_capture_review on integration/souk-pilot (it was
+written against 0068 on its own branch).
 
 business_users:
 - email_verification_required boolean NOT NULL default false. Every existing
@@ -27,7 +26,7 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision = "0070_vendor_email_verification"
-down_revision = "0068_offline_review_hardening"
+down_revision = "0069_offline_capture_review"
 branch_labels = None
 depends_on = None
 

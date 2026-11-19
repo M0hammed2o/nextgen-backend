@@ -1,7 +1,7 @@
 """Souk WhatsApp gate: order-ready template per business + notify consent provenance
 
 Revision ID: 0071_event_wa_ready_template
-Revises: 0068_offline_review_hardening
+Revises: 0070_vendor_email_verification
 Create Date: 2026-11-19
 
 businesses:
@@ -18,8 +18,7 @@ orders:
 
 Additive only; no data rewritten. No constraint or index is created, so there
 are no op.f() names to generate.
-NOTE: down_revision is 0068 on this branch; parallel branches add 0069/0070,
-so this is re-pointed at merge time. The id is shortened from the planned
+Chained after 0070_vendor_email_verification on integration/souk-pilot. The id is shortened from the planned
 "0071_event_whatsapp_ready_template" (34 chars) because alembic_version.version_num
 is varchar(32); the longer id failed the upgrade with StringDataRightTruncationError.
 """
@@ -28,7 +27,7 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision = "0071_event_wa_ready_template"
-down_revision = "0068_offline_review_hardening"
+down_revision = "0070_vendor_email_verification"
 branch_labels = None
 depends_on = None
 
