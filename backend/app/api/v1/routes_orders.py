@@ -145,6 +145,18 @@ class OrderResponse(BaseModel):
     special_instructions: str | None = None
     cancelled_reason: str | None
     exchange_of_order_id: uuid.UUID | None = None
+    # Offline POS capture (migration 0067). Nullable bools: an unflushed Order
+    # built in Python reads back None for a column default.
+    is_offline_capture: bool | None = False
+    offline_captured_at: datetime | None = None
+    offline_synced_at: datetime | None = None
+    offline_synced_by_user_id: uuid.UUID | None = None
+    offline_unattributed: bool | None = False
+    offline_late_to_closed_till: bool | None = False
+    offline_stock_shortfall: bool | None = False
+    offline_client_total_cents: int | None = None
+    offline_price_variance_cents: int | None = None
+    offline_review_required: bool | None = False
     items: list[OrderItemResponse] = []
     payment_allocations: list[PaymentAllocationResponse] = []
     created_at: datetime

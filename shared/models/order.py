@@ -6,7 +6,7 @@ Includes order items (snapshots at time of order) and audit events.
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -23,6 +23,14 @@ class Order(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     __table_args__ = (
         UniqueConstraint(
             "business_id", "order_number", name="uq_orders_business_id_order_number"
+        ),
+        CheckConstraint(
+            "NOT is_offline_capture OR offline_captured_at IS NOT NULL",
+            name="offline_capture_has_time",
+        ),
+        Index(
+            "ix_orders_business_id_offline_flagged", "business_id", "offline_captured_at",
+            postgresql_where=text("offline_review_required"),
         ),
     )
 
@@ -253,6 +261,31 @@ class Order(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         nullable=True, index=True,
     )
 
+    # ── Offline POS capture (migration 0067) ──────────────────────────────
+    # A sale rung up on a device while offline and replayed on reconnect.
+    # created_by_user_id is the cashier who made the sale; the user whose
+    # session synced it is offline_synced_by_user_id. Price is always the
+    # server's; offline_client_total_cents is only what the device showed.
+    is_offline_capture: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False)
+    offline_captured_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    offline_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    offline_synced_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True, comment="business_users.id, not FK-enforced")
+    offline_unattributed: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False,
+        comment="No till session covered offline_captured_at; till_session_id is NULL")
+    offline_late_to_closed_till: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False,
+        comment="Attributed to a till session already closed when the sale synced")
+    offline_stock_shortfall: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False,
+        comment="The sale took an ingredient/variant stock below zero")
+    offline_client_total_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    offline_price_variance_cents: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, comment="client total minus server total, only when they differ")
+    offline_review_required: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False)
 
     # ── Relationships ────────────────────────────────────────────────────
     items = relationship("OrderItem", back_populates="order", lazy="selectin")
