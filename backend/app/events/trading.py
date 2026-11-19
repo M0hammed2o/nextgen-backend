@@ -126,6 +126,8 @@ _MESSAGES = {
     "NOT_AN_EVENT_DAY": "Trading is not allowed: today is not an event trading day.",
     "CALENDAR_NOT_PUBLISHED": "Trading is not allowed: the event calendar has not been published yet.",
     "PREP_WINDOW": "Trading is not allowed yet: the event has not started. You can configure your stall.",
+    "EMAIL_NOT_VERIFIED": "Trading is not allowed until the owner's email address is verified. "
+                          "Use the link in the verification email, or request a new one.",
 }
 
 

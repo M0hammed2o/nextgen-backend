@@ -215,7 +215,11 @@ async def test_h1_admin_bulk_and_self_registered_vendors_have_whatsapp_disabled(
         pub.RegisterRequest(registration_code=code, business_name="SR Self Stall", category="FOOD",
                             owner_full_name="Self Owner", owner_email=email, password="Vendor-chosen-pw-1",
                             accept_terms=True), None, db)
-    self_biz = (await db.execute(select(Business).where(Business.business_code == res["business_code"]))).scalar_one()
+    # The register response no longer carries the business code (email
+    # verification, migration 0070): find the business by the owner's email.
+    assert "business_code" not in res
+    self_biz = (await db.execute(select(Business).join(BusinessUser, BusinessUser.business_id == Business.id)
+                                 .where(BusinessUser.email == email))).scalar_one()
     assert self_biz.plan == "EVENT" and self_biz.is_whatsapp_enabled is False
 
 

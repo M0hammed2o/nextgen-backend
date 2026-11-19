@@ -11,6 +11,9 @@ Tenant isolation: business_id comes ONLY from the JWT (``user.business_id``).
 Every read and write filters on it; a subscription that belongs to another
 business is indistinguishable from one that does not exist (404).
 
+A payment claim is refused (403 EMAIL_NOT_VERIFIED) while a self-registered
+owner's email is unverified (docs/VENDOR_EMAIL_VERIFICATION.md).
+
 These routes deliberately do NOT use the trading gate: a vendor pays during
 CONFIGURE access, which is exactly when it needs them. They never mark
 anything paid. A payment claim only records the vendor's reference; a
@@ -41,6 +44,7 @@ from backend.app.events.subscriptions import (
     payment_reference_in_use,
     quote_or_422,
 )
+from backend.app.services.email_verification import owner_email_unverified
 from shared.enums import AuditScope
 from shared.models.audit import AuditEvent
 from shared.models.event import Event, EventVendor, EventVendorSubscription
@@ -158,6 +162,13 @@ async def _own_subscription_locked(db: AsyncSession, user: AuthUser, subscriptio
 async def claim_payment(subscription_id: uuid.UUID, body: PaymentClaim,
                         user: AuthUser = Depends(require_owner_or_manager), db: AsyncSession = Depends(get_db)):
     """Record the reference the vendor paid with. Does NOT mark the subscription paid."""
+    # Email verification: an unverified self-registered vendor cannot claim a
+    # payment (nobody should pay for an account whose owner has not proved the
+    # email). Checked before any lock or write. Admin-provisioned vendors and
+    # restaurants never have verification required.
+    if await owner_email_unverified(db, user.business_id):
+        raise AppError("EMAIL_NOT_VERIFIED",
+                       "Verify your email address before recording a payment for this account.", 403)
     sub = await _own_subscription_locked(db, user, subscription_id)
     if sub.status != "UNPAID":
         raise AppError("SUBSCRIPTION_NOT_UNPAID", f"only an unpaid subscription can be claimed (this one is {sub.status})", 409)
