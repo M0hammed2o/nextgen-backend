@@ -27,16 +27,18 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.errors import AppError
-from backend.app.events.rules import TRADE
-from backend.app.events.service import business_access_decision
+from backend.app.events.rules import TRADE, PaidRange, last_paid_trade_day
+from backend.app.events.service import EVENT_SUSPENSION_REASON, business_access_decision
 from shared.enums import EVENT_PLAN
 from shared.models.business import Business
+from shared.models.event import Event, EventVendor
 
 # Offline POS sync (Phase 3b). A queued sale carries the time it was rung up;
 # it is only believable inside this window. The 72h bound is what limits
@@ -54,21 +56,43 @@ REASON_LATE_SYNC = "late_sync"
 REASON_CASHIER_DIFFERS = "cashier_differs_from_syncer"
 OFFLINE_CAPTURE_MAX_FUTURE_SKEW = timedelta(minutes=5)
 
+# BUG-0208 post-event sync grace (owner approval 2026-11-19). After an event
+# vendor's last paid day the hourly reconcile suspends it
+# (EVENT_SUBSCRIPTION_ENDED). For this long after the END of that last paid
+# day (end of that local date, in the event's timezone) the suspended vendor
+# may still authenticate, but ONLY for the sync-only allowlist in
+# backend/app/events/sync_grace.py (upload queued offline sales, view
+# reconciliation, close the till). OWNER MAY ADJUST. It does NOT change the
+# capture age bound above: a capture older than 36h still goes to manager
+# review, never auto-accepted.
+EVENT_SYNC_GRACE = timedelta(hours=72)
+# A paid-day capture synced while the vendor is in that grace (informational;
+# replaces capture_day_unpaid_at_sync, which would wrongly suggest backdating).
+REASON_POST_EVENT_GRACE_SYNC = "post_event_grace_sync"
+# An offline capture refused by the automatic age bound and later approved by
+# an owner/manager from the late-upload review queue.
+REASON_LATE_CAPTURE_APPROVED = "late_capture_approved"
+
 
 def validate_capture_window(
-    captured_at: datetime, now: datetime | None = None, max_age: timedelta = OFFLINE_CAPTURE_MAX_AGE,
+    captured_at: datetime, now: datetime | None = None, max_age: timedelta | None = OFFLINE_CAPTURE_MAX_AGE,
 ) -> datetime:
     """
     Return `captured_at` as an aware UTC datetime, or raise 422
     OFFLINE_CAPTURE_TOO_OLD / OFFLINE_CAPTURE_IN_FUTURE. A naive timestamp is
     refused (422 OFFLINE_CAPTURE_NO_TIMEZONE): guessing a zone would let the
     event-day decision move by hours.
+
+    `max_age=None` skips ONLY the age bound. It is used for exactly two
+    things: deciding whether a too-old capture may be queued for manager
+    review (everything else must still pass) and re-validating a capture an
+    owner/manager is approving from that queue. Never for an automatic accept.
     """
     if captured_at.tzinfo is None or captured_at.utcoffset() is None:
         raise AppError("OFFLINE_CAPTURE_NO_TIMEZONE", "offline_captured_at must include a timezone offset", 422)
     now = now or datetime.now(timezone.utc)
     captured = captured_at.astimezone(timezone.utc)
-    if captured < now - max_age:
+    if max_age is not None and captured < now - max_age:
         raise AppError(
             "OFFLINE_CAPTURE_TOO_OLD",
             "This offline sale was captured too long ago to be accepted",
@@ -93,6 +117,7 @@ class OfflineCaptureGate:
 
 async def offline_capture_gate(
     db: AsyncSession, business_id: uuid.UUID, captured_at: datetime, now: datetime | None = None,
+    *, in_sync_grace: bool = False, enforce_max_age: bool = True, judge_sync_time: bool = True,
 ) -> OfflineCaptureGate:
     """
     Judge an offline capture for `business_id` (from the JWT). Raises like
@@ -104,21 +129,82 @@ async def offline_capture_gate(
       backdating into a paid one).
     - Any plan: a capture more than OFFLINE_LATE_SYNC_THRESHOLD older than
       the sync gets reason late_sync.
+
+    `in_sync_grace` (BUG-0208): the caller is a suspended event vendor inside
+    its post-event sync grace (decided live by get_current_user, never by the
+    client). The paid-day check is unchanged; the sync-time reason becomes
+    post_event_grace_sync instead of capture_day_unpaid_at_sync.
+    `enforce_max_age=False` / `judge_sync_time=False`: review-queue use only
+    (see validate_capture_window).
     """
     now = now or datetime.now(timezone.utc)
     plan = (await db.execute(select(Business.plan).where(Business.id == business_id))).scalar_one_or_none()
     is_event = plan == EVENT_PLAN
-    captured = validate_capture_window(
-        captured_at, now, EVENT_OFFLINE_CAPTURE_MAX_AGE if is_event else OFFLINE_CAPTURE_MAX_AGE,
-    )
+    max_age = EVENT_OFFLINE_CAPTURE_MAX_AGE if is_event else OFFLINE_CAPTURE_MAX_AGE
+    captured = validate_capture_window(captured_at, now, max_age if enforce_max_age else None)
     reasons: list[str] = []
     if is_event:
         await _require_trade_at(db, business_id, captured)
-        if (await business_access_decision(db, business_id, now)).level != TRADE:
-            reasons.append(REASON_CAPTURE_DAY_UNPAID_AT_SYNC)
+        if judge_sync_time and (await business_access_decision(db, business_id, now)).level != TRADE:
+            reasons.append(REASON_POST_EVENT_GRACE_SYNC if in_sync_grace else REASON_CAPTURE_DAY_UNPAID_AT_SYNC)
     if captured < now - OFFLINE_LATE_SYNC_THRESHOLD:
         reasons.append(REASON_LATE_SYNC)
     return OfflineCaptureGate(captured_at=captured, reasons=reasons)
+
+
+async def event_sync_grace_until(
+    db: AsyncSession, business_id: uuid.UUID, now: datetime | None = None,
+) -> datetime | None:
+    """
+    BUG-0208: when this business's post-event sync grace ends, or None if it
+    has none right now. Computed live from the database on every call; no
+    flag is cached. ALL of these must hold, otherwise None:
+
+    - the business is suspended (is_active false) with EXACTLY the automatic
+      end-of-event reason EVENT_SUBSCRIPTION_ENDED. An administrator's
+      suspension (EVENT_ADMIN_SUSPENDED), a billing suspension, or any other
+      reason never gets grace;
+    - the business is on the EVENT plan (a restaurant never gets grace);
+    - at some event that is not CANCELLED, where this vendor is not
+      CANCELLED, the vendor's last paid TRADE day L ended at or before `now`
+      and `now` is before end(L) + EVENT_SYNC_GRACE, with end(L) the end of
+      local date L in that event's timezone.
+
+    A cancelled event or vendor contributes nothing, even if it had paid days.
+    business_id must come from the caller's JWT.
+    """
+    from sqlalchemy.orm import selectinload
+
+    now = now or datetime.now(timezone.utc)
+    row = (await db.execute(
+        select(Business.is_active, Business.suspended_reason, Business.plan).where(Business.id == business_id)
+    )).one_or_none()
+    if row is None:
+        return None
+    is_active, reason, plan = row
+    if is_active or reason != EVENT_SUSPENSION_REASON or plan != EVENT_PLAN:
+        return None
+    vendors = (await db.execute(
+        select(EventVendor)
+        .where(EventVendor.business_id == business_id)
+        .options(selectinload(EventVendor.subscriptions), selectinload(EventVendor.event).selectinload(Event.days))
+    )).scalars().all()
+    best: datetime | None = None
+    for vendor in vendors:
+        event = vendor.event
+        if vendor.status == "CANCELLED" or event.status == "CANCELLED":
+            continue
+        billable = {d.day for d in event.days if d.is_billable}
+        paid = [PaidRange(s.starts_on, s.ends_on) for s in vendor.subscriptions if s.status == "PAID"]
+        last = last_paid_trade_day(billable, paid)
+        if last is None:
+            continue
+        ended = datetime.combine(last + timedelta(days=1), time(0), tzinfo=ZoneInfo(event.timezone))
+        ended = ended.astimezone(timezone.utc)
+        until = ended + EVENT_SYNC_GRACE
+        if ended <= now < until and (best is None or until > best):
+            best = until
+    return best
 
 
 _MESSAGES = {

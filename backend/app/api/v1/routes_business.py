@@ -712,7 +712,14 @@ async def get_event_access(
 
     plan = (await db.execute(select(Business.plan).where(Business.id == user.business_id))).scalar_one_or_none()
     if plan != EVENT_PLAN:
+        # Unchanged shape: a non-event business never has a sync-only grace.
         return {"is_event_vendor": False, "access_level": None, "reason": None, "events": []}
+    # BUG-0208: sync_only / sync_only_until come from get_current_user, which
+    # decided the post-event sync grace live. While sync_only is true the
+    # vendor may only upload queued offline sales and reconcile; access_level
+    # keeps its old meaning (NONE after the event) for older clients.
+    sync_only_until = user.sync_only_until
+    sync_fields = {"sync_only": sync_only_until is not None, "sync_only_until": sync_only_until}
     decision = await business_access_decision(db, user.business_id)
     vendors = (await db.execute(
         select(EventVendor)
@@ -734,7 +741,8 @@ async def get_event_access(
                 for sub in sorted(v.subscriptions, key=lambda x: x.starts_on)
             ],
         })
-    return {"is_event_vendor": True, "access_level": decision.level, "reason": decision.reason, "events": events}
+    return {"is_event_vendor": True, "access_level": decision.level, "reason": decision.reason, "events": events,
+            **sync_fields}
 
 
 @router.get("/payments/health", response_model=PaymentHealthResponse)
