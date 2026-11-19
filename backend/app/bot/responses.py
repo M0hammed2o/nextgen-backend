@@ -366,6 +366,15 @@ def event_whatsapp_closed_response(business: Business, event_name: str | None) -
     )
 
 
+def delivery_order_already_placed_response(order_number: str) -> str:
+    """A repeated fee approval for an order that is already live (staff moved
+    it on, or a concurrent reply finalised it): nothing new is placed."""
+    return (
+        f"Your order *{order_number}* has already been placed. ✅\n\n"
+        "No need to confirm again. We'll let you know when it's on its way."
+    )
+
+
 def delivery_order_expired_response() -> str:
     """A late fee approval / payment choice for an order that was already
     cancelled (fee timeout or staff): nothing is placed (H-3)."""

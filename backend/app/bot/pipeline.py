@@ -6857,12 +6857,26 @@ async def _finalize_pending_delivery_order(
             )
             row = result.one_or_none()
             if row is None:
-                # Expired or cancelled meanwhile: nothing was placed.
+                # No longer awaiting the fee. Re-read why (H-3 follow-up): it
+                # may have been cancelled (expired), or it may already be live
+                # (staff moved it on, or a concurrent "yes" finalised it).
+                current = (await db.execute(
+                    select(_Order.status, _Order.order_number).where(
+                        _Order.id == _parse_uuid(pending_order_id),
+                        _Order.business_id == business.id,
+                    )
+                )).one_or_none()
                 logger.warning(
-                    "DELIVERY_FINALISE_NOT_PENDING: order_id=%s no longer awaiting fee approval, "
-                    "session_id=%s", pending_order_id, session.id,
+                    "DELIVERY_FINALISE_NOT_PENDING: order_id=%s status=%s, session_id=%s",
+                    pending_order_id, current.status if current else None, session.id,
                 )
                 state_machine.clear_cart(session)
+                if current is not None and current.status != OrderStatus.CANCELLED.value:
+                    state_machine.transition_state(session, ConversationState.ORDER_PLACED.value)
+                    return (
+                        responses.delivery_order_already_placed_response(current.order_number),
+                        False, None, None, None,
+                    )
                 state_machine.transition_state(session, ConversationState.IDLE.value)
                 return responses.delivery_order_expired_response(), False, None, None, None
             order_number = row.order_number

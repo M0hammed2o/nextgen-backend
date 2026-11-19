@@ -85,6 +85,11 @@ async def test_cancelled_order_is_not_resurrected_customer_told_it_expired():
     session = _Session({"pending_order_id": str(order_id), "delivery_fee_cents": 3500,
                         "payment_method": "CASH_ON_COLLECTION", "cart": [{"x": 1}]})
     db = _db_returning(None)  # UPDATE matched 0 rows: the order is no longer pending
+    cancelled = MagicMock()
+    cancelled.one_or_none.return_value = SimpleNamespace(status="CANCELLED", order_number="BO-0042")
+    zero_rows = MagicMock()
+    zero_rows.one_or_none.return_value = None
+    db.execute = AsyncMock(side_effect=[zero_rows, cancelled])
     with patch.object(pipeline.usage_tracker, "increment_usage", AsyncMock()) as usage:
         text, *_ = await pipeline._finalize_pending_delivery_order(db, _business(), MagicMock(), session)
 
@@ -94,4 +99,26 @@ async def test_cancelled_order_is_not_resurrected_customer_told_it_expired():
     assert not any(isinstance(c.args[0], OrderEvent) for c in db.add.call_args_list)
     assert session.state == ConversationState.IDLE.value
     assert state_machine.get_context(session, "pending_order_id") is None
+    assert state_machine.get_cart(session) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["NEW", "ACCEPTED", "IN_PROGRESS", "READY"])
+async def test_already_live_order_is_reported_as_placed_not_expired(status):
+    """H-3 follow-up (review L-1): 0 rows can also mean the order is already live
+    (staff moved FEE_SENT -> NEW, or a concurrent "yes" finalised it)."""
+    session = _Session({"pending_order_id": str(uuid.uuid4()), "payment_method": "CASH_ON_COLLECTION",
+                        "cart": [{"x": 1}]})
+    zero_rows, live = MagicMock(), MagicMock()
+    zero_rows.one_or_none.return_value = None
+    live.one_or_none.return_value = SimpleNamespace(status=status, order_number="BO-0042")
+    db = _db_returning(None)
+    db.execute = AsyncMock(side_effect=[zero_rows, live])
+    with patch.object(pipeline.usage_tracker, "increment_usage", AsyncMock()) as usage:
+        text, *_ = await pipeline._finalize_pending_delivery_order(db, _business(), MagicMock(), session)
+    assert "BO-0042" in text and "already been placed" in text
+    assert "expired" not in text
+    usage.assert_not_awaited()  # not counted twice
+    assert not any(isinstance(c.args[0], OrderEvent) for c in db.add.call_args_list)
+    assert session.state == ConversationState.ORDER_PLACED.value
     assert state_machine.get_cart(session) == []

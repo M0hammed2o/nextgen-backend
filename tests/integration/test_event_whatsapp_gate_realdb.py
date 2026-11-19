@@ -490,3 +490,27 @@ async def test_h3_finalise_keeps_vat_total_set_by_set_delivery_fee(stalls):
     o = snap.orders[0]
     assert (o.status, o.total_cents, o.tax_cents, o.delivery_fee_cents) == ("NEW", 5750, 750, 2000)
     assert "R57.50" in _sent_texts(w)[0]
+
+
+async def test_h3_repeat_yes_for_an_already_live_order_says_placed_not_expired(stalls):
+    """Review L-1: the order went FEE_SENT -> NEW elsewhere (staff, or a concurrent "yes")."""
+    st = await stalls.make(plan="STARTER", connection=None, delivery=True)
+    with outside_world():
+        await _send(st)
+    async with get_session_factory()() as db:
+        order = (await db.execute(select(Order).where(Order.business_id == st.business_id))).scalar_one()
+        order.status = "NEW"
+        sess = (await db.execute(select(ConversationSession).where(
+            ConversationSession.id == st.session_id))).scalar_one()
+        sess.state = ConversationState.COLLECTING_PAYMENT.value
+        sess.context_json = {**sess.context_json, "pending_order_id": str(order.id), "delivery_fee_cents": 2000,
+                             "delivery_fee_status": "APPROVED"}
+        await db.commit()
+        number = order.order_number
+    with outside_world() as w:
+        await _send(st, "cash")
+    snap = await _snapshot(st)
+    assert [o.status for o in snap.orders] == ["NEW"]
+    text = _sent_texts(w)[0]
+    assert "already been placed" in text and number in text and "expired" not in text
+    assert snap.state == ConversationState.ORDER_PLACED.value
