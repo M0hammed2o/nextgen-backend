@@ -35,6 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.config import get_settings
 from backend.app.core.crypto import CredentialDecryptionError, decrypt_credential
+from shared.enums import EVENT_PLAN
 from shared.models.business import Business
 from shared.models.whatsapp_connection import WhatsAppConnection
 
@@ -138,6 +139,17 @@ async def resolve_whatsapp_credentials(
             "Business=%s has a customer WABA on record (%s) but no active "
             "connection row — no platform-token fallback.",
             business.id, business.whatsapp_business_account_id,
+        )
+        return None
+
+    # Souk WhatsApp gate: an event vendor must message customers through its
+    # OWN Embedded-Signup WABA, so Meta bills the vendor. It never gets the
+    # platform token (which would bill NextGen), even with a number set.
+    if business.plan == EVENT_PLAN:
+        logger.info(
+            "Business=%s is on the event plan with no CONNECTED own connection — "
+            "no platform-token fallback for event vendors.",
+            business.id,
         )
         return None
 
