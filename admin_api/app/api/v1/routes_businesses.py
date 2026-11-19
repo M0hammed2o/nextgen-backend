@@ -587,23 +587,40 @@ async def update_business(
                 422,
             )
 
-    # L-4: an event-plan business must never end up WhatsApp-enabled or with a
-    # WhatsApp number (the bot path is not behind the event trading gate).
+    # Souk WhatsApp gate (replaces the interim L-4 block; docs/EVENT_WHATSAPP.md).
+    # Bot orders now pass the event trading gate, so a SUPER_ADMIN may switch
+    # WhatsApp on for ONE event vendor (is_whatsapp_enabled, the per-vendor
+    # kill switch from migration 0065). Nobody may type a WhatsApp number or
+    # WABA id for an event vendor: it only ever comes from the vendor's own
+    # Embedded Signup (so the vendor, not NextGen, is billed by Meta).
     new_plan = changes.get("plan", biz.plan)
     if new_plan == EVENT_PLAN:
-        if changes.get("is_whatsapp_enabled") is True:
+        if changes.get("is_whatsapp_enabled") is True and user.role != AdminRole.SUPER_ADMIN:
             raise AppError(
                 "EVENT_PLAN_WHATSAPP_NOT_ALLOWED",
-                "An event-plan business cannot have WhatsApp enabled", 422,
+                "Only a super admin can enable WhatsApp for an event vendor", 403,
             )
-        new_number = changes["whatsapp_phone_number_id"] if "whatsapp_phone_number_id" in changes             else biz.whatsapp_phone_number_id
-        if new_number:
-            raise AppError(
-                "EVENT_PLAN_WHATSAPP_NOT_ALLOWED",
-                "An event-plan business cannot have a WhatsApp number; clear whatsapp_phone_number_id "
-                "in the same request", 422,
+        for field in ("whatsapp_phone_number_id", "whatsapp_business_account_id"):
+            if changes.get(field) and changes[field] != getattr(biz, field):
+                raise AppError(
+                    "EVENT_PLAN_WHATSAPP_NOT_ALLOWED",
+                    "An event vendor's WhatsApp number comes only from its own Embedded Signup "
+                    "and cannot be set here", 422,
+                )
+        if biz.plan != EVENT_PLAN:
+            # Moving INTO the event plan: a number from the old plan (platform
+            # token) must be cleared in the same request, and WhatsApp starts
+            # off; enabling it is a separate, explicit super-admin request.
+            new_number = (
+                changes["whatsapp_phone_number_id"] if "whatsapp_phone_number_id" in changes
+                else biz.whatsapp_phone_number_id
             )
-        if biz.plan != EVENT_PLAN or "is_whatsapp_enabled" in changes:
+            if new_number:
+                raise AppError(
+                    "EVENT_PLAN_WHATSAPP_NOT_ALLOWED",
+                    "An event-plan business cannot keep a typed-in WhatsApp number; clear "
+                    "whatsapp_phone_number_id in the same request", 422,
+                )
             changes["is_whatsapp_enabled"] = False
 
     # Fail-closed WhatsApp number handover (migration 0059): bump the

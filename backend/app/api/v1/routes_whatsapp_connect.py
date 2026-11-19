@@ -51,22 +51,27 @@ router = APIRouter(prefix="/business/whatsapp/connection", tags=["whatsapp-conne
 # ── Guard (mirrors _require_inventory_enabled in routes_inventory.py) ───────
 
 async def _require_whatsapp_module_enabled(
-    db: AsyncSession, business_id: uuid.UUID, *, mutating: bool = False
+    db: AsyncSession, business_id: uuid.UUID, *, mutating: bool = False, disconnecting: bool = False,
 ) -> Business:
     business = (
         await db.execute(select(Business).where(Business.id == business_id))
     ).scalar_one_or_none()
     if not business:
         raise NotFoundError("Business")
-    if mutating and business.plan == EVENT_PLAN:
-        # Security review H1: WhatsApp-originated orders do not pass the souk
-        # trading gate (protected bot files), so an event vendor must not be
-        # able to attach a WhatsApp number until the platform approves it.
-        raise AppError(
-            "EVENT_WHATSAPP_NOT_AVAILABLE",
-            "WhatsApp for event vendors is pending platform approval and cannot be connected yet.",
-            403,
-        )
+    if business.plan == EVENT_PLAN:
+        # Souk WhatsApp gate (docs/EVENT_WHATSAPP.md). Bot orders now pass the
+        # event trading gate, but WhatsApp stays off for an event vendor until
+        # a SUPER_ADMIN switches is_whatsapp_enabled on for that vendor (the
+        # per-vendor kill switch from migration 0065).
+        if disconnecting:
+            # The owner can always remove their own number, even while off.
+            return business
+        if mutating and not business.is_whatsapp_enabled:
+            raise AppError(
+                "EVENT_WHATSAPP_NOT_AVAILABLE",
+                "WhatsApp for event vendors is pending platform approval and cannot be connected yet.",
+                403,
+            )
     if not business.is_whatsapp_enabled:
         raise AppError(
             "WHATSAPP_NOT_ENABLED",
@@ -474,7 +479,7 @@ async def disconnect_whatsapp(
     user: AuthUser = Depends(require_owner),
     db: AsyncSession = Depends(get_db),
 ):
-    business = await _require_whatsapp_module_enabled(db, user.business_id)
+    business = await _require_whatsapp_module_enabled(db, user.business_id, disconnecting=True)
     try:
         connection = await connection_service.disconnect(db, business)
     except connection_service.ConnectionNotFound:
